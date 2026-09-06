@@ -204,13 +204,21 @@ default 32768). That threshold is a conservative engineering boundary pending th
 final 32k screen, not a measured crossover.
 
 `DS4_GLM_ENABLE_EXPERT_BANK=1` force-enables another compatible profile; `=0` forces
-it off. `DS4_GLM_DISABLE_EXPERT_BANK=1` is the strong kill switch. The fused and
-pipelined controls accept `1` or `0`, with unset taking the guarded profile default;
-the pipeline requires the fused layer command buffer. `DS4_GLM_DISABLE_SUPERCHUNK=1`
-is the strong schedule kill. Dynamic memory admission and ordinary fallback still
-apply. These defaults are not present at the `b723dfa` capability commit: release
+it off. Forcing the bank on an unmatched profile does not also force the fused command
+buffer or pipeline: enable those controls explicitly. `DS4_GLM_DISABLE_EXPERT_BANK=1`
+is the strong kill switch. The fused and pipelined controls accept `1` or `0`, with
+unset taking the guarded profile default. `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS` is a
+boolean; `=1` selects the fixed eight-layer bound rather than accepting a layer count,
+and it requires the fused layer command buffer. `DS4_GLM_DISABLE_SUPERCHUNK=1` is the
+strong schedule kill. Dynamic memory admission and ordinary fallback still apply.
+These defaults are not present at the `b723dfa` capability commit: release
 documentation must not call them shipped until their implementation, final build and
 boundary screen are complete.
+
+Speculative DFlash prefill seeding captures tap-layer activations inside the ordinary
+per-chunk schedule, so an armed speculative seed makes the expert-bank superchunk
+refuse. Conservative mode does no speculative prefill capture and remains eligible for
+the bank; serial mode loads no drafter and is eligible as well.
 
 For the same validated profile, the planned Metal mapping default also enables
 untracked model views when `DS4_METAL_MODEL_UNTRACKED` is unset. `=0` disables that
@@ -251,7 +259,7 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_GLM_ENABLE_EXPERT_BANK` | supported control (pending guarded default) | Unset selects the exact M3 Ultra/public-Q4 profile automatically; `1` forces another compatible profile; `0` forces off. Final implementation and screen pending. | expert-bank admission |
 | `DS4_GLM_EXPERT_BANK_MIN_TOKENS` | supported control (pending guarded default) | Minimum prompt tokens for the automatic bank schedule; planned default 32768, a provisional engineering boundary pending the final 32k screen. | expert-bank admission |
 | `DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB` | supported control (pending guarded default) | Unset takes the guarded profile default; `1` enables and `0` disables the fused layer command buffer. | expert-bank scheduler |
-| `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS` | supported control (pending guarded default) | Unset takes the guarded profile default (eight-layer bound); `1` enables and `0` disables the layer pipeline. Requires the fused layer command buffer. | expert-bank scheduler |
+| `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS` | supported control (pending guarded default) | Boolean: unset takes the guarded profile default, `1` enables the fixed eight-layer pipeline, and `0` disables it. It is not a layer-count setting and requires the fused layer command buffer. | expert-bank scheduler |
 | `DS4_METAL_MODEL_UNTRACKED` | supported control (pending guarded default) | Unset enables untracked model views only on the validated Metal M3 Ultra/public-Q4 profile; `1` enables elsewhere and `0` disables explicitly. Independent of bank admission. | Metal model mapping |
 | `DS4_GLM_DSA_TAIL_CHECKED` | supported control | =0 restores the legacy unchecked ragged tail in DSA attention (default 1: bounds-checked; registry entry 4). | `ds4_metal.m:41060` |
 | `DS4_GLM_ENABLE_BF16_LOWRANK_SPLITK` | supported control | =0 turns the BF16 low-rank split-K off (default on since bundle round 1). | `ds4_metal.m:52171` |
@@ -569,7 +577,7 @@ until the rebuilt artifact is screened.
   cached (`cache_source memory-text`, `cached_tokens 7014`) while the whole prompt was
   rebuilt, and the disk-snapshot path — tried only when nothing live is claimed — was
   skipped. Observed on the public build `a0bf48d` as lifecycle test T9 (receipt
-  `~/megakernel-refs/public-artifact/server-lifecycle/RUN-20260906T121302Z`): a 7,015-token
+  `server-lifecycle/RUN-20260906T121302Z`): a 7,015-token
   prompt repeated, 15.67 s then 15.33 s, no saved work, although a 6,144-token cold
   snapshot had been stored seconds earlier. This fork's fix, commit `8d7e091` ("server:
   validate the live text-prefix hit against the session before claiming it"), checks the
@@ -578,7 +586,7 @@ until the rebuilt artifact is screened.
   are servable; not claiming it (disk snapshot may be used)`), so the disk snapshot is
   used. Receipt on the v2 candidate (`public-glm53` + `8d7e091` + the KDA test commits;
   `ds4-server` sha256 `8bc890e9…`, ctx 65536):
-  `~/megakernel-refs/public-artifact/server-lifecycle/RUN-20260906T123859Z` — the repeat
+  `server-lifecycle/RUN-20260906T123859Z` — the repeat
   of the 7,015-token prompt logged the rewind rejection, the declined text claim, then
   `kv cache hit text tokens=6144 … load=36.9 ms` and `chat ctx=6144..7015:871` prefill
   over exactly the 871-token suffix (`server.log` 138–147); accounting `cache_source

@@ -68,8 +68,8 @@ Partial final blocks remain scalar. Never leave
 comparison or benchmark flags enabled in a throughput pair.
 
 Frozen pre-experiment source is commit `2ce5473`. Its executable and runtime
-Metal directory are preserved together at
-`/Users/mark/megakernel-refs/public-artifact/ASTRAL-DFLASH-BASELINE-2ce5473`.
+Metal directory are preserved together in retained receipt
+`ASTRAL-DFLASH-BASELINE-2ce5473`.
 Run it from that directory to use its frozen shaders. Its executable SHA256 is
 `1eedbd95bfa65d336f7440468ee0a81992943f7995d4a3626514008cdf915b5c`.
 
@@ -97,8 +97,8 @@ decision differences. No GPU-resident FC/output-normalization rewrite is include
 The frozen `f245d63` screen compared 26,019,840 full-logit words across 168 real
 verifier rows and found NT4/reference identity. The separate short JSON speed
 screen measured serial 39.86, old DFlash 47.54, NT4 48.35, and NT4+FC 49.26 t/s,
-with the same 1432-byte output and acceptance counts. Receipts are in
-`/Users/mark/megakernel-refs/public-artifact/ASTRAL-DFLASH-HEAD-SPEED-20260906T182159Z`.
+with the same 1432-byte output and acceptance counts. The retained receipt is
+`ASTRAL-DFLASH-HEAD-SPEED-20260906T182159Z`.
 These are scoped observations; 50 t/s has not been demonstrated by that screen.
 
 `make dflash-fastpath-test` checks production force/kill/exact precedence on the

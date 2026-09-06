@@ -57,9 +57,8 @@ session generation without begin refuses speculation and retains charged debt.
 
 ## Empirical profile v1
 
-Authority: root-owned receipts ASTRAL-DFLASH-JSON-20260906T173129Z and
-ASTRAL-DFLASH-CACHE-20260906T173358Z under
-`/Users/mark/megakernel-refs/public-artifact`, based on prefix commit 2ce5473.
+Authority: retained receipts `ASTRAL-DFLASH-JSON-20260906T173129Z` and
+`ASTRAL-DFLASH-CACHE-20260906T173358Z`, based on prefix commit `2ce5473`.
 Largest observed shortened operation: about 266ms; observed refresh:43.5ms;
 seed ingestion:22.4ms; cached-request time not assigned to these segments:
 about1.5ms. Sum about333ms, with a1.5x margin, rounded to **500ms**. The same

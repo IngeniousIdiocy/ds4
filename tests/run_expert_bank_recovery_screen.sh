@@ -9,13 +9,17 @@
 # MODE=ledgeroff16/ledgerbank16/ledgerfused16 collect mode-1 GPU spans.
 set -o pipefail
 
-W=${W:-/Users/mark/src/ds4-wt-astral-expertbank}
-M=${M:-/Users/mark/src/ds4-glm/gguf/GLM-5.3-Flash-Q4_K-9ab7053.gguf}
-P62=${P62:-/Users/mark/megakernel-refs/prompt-backup/needle-64k.txt}
-IDS=${IDS:-/Users/mark/megakernel-refs/public-artifact/PREFILL-Q8-20260906T152843Z/expertbank/moe-ids-62k-public.bin}
-G=${G:-/Users/mark/megakernel-refs/gpulock.sh}
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+W=${W:-$ROOT}
+M=${M:-}
+P62=${P62:-}
+IDS=${IDS:-}
+G=${G:-}
 MODE=${MODE:-native16}
-O=${O:-/Users/mark/megakernel-refs/public-artifact/EXPERTBANK-RECOVERY-$(date -u +%Y%m%dT%H%M%SZ)}
+O=${O:-${TMPDIR:-/tmp}/ds4-expert-bank-$(date -u +%Y%m%dT%H%M%SZ)}
+
+[ -n "$M" ] || { echo "M must name the target GGUF" >&2; exit 2; }
+[ -n "$G" ] || { echo "G must name the GPU-lock helper" >&2; exit 2; }
 
 if [ -z "${GPU_LOCK_TOKEN:-}" ]; then
     echo "GPU_LOCK_TOKEN is required; the coordinator must acquire the GPU lock" >&2
@@ -26,6 +30,7 @@ mkdir -p "$O"
 
 case "$MODE" in
 expansion)
+    [ -n "$IDS" ] || { echo "IDS must name the routed-id fixture" >&2; exit 2; }
     "$W/tests/test_glm_expert_bank" \
         --gguf "$M" --ids "$IDS" --layer 24 \
         --off-gate 91109299648 --off-up 92468254144 --off-down 93827208640 \
@@ -36,6 +41,7 @@ expansion)
         "$O/expansion.out"
     ;;
 stage0-16)
+    [ -n "$IDS" ] || { echo "IDS must name the routed-id fixture" >&2; exit 2; }
     "$W/tests/test_glm_expert_bank" \
         --gguf "$M" --ids "$IDS" --layer 24 --tokens 16224 \
         --off-gate 91109299648 --off-up 92468254144 --off-down 93827208640 \
@@ -47,6 +53,7 @@ stage0-16)
         "$O/stage0-16.out"
     ;;
 native16|packed16|async16|fused16)
+    [ -n "$P62" ] || { echo "P62 must name the long prompt" >&2; exit 2; }
     head -c 69254 "$P62" >"$O/p16k.txt"
     packed_env=
     if [ "$MODE" = packed16 ]; then
@@ -77,6 +84,7 @@ native16|packed16|async16|fused16)
         "$O/native16.err"
     ;;
 ledgeroff16|ledgerbank16|ledgerfused16)
+    [ -n "$P62" ] || { echo "P62 must name the long prompt" >&2; exit 2; }
     head -c 69254 "$P62" >"$O/p16k.txt"
     bank_env=DS4_GLM_ENABLE_EXPERT_BANK=1
     if [ "$MODE" = ledgeroff16 ]; then

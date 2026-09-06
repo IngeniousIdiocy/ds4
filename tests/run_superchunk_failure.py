@@ -17,6 +17,10 @@ import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+COMPARATOR_VERSION = 2
+FIRST_CHUNK = 4096
+GROUP_TOKENS = 32768
+FAULT_POSITION = FIRST_CHUNK + GROUP_TOKENS
 FAULT = re.compile(r"TEST_SC_ROUTED_FAILURE group=(\d+) pos=(\d+) tokens=(\d+) "
                    r"layer=(\d+) routed=(\d+) banks=(\d+) refused=(\d+)")
 CALLER = re.compile(r"TEST_SC_FAILURE_CALLER session=(\S+) status=(-?\d+) "
@@ -35,33 +39,47 @@ def verify(fault_log, recovery_log, before, after):
     caller = CALLER.findall(fault_log)
     require(len(fault) == len(caller) == 1, "need exactly one routed fault and invalid caller receipt")
     group, pos, tokens, layer, routed, banks, refused = map(int, fault[0])
-    require((group, pos, tokens, routed, banks, refused) == (2, 32768, 32768, 8, 8, 0),
-            "fault did not follow one full group and eight banked routed dispatches")
+    require((group, pos, tokens, routed, banks, refused) ==
+            (2, FAULT_POSITION, GROUP_TOKENS, 8, 8, 0),
+            "fault did not follow the ordinary 4096-token chunk, one full group and eight banked dispatches")
+    require("pos=4096..36863" in fault_log and
+            "status=1 (done) tokens=32768 chunks=4 routed_layers=42 bank_expanded=42" in fault_log,
+            "first banked group did not complete after the ordinary initial chunk")
     session, status, checkpoint, valid = caller[0]
-    require((int(status), int(checkpoint), int(valid)) == (-1, 32768, 0),
+    require((int(status), int(checkpoint), int(valid)) == (-1, FAULT_POSITION, 0),
             "routed failure did not invalidate the nonempty checkpoint")
     require(fault_log.index("TEST_SC_ROUTED_FAILURE") < fault_log.index("TEST_SC_FAILURE_CALLER"),
             "caller receipt precedes the fault")
     prime = PRIME.findall(recovery_log)
-    require(any(s == session and int(v) == 0 for s, _, v, _ in prime),
+    require(any(s == session and int(n) == FAULT_POSITION and int(v) == 0
+                for s, n, v, _ in prime),
             "same session did not re-prime from invalid state")
     require(not FAULT.search(recovery_log), "fault repeated during recovery")
     require(isinstance(before, str) and before, "fresh baseline assistant content is empty")
     require(before.encode() == after.encode(), "recovered assistant content differs from fresh baseline")
-    return {"group": group, "checkpoint": pos, "routed": routed, "banks": banks,
+    return {"comparator_version": COMPARATOR_VERSION, "ordinary_prefix": FIRST_CHUNK,
+            "group": group, "checkpoint": pos, "routed": routed, "banks": banks,
             "layer": layer, "same_session": session, "content_bytes": len(before.encode())}
 
 
 def self_test():
-    f = ("TEST_SC_ROUTED_FAILURE group=2 pos=32768 tokens=32768 layer=10 routed=8 banks=8 refused=0\n"
-         "TEST_SC_FAILURE_CALLER session=0x123 status=-1 checkpoint=32768 valid=0\n")
-    r = "TEST_SC_REPRIME session=0x123 prior_len=32768 prior_valid=0 prompt=20\n"
+    # Frontier and summary fields from the retained 538c37c runtime receipt.
+    f = ("GLM SUPER-CHUNK prefill ENGAGED: pos=4096..36863\n"
+         "GLM SUPER-CHUNK done: status=1 (done) tokens=32768 chunks=4 routed_layers=42 bank_expanded=42\n"
+         "TEST_SC_ROUTED_FAILURE group=2 pos=36864 tokens=32768 layer=10 routed=8 banks=8 refused=0\n"
+         "TEST_SC_FAILURE_CALLER session=0x123 status=-1 checkpoint=36864 valid=0\n")
+    r = "TEST_SC_REPRIME session=0x123 prior_len=36864 prior_valid=0 prompt=14\n"
     verify(f, r, "healthy", "healthy")
     controls = [
-        (f.replace("pos=32768", "pos=0"), r, "healthy", "healthy"),
+        (f.replace("pos=36864", "pos=0"), r, "healthy", "healthy"),
+        (f.replace("pos=36864", "pos=32768"), r, "healthy", "healthy"),
+        (f.replace("checkpoint=36864", "checkpoint=32768"), r, "healthy", "healthy"),
+        (f.replace("status=1 (done)", "status=-1 (failed)"), r, "healthy", "healthy"),
+        (f.replace("pos=4096..36863", "pos=0..32767"), r, "healthy", "healthy"),
         (f.replace("banks=8", "banks=7"), r, "healthy", "healthy"),
         (f.replace("valid=0", "valid=1"), r, "healthy", "healthy"),
         (f, r.replace("0x123", "0x456"), "healthy", "healthy"),
+        (f, r.replace("prior_len=36864", "prior_len=0"), "healthy", "healthy"),
         (f, r, "healthy", "Healthy"),
         (f, r, "", ""),
     ]
@@ -75,7 +93,27 @@ def self_test():
     stripped = re.sub(r"#if defined\(DS4_TEST_GLM_SC_FAIL_GROUP\)\n.*?#endif\n", "", c, flags=re.S)
     require("TEST_SC_" not in stripped and "test_sc_group" not in stripped,
             "fault logic or receipts escaped the dedicated compile-time guard")
-    print("PASS failure comparator: valid recovery, six planted refusals, production guards")
+    print(f"PASS failure comparator v{COMPARATOR_VERSION}: valid recovery, {len(controls)} planted refusals, production guards")
+
+
+def reanalyze(directory):
+    """Read preserved artifacts; never rewrite the original failed result."""
+    original = json.loads((directory / "result.json").read_text())
+    baseline = json.loads((directory / "baseline.response").read_text())
+    fault = json.loads((directory / "fault.response").read_text())
+    recovery = json.loads((directory / "recovery.response").read_text())
+    require(original.get("server_returncode") == 0, "server did not exit cleanly")
+    require("error" in fault, "fault response does not contain an error")
+    for response in (baseline, recovery):
+        require(response["usage"]["prompt_tokens_details"]["cached_tokens"] == 0,
+                "baseline or recovery reused cached prompt tokens")
+    result = verify((directory / "fault.log").read_text(),
+                    (directory / "recovery.log").read_text(),
+                    baseline["choices"][0]["message"]["content"],
+                    recovery["choices"][0]["message"]["content"])
+    result.update({"passed": True, "reanalyzed_from": str(directory.resolve()),
+                   "original_result": original, "server_returncode": 0})
+    print(json.dumps(result, indent=2))
 
 
 def request(port, body=None):
@@ -92,6 +130,7 @@ def request(port, body=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--receipts", type=pathlib.Path, help="CPU-only reanalysis of a retained vehicle directory")
     parser.add_argument("--server", type=pathlib.Path, default=ROOT / "tests/ds4_server_sc_failure")
     parser.add_argument("--model", type=pathlib.Path)
     parser.add_argument("--fault-prompt", type=pathlib.Path, help="native ~62k-token prompt; padded by default")
@@ -99,17 +138,21 @@ def main():
     parser.add_argument("--out", type=pathlib.Path)
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--lock-token")
-    parser.add_argument("--lock-script", default="/Users/mark/megakernel-refs/gpulock.sh")
+    parser.add_argument("--lock-script", type=pathlib.Path,
+                        help="GPU-lock helper; required for the runtime screen")
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return
-    require(args.model and args.fault_prompt and args.out and args.lock_token,
-            "--model, --fault-prompt, --out and --lock-token are required")
+    if args.receipts:
+        reanalyze(args.receipts)
+        return
+    require(args.model and args.fault_prompt and args.out and args.lock_token and args.lock_script,
+            "--model, --fault-prompt, --out, --lock-token and --lock-script are required")
     require(0 <= args.padding <= 8192, "padding must be 0..8192")
     require(args.server.is_file() and args.model.is_file(), "missing test server or model")
     require(b"TEST_SC_ROUTED_FAILURE" in args.server.read_bytes(), "server lacks the compile-only hook")
-    subprocess.run([args.lock_script, "preflight", args.lock_token], check=True)
+    subprocess.run([str(args.lock_script), "preflight", args.lock_token], check=True)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", args.port))  # refuse an existing listener
     args.out.mkdir(parents=True, exist_ok=False)

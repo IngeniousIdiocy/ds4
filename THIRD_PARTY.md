@@ -70,6 +70,10 @@ card's, and the weights are not part of this repository.
   carries its own redistribution terms, is retained where a case begins at the top of the
   file), from upstream's long-context test prompts and, for the long manifest only, from
   this repository's own documentation.
+  The manifest's `security_prompt` cases are deterministic windows from
+  `tests/long_context_security_prompt.txt`, inherited from upstream at `9ab7053`.
+  Paths and internal-looking sample URLs in that fixture are upstream test text, not
+  local data or provenance claims; this subset is not described as public-domain prose.
 - `gguf-tools/quality-testing/data/*` are upstream's reference outputs (see upstream's
   `gguf-tools/quality-testing/README.md` for their provenance).
 

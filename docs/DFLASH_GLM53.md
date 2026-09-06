@@ -24,11 +24,18 @@ result.
 verified: the pinned source hash was computed here, and re-running the pinned
 converter command reproduced the tested artifact byte for byte. The `b723dfa`
 capability build also passed the affected startup, server reuse, cancellation,
-stop and natural-EOS runtime checks. The fixed-horizon measurement in §1 shows
+stop and bounded natural-EOS runtime checks. The EOS control may fire while a
+decoded control marker is still visible; visible markers are diagnostic text, not an
+exact count of sampled EOS-token events. The fixed-horizon measurement in §1 shows
 that this drafter can pay on one favorable structured workload. It does not
 establish a general speedup. DFlash2 remains optional, greedy-only and dependent
 on a locally obtained drafter. The final rebuilt release artifact still needs
 its own retained runtime receipt.
+
+Only explicit speculative mode arms prefill feature seeding. That capture uses the
+ordinary per-chunk prefill path, so the expert-bank superchunk refuses while it is
+armed. Conservative mode refreshes features only after request credit funds a decode
+bundle, and serial mode loads no drafter; both remain eligible for expert-bank prefill.
 
 ---
 

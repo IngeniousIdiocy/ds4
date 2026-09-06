@@ -3,14 +3,19 @@
 # an earlier ordinary control and never launches ds4 or repeats prefill.
 set -o pipefail
 
-W=${W:-/Users/mark/src/ds4-wt-astral-router}
-M=${M:-/Users/mark/src/ds4-glm/gguf/GLM-5.3-Flash-Q4_K-9ab7053.gguf}
-G=${G:-/Users/mark/megakernel-refs/gpulock.sh}
-CAP=${CAP:-/Users/mark/megakernel-refs/public-artifact/ASTRAL-ROUTER-REAL-20260906T181812Z/capture}
-O=${O:-/Users/mark/megakernel-refs/public-artifact/ASTRAL-ROUTER-REAL-20260906T181812Z/compare-retry}
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+W=${W:-$ROOT}
+M=${M:-}
+G=${G:-}
+CAP=${CAP:-}
+O=${O:-${TMPDIR:-/tmp}/ds4-router-b4-compare-$(date -u +%Y%m%dT%H%M%SZ)}
 LAYER=${LAYER:-24}
 POS=${POS:-4096}
 ROWS=${ROWS:-8192}
+
+[ -n "$M" ] || { echo "M must name the target GGUF" >&2; exit 2; }
+[ -n "$G" ] || { echo "G must name the GPU-lock helper" >&2; exit 2; }
+[ -n "$CAP" ] || { echo "CAP must name the existing capture prefix" >&2; exit 2; }
 
 if [ "${RUN_ROUTER_B4_GPU:-}" != 1 ]; then
     echo "RUN_ROUTER_B4_GPU=1 is required; this wrapper runs Metal work" >&2
