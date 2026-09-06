@@ -224,6 +224,16 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 
+## GLM-5.3-Flash on the M3 Ultra (this branch)
+
+This branch carries a Metal-side decode/prefill kernel set, server changes and a
+fidelity harness for GLM-5.3-Flash on a 512 GB Mac Studio. Start with
+[the GLM-5.3 M3 Ultra guide](docs/GLM53_M3ULTRA.md) — tested configuration, the
+exactness contract (`DS4_GLM_EXACT=1` reproduces upstream's numerics), feature status,
+switch reference and known issues — and read
+[CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relative to upstream and why.
+`./ds4 --help glm53` lists the supported controls and kill switches.
+
 ## Logo
 
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more

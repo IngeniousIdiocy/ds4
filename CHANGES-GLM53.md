@@ -1,0 +1,248 @@
+# Changes on the GLM-5.3 M3 Ultra branch
+
+An engineering account of what this branch changes relative to upstream ds4 at
+`9ab7053`, written for a reviewer of the code. User-facing details (configuration,
+switches, status, known issues) are in `docs/GLM53_M3ULTRA.md`; the fidelity rules in
+`bench/FIDELITY.md`; the exact-mode contract in `bench/EXACT-MODE-PLAN.md`. Speed and
+quality numbers are not repeated here — the branch's claims are bound to receipts on
+the public artifact (see `docs/GLM53_M3ULTRA.md`, "Results"), and the historical
+per-round numbers, measured on a retired custom quantization, are kept only in
+`bench/README.md` under a historical heading.
+
+The target is one machine and one regime: single-stream GLM-5.3-Flash on an M3 Ultra,
+at the 40k–300k contexts where a coding agent spends 97% of its decoded tokens. The
+M3 Ultra is two dies and 80 GPU cores behind roughly 700 GB/s of measured memory
+bandwidth; a decode step of this model reads about 14 GB of weights, so the roofline is
+~50 t/s and the work was to close the gap to it without changing what the model
+computes.
+
+## 1. Decode kernels
+
+Where the time went was established first, with a stage-ablation switch
+(`DS4_GLM_DECODE_ABLATE` family) and a per-kernel bandwidth ledger
+(`DS4_KERNEL_LEDGER`, `ds4_metal.m:1770`). Two findings drove everything after:
+
+- The large kernels (LM head, KDA qkv, dense FFN) already ran at 700+ GB/s. The debt
+  was in **small, parallelism-starved kernels**: hundreds of dispatches per token with
+  1–64 threadgroups on an 80-core GPU, each paying a fixed dependent-dispatch floor. Of
+  ~1,000 dispatches per token, ~600 under 100 threadgroups consumed a fifth of the token
+  for 4% of the bytes.
+- A dependent-dispatch boundary in the production serial encoder is worth about 1 µs,
+  not the 6 µs the ledger's intercept first suggested, so *launch* fusion alone is not
+  the lever; removing a dependency hop, widening a starved kernel, or folding a small
+  latency-bound row set into the tail of a large streaming grid is.
+
+What shipped, all default-on, each with a kill switch, and bit-identical unless marked
+Tier 2 (see `bench/FIDELITY.md` for what each tier proves):
+
+- **KDA layers** (`metal/glm53_kda.metal`, host in `ds4.c:43661-45473`): the recurrence
+  split into phases (64 → 512 threadgroups); prep and state fused into one wide
+  threadgroup per head (two dispatches per layer instead of three); the low-rank
+  projections packed — `f_a+g_a+beta` as one flat matvec, `f_b+g_b` as a pair — and the
+  flat rows folded into the tail of the Q8_0 q/k/v grid so they ride in the same wave
+  instead of paying their own launch; `f_b/g_b` and the output projection folded into
+  the state kernel's prologue and tail. An all-Q8 fusion of the whole projection stage
+  (eight dispatches to two) exists opt-in (`DS4_GLM_ENABLE_KDA_PROJ_FUSE`) and is the
+  first path written for the public artifact's all-Q8 KDA layout; it is not validated.
+- **Hyper-connection (HC) pre-stage** (`metal/dsv4_hc.metal`, `ds4_metal.m:52600-53110`):
+  the RMS + split-K mixer and the reduce + weighted-sum collapsed into a fused pair with
+  a redundant-RMS trick (four dispatches to two); the tail replicated across 13
+  threadgroups, each writing its own slice, with zero cross-threadgroup data; the
+  split-K reduce in float4; **Tier 2:** 16 split-K slices at 32 simdgroups instead of 8,
+  and "algebra half A" (the unscaled split-K dot with the scale applied in the tail, so
+  no threadgroup re-reads the 64 KB HC row). The one-dispatch form with a
+  last-threadgroup tail was built and measured slower (the tail is single-core-bandwidth
+  bound, not dispatch bound) and is kept opt-in.
+- **Epilogue fusions** (`ds4.c:44979-46471`): residual add and mHC expand folded into
+  the epilogue of the preceding Q8_0 matvec (MoE shared-down, attention-out, dense-down),
+  removing ~130 dispatches per token and, more importantly, a dependency hop each; HC
+  norm and norm+mix fused; the Sinkhorn comb moved past a barrier it did not need.
+- **Router and shared expert** (`ds4_metal.m:41929-42160`, `metal/dense.metal`,
+  `metal/dsv4_misc.metal`): top-8 selection folded onto the tail of the router logits
+  matvec; the router then folded into the head of the shared-expert gate+up grid (144
+  router threadgroups ahead of 512 shared-expert ones, with a ticket and seq_cst fences
+  on both sides, and a new 8 KB shared-mid tensor that breaks an `ffn_mid` alias) — 42
+  fewer dispatches per token and the largest single decode win; an iterative top-k
+  router selection instead of a 512-wide bitonic sort.
+- **Routed experts** (`metal/moe.metal`, `ds4_metal.m:42893-42940`): **Tier 2**
+  expert-parallel down projection — one expert slot per threadgroup (16,384 threadgroups
+  where the sequential form launched 1,024), partials summed in fixed slot order inside
+  the shared-down epilogue; `ushort4` quant loads in the gate+up pair.
+- **DSA attention and indexer** (`ds4.c:42366-44626`, `ds4_metal.m:20112-20540`,
+  `metal/argsort.metal`, `metal/dsv4_misc.metal`): q_a, kv_a and the three indexer
+  projections in one dispatch with the BF16 rows at the head of the Q8 grid; the
+  indexer scorer stages its query once per threadgroup (it had been re-reading 249 MB of
+  query per token against 4 MB of keys); the mono → split8 attention crossover lowered
+  to 64 selected rows, the split8 reduce widened to 512 threads with ushort-paired Q8_0
+  value rows; and, for the top-k that selects the 2,051 attended rows, a **bounded
+  radix fast path** (three dispatches with a 13-bit signed-monotone key, a predicate
+  over the complete input that accepts only a strictly separated winner set, and the
+  production sort/merge chain always encoded as indirect dispatches whose grids the fast
+  path writes — zero threadgroups on accept, real grids on reject). The last item is what
+  the 300k regime gains from; acceptance is ~99% on real score rows.
+- **Q8_0 matvec family:** the residual-add/HC epilogue fusion above; a per-family
+  simdgroup-count override (`DS4_GLM_T2S_Q8NSG_<FAM>`, Tier 2, pinned under exact mode).
+- **HC-expand epilogue `ptail`** (`metal/t2screen.metal`): the epilogue spread over
+  eight lanes instead of one; Tier 1, default on, and the reason that file is not
+  bench-only.
+
+Two negative results are kept in the tree opt-in as reproducible references: the
+**MoE block dataflow kernel** (`metal/glm53_moe_block.metal`; router, shared expert,
+eight routed experts, slot sum, residual add and HC expand in one persistent
+240-threadgroup dispatch — bit-exact over 7.3 billion words, 168 fewer dispatches per
+token, and slower in the graph, because a 240-threadgroup grid is far more
+latency-sensitive than an 8,192-threadgroup one and the counter handoffs cost more than
+the ~3 µs of overlap they buy), and **hc_pre algebra half B** (sliced collapse with a
+communicated sum of squares and a watchdog-recovered counter wait).
+
+Two hardware facts that shaped the kernels and are worth knowing when reading them: on
+the two-die M3 Ultra, plain device stores from one threadgroup are not reliably visible
+to an elected last threadgroup in the same dispatch even under seq_cst device-scope
+fences — cross-threadgroup data inside one dispatch has to travel through atomics or
+cross a dispatch boundary; and fast-math re-associates regardless of source order, so
+bit-identity requires identical lane/instruction structure (`acc += x*w` contracts to an
+FMA and drifts 1 ULP; `fma(x, w, 0.0f)` pins the product).
+
+## 2. Prefill kernels
+
+Prefill runs different kernels from decode (batched, tiled), so the decode work bought
+it nothing; it was taken up separately with the same method (per-stage trace,
+`DS4_GLM_PREFILL_TRACE`, `ds4.c:38137`). Default-on unless marked:
+
+- **KDA prefill fast path** (`ds4_metal.m:55510-55660`, `metal/glm53_kda.metal`): a
+  prepare/recurrence pair with a 16-column recurrence, staged q/k/decay, and block sizes
+  chosen per row count; the sweep knobs that found the shape are still readable from the
+  environment.
+- **BF16 low-rank split-K** (`ds4_metal.m:52129-52200`, `metal/glm53_bf16.metal`,
+  **Tier 2**): the 4-to-8-threadgroup matmul dispatches for the HC mixer, the KDA
+  low-rank pair and the DSA indexer k/gate become 16 threadgroups per tile of partial
+  sums added in fixed slice order. Its kernel ordering error against an FP64 reference
+  is under 1% of the rounding floor main's own input narrowing already introduces.
+- **Blocked online softmax in batched DSA attention** (`ds4_metal.m:40862-41100`,
+  `metal/dsv4_misc.metal`, **Tier 2**): a 24-row gather stage with a 4-row softmax
+  sub-block in one pass; 16-byte gather copies; the rescale skipped where it is an
+  identity; the dead rope path removed at this shape.
+- **Checked ragged tail** (same kernel, **Tier 2 by registration**, though it corrects
+  rather than reorders): upstream's pool expansion writes `0xffffffff` sentinels into
+  the 1–3 unused tail slots of three tokens in four, and the valid-only attention kernel
+  stages the cache at that row. The branch bounds-checks the tail; exact mode keeps the
+  legacy behaviour because upstream has it. `bench/FIDELITY.md` records the measurement.
+- **Token-tiled router and qk low-rank kernels** (`ds4_metal.m:24726-24900`, `:39631`):
+  one weight pass per block of tokens instead of one per token (the qk low-rank kernel
+  had been re-walking a 512×256 Q8_0 matrix per token, 9% of a 62k prefill).
+- **Routed-expert GEMM inner loop** (`ds4_metal.m:43790-44020`): 16-byte dequant loads,
+  narrow-tile selection, a grouped path above a token threshold; A-stage double
+  buffering is implemented but off.
+- **Dense half copy / ring** (`ds4_metal.m:21150-21300`) and the **indexer causal grid**
+  (`ds4_metal.m:39155`: the staircase of causal scores as a rectangle plus one fill
+  kernel instead of a full grid), and the **prefill folds** (width-4 HC expand and
+  SwiGLU, per-expert work map, FFN add folded one pass earlier).
+- **Prefill chunk** raised to 8192 tokens beyond the dense window
+  (`DS4_GLM53_PREFILL_CHUNK`, `ds4.c:37897`), where the chunk only affects buffer sizes
+  and routed-tile fill.
+
+The blocked softmax and the split-K were adopted together as one "bundle" against the
+1,000-case manifest; that procedure, and why greedy-output identity cannot gate prefill
+changes, is in `bench/FIDELITY.md`.
+
+## 3. DFlash2 speculative decoding
+
+`ds4_dflash2.inc`, `ds4_dflash_glm.inc`, `ds4_dflash_seed.inc`, `ds4_dflash_selector.inc`,
+`ds4_dflash_golden.inc`, `metal/dflash2.metal`, `gguf-tools/dflash2_to_gguf.py`, and the
+`--dflash` flag in `ds4_cli.c:2130` / `ds4_server.c:14488`. A GLM-5.3 port of the
+DFlash/DFlash2 block-diffusion draft engine from antirez/ds4 PR #844 (attribution in
+`THIRD_PARTY.md`): a simdgroup SDPA drafter kernel, BF16 drafter weights, a persistent
+sliding-window context-KV cache, the z-lab candidate selector, exact rejection sampling
+for the sampled path, and an adaptive throttle that prices the draft cycle against
+serial decode from live wall-clock measurements and parks speculation when acceptance
+cannot pay (this is what kept it break-even rather than negative on agentic content at
+depth, where the embedded MTP-2 draft loses 10–20%).
+
+**On this branch it is refused at run time** (`ds4_dflash_glm.inc:57-101`). Upstream
+now includes the DSA indexer tail ring in the speculative state it restores after a
+rejected draft; the DFlash rollback restores KDA state only, and all three verify routes
+write the ring for every drafted row, so a partial acceptance would leave rejected rows
+in it. Rather than ship a selectable mode with a known-incomplete rollback, the cycle is
+refused before any target state is mutated and the token is evaluated serially, with
+one stderr notice. The two completions and the certification they need are described in
+`docs/GLM53_M3ULTRA.md`. The same incompleteness in upstream's MTP row-snapshot fast
+path is handled by a guard (`ds4.c:68578`) that makes the fast path fall through to
+upstream's full restore+replay on every real GLM-5.3 graph.
+
+## 4. Server
+
+`ds4_server.c`; each item default-on with a switch:
+
+- **Thinking-turn cache keys for GLM** — after a thinking turn the server remembered a
+  "visible key" so the next request could continue from live KV, but rendered it in
+  DeepSeek syntax; GLM's template keeps the opening `<think>`, trims assistant text and
+  has no DeepSeek EOS marker, so on GLM the key never matched and every multi-turn
+  thinking exchange with a reasoning-stripping client re-prefilled from scratch (four
+  minutes per turn at 100k). Fixed; the checkpoint is now also recorded for turns
+  truncated by `max_tokens` and for tool-context turns (`DS4_SERVER_CHECKPOINT_ON_LENGTH`,
+  `DS4_SERVER_CHECKPOINT_WITH_TOOLS`, `ds4_server.c:11700-11715`), which had been the
+  remaining source of cache misses at depth.
+- **KV eviction stores trimmed to the client's transcript** (`ds4_server.c:10431`,
+  `DS4_KV_EVICT_RAW` restores the old store): the disk key is otherwise the rendered
+  sampled text including hidden thinking and tool markup, which clients that reshape the
+  assistant turn never reproduce.
+- **Checkpoint granularity** — the recommended `--kv-cache-continued-interval-tokens 4096
+  --kv-cache-cold-max-tokens 30000`, after a client inserted a system reminder into the
+  middle of a 24k transcript and every strict-prefix cache mechanism missed; a saved
+  checkpoint shorter than the divergence point turns a 62 s re-prefill into ~20 s.
+- **Streaming guard** (`ds4_server.c:6553`, `DS4_STREAM_GUARD_LEGACY`): with thinking and
+  tools both enabled, both emitters held *all* answer text after the first `</think>`
+  until a second one, a tool-call start or the end of generation, so the answer arrived
+  as one delta. The guard now holds only while the pending bytes could still spell
+  `<think>`.
+- **Anthropic default effort** (`ds4_server.c:3859`, `DS4_ANTHROPIC_DEFAULT_EFFORT`) for
+  clients that cannot send `reasoning_effort`; **slot placement by eviction cost**
+  (`ds4_server.c:13682`, only with `--batched-session ≥ 2`, which must not be enabled for
+  this workload because batched mode disables speculative decoding); **GLM tool-result
+  reorder** (`ds4_server.c:2732`, with a jinja2 reference renderer in
+  `tests/glm_tool_result_reorder_ref.py`); **trace segment cap** (`DS4_TRACE_MAX_MB`).
+- The merge adopted upstream's newer multimodal session handling (a validity predicate
+  instead of the fork's unconditional invalidation); see `docs/GLM53_M3ULTRA.md`.
+
+## 5. Exact mode and the fidelity harness
+
+The rule (`bench/FIDELITY.md`): a change either proves bit-identity in a randomized
+poisoned harness with a detected control arm (Tier 1), or it is a floating-point-order
+change (Tier 2) that ships behind its own kill switch, is registered in
+`glm53_exact_mode()` (`ds4_metal.m:52681` and the registry comment after it; mirror
+`glm53_exact_mode_c()` in `ds4.c:42329`), and may default on only after the
+teacher-forced scorer shows it indistinguishable from the same-build control within a
+cumulative 3e-4 avg_nll budget against clean upstream. `DS4_GLM_EXACT=1` clamps all
+eleven registered entries at once, so the branch can be scored byte-identical to
+upstream at the pin (`bench/EXACT-MODE-PLAN.md`).
+
+The harness itself: `bench/prefill-gate.sh` (interleaved A/B prefill gate with byte
+identity), `bench/tier2-gate.sh` + `bench/compare_1k.py` (the 1,000-case scorer gate
+with paired statistics), the two manifest generators and their fixtures, and a set of
+in-engine instruments that are off unless asked for — the kernel ledger, prefill
+trace, selection trace, top-k and scorer operand capture, an FP64 host reference for
+DSA attention, generation counters and an ignore-EOS mode so paired benchmarks get
+equal decode windows. Speed-bench microbenches for the small-kernel fusion and the depth
+selector have Makefile targets. The tail-sentinel defect in upstream's DSA selection was
+found with these instruments.
+
+## 6. Documentation and packaging
+
+`docs/GLM53_M3ULTRA.md` (configuration, contract, feature status with "implemented" and
+"validated" kept apart, switch reference, recipes, receipt-bound results, known issues,
+checklist); `bench/README.md`, `bench/FIDELITY.md`, `bench/EXACT-MODE-PLAN.md` rewritten
+for a public reader with the historical ledger separated from the public-artifact epoch;
+the bench scripts parametrized so they run from a fresh checkout; `THIRD_PARTY.md` for
+the DFlash2 provenance, the non-redistributable drafter weights and the jinja2 test
+dependency; and this file. The campaign's working notes (prefill plan, decode backlog,
+exact-reference procedure) are kept outside the public tree; their technical content is
+summarized in `bench/README.md` ("Campaign notes").
+
+## How this was built
+
+The kernel, server and harness work was carried out by AI coding agents (Anthropic's
+Claude models, through Claude Code) working under the direction of the repository
+owner, who set the targets, chose the fidelity rules, reviewed and gated every adoption,
+and ran the machine; independent review of the fidelity methodology was also
+AI-assisted. The commits are attributed accordingly rather than relabelled. The
+engineering claims are meant to stand on their receipts, not on who typed them.
