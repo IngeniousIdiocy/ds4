@@ -36,7 +36,9 @@ static void glm_dflash_seed_configure(const ds4_dflash2_weights *dw) {
         }
     }
     g_glm_dflash_seed.chunk_cap = glm53_prefill_chunk_tokens();
-    g_glm_dflash_seed.enabled = 1;
+    /* Capped requests cannot pay optional prefill capture from future decode
+     * credit. They obtain fresh features only after funding a decode bundle. */
+    g_glm_dflash_seed.enabled = getenv("DS4_DFLASH_NO_ADAPTIVE") != NULL;
 }
 
 /* Stamp the prefill about to run with its session's conditioning generation,
@@ -115,6 +117,10 @@ static void glm_dflash_seed_chunk_end(uint32_t chunk, uint32_t pos_end,
         sd->ring_end_pos = pos_end;
         sd->owner_gen = sd->bound_gen;
         g_dflash_overhead.seed_rows += take;
+    } else {
+        /* The in-place ring may already have dropped rows or received a
+         * partial copy. Drop eligibility; the next cycle can refresh safely. */
+        glm_dflash_seed_invalidate();
     }
     g_dflash_overhead.seed_readback_ms += (now_sec() - t0) * 1000.0;
     g_dflash_overhead.seed_chunks++;

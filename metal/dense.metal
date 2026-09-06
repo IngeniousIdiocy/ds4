@@ -229,6 +229,73 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+/* DFlash vocabulary-head experiment. Four independent tokens reuse each
+ * pair of vocabulary rows' Q8 bytes and scales. Keep the scalar NSG8 head's
+ * K assignment, eight-product sumq, scale-after-sumq, and two simd_sum stages.
+ * As in the F32 router token tile below, all tokens share two barriers. */
+kernel void kernel_dflash_q8_0_head_nt4(
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]],
+        device const char *src0 [[buffer(1)]],
+        device const char *src1 [[buffer(2)]],
+        device float *dst [[buffer(3)]],
+        threadgroup float *sh [[threadgroup(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NT = 4, NR = 2, NQ = 8, NW = 32;
+    const short NSG = FC_mul_mv_nsg;
+    const uint r0 = tg.x * NR, token0 = tg.y * NT;
+    const int ib0 = sg * NQ + lane / (NW / NQ);
+    const short il = lane % (NW / NQ);
+    const int nb = args.ne00 / QK8_0;
+    float sums[NT][NR];
+    FOR_UNROLL (short t = 0; t < NT; t++) {
+        FOR_UNROLL (short r = 0; r < NR; r++) sums[t][r] = 0.0f;
+    }
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        int8_t qs[NR][NQ];
+        float scales[NR];
+        FOR_UNROLL (short r = 0; r < NR; r++) {
+            device const block_q8_0 *w = (device const block_q8_0 *)(
+                src0 + (uint64_t)(r0 + r) * args.nb01);
+            scales[r] = w[ib].d;
+            FOR_UNROLL (short i = 0; i < NQ; i++) qs[r][i] = w[ib].qs[il * NQ + i];
+        }
+        FOR_UNROLL (short t = 0; t < NT; t++) {
+            device const float *y = (device const float *)(
+                src1 + (uint64_t)(token0 + t) * args.nb11);
+            float yl[NQ];
+            FOR_UNROLL (short i = 0; i < NQ; i++) yl[i] = y[ib * QK8_0 + il * NQ + i];
+            FOR_UNROLL (short r = 0; r < NR; r++) {
+                float sumq = 0.0f;
+                FOR_UNROLL (short i = 0; i < NQ; i++) sumq += qs[r][i] * yl[i];
+                sums[t][r] += sumq * scales[r];
+            }
+        }
+    }
+    FOR_UNROLL (short t = 0; t < NT; t++) {
+        FOR_UNROLL (short r = 0; r < NR; r++) {
+            if (sg == 0) sh[NW * (t * NR + r) + lane] = 0.0f;
+            sums[t][r] = simd_sum(sums[t][r]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short t = 0; t < NT; t++) {
+        FOR_UNROLL (short r = 0; r < NR; r++) {
+            if (lane == 0) sh[NW * (t * NR + r) + sg] = sums[t][r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        FOR_UNROLL (short t = 0; t < NT; t++) {
+            FOR_UNROLL (short r = 0; r < NR; r++) {
+                const float total = simd_sum(sh[NW * (t * NR + r) + lane]);
+                if (lane == 0) dst[(uint64_t)(token0 + t) * args.ne0 + r0 + r] = total;
+            }
+        }
+    }
+}
+
 // Fused decode-time Q8_0 matvec over three same-shaped weights sharing one
 // input (GLM-5.3 KDA q/k/v): threadgroup z selects the matrix, so the three
 // projections cost one dispatch instead of three. Per-row math is identical
@@ -3492,6 +3559,24 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+/* GLM-5.3 router B4. Four F32 partial products are reduced in a fixed
+ * balanced order after the split-K matrix-unit projections. */
+struct ds4_router_splitk_b4_args {
+    uint32_t n_elem;
+};
+
+kernel void kernel_glm53_router_splitk_b4_sum_f32(
+        constant ds4_router_splitk_b4_args & args,
+        device const float * partials,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_elem) return;
+    const ulong n = (ulong)args.n_elem;
+    const float a = partials[(ulong)gid] + partials[n + (ulong)gid];
+    const float b = partials[2ul*n + (ulong)gid] + partials[3ul*n + (ulong)gid];
+    dst[gid] = a + b;
+}
 
 /*
  * Prefill lever 19: dense Q8_0 weight -> half, once per prefill chunk.

@@ -1658,7 +1658,26 @@ static int dflash2_propose(
     const double tp0 = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
     float *h_ctx = xmalloc((size_t)target_rows * H * sizeof(float));
     float *fc_out = xmalloc((size_t)target_rows * H * sizeof(float));
-    dflash2_matvecs(fc_out, dm, dw->fc, target_concat, target_rows);
+    int fc_mm_ran = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    extern void ds4_gpu_glm53_bf16_mv_max_set(uint32_t v);
+    extern uint32_t ds4_gpu_glm53_bf16_mv_max_get(void);
+    /* The FC precedes the existing layer MM scope. Share its BF16 weights
+     * across 2..8 rows, then restore dispatch policy before CPU normalization
+     * or any fallback. The target verifier still checks the resulting drafts. */
+    if (getenv("DS4_DFLASH_FC_MM") && dw->fc->type == DS4_TENSOR_BF16 &&
+        target_rows >= 2u && target_rows <= 8u) {
+        const uint32_t fc_mv_max = ds4_gpu_glm53_bf16_mv_max_get();
+        ds4_gpu_glm53_bf16_mv_max_set(1);
+        fc_mm_ran = dflash2_matvecs_gpu(
+            fc_out, dm, dw->fc, target_concat, target_rows);
+        ds4_gpu_glm53_bf16_mv_max_set(fc_mv_max);
+    }
+#endif
+    if (!fc_mm_ran) dflash2_matvecs(fc_out, dm, dw->fc, target_concat, target_rows);
+    if (getenv("DS4_DFLASH_FC_MM") && getenv("DS4_DFLASH_STATS")) {
+        fprintf(stderr, "ds4: dflash fc rows=%u mm=%d\n", target_rows, fc_mm_ran);
+    }
     for (uint32_t t = 0; t < target_rows; t++) {
         rms_norm_weight(h_ctx + (size_t)t * H, fc_out + (size_t)t * H,
                         tensor_data(dm, dw->enc_output_norm), H, dw->rms_eps);
@@ -1673,10 +1692,10 @@ static int dflash2_propose(
     }
     int gpu_all = 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    extern void ds4_gpu_glm53_bf16_mv_max_set(uint32_t v);
+    const uint32_t layer_mv_max = ds4_gpu_glm53_bf16_mv_max_get();
     ds4_gpu_glm53_bf16_mv_max_set(1);
     if (cache && !dflash_cache_make_room(cache, dw, target_rows)) {
-        ds4_gpu_glm53_bf16_mv_max_set(8);
+        ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
         free(h); free(fc_out); free(h_ctx);
         return 0;
     }
@@ -1705,7 +1724,7 @@ static int dflash2_propose(
     }
 #endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    ds4_gpu_glm53_bf16_mv_max_set(8);
+    ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
 #endif
     if (!gpu_all) {
         if (cache) ds4_die("DFlash Metal forward with context cache failed");

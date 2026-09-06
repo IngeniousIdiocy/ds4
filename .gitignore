@@ -64,3 +64,5 @@ __pycache__/
 /dflash2-weights/
 /tests/test_glm_expert_bank
 /tests/test_glm_superchunk_state
+/speed-bench/metal_router_b4_fixture
+/tests/test_dflash_budget

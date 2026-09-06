@@ -236,6 +236,8 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
+/* Read initialized host metadata; does not initialize or run Metal. */
+int ds4_gpu_dflash_budget_profile_device(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
@@ -794,6 +796,13 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+/* Experimental DFlash vocabulary head: four tokens share Q8 loads while
+ * retaining the scalar head's NSG8 K walk and per-token reduction tree.
+ * Returns 0 without dispatch for shapes other than 4096 -> 154880, rows=8. */
+int ds4_gpu_dflash_head_nt4_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -3944,6 +3953,20 @@ int ds4_gpu_dense_half_ring_prepare(const void *model_map,
                                     uint64_t    out_dim,
                                     uint64_t    rows);
 void ds4_gpu_dense_half_ring_release(void);
+
+/* GLM-5.3 prefill router B4: four F32 matrix-unit K slices followed by a
+ * fixed balanced F32 reduction. The graph supplies a scratch tensor holding
+ * 4*n_tokens*288 floats. This Tier-2 path is default off and exact-mode
+ * clamped; callers should query active() before dispatching it. */
+int ds4_gpu_router_splitk_b4_active(void);
+int ds4_gpu_router_splitk_b4_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *partials,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens);
 /* --------------------------------------------------------------------------
  * Tier-2 screening instrumentation.
  *

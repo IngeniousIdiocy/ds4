@@ -3555,6 +3555,11 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+int ds4_gpu_dflash_budget_profile_device(void) {
+    return strcmp(g_metal_device_name, "Apple M3 Ultra") == 0 &&
+        [[NSProcessInfo processInfo] physicalMemory] >= (UINT64_C(500) << 30);
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -22623,6 +22628,45 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
 }
 
+int ds4_gpu_dflash_head_nt4_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!out || !x || !model_map || in_dim != 4096u ||
+        out_dim != 154880u || n_rows != 8u) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t weight_bytes = out_dim * (in_dim / 32u) * 34u;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        ds4_gpu_tensor_bytes(x) < n_rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < n_rows * out_dim * sizeof(float)) return 0;
+    @autoreleasepool {
+        uint64_t inner = 0;
+        id<MTLBuffer> weights = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &inner);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            "kernel_dflash_q8_0_head_nt4", 8);
+        if (!weights || !pipeline) return 0;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.ne11 = args.ne1 = (int32_t)n_rows;
+        args.nb12 = args.nb13 = n_rows * in_dim * sizeof(float);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:32u * 2u * 4u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 2u, 2u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(32u, 8u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DFlash NT4 vocabulary head");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -24738,6 +24782,119 @@ static int ds4_gpu_router_batch_tile_enabled(void) {
     static int cached = -1;
     if (cached < 0) cached = ds4_gpu_env_bool("DS4_GLM_DISABLE_ROUTER_BATCH_TILE") == 1 ? 0 : 1;
     return cached;
+}
+
+/* GLM-5.3 prefill router B4. The public router is F32 [288,4096]. B4 keeps
+ * those operands and splits the K reduction into four 1024-wide matrix-unit
+ * products, then sums their F32 outputs in a fixed balanced tree. It is Tier 2
+ * by reassociation, default off, independently killable, and exact-mode
+ * clamped. */
+#ifndef DS4_GLM_ROUTER_SPLITK_B4_DEFAULT
+#define DS4_GLM_ROUTER_SPLITK_B4_DEFAULT 0
+#endif
+
+int ds4_gpu_router_splitk_b4_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int on = DS4_GLM_ROUTER_SPLITK_B4_DEFAULT;
+        const int knob = ds4_gpu_env_bool("DS4_GLM_ENABLE_ROUTER_SPLITK_B4");
+        if (knob >= 0) on = knob;
+        if (ds4_gpu_env_bool("DS4_GLM_DISABLE_ROUTER_SPLITK_B4") == 1 ||
+            glm53_exact_mode()) {
+            on = 0;
+        }
+        cached = on;
+    }
+    return cached;
+}
+
+typedef struct { uint32_t n_elem; } ds4_router_splitk_b4_args;
+
+int ds4_gpu_router_splitk_b4_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *partials,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens) {
+    enum { B4_IN = 4096, B4_OUT = 288, B4_SPLITS = 4, B4_K = 1024 };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_router_splitk_b4_active() || !out || !partials || !x ||
+        !model_map || n_tokens < 8u || n_tokens > 8192u) return 0;
+
+    const uint64_t elems = (uint64_t)n_tokens * B4_OUT;
+    if (elems > UINT32_MAX || elems > UINT64_MAX / B4_SPLITS / sizeof(float)) return 0;
+    const uint64_t partial_bytes = elems * B4_SPLITS * sizeof(float);
+    const uint64_t out_bytes = elems * sizeof(float);
+    const uint64_t x_bytes = (uint64_t)n_tokens * B4_IN * sizeof(float);
+    const uint64_t row_bytes = (uint64_t)B4_IN * sizeof(float);
+    const uint64_t weight_bytes = row_bytes * B4_OUT;
+    if (ds4_gpu_tensor_bytes(partials) < partial_bytes ||
+        ds4_gpu_tensor_bytes(out) < out_bytes ||
+        ds4_gpu_tensor_bytes(x) < x_bytes ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> pbuf = ds4_gpu_tensor_buffer(partials);
+        id<MTLBuffer> obuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !pbuf || !obuf) return 0;
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                      weight_offset, weight_bytes,
+                                                      &inner_offset);
+        if (!wbuf) return 0;
+        const bool bc_out = (B4_OUT % 64u) != 0u || (n_tokens % 32u) != 0u;
+        id<MTLComputePipelineState> mm =
+            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32_mu", false, bc_out);
+        id<MTLComputePipelineState> red =
+            ds4_gpu_get_pipeline("kernel_glm53_router_splitk_b4_sum_f32");
+        if (!mm || !red) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        for (uint32_t s = 0; s < B4_SPLITS; s++) {
+            ds4_gpu_mul_mm_args a =
+                ds4_gpu_make_mm_args(B4_IN, B4_OUT, n_tokens, row_bytes);
+            a.ne00 = B4_K;
+            const uint64_t slice_bytes = (uint64_t)s * B4_K * sizeof(float);
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            if (!enc) return 0;
+            [enc setComputePipelineState:mm];
+            [enc setBytes:&a length:sizeof(a) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)(inner_offset + slice_bytes) atIndex:1];
+            [enc setBuffer:xbuf offset:(NSUInteger)(ds4_gpu_tensor_offset(x) + slice_bytes) atIndex:2];
+            [enc setBuffer:pbuf offset:(NSUInteger)(ds4_gpu_tensor_offset(partials) +
+                                                    (uint64_t)s * elems * sizeof(float)) atIndex:3];
+            [enc setThreadgroupMemoryLength:12288u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tokens + 31u) / 32u,
+                                                  ((NSUInteger)B4_OUT + 63u) / 64u, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
+        ds4_router_splitk_b4_args ra = { .n_elem = (uint32_t)elems };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:red];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:0];
+        [enc setBuffer:pbuf offset:(NSUInteger)ds4_gpu_tensor_offset(partials) atIndex:1];
+        [enc setBuffer:obuf offset:(NSUInteger)ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM router split-K B4")) return 0;
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM router split-K B4 ENGAGED: f32 4096->288 splits=4 tokens=%u\n",
+                    n_tokens);
+        }
+    }
+    return 1;
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_tokens_pipeline(
@@ -52721,6 +52878,9 @@ static uint32_t g_glm53_bf16_mv_max = 8;
  * DFlash drafter (8-row blocks over 100MB FFN mats) wants the mm path. */
 void ds4_gpu_glm53_bf16_mv_max_set(uint32_t v) {
     g_glm53_bf16_mv_max = v ? v : 1u;
+}
+uint32_t ds4_gpu_glm53_bf16_mv_max_get(void) {
+    return g_glm53_bf16_mv_max;
 }
 
 /* T2 screen candidate BF16NSG (SPEC T5).  Same re-association argument as

@@ -35,6 +35,7 @@
 # Runs the model: hold the GPU lock.
 
 set -eu
+export DS4_DFLASH_NO_ADAPTIVE=1 # scripted correctness, not capped performance
 
 DS4="${DS4:-./ds4}"
 MODEL="${MODEL:?set MODEL to the target gguf}"

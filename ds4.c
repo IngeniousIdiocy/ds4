@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_dflash_budget.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
@@ -41663,6 +41664,7 @@ typedef struct ds4_glm_gpu_graph {
     uint32_t        sc_timing_skipped_token_uploads;
     ds4_gpu_tensor *dflash_capture;
     ds4_gpu_tensor *dflash_hcrows;
+    ds4_gpu_tensor *dflash_head_compare;
     float          *mtp_logits_host;
     int             mtp_ready;
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
@@ -43522,6 +43524,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->sc_hc_scale);
     ds4_gpu_tensor_free(g->dflash_capture);
     ds4_gpu_tensor_free(g->dflash_hcrows);
+    ds4_gpu_tensor_free(g->dflash_head_compare);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
@@ -43557,6 +43560,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     g->sc_timing_skipped_token_uploads = 0;
     g->dflash_capture = NULL;
     g->dflash_hcrows = NULL;
+    g->dflash_head_compare = NULL;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -47965,6 +47969,51 @@ static bool glm_graph_matmul_f32_rows_scalar(
     return true;
 }
 
+/* Fixed-shape GLM-5.3 router projection. B4 borrows batch_ffn_mid only while
+ * it is dead, before the routed expert dispatch consumes that tensor. All
+ * non-router shapes and every disabled/refused B4 case retain the existing
+ * projection path. */
+static bool glm_graph_router_project_f32(
+        ds4_glm_gpu_graph    *g,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens) {
+    if (!g || !model || !weight || !x || !g->batch_router_logits) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_gpu_router_splitk_b4_active() &&
+        weight->type == DS4_TENSOR_F32 &&
+        weight->ndim == 2 &&
+        weight->dim[0] == DS4_N_EMBD &&
+        weight->dim[1] == DS4_N_EXPERT &&
+        n_tokens >= 8u && n_tokens <= 8192u) {
+        const uint64_t elems = (uint64_t)n_tokens * DS4_N_EXPERT;
+        const uint64_t need = elems * 4u * sizeof(float);
+        if (!g->batch_ffn_mid || ds4_gpu_tensor_bytes(g->batch_ffn_mid) < need) {
+            fprintf(stderr,
+                    "ds4: GLM router split-K B4 refused undersized scratch "
+                    "(%llu bytes required)\n",
+                    (unsigned long long)need);
+            return false;
+        }
+        return ds4_gpu_router_splitk_b4_tensor(g->batch_router_logits,
+                                                g->batch_ffn_mid,
+                                                model->map,
+                                                model->size,
+                                                weight->abs_offset,
+                                                x,
+                                                n_tokens) != 0;
+    }
+#endif
+    return glm_graph_matmul_f32_rows_scalar(g->batch_router_logits,
+                                             model,
+                                             weight->abs_offset,
+                                             DS4_N_EMBD,
+                                             DS4_N_EXPERT,
+                                             x,
+                                             n_tokens);
+}
+
 static bool glm_graph_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -48370,13 +48419,11 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
     (void)down_in;
 
     failed_stage = "router projection";
-    bool ok = glm_graph_matmul_f32_rows_scalar(g->batch_router_logits,
-                                               model,
-                                               l->ffn_gate_inp->abs_offset,
-                                               DS4_N_EMBD,
-                                               DS4_N_EXPERT,
-                                               g->batch_ffn_norm,
-                                               n_tokens);
+    bool ok = glm_graph_router_project_f32(g,
+                                           model,
+                                           l->ffn_gate_inp,
+                                           g->batch_ffn_norm,
+                                           n_tokens);
     const bool use_batch_router_select =
         glm_graph_indexed_prefill_batch_router_select();
     if (ok && use_batch_router_select) {
@@ -48917,14 +48964,11 @@ static bool glm_graph_encode_ffn_batch(
     (void)up_in;
     (void)down_in;
 
-    ok = ds4_gpu_matmul_f32_tensor(g->batch_router_logits,
-                                   model->map,
-                                   model->size,
-                                   l->ffn_gate_inp->abs_offset,
-                                   DS4_N_EMBD,
-                                   DS4_N_EXPERT,
-                                   g->batch_ffn_norm,
-                                   n_tokens) != 0;
+    ok = glm_graph_router_project_f32(g,
+                                      model,
+                                      l->ffn_gate_inp,
+                                      g->batch_ffn_norm,
+                                      n_tokens);
     if (!ok) {
         fprintf(stderr,
                 "ds4: GLM sparse FFN router projection failed at layer %u "
@@ -50859,11 +50903,6 @@ static bool glm_graph_forward_tokens(
         !glm_graph_span_fits_context(g, pos0, n_tokens)) {
         return false;
     }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    const bool dflash_seed_armed =
-        !g_glm_dflash_cap.enabled && g->glm53 &&
-        glm_dflash_seed_chunk_begin(n_tokens);
-#endif
     if (!glm_graph_span_fits_full_attention(g, pos0, n_tokens)) {
         glm_graph_log_full_attention_limit(g, pos0, n_tokens);
         return false;
@@ -50972,6 +51011,12 @@ static bool glm_graph_forward_tokens(
         glm_vision_overlay_free(&vision_overlay);
         return false;
     }
+    /* All direct-return setup failures precede seed arming. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool dflash_seed_armed =
+        ok && !g_glm_dflash_cap.enabled && g->glm53 &&
+        glm_dflash_seed_chunk_begin(n_tokens);
+#endif
     ds4_gpu_tensor *cur = g->glm53 ? cur_view : g->batch_cur;
     ds4_gpu_tensor *next = g->glm53 ? next_view : g->batch_next;
     ds4_gpu_tensor *hc_cur = hc_cur_view;
@@ -52294,11 +52339,6 @@ static bool glm_graph_forward_indexed_tokens(
         !glm_graph_span_fits_context(g, pos0, n_tokens)) {
         return false;
     }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    const bool dflash_seed_armed =
-        !g_glm_dflash_cap.enabled && g->glm53 &&
-        glm_dflash_seed_chunk_begin(n_tokens);
-#endif
     if (!glm_graph_batch_rows_ensure(g, n_tokens)) return false;
     if (g->glm53 && !glm53_graph_prefill_workspace_ensure(g, n_tokens)) {
         return false;
@@ -52426,6 +52466,12 @@ static bool glm_graph_forward_indexed_tokens(
         glm_vision_overlay_free(&vision_overlay);
         return false;
     }
+    /* All direct-return setup failures precede seed arming. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool dflash_seed_armed =
+        ok && !g_glm_dflash_cap.enabled && g->glm53 &&
+        glm_dflash_seed_chunk_begin(n_tokens);
+#endif
     ds4_gpu_tensor *cur = g->glm53 ? cur_view : g->batch_cur;
     ds4_gpu_tensor *next = g->glm53 ? next_view : g->batch_next;
     ds4_gpu_tensor *hc_cur = hc_cur_view;
@@ -58532,6 +58578,10 @@ struct ds4_session {
     uint64_t dflash_bound_gen;
     float dflash_cycle_ms;          /* EMA of full-cycle wall time */
     float dflash_serial_ms;         /* EMA of serial fallback token time */
+    ds4_dflash_budget dflash_budget;
+    uint64_t dflash_budget_gen;
+    uint64_t dflash_budget_estimate_ns;
+    bool dflash_budget_attempted;
     int glm_mtp_draft;
     int glm_mtp_parent;
     int glm_mtp_have;
@@ -60756,6 +60806,103 @@ static void ds4_session_dflash_new_generation(ds4_session *s) {
 static void ds4_session_dflash_reset_conditioning(ds4_session *s) { (void)s; }
 static void ds4_session_dflash_new_generation(ds4_session *s) { (void)s; }
 #endif
+
+/* Empirical M3 Ultra profile, not a physical upper bound. Provenance and
+ * scope: tests/DFLASH-ADMISSION.md. Override is diagnostic, never required. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static uint64_t dflash_budget_profile(ds4_session *s) {
+    const char *override = getenv("DS4_DFLASH_BUDGET_MS");
+    if (override) {
+        char *end = NULL;
+        errno = 0;
+        const double ms = strtod(override, &end);
+        uint64_t ns = 0;
+        return errno == 0 && end != override && *end == '\0' &&
+            dflash_budget_ns(ms / 1000.0, true, &ns) ? ns : 0;
+    }
+    ds4_engine *e = s->engine;
+    const ds4_dflash2_weights *dw = &e->dflash_weights;
+    if (!ds4_gpu_dflash_budget_profile_device() || !ds4_model_is_glm53() ||
+        DS4_N_LAYER - DS4_N_NEXTN_PREDICT != 45u || DS4_N_EMBD != 4096u ||
+        DS4_N_VOCAB != 154880u || s->ctx_size > 320000 ||
+        e->model.size != UINT64_C(185299232064) ||
+        e->dflash_model.size != UINT64_C(2342595168) ||
+        !e->weights.output || e->weights.output->type != DS4_TENSOR_Q8_0 ||
+        !dw->fc || dw->fc->type != DS4_TENSOR_BF16 || dw->n_layer != 5u ||
+        dw->n_embd != 4096u || dw->n_target != 5u || dw->block_size != 8u ||
+        dw->sliding_window != 2048u || dw->classic || dw->n_ff != 12288u ||
+        dw->n_head != 32u || dw->n_head_kv != 8u || dw->head_dim != 128u ||
+        dw->fc->dim[0] != 20480u ||
+        getenv("DS4_DFLASH_SDPA_SCALAR") ||
+        getenv("DS4_DFLASH_FORCE_REPLAY") || getenv("DS4_DFLASH_SCRIPT") ||
+        getenv("DS4_DFLASH_HEAD_COMPARE") || getenv("DS4_DFLASH_HEAD_BENCH") ||
+        getenv("DS4_DFLASH_FORCE_DRAFTS") || getenv("DS4_DFLASH_ZERO_FEATURES")) return 0;
+    const char *cap = getenv("DS4_DFLASH_CTX_CAP");
+    if (cap) {
+        char *end = NULL;
+        const unsigned long n = strtoul(cap, &end, 10);
+        if (end == cap || *end || n == 0 || n > 256u) return 0;
+    }
+    return UINT64_C(500000000);
+}
+#endif
+
+void ds4_session_decode_begin(ds4_session *s) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!s || !s->engine || !s->engine->dflash_ready) return;
+    const double account_start = now_sec();
+    dflash_budget_begin(&s->dflash_budget);
+    s->dflash_budget_gen = s->dflash_gen;
+    s->dflash_budget_estimate_ns = dflash_budget_profile(s);
+    ds4_session_dflash_reset_conditioning(s);
+    s->dflash_bound_gen = s->dflash_gen;
+    s->dflash_last_pos = (uint32_t)s->checkpoint.len;
+    if (getenv("DS4_DFLASH_NO_ADAPTIVE")) s->dflash_budget.active = false;
+    if (getenv("DS4_DFLASH_STATS")) {
+        fprintf(stderr, "ds4: dflash admission policy=%s profile=%s estimate_ms=%.3f ctx=%d\n",
+            s->dflash_budget.active ? "request-credit" : "uncapped-experiment",
+            getenv("DS4_DFLASH_BUDGET_MS") ? "diagnostic-override" : "m3ultra-public-v1",
+            (double)s->dflash_budget_estimate_ns / 1e6, s->ctx_size);
+    }
+    if (s->dflash_budget.active) {
+        uint64_t ns = 0;
+        (void)dflash_budget_ns(now_sec() - account_start, true, &ns);
+        dflash_budget_account(&s->dflash_budget, ns);
+    }
+#else
+    (void)s;
+#endif
+}
+
+void ds4_session_decode_ack(ds4_session *s, int consumed, bool done) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!s || !s->engine || !s->engine->dflash_ready || !s->dflash_budget.active) return;
+    const double account_start = now_sec();
+    ds4_dflash_budget *b = &s->dflash_budget;
+    const bool report = done || (b->pending_optional && b->pending_rows);
+    const bool was_parked = b->parked;
+    /* Positive-temperature GLM and other ordinary paths have no pending
+     * DFlash call. They receive no invented credit. */
+    if (b->pending_rows || done) dflash_budget_ack(b, consumed < 0 ? UINT32_MAX : (uint32_t)consumed, done);
+    if (getenv("DS4_DFLASH_STATS") && (report || (!was_parked && b->parked))) {
+        uint64_t ref = 0;
+        (void)dflash_budget_reference(b, &ref);
+        fprintf(stderr, "ds4: dflash budget consumed=%d done=%d actual_ms=%.3f reference_ms=%.3f "
+                "credit_ms=%.3f escrow_ms=%.3f probes=%u overruns=%u parked=%d\n",
+                consumed, done, (double)b->actual_ns / 1e6, (double)ref / 1e6,
+                (double)dflash_budget_credit(b) / 1e6, (double)b->escrow_ns / 1e6,
+                b->probes, b->overruns, b->parked);
+    }
+    uint64_t ns = 0;
+    (void)dflash_budget_ns(now_sec() - account_start, true, &ns);
+    const uint32_t previous_overruns = b->overruns;
+    dflash_budget_account(b, ns);
+    if (b->overruns != previous_overruns)
+        fprintf(stderr, "ds4: dflash budget accounting OVERRUN; parked for request\n");
+#else
+    (void)s; (void)consumed; (void)done;
+#endif
+}
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {

@@ -71,7 +71,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-small-fuse-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-small-fuse-bench metal-router-b4-fixture check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp check-expert-bank-kernels superchunk-state-test
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -153,6 +153,14 @@ speed-bench/metal_depth_select_bench: speed-bench/metal_depth_select_bench.o ds4
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-depth-select-bench: speed-bench/metal_depth_select_bench
+
+speed-bench/metal_router_b4_fixture.o: speed-bench/metal_router_b4_fixture.c speed-bench/gguf_lite.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/metal_router_b4_fixture: speed-bench/metal_router_b4_fixture.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+metal-router-b4-fixture: speed-bench/metal_router_b4_fixture
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -322,7 +330,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_dflash2.inc ds4_dflash_glm.inc ds4_dflash_script.inc ds4_dflash_rollback.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_dflash2.inc ds4_dflash_glm.inc ds4_dflash_script.inc ds4_dflash_rollback.h ds4_dflash_budget.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -598,7 +606,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_dflash2.inc ds4_dflash_rollback.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_dflash2.inc ds4_dflash_rollback.h ds4_dflash_budget.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -638,7 +646,7 @@ dflash-rollback-test: tests/test_dflash_rollback
 dflash-prefix-test: tests/test_dflash_prefix
 	./tests/test_dflash_prefix
 
-tests/test_dflash_prefix: tests/test_dflash_prefix.c ds4_glm53_prefix.h ds4_dflash_rollback.h
+tests/test_dflash_prefix: tests/test_dflash_prefix.c ds4_glm53_prefix.h ds4_dflash_rollback.h ds4_dflash_budget.h
 	$(CC) -std=c11 -Wall -Wextra -O0 -o $@ $< -lm
 
 tests/test_dflash_lifecycle.o: tests/test_dflash_lifecycle.c
@@ -849,7 +857,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
-	rm -f tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state
+	rm -f tests/test_dflash_prefix tests/test_dflash_budget tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
@@ -857,3 +865,10 @@ clean:
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_metal_tp_spec
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_depth_select_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_q8 tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+.PHONY: dflash-budget-test
+dflash-budget-test: tests/test_dflash_budget
+	./tests/test_dflash_budget
+
+tests/test_dflash_budget: tests/test_dflash_budget.c ds4_dflash_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_budget.c

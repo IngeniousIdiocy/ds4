@@ -129,6 +129,7 @@ int main(int argc, char **argv) {
     int produced = 0, steps = 0, multi_steps = 0, setup_tokens = 0;
     double setup_s = 0.0;
     const double d0 = now_s();
+    ds4_session_decode_begin(s);
     double after_setup = d0;
     while (produced < ngen) {
         if (ds4_session_copy_logits(s, logits, nv) != nv) {
@@ -144,6 +145,7 @@ int main(int argc, char **argv) {
             n = ds4_session_eval_speculative_argmax(
                     s, next, offered, -1, accepted, room, err, sizeof err);
             if (n < 0) {
+                ds4_session_decode_ack(s, 0, true);
                 fprintf(stderr, "speculative eval failed at %d: %s\n",
                         produced, err);
                 return 1;
@@ -165,6 +167,7 @@ int main(int argc, char **argv) {
             }
             for (int i = 0; i < n; i++) out[produced++] = accepted[i];
             if (n > 1) multi_steps++;
+            ds4_session_decode_ack(s, n, produced >= ngen);
         } else {
             if (ds4_session_eval(s, next, err, sizeof err) != 0) {
                 fprintf(stderr, "eval failed at %d: %s\n", produced, err);

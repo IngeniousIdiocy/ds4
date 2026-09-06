@@ -453,7 +453,8 @@ static void print_glm53(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     title(fp, c, "Kill Switches");
     para(fp, c, "Each turns one default-on change off, for A/B measurement and bisection. Unless the meaning says otherwise a switch is read as set to any non-empty value.");
-    opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Disables the adaptive break-even throttle that parks speculation when it cannot pay.");
+    opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Uncapped DFlash experiment: bypasses request-credit admission and restores prefill seeding; no 2% slowdown claim.");
+    opt(fp, c, "DS4_DFLASH_BUDGET_MS", "Diagnostic positive full refresh/proposal budget estimate; default 500ms on the calibrated M3 Ultra public-model profile. Invalid values stay serial.");
     opt(fp, c, "DS4_DFLASH_NO_SELECTOR", "Disables the DFlash2 candidate selector (coherent-chain tracing).");
     opt(fp, c, "DS4_DFLASH_SDPA_SCALAR", "Forces the scalar SDPA drafter kernel instead of the simdgroup one.");
     opt(fp, c, "DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK", "Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2).");

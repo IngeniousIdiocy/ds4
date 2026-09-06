@@ -6,6 +6,7 @@
 # MODEL, DFLASH required; DS4, OUT, PROMPT, NGEN, CTX optional.
 # This is causal-integrity instrumentation, never a throughput benchmark.
 set -eu
+export DS4_DFLASH_NO_ADAPTIVE=1 # scripted correctness, not capped performance
 unset DS4_DFLASH_SCRIPT_SERIAL DS4_DFLASH_FORCE_REPLAY DS4_DFLASH_NO_WIDE_ROLLBACK
 DS4="${DS4:-./ds4}"
 MODEL="${MODEL:?set MODEL}"

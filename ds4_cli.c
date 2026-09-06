@@ -664,6 +664,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                     max_tokens);
     }
     const double t_decode0 = cli_now_sec();
+    ds4_session_decode_begin(session);
+    const bool dflash_capped = cfg->engine.dflash_path &&
+        getenv("DS4_DFLASH_NO_ADAPTIVE") == NULL;
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
         if (greedy_argmax && have_greedy_next) {
@@ -677,17 +680,19 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if ((!dflash_capped || generated + 1 < max_tokens) &&
+            ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
-                session, token, max_tokens - generated,
+                session, token, max_tokens - generated - (dflash_capped ? 1 : 0),
                 ds4_token_eos(engine), cfg->gen.temperature, 0,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
+                ds4_session_decode_ack(session, 0, true);
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
@@ -717,6 +722,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             continue;
         }
 
+        const int before_consumed = generated;
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
             if (!bench_ignore_eos && ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
@@ -734,8 +740,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             generated++;
             if (generated >= max_tokens) break;
         }
+        ds4_session_decode_ack(session, generated - before_consumed,
+            stop || generated >= max_tokens || cli_interrupt_requested());
         if (stop) break;
     }
+    ds4_session_decode_ack(session, 0, true);
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
@@ -1722,6 +1731,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     bool have_greedy_next = false;
     int greedy_next = -1;
     const double t_decode0 = cli_now_sec();
+    ds4_session_decode_begin(chat->session);
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
         if (greedy_argmax && have_greedy_next) {
@@ -1750,6 +1760,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
                 err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
+                ds4_session_decode_ack(chat->session, 0, true);
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
@@ -1774,6 +1785,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             continue;
         }
 
+        const int before_consumed = generated;
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
             if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
@@ -1789,8 +1801,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             generated++;
             if (generated >= max_tokens) break;
         }
+        ds4_session_decode_ack(chat->session, generated - before_consumed,
+            stop || generated >= max_tokens || cli_interrupt_requested());
         if (stop) break;
     }
+    ds4_session_decode_ack(chat->session, 0, true);
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
 

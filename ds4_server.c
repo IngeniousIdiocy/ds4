@@ -12901,6 +12901,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
     }
     if (!rng) rng = UINT64_C(0x9e3779b97f4a7c15);
+    bool decode_budget_started = false;
 decode_again:
     ;
     buf text = {0};
@@ -12920,6 +12921,10 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    if (!decode_budget_started) {
+        ds4_session_decode_begin(slot->session);
+        decode_budget_started = true;
+    }
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -13006,6 +13011,7 @@ decode_again:
             ntok = 1;
         }
 
+        const int before_consumed = completion;
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
@@ -13194,8 +13200,11 @@ decode_again:
                 break;
             }
         }
+        ds4_session_decode_ack(slot->session, completion - before_consumed,
+            stop_decode || completion >= max_tokens || job_cancelled(j) || g_stop_requested);
         if (stop_decode) break;
     }
+    ds4_session_decode_ack(slot->session, 0, true);
     server_generation_leave(s);
 
     if (job_cancelled(j)) {

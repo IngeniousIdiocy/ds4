@@ -81,6 +81,79 @@ static void dflash_cycle_disarm(void) {
     ds4_gpu_glm53_tail_stepsnap_end();
 }
 
+/* Diagnostic only: compare every logit on identical real verifier inputs.
+ * The caller keeps the scalar logits for acceptance even when differences
+ * are observed. Margins distinguish a close decision from a large shift. */
+static void dflash_head_compare_logits(uint32_t pos, uint32_t rows,
+                                       const float *reference,
+                                       const float *candidate) {
+    for (uint32_t r = 0; r < rows; r++) {
+        const float *a = reference + (uint64_t)r * DS4_N_VOCAB;
+        const float *b = candidate + (uint64_t)r * DS4_N_VOCAB;
+        const int ai = glm_session_logits_argmax(a), bi = glm_session_logits_argmax(b);
+        float a_second = -FLT_MAX, b_second = -FLT_MAX;
+        double max_abs = 0;
+        uint32_t different = 0, nonfinite = 0;
+        for (uint32_t j = 0; j < DS4_N_VOCAB; j++) {
+            uint32_t ab, bb;
+            memcpy(&ab, &a[j], sizeof(ab));
+            memcpy(&bb, &b[j], sizeof(bb));
+            different += ab != bb;
+            if ((ab & 0x7f800000u) == 0x7f800000u ||
+                (bb & 0x7f800000u) == 0x7f800000u) nonfinite++;
+            else {
+                const double d = fabs((double)a[j] - (double)b[j]);
+                if (d > max_abs) max_abs = d;
+            }
+            if ((int)j != ai && a[j] > a_second) a_second = a[j];
+            if ((int)j != bi && b[j] > b_second) b_second = b[j];
+        }
+        fprintf(stderr, "ds4: dflash head compare pos=%u row=%u words=%u "
+                "different=%u nonfinite=%u max_abs=%.9g ref_argmax=%d "
+                "nt4_argmax=%d ref_margin=%.9g nt4_margin=%.9g\n",
+                pos, r, (unsigned)DS4_N_VOCAB, different, nonfinite, max_abs,
+                ai, bi, (double)a[ai] - a_second, (double)b[bi] - b_second);
+    }
+}
+
+/* Optional first-block microbenchmark. Same resident normalized rows, no
+ * model forward or state mutation. Mean wall time includes encode+completion;
+ * these diagnostic runs must never be quoted as generation throughput. */
+static bool dflash_head_bench(ds4_session *s, uint32_t pos) {
+    static bool done;
+    const char *setting = getenv("DS4_DFLASH_HEAD_BENCH");
+    if (!setting || done) return true;
+    done = true;
+    uint32_t count = (uint32_t)strtoul(setting, NULL, 10);
+    if (count == 0) count = 8;
+    if (count > 128) count = 128;
+    ds4_engine *e = s->engine;
+    for (uint32_t trial = 0; trial < 3; trial++) {
+        for (uint32_t arm = 0; arm < 2; arm++) {
+            const bool nt4 = ((arm + trial) % 2u) != 0;
+            const double t0 = now_sec();
+            bool ok = ds4_gpu_begin_commands() != 0;
+            for (uint32_t i = 0; ok && i < count; i++) {
+                ok = nt4 ? ds4_gpu_dflash_head_nt4_tensor(
+                    s->glm_graph.dflash_head_compare, e->model.map, e->model.size,
+                    e->weights.output->abs_offset, DS4_N_EMBD, DS4_N_VOCAB,
+                    g_dflash_pool.batch_norm, 8) :
+                    ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                    s->glm_graph.dflash_head_compare, e->model.map, e->model.size,
+                    e->weights.output->abs_offset, DS4_N_EMBD, DS4_N_VOCAB,
+                    g_dflash_pool.batch_norm, 8);
+            }
+            if (!ds4_gpu_end_commands()) ok = false;
+            fprintf(stderr, "ds4: dflash head bench pos=%u trial=%u arm=%s "
+                    "iterations=%u rows=8 mean_wall_ms=%.6f ok=%d\n", pos,
+                    trial + 1u, nt4 ? "nt4" : "scalar_rows", count,
+                    (now_sec() - t0) * 1000.0 / count, ok);
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
 static int ds4_session_glm_dflash_cycle_impl(
         ds4_session *s, int first_token,
         float temperature, int top_k, float top_p, float min_p,
@@ -279,7 +352,8 @@ static int ds4_session_glm_dflash_cycle_impl(
     const float breakeven =
         s->dflash_serial_ms > 0.1f && s->dflash_cycle_ms > 0.1f ?
             s->dflash_cycle_ms / s->dflash_serial_ms : 4.1f;
-    if (!sblk && !getenv("DS4_DFLASH_NO_ADAPTIVE") && s->dflash_warm) {
+    if (!sblk && !s->dflash_budget.active &&
+        !getenv("DS4_DFLASH_NO_ADAPTIVE") && s->dflash_warm) {
         if (s->dflash_ema == 0.0f) s->dflash_ema = breakeven + 1.5f;
         if (s->dflash_ema < breakeven) {
             s->dflash_lowrun++;
@@ -367,7 +441,8 @@ static int ds4_session_glm_dflash_cycle_impl(
         if (rc != 0) return -1;
         /* This is a measured serial target step even when no park has yet
          * occurred. Capture overhead stays charged conservatively. */
-        s->dflash_serial_ms = dflash_timing_ema(s->dflash_serial_ms, refresh_ms);
+        if (!s->dflash_budget.active)
+            s->dflash_serial_ms = dflash_timing_ema(s->dflash_serial_ms, refresh_ms);
         if (ds4_gpu_tensor_read(g->dflash_capture, 0, s->dflash_pending,
                                 (uint64_t)n_taps * H * sizeof(float))) {
             s->dflash_pending_rows = 1;
@@ -377,6 +452,7 @@ static int ds4_session_glm_dflash_cycle_impl(
         accepted[0] = first_token;
         return 1;
     }
+    s->dflash_budget_attempted = true;
     const uint32_t L = (uint32_t)n_draft + 1u;
     int toks[DS4_DFLASH2_MAX_DRAFT + 1];
     toks[0] = first_token;
@@ -494,11 +570,23 @@ static int ds4_session_glm_dflash_cycle_impl(
         snprintf(err, errlen, "dflash: hc upload failed");
         return -1;
     }
-    /* All L heads in one command stream: collapse each hc row, then the
-     * shared Q8 head into the pool logits, one readback at the end. */
+    /* NT4 is opt-in and head-local. Compare/bench modes always retain scalar
+     * logits for acceptance; unsupported shapes use the existing scalar path. */
+    const bool head_shape = H == 4096u && DS4_N_VOCAB == 154880u && L == 8u &&
+        e->weights.output->type == DS4_TENSOR_Q8_0;
+    const bool head_compare = head_shape &&
+        (getenv("DS4_DFLASH_HEAD_COMPARE") || getenv("DS4_DFLASH_HEAD_BENCH"));
+    const bool head_use = head_shape && getenv("DS4_DFLASH_HEAD_NT4") && !head_compare;
+    bool head_nt4_ran = false;
+    if (head_compare && !g->dflash_head_compare) {
+        g->dflash_head_compare = ds4_gpu_tensor_alloc(
+            (uint64_t)8u * DS4_N_VOCAB * sizeof(float));
+    }
+    /* All heads in one command stream, one scalar-logit readback at the end. */
     {
         bool ok = g_dflash_pool.inited &&
                   L <= g_dflash_pool.spec_cap &&
+                  (!head_compare || g->dflash_head_compare) &&
                   ds4_gpu_begin_commands() != 0;
         for (uint32_t r = 0; ok && r < L; r++) {
             ds4_gpu_tensor *row = glm_graph_tensor_row_view_strided(
@@ -520,7 +608,13 @@ static int ds4_session_glm_dflash_cycle_impl(
                     e->weights.output_norm->abs_offset,
                     DS4_N_EMBD, L, DS4_RMS_EPS) != 0;
         }
-        if (ok) {
+        if (ok && head_use) {
+            head_nt4_ran = ds4_gpu_dflash_head_nt4_tensor(
+                g_dflash_pool.batch_logits, e->model.map, e->model.size,
+                e->weights.output->abs_offset, H, DS4_N_VOCAB,
+                g_dflash_pool.batch_norm, L) != 0;
+        }
+        if (ok && !head_nt4_ran) {
             for (uint32_t r = 0; ok && r < L; r++) {
                 ds4_gpu_tensor *xr = ds4_gpu_tensor_view(
                         g_dflash_pool.batch_norm,
@@ -540,17 +634,38 @@ static int ds4_session_glm_dflash_cycle_impl(
                 ds4_gpu_tensor_free(yr);
             }
         }
+        if (ok && head_compare) {
+            head_nt4_ran = ds4_gpu_dflash_head_nt4_tensor(
+                g->dflash_head_compare, e->model.map, e->model.size,
+                e->weights.output->abs_offset, H, DS4_N_VOCAB,
+                g_dflash_pool.batch_norm, L) != 0;
+            ok = head_nt4_ran;
+        }
         if (!ds4_gpu_end_commands()) ok = false;
         if (ok) {
             ok = ds4_gpu_tensor_read(
                     g_dflash_pool.batch_logits, 0, row_logits,
                     (uint64_t)L * DS4_N_VOCAB * sizeof(float)) != 0;
         }
+        if (ok && head_compare) {
+            static float *compare_logits;
+            if (!compare_logits) compare_logits = xmalloc(
+                (size_t)8u * DS4_N_VOCAB * sizeof(float));
+            ok = ds4_gpu_tensor_read(g->dflash_head_compare, 0, compare_logits,
+                (uint64_t)L * DS4_N_VOCAB * sizeof(float)) != 0;
+            if (ok) dflash_head_compare_logits(pos, L, row_logits, compare_logits);
+            if (ok) ok = dflash_head_bench(s, pos);
+        }
         if (!ok) {
             dflash_cycle_fail_after_verify(s, g, state_saved);
             snprintf(err, errlen, "dflash: verify head failed");
             return -1;
         }
+    }
+    if ((getenv("DS4_DFLASH_HEAD_NT4") || getenv("DS4_DFLASH_HEAD_COMPARE") ||
+         getenv("DS4_DFLASH_HEAD_BENCH")) && getenv("DS4_DFLASH_STATS")) {
+        fprintf(stderr, "ds4: dflash head pos=%u rows=%u nt4=%d scalar_logits_retained=%d\n",
+                pos, L, head_nt4_ran, !head_use || !head_nt4_ran);
     }
 
     const double t_heads = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
@@ -755,9 +870,56 @@ static int ds4_session_glm_dflash_cycle_argmax(
         ds4_session *s, int first_token,
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
-    return ds4_session_glm_dflash_cycle_impl(s, first_token,
-                                             0.0f, 0, 0.0f, 0.0f, NULL,
-                                             accepted, accepted_cap,
-                                             err, errlen);
+    if (getenv("DS4_DFLASH_NO_ADAPTIVE")) {
+        return ds4_session_glm_dflash_cycle_impl(s, first_token,
+            0.0f, 0, 0.0f, 0.0f, NULL, accepted, accepted_cap, err, errlen);
+    }
+    const double start = now_sec();
+    ds4_dflash_budget *b = &s->dflash_budget;
+    dflash_budget_before_call(b);
+    if (s->dflash_budget_gen != s->dflash_gen) b->parked = true;
+    /* Both supported block widths were priced; narrower final blocks were
+     * not. No allocation, cache setup, seed ingest or feature capture precedes
+     * this reservation. A refresh carries its remaining escrow to the probe. */
+    const uint64_t end = (uint64_t)s->checkpoint.len + 8u;
+    const bool shape = accepted_cap >= 7 && s->ctx_size <= 320000 &&
+        end <= (uint64_t)s->ctx_size &&
+        (!s->glm_graph.compact_cache_cap || end < s->glm_graph.compact_cache_cap);
+    const bool optional = shape && dflash_budget_reserve(b, s->dflash_budget_estimate_ns);
+    s->dflash_budget_attempted = false;
+    int rc;
+    uint64_t serial_ns = 0, actual_ns = 0;
+    if (optional) {
+        rc = ds4_session_glm_dflash_cycle_impl(s, first_token,
+            0.0f, 0, 0.0f, 0.0f, NULL, accepted, accepted_cap, err, errlen);
+    } else {
+        b->escrow_ns = 0;
+        s->dflash_pending_rows = 0;
+        const double serial_start = now_sec();
+        rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        const double serial_seconds = now_sec() - serial_start;
+        if (!dflash_budget_ns(serial_seconds, false, &serial_ns)) b->parked = true;
+        if (rc == 0) {
+            s->dflash_serial_ms = dflash_timing_ema(s->dflash_serial_ms,
+                (float)(serial_seconds * 1000.0));
+            accepted[0] = first_token;
+            rc = 1;
+        } else rc = -1;
+    }
+    if (!dflash_budget_ns(now_sec() - start, true, &actual_ns)) b->parked = true;
+    const uint32_t previous_overruns = b->overruns;
+    dflash_budget_finish(b, actual_ns, serial_ns, rc > 0 ? (uint32_t)rc : 0u,
+        optional, optional && rc > 0 && !s->dflash_budget_attempted &&
+        s->dflash_pending_rows != 0);
+    if (b->overruns != previous_overruns) {
+        fprintf(stderr, "ds4: dflash budget OVERRUN actual_ms=%.3f estimate_ms=%.3f; parked for request\n",
+            (double)actual_ns / 1e6, (double)s->dflash_budget_estimate_ns / 1e6);
+    }
+    if (optional && getenv("DS4_DFLASH_STATS")) {
+        fprintf(stderr, "ds4: dflash admission operation=%s actual_ms=%.3f escrow_ms=%.3f rows=%d parked=%d\n",
+            s->dflash_budget_attempted ? "proposal" : "refresh",
+            (double)actual_ns / 1e6, (double)b->escrow_ns / 1e6, rc, b->parked);
+    }
+    return rc;
 }
 #endif
