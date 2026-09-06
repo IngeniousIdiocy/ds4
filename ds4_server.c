@@ -305,6 +305,18 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+/* max_tokens / max_completion_tokens / max_output_tokens.  Unlike json_int(),
+ * which clamps so the other numeric knobs stay lenient, a negative, NaN,
+ * infinite or fractional value is a request error: the client gets a 4xx
+ * instead of a silently empty completion. */
+static bool json_max_tokens(const char **p, int *out) {
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (!(v >= 0) || v > INT_MAX || v != floor(v)) return false;
+    *out = (int)v;
+    return true;
+}
+
 static bool json_bool(const char **p, bool *out) {
     json_ws(p);
     if (json_lit(p, "true")) {
@@ -3711,9 +3723,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!json_max_tokens(&p, &r->max_tokens)) {
+                snprintf(err, errlen, "invalid %s: must be a non-negative integer", key);
                 free(key);
-                goto bad;
+                goto bad_with_err;
             }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -3835,9 +3848,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     free(tool_schemas);
     return true;
 bad:
+    snprintf(err, errlen, "invalid JSON request");
+bad_with_err:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -3951,9 +3965,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!json_max_tokens(&p, &r->max_tokens)) {
+                snprintf(err, errlen, "invalid %s: must be a non-negative integer", key);
                 free(key);
-                goto bad;
+                goto bad_with_err;
             }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -4064,10 +4079,11 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    snprintf(err, errlen, "invalid JSON request");
+bad_with_err:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4932,9 +4948,10 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!json_max_tokens(&p, &r->max_tokens)) {
+                snprintf(err, errlen, "invalid %s: must be a non-negative integer", key);
                 free(key);
-                goto bad;
+                goto bad_with_err;
             }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -5086,11 +5103,12 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    snprintf(err, errlen, "invalid JSON request");
+bad_with_err:
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -5164,9 +5182,10 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!json_max_tokens(&p, &r->max_tokens)) {
+                snprintf(err, errlen, "invalid %s: must be a non-negative integer", key);
                 free(key);
-                goto bad;
+                goto bad_with_err;
             }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -5273,8 +5292,9 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     free(prompt);
     return true;
 bad:
-    free(prompt);
     snprintf(err, errlen, "invalid JSON request");
+bad_with_err:
+    free(prompt);
     request_free(r);
     return false;
 }
@@ -14027,10 +14047,24 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+/* The listing leads with the loaded model's own id, the one
+ * server_model_id_from_engine() assigns to requests that name no model
+ * (keyed off the GGUF architecture at load).  On GLM-5.3 the GLM-5.2 ids
+ * stay listed and accepted as compatibility aliases; docs/GLM53_M3ULTRA.md
+ * documents them. */
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (ds4_engine_is_glm53(s->engine)) {
+        static const char *const ids[] = {
+            "glm-5.3-flash", "glm-5.3-flash-chat", "glm-5.3-flash-reasoner",
+            "glm-5.2", "glm-5.2-chat", "glm-5.2-reasoner",
+        };
+        for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+            if (i) buf_putc(&b, ',');
+            append_model_json(&b, s, ids[i]);
+        }
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
@@ -19076,6 +19110,95 @@ static void test_json_int_handles_non_finite_values(void) {
     TEST_ASSERT(value == 0);
 }
 
+static void test_max_tokens_rejects_invalid_values(void) {
+    char err[128];
+    request r;
+    bool ok = parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":-5,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "invalid max_tokens") != NULL);
+    if (ok) request_free(&r);
+
+    ok = parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_completion_tokens\":1.5,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "invalid max_completion_tokens") != NULL);
+    if (ok) request_free(&r);
+
+    /* The accept side is checked on the helper: a parser success here would
+     * tokenize the prompt, which needs a loaded engine. */
+    const char *p = "8";
+    int value = -1;
+    TEST_ASSERT(json_max_tokens(&p, &value) && value == 8);
+    p = "0";
+    TEST_ASSERT(json_max_tokens(&p, &value) && value == 0);
+    p = "1e2";
+    TEST_ASSERT(json_max_tokens(&p, &value) && value == 100);
+    p = "NaN";
+    TEST_ASSERT(!json_max_tokens(&p, &value));
+    p = "Infinity";
+    TEST_ASSERT(!json_max_tokens(&p, &value));
+
+    ok = parse_anthropic_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":-1,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "invalid max_tokens") != NULL);
+    if (ok) request_free(&r);
+
+    ok = parse_responses_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_output_tokens\":-1,"
+        "\"input\":\"hello\"}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "invalid max_output_tokens") != NULL);
+    if (ok) request_free(&r);
+
+    ok = parse_completion_request(NULL,
+        "{\"prompt\":\"hello\",\"max_tokens\":-1}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "invalid max_tokens") != NULL);
+    if (ok) request_free(&r);
+}
+
+static void test_models_listing_leads_with_engine_id(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    s.ctx_size = 32768;
+    s.default_tokens = 4096;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_ASSERT(send_models(&s, sv[0]));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    char first[96];
+    snprintf(first, sizeof(first), "\"data\":[{\"id\":\"%s\"",
+             server_model_id_from_engine(s.engine));
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+    TEST_ASSERT(strstr(out, first) != NULL);
+    /* Every listed id must be accepted by GET /v1/models/<id> and in requests. */
+    for (const char *p = strstr(out, "\"id\":\""); p; p = strstr(p + 1, "\"id\":\"")) {
+        const char *start = p + strlen("\"id\":\"");
+        const char *end = strchr(start, '"');
+        char id[64];
+        TEST_ASSERT(end && (size_t)(end - start) < sizeof(id));
+        if (!end || (size_t)(end - start) >= sizeof(id)) break;
+        memcpy(id, start, (size_t)(end - start));
+        id[end - start] = '\0';
+        TEST_ASSERT(server_model_alias_known(id));
+    }
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_tool_history_validation_handles_large_replays(void) {
     chat_msgs responses = {0};
     chat_msgs anthropic = {0};
@@ -20990,6 +21113,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_json_int_handles_non_finite_values();
+    test_max_tokens_rejects_invalid_values();
+    test_models_listing_leads_with_engine_id();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();

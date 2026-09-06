@@ -79,6 +79,25 @@ Defaults are the "fast mode" of `bench/FIDELITY.md`: every adopted kernel change
 including the eleven registered floating-point-order changes. Nothing needs to be set to
 get the shipped configuration.
 
+### Model ids
+
+`GET /v1/models` lists the loaded model under its own id first. The id is derived from
+the GGUF at load: `general.architecture = glm5-next` selects the GLM-5.3 shape
+(`ds4.c`, `config_validate_model`), and `server_model_id_from_engine()`
+(`ds4_server.c`) maps that to `glm-5.3-flash`, the same id a request that names no model
+is assigned. The listing is, in order:
+
+| id | effect |
+|---|---|
+| `glm-5.3-flash` | the model; thinking controlled by the request |
+| `glm-5.3-flash-chat` (also `-no-think`, `-nothink`) | thinking off |
+| `glm-5.3-flash-reasoner` | thinking on |
+| `glm-5.2`, `glm-5.2-chat`, `glm-5.2-reasoner` | **legacy aliases** kept for clients configured against the GLM-5.2 ids; same model, same thinking semantics as the `glm-5.3-flash` forms |
+
+`zai/`-prefixed forms of all of the above are accepted in requests and on
+`GET /v1/models/<id>` but are not listed. The `name` field of every entry is the loaded
+shape's name (`GLM 5.3 Flash`).
+
 ## The exactness contract
 
 `DS4_GLM_EXACT=1` turns every registered floating-point-order change off, so the build
@@ -124,7 +143,7 @@ are deliberately separate.
 | Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge | **re-validation pending** on a vision prompt |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
 | DFlash2 speculative decoding (`--dflash`) | **refused and documented**: the drafter loads, then the engine decodes serially with one stderr notice on any graph that has DSA indexer tail state, i.e. every real GLM-5.3 graph (`ds4_dflash_glm.inc:57-101`) | serial-fallback identity (`DS4_DFLASH_DISABLE=1` vs `--dflash`) is step 0 of the certification recipe; not yet run |
-| CUDA / ROCm / tensor parallel / SSD streaming | upstream's, merged unchanged | not exercised by this branch |
+| CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
 
 **Why DFlash2 is refused.** Upstream now counts the DSA indexer tail ring
 (`layer_indexer_tail_k`, K+gate) as speculative state, and restores it with the KDA
@@ -137,6 +156,30 @@ both need a GPU certification run — a forced-rejection stream across a pool bo
 byte-identical tokens *and* byte-identical saved indexer tail — before the refusal may be
 lifted. Refusing costs nothing the serial path was not already paying and leaves no
 unsafe selectable mode.
+
+### Dispositions
+
+Stated once, so a reader does not have to infer them from the table:
+
+- **DFlash2 speculative decoding is ported but refuses at run time on GLM-5.3.** After
+  upstream widened the speculative state to include the DSA indexer tail, the state the
+  DFlash rollback restores (KDA state only) is narrower than the state a rejected draft
+  has to undo, so the cycle is refused before any target state is mutated and every token
+  is decoded serially. Completing it is Metal-side work (a per-step snapshot of the
+  indexer tail, or full restore plus replay) followed by the certification run above;
+  neither is done here.
+- **Unsupported or untested configurations.** The CUDA and ROCm paths carry small
+  GLM-5.3 additions (`ds4_cuda.cu`, `rocm/ds4_rocm_glm.cuh`) that are compile-only as far
+  as this branch goes: no CUDA or ROCm machine built or ran them here; tensor
+  parallelism and SSD streaming are upstream's and not exercised; the multimodal
+  (vision) session reuse adopted in the merge has not been re-validated on this branch.
+  None of these should be assumed to work here beyond what upstream `9ab7053` already
+  established.
+- **Cache and recovery cases not validated here.** The lifecycle suite covers a
+  same-process sequence (cold prefill, one snapshot stored, an immediate repeat,
+  disconnects, invalid requests, over-context prompts). It does not exercise a server
+  restart against a warm disk cache, a session reset, or eviction under disk-space
+  pressure; those paths are upstream's and remain **not validated here**.
 
 ## Environment switches introduced by this branch
 
@@ -413,13 +456,18 @@ receipt.
 
 ## Known issues
 
-- **`/v1/models` lists GLM-5.2 alias ids** (`glm-5.2`, `glm-5.2-chat`, `glm-5.2-reasoner`)
-  for a GLM-5.3 model: upstream's alias table (`ds4_server.c:1137`, `:14016-14020`)
-  keys the DSA family by its first member. Requests using `glm-5.3-flash` names are
-  accepted (`ds4_server.c:1111-1153`); only the listing is misleading.
-- **Negative `max_tokens` is accepted** and clamped to 0 (`ds4_server.c:12881`) rather
-  than rejected with a 4xx; observed as an "observational" failure in the lifecycle
-  suite because no contract exists either way.
+- **`/v1/models` listed only GLM-5.2 alias ids for a GLM-5.3 model — fixed.** Upstream's
+  listing keyed the DSA family by its first member. `send_models()` now leads with the
+  loaded model's id and keeps the GLM-5.2 ids as documented legacy aliases (see "Model
+  ids" above); lifecycle test T13 checks the listing. Receipts from before this fix
+  (`RUN-20260906T12…`) show the old listing.
+- **Negative `max_tokens` was accepted and clamped to 0 — fixed.** `max_tokens`,
+  `max_completion_tokens` and `max_output_tokens` must now be a non-negative integer
+  (`json_max_tokens()`, all four request parsers); anything else is a 400 in the server's
+  usual error shape, `{"error":{"message":"invalid max_tokens: must be a non-negative
+  integer","type":"invalid_request_error"}}`. Zero is still accepted and yields an empty
+  completion with `finish_reason: length`. Lifecycle test T14 checks it; T7b's
+  observational miss in the earlier receipts is this.
 - **DFlash2 is unavailable on this branch** (refused as described above); `--dflash` is
   accepted, the drafter loads, and decoding is serial with one stderr notice.
 - **Repeat of a long prompt accounted as a cache hit while the whole prompt was

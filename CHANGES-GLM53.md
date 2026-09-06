@@ -201,6 +201,10 @@ upstream's full restore+replay on every real GLM-5.3 graph.
   this workload because batched mode disables speculative decoding); **GLM tool-result
   reorder** (`ds4_server.c:2732`, with a jinja2 reference renderer in
   `tests/glm_tool_result_reorder_ref.py`); **trace segment cap** (`DS4_TRACE_MAX_MB`).
+- Two request-surface fixes from the audit: `/v1/models` leads with the loaded model's
+  own id (`glm-5.3-flash`, derived from the GGUF architecture) and keeps the GLM-5.2 ids
+  as documented aliases; a negative or fractional `max_tokens` is a 400 in the existing
+  error shape instead of a 200 with an empty completion (`json_max_tokens()`).
 - The merge adopted upstream's newer multimodal session handling (a validity predicate
   instead of the fork's unconditional invalidation); see `docs/GLM53_M3ULTRA.md`.
 
@@ -244,5 +248,7 @@ The kernel, server and harness work was carried out by AI coding agents (Anthrop
 Claude models, through Claude Code) working under the direction of the repository
 owner, who set the targets, chose the fidelity rules, reviewed and gated every adoption,
 and ran the machine; independent review of the fidelity methodology was also
-AI-assisted. The commits are attributed accordingly rather than relabelled. The
-engineering claims are meant to stand on their receipts, not on who typed them.
+AI-assisted. The commits are attributed accordingly rather than relabelled: the git
+author field is the owner's configured identity, and the `Co-Authored-By` trailer names
+the model that produced the code. The engineering claims are meant to stand on their
+receipts, not on who typed them.

@@ -20187,8 +20187,9 @@ static const ds4_glm_scorer_variant_t g_glm_scorer_variants[] = {
     { "half_r2", "kernel_glm_indexer_score_one_stream_half_r2",   8192u, 2u },
     { "noq_r8",  "kernel_glm_indexer_score_one_stream_noq_r8",       0u, 8u },
     /* ---- Tier 2 (`scorer-xreduce`): entries from here on change the
-     * floating-point summation ORDER and are reachable ONLY through
-     * DS4_GLM_ENABLE_SCORER_XREDUCE.  DS4_GLM_DISABLE_SCORER_XREDUCE and
+     * floating-point summation ORDER. The measured xr8 shape is selected by
+     * default on M3 Ultra, subject to the depth gate below. Other devices
+     * require DS4_GLM_ENABLE_SCORER_XREDUCE. DS4_GLM_DISABLE_SCORER_XREDUCE and
      * DS4_GLM_EXACT=1 force the selection back to index 0 unconditionally. */
     { "xr",      "kernel_glm_indexer_score_one_stream_xr",        16384u, 4u },
     { "xr_r2",   "kernel_glm_indexer_score_one_stream_xr_r2",     16384u, 2u },
@@ -20251,8 +20252,14 @@ static int ds4_gpu_glm_scorer_variant_index(void) {
     if (!initialized) {
         index = DS4_GLM_SCORER_DEFAULT_VARIANT;
 
-        /* Tier 2 opt-in.  Default OFF; selects the gated shape. */
-        if (ds4_gpu_glm_scorer_env_on("DS4_GLM_ENABLE_SCORER_XREDUCE")) {
+        /* The public-file M3 Ultra campaign admits xr8 above the existing
+         * depth gate. An explicit ENABLE=0 preserves the previous default;
+         * the kill switch and EXACT remain absolute clamps below. */
+        const char *xreduce_enable = getenv("DS4_GLM_ENABLE_SCORER_XREDUCE");
+        const bool xreduce_enabled = xreduce_enable ?
+            ds4_gpu_glm_scorer_env_on("DS4_GLM_ENABLE_SCORER_XREDUCE") :
+            ds4_gpu_device_name_contains("Apple M3 Ultra");
+        if (xreduce_enabled) {
             index = DS4_GLM_SCORER_XREDUCE_DEFAULT_SHAPE;
             const char *shape = getenv("DS4_GLM_SCORER_XREDUCE_SHAPE");
             if (shape && shape[0]) {
@@ -52902,7 +52909,8 @@ static int glm53_exact_mode(void) {
  *   5. DSA indexer scorer, transposed butterfly reduction across heads (this
  *      file, g_glm_scorer_variants entries "xr*"; metal/dsv4_misc.metal
  *      kernel_glm_indexer_score_one_stream_xr*), branch scorer-xreduce,
- *      DEFAULT OFF: opt in with DS4_GLM_ENABLE_SCORER_XREDUCE=1, kill with
+ *      DEFAULT ON on M3 Ultra above the 37,500-row depth gate; opt in on
+ *      other devices with DS4_GLM_ENABLE_SCORER_XREDUCE=1, kill with
  *      DS4_GLM_DISABLE_SCORER_XREDUCE=1, and this umbrella forces it off
  *      unconditionally (the clamp lives in
  *      ds4_gpu_glm_scorer_variant_index(), so even an explicit
@@ -56365,4 +56373,3 @@ int ds4_gpu_qwen_rope_rotate_half_rows_tensor(
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "qwen rotate-half rows");
 }
-
