@@ -597,8 +597,27 @@ kernel void kernel_glm_kv_lora_rms_norm(
     device const float *w = (device const float *)weight;
     device float *out = (device float *)(dst + (uint64_t)row * args.kv_lora_dim * sizeof(float));
 
+    /* Decode runs this in one threadgroup, so there is no other work to hide
+     * memory latency behind: the strided loops below are unrolled four deep so
+     * a thread's four loads are in flight together instead of one per trip.
+     * The accumulation order is unchanged (ascending i, same additions), so
+     * the sum is bit-identical to the one-load-per-trip loop. */
+    const uint dim = args.kv_lora_dim;
+    const uint nth2 = nth * 2u;
+    const uint nth3 = nth * 3u;
     float ss = 0.0f;
-    for (uint i = tid; i < args.kv_lora_dim; i += nth) {
+    uint i = tid;
+    for (; i + nth3 < dim; i += nth * 4u) {
+        const float v0 = x[i];
+        const float v1 = x[i + nth];
+        const float v2 = x[i + nth2];
+        const float v3 = x[i + nth3];
+        ss += v0 * v0;
+        ss += v1 * v1;
+        ss += v2 * v2;
+        ss += v3 * v3;
+    }
+    for (; i < dim; i += nth) {
         const float v = x[i];
         ss += v * v;
     }
@@ -610,9 +629,24 @@ kernel void kernel_glm_kv_lora_rms_norm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const float inv = rsqrt(scratch[0] / (float)args.kv_lora_dim + args.eps);
-    for (uint i = tid; i < args.kv_lora_dim; i += nth) {
-        out[i] = x[i] * inv * w[i];
+    const float inv = rsqrt(scratch[0] / (float)dim + args.eps);
+    uint j = tid;
+    for (; j + nth3 < dim; j += nth * 4u) {
+        const float x0 = x[j];
+        const float x1 = x[j + nth];
+        const float x2 = x[j + nth2];
+        const float x3 = x[j + nth3];
+        const float w0 = w[j];
+        const float w1 = w[j + nth];
+        const float w2 = w[j + nth2];
+        const float w3 = w[j + nth3];
+        out[j] = x0 * inv * w0;
+        out[j + nth] = x1 * inv * w1;
+        out[j + nth2] = x2 * inv * w2;
+        out[j + nth3] = x3 * inv * w3;
+    }
+    for (; j < dim; j += nth) {
+        out[j] = x[j] * inv * w[j];
     }
 }
 
@@ -1027,20 +1061,52 @@ kernel void kernel_glm53_indexer_pool_update(
         return;
     }
 
+    /* One thread owns a pool row's whole mean/variance, and both passes are a
+     * strict left-to-right accumulation whose order has to stand. Only the
+     * loads are rescheduled: eight are issued per trip instead of one, so the
+     * dependent add chain stops paying a threadgroup-load latency per element.
+     * The additions still run in ascending d, so the result is unchanged. */
     if (tid < args.pool_size) {
-        const uint r = tid;
+        threadgroup const float *row = rows + (uint64_t)tid * args.head_dim;
+        const uint n = args.head_dim;
         float sum = 0.0f;
-        for (uint d = 0; d < args.head_dim; d++) {
-            sum += rows[(uint64_t)r * args.head_dim + d];
+        uint d = 0;
+        for (; d + 7u < n; d += 8u) {
+            const float v0 = row[d];
+            const float v1 = row[d + 1u];
+            const float v2 = row[d + 2u];
+            const float v3 = row[d + 3u];
+            const float v4 = row[d + 4u];
+            const float v5 = row[d + 5u];
+            const float v6 = row[d + 6u];
+            const float v7 = row[d + 7u];
+            sum += v0; sum += v1; sum += v2; sum += v3;
+            sum += v4; sum += v5; sum += v6; sum += v7;
         }
-        const float m = sum / (float)args.head_dim;
+        for (; d < n; d++) sum += row[d];
+        const float m = sum / (float)n;
         float ss = 0.0f;
-        for (uint d = 0; d < args.head_dim; d++) {
-            const float delta = rows[(uint64_t)r * args.head_dim + d] - m;
+        d = 0;
+        for (; d + 7u < n; d += 8u) {
+            const float v0 = row[d];
+            const float v1 = row[d + 1u];
+            const float v2 = row[d + 2u];
+            const float v3 = row[d + 3u];
+            const float v4 = row[d + 4u];
+            const float v5 = row[d + 5u];
+            const float v6 = row[d + 6u];
+            const float v7 = row[d + 7u];
+            const float d0 = v0 - m, d1 = v1 - m, d2 = v2 - m, d3 = v3 - m;
+            const float d4 = v4 - m, d5 = v5 - m, d6 = v6 - m, d7 = v7 - m;
+            ss += d0 * d0; ss += d1 * d1; ss += d2 * d2; ss += d3 * d3;
+            ss += d4 * d4; ss += d5 * d5; ss += d6 * d6; ss += d7 * d7;
+        }
+        for (; d < n; d++) {
+            const float delta = row[d] - m;
             ss += delta * delta;
         }
-        mean[r] = m;
-        inv[r] = rsqrt(ss / (float)args.head_dim + args.eps);
+        mean[tid] = m;
+        inv[tid] = rsqrt(ss / (float)n + args.eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1772,6 +1838,33 @@ static inline float glm_q8_0_dot_row_tg_f32_512(
     return acc;
 }
 
+/* Same dot, same order, half the loads: a Q8_0 block is 34 bytes so its
+ * quantised bytes start at an even but not 4-byte-aligned offset, and ushort
+ * is therefore the widest legal vector load for them.  Sixteen ushort loads
+ * replace thirty-two int8 loads per block and the two halves are consumed in
+ * ascending element order, so every addend and every rounding is the one
+ * glm_q8_0_dot_row_tg_f32_512 produces.  Bit-identity verified against it over
+ * 50,000 randomised draws with poisoned outputs (lever-dsa-glue). */
+static inline float glm_q8_0_dot_row_tg_f32_512_u16(
+        device const char *row,
+        threadgroup const float *x) {
+    float acc = 0.0f;
+    for (uint block = 0; block < 16u; block++) {
+        device const char *block_base = row + (uint64_t)block * 34u;
+        const float d = (float)(*((device const half *)block_base));
+        device const ushort *qw = (device const ushort *)(block_base + 2u);
+        const uint base = block << 5;
+        FOR_UNROLL (uint p = 0; p < 16u; p++) {
+            const ushort w = qw[p];
+            const int8_t lo = (int8_t)(w & 0xffu);
+            const int8_t hi = (int8_t)(w >> 8);
+            acc += d * (float)lo * x[base + 2u * p];
+            acc += d * (float)hi * x[base + 2u * p + 1u];
+        }
+    }
+    return acc;
+}
+
 static inline float glm_q8_0_dot_row_tg_f32_fast(
         device const char *row,
         threadgroup const float *x,
@@ -2012,6 +2105,773 @@ kernel void kernel_glm_indexer_score_one_direct(
 
     if (tid == 0) {
         scores[row] = acc;
+    }
+}
+
+/*
+ * Streaming rewrite of kernel_glm_indexer_score_one_direct.
+ *
+ * The direct kernel spends one 128-thread threadgroup per pooled key row.  A
+ * row is only 128 F16 keys (256 B), but every threadgroup re-reads the whole
+ * 16 KB indexer query through the device path and pays 16 threadgroup barriers
+ * to funnel 32 per-head partials through one thread.  At 62k context that is
+ * 15558 threadgroups x 16 KB = 249 MB of query loads against 4 MB of key
+ * loads, which is why the kernel measures 59 GB/s on its key traffic.
+ *
+ * Here one simdgroup owns DS4_GLM_IDX_STREAM_ROWS consecutive key rows and the
+ * query is staged once per threadgroup in threadgroup memory, so query traffic
+ * drops by (threads/32 * ROWS) and the barrier count drops to one.
+ *
+ * Bit-exactness: the per-head value is still
+ *     max(simd_sum(dot(q4[lane], k4[lane])) * scale, 0) * weights[head]
+ * accumulated into one running float in head order 0..31, i.e. the same lane
+ * structure, the same simd_sum tree and the same accumulation order as the
+ * direct kernel.  Only the address space the operands come from changes.
+ */
+#define DS4_GLM_IDX_STREAM_ROWS 4u
+
+kernel void kernel_glm_indexer_score_one_stream(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * DS4_GLM_IDX_STREAM_ROWS;
+    if (row0 >= n) return;
+
+    /* Clamp the tail rows onto the last valid row so the inner loop stays
+     * branch-free; their accumulators are simply never stored. */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1   * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2   * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3   * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1   * 32u + lane];
+        k2 = kf[(uint64_t)r2   * 32u + lane];
+        k3 = kf[(uint64_t)r3   * 32u + lane];
+    }
+
+    /* The direct kernel routes max(...)*weights[head] through threadgroup
+     * memory before accumulating, which forces the product to be rounded to
+     * f32 first.  Written as `acc += x * w` the fast-math compiler contracts
+     * the pair into one FMA and the score drifts by 1 ULP - enough to flip
+     * selection at the top-k cut.  fma(x, w, 0.0f) is the correctly rounded
+     * product and pins the multiply out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint h = 0; h < 32u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+    }
+}
+
+
+/* =====================================================================
+ * Lever `scorer-depth` (worktree only): bit-exact restructurings of
+ * kernel_glm_indexer_score_one_stream above, which is left byte-identical.
+ * Every variant reproduces the arithmetic order of the production kernel
+ * verbatim -- one accumulator per key row carried through heads 0..31 in
+ * ascending order, dot -> simd_sum -> * scale -> relu -> fma(p, w, 0.0f) --
+ * and changes only occupancy (how much of the F32 query is staged), rows in
+ * flight per simdgroup, or the address space the query is read from.
+ * ===================================================================== */
+
+/* V1 half-head staging: 16 heads x 128 F32 = 8 KiB, two staging passes, ONE accumulator per row across the split, participating barriers, no early return. */
+kernel void kernel_glm_indexer_score_one_stream_half(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    for (uint i = tid; i < 16u * 32u; i += ntg) q4tg[i] = q4src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 4u;
+    /* A barrier follows below, so an inactive simdgroup CANNOT return here.
+     * It participates with masked loads (row 0,
+     * always valid because the host never dispatches with n_rows == 0) and
+     * suppressed stores. */
+    const bool active = (row0 < n);
+    const uint last = n - 1u;
+    const uint b0 = active ? row0 : 0u;
+    const uint r1 = active ? min(row0 + 1u, last) : 0u;
+    const uint r2 = active ? min(row0 + 2u, last) : 0u;
+    const uint r3 = active ? min(row0 + 3u, last) : 0u;
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint h = 0u; h < 16u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* every read of pass 0 is done */
+    for (uint i = tid; i < 16u * 32u; i += ntg) q4tg[i] = q4src[16u * 32u + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* pass 1 is staged */
+    for (uint h = 16u; h < 32u; h++) {
+        const float4 qv = q4tg[(h - 16u) * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (active && lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+    }
+}
+
+/* V2 quarter-head staging: 8 heads = 4 KiB, four staging passes. */
+kernel void kernel_glm_indexer_score_one_stream_quarter(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    for (uint i = tid; i < 8u * 32u; i += ntg) q4tg[i] = q4src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 4u;
+    /* A barrier follows below, so an inactive simdgroup CANNOT return here.
+     * It participates with masked loads (row 0,
+     * always valid because the host never dispatches with n_rows == 0) and
+     * suppressed stores. */
+    const bool active = (row0 < n);
+    const uint last = n - 1u;
+    const uint b0 = active ? row0 : 0u;
+    const uint r1 = active ? min(row0 + 1u, last) : 0u;
+    const uint r2 = active ? min(row0 + 2u, last) : 0u;
+    const uint r3 = active ? min(row0 + 3u, last) : 0u;
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint h = 0u; h < 8u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* every read of pass 0 is done */
+    for (uint i = tid; i < 8u * 32u; i += ntg) q4tg[i] = q4src[8u * 32u + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* pass 1 is staged */
+    for (uint h = 8u; h < 16u; h++) {
+        const float4 qv = q4tg[(h - 8u) * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* every read of pass 1 is done */
+    for (uint i = tid; i < 8u * 32u; i += ntg) q4tg[i] = q4src[16u * 32u + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* pass 2 is staged */
+    for (uint h = 16u; h < 24u; h++) {
+        const float4 qv = q4tg[(h - 16u) * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* every read of pass 2 is done */
+    for (uint i = tid; i < 8u * 32u; i += ntg) q4tg[i] = q4src[24u * 32u + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* pass 3 is staged */
+    for (uint h = 24u; h < 32u; h++) {
+        const float4 qv = q4tg[(h - 24u) * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (active && lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+    }
+}
+
+/* V3 no staging at all: the query is read straight from device memory (same F32 values), zero threadgroup memory. */
+kernel void kernel_glm_indexer_score_one_stream_noq(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 4u;
+    if (row0 >= n) return;
+
+    const uint last = n - 1u;
+    const uint b0 = row0;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint h = 0; h < 32u; h++) {
+        const float4 qv = q4src[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+    }
+}
+
+/* V4 rows per simdgroup = 2, full 16 KiB staging. */
+kernel void kernel_glm_indexer_score_one_stream_r2(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 2u;
+    if (row0 >= n) return;
+
+    const uint last = n - 1u;
+    const uint b0 = row0;
+    const uint r1 = min(row0 + 1u, last);
+
+    float4 k0, k1;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f;
+    for (uint h = 0; h < 32u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+    }
+}
+
+/* V5 rows per simdgroup = 8, full 16 KiB staging. */
+kernel void kernel_glm_indexer_score_one_stream_r8(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 8u;
+    if (row0 >= n) return;
+
+    const uint last = n - 1u;
+    const uint b0 = row0;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+    const uint r4 = min(row0 + 4u, last);
+    const uint r5 = min(row0 + 5u, last);
+    const uint r6 = min(row0 + 6u, last);
+    const uint r7 = min(row0 + 7u, last);
+
+    float4 k0, k1, k2, k3, k4, k5, k6, k7;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+        k4 = float4(kh[(uint64_t)r4 * 32u + lane]);
+        k5 = float4(kh[(uint64_t)r5 * 32u + lane]);
+        k6 = float4(kh[(uint64_t)r6 * 32u + lane]);
+        k7 = float4(kh[(uint64_t)r7 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+        k4 = kf[(uint64_t)r4 * 32u + lane];
+        k5 = kf[(uint64_t)r5 * 32u + lane];
+        k6 = kf[(uint64_t)r6 * 32u + lane];
+        k7 = kf[(uint64_t)r7 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    for (uint h = 0; h < 32u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+        a4 = a4 + fma(max(simd_sum(dot(qv, k4)) * args.scale, 0.0f), w, 0.0f);
+        a5 = a5 + fma(max(simd_sum(dot(qv, k5)) * args.scale, 0.0f), w, 0.0f);
+        a6 = a6 + fma(max(simd_sum(dot(qv, k6)) * args.scale, 0.0f), w, 0.0f);
+        a7 = a7 + fma(max(simd_sum(dot(qv, k7)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+        if (row0 + 4u < n) scores[row0 + 4u] = a4;
+        if (row0 + 5u < n) scores[row0 + 5u] = a5;
+        if (row0 + 6u < n) scores[row0 + 6u] = a6;
+        if (row0 + 7u < n) scores[row0 + 7u] = a7;
+    }
+}
+
+/* V6 half-head staging x 8 rows per simdgroup: 8 KiB and twice the rows in flight. */
+kernel void kernel_glm_indexer_score_one_stream_half_r8(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    for (uint i = tid; i < 16u * 32u; i += ntg) q4tg[i] = q4src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 8u;
+    /* A barrier follows below, so an inactive simdgroup CANNOT return here.
+     * It participates with masked loads (row 0,
+     * always valid because the host never dispatches with n_rows == 0) and
+     * suppressed stores. */
+    const bool active = (row0 < n);
+    const uint last = n - 1u;
+    const uint b0 = active ? row0 : 0u;
+    const uint r1 = active ? min(row0 + 1u, last) : 0u;
+    const uint r2 = active ? min(row0 + 2u, last) : 0u;
+    const uint r3 = active ? min(row0 + 3u, last) : 0u;
+    const uint r4 = active ? min(row0 + 4u, last) : 0u;
+    const uint r5 = active ? min(row0 + 5u, last) : 0u;
+    const uint r6 = active ? min(row0 + 6u, last) : 0u;
+    const uint r7 = active ? min(row0 + 7u, last) : 0u;
+
+    float4 k0, k1, k2, k3, k4, k5, k6, k7;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+        k4 = float4(kh[(uint64_t)r4 * 32u + lane]);
+        k5 = float4(kh[(uint64_t)r5 * 32u + lane]);
+        k6 = float4(kh[(uint64_t)r6 * 32u + lane]);
+        k7 = float4(kh[(uint64_t)r7 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+        k4 = kf[(uint64_t)r4 * 32u + lane];
+        k5 = kf[(uint64_t)r5 * 32u + lane];
+        k6 = kf[(uint64_t)r6 * 32u + lane];
+        k7 = kf[(uint64_t)r7 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    for (uint h = 0u; h < 16u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+        a4 = a4 + fma(max(simd_sum(dot(qv, k4)) * args.scale, 0.0f), w, 0.0f);
+        a5 = a5 + fma(max(simd_sum(dot(qv, k5)) * args.scale, 0.0f), w, 0.0f);
+        a6 = a6 + fma(max(simd_sum(dot(qv, k6)) * args.scale, 0.0f), w, 0.0f);
+        a7 = a7 + fma(max(simd_sum(dot(qv, k7)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* every read of pass 0 is done */
+    for (uint i = tid; i < 16u * 32u; i += ntg) q4tg[i] = q4src[16u * 32u + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* pass 1 is staged */
+    for (uint h = 16u; h < 32u; h++) {
+        const float4 qv = q4tg[(h - 16u) * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+        a4 = a4 + fma(max(simd_sum(dot(qv, k4)) * args.scale, 0.0f), w, 0.0f);
+        a5 = a5 + fma(max(simd_sum(dot(qv, k5)) * args.scale, 0.0f), w, 0.0f);
+        a6 = a6 + fma(max(simd_sum(dot(qv, k6)) * args.scale, 0.0f), w, 0.0f);
+        a7 = a7 + fma(max(simd_sum(dot(qv, k7)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (active && lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+        if (row0 + 4u < n) scores[row0 + 4u] = a4;
+        if (row0 + 5u < n) scores[row0 + 5u] = a5;
+        if (row0 + 6u < n) scores[row0 + 6u] = a6;
+        if (row0 + 7u < n) scores[row0 + 7u] = a7;
+    }
+}
+
+/* V7 half-head staging x 2 rows per simdgroup. */
+kernel void kernel_glm_indexer_score_one_stream_half_r2(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    for (uint i = tid; i < 16u * 32u; i += ntg) q4tg[i] = q4src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 2u;
+    /* A barrier follows below, so an inactive simdgroup CANNOT return here.
+     * It participates with masked loads (row 0,
+     * always valid because the host never dispatches with n_rows == 0) and
+     * suppressed stores. */
+    const bool active = (row0 < n);
+    const uint last = n - 1u;
+    const uint b0 = active ? row0 : 0u;
+    const uint r1 = active ? min(row0 + 1u, last) : 0u;
+
+    float4 k0, k1;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f;
+    for (uint h = 0u; h < 16u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* every read of pass 0 is done */
+    for (uint i = tid; i < 16u * 32u; i += ntg) q4tg[i] = q4src[16u * 32u + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* pass 1 is staged */
+    for (uint h = 16u; h < 32u; h++) {
+        const float4 qv = q4tg[(h - 16u) * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (active && lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+    }
+}
+
+/* V8 no staging x 8 rows per simdgroup: zero threadgroup memory, 64 rows per 256-thread group. */
+kernel void kernel_glm_indexer_score_one_stream_noq_r8(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    device const float4 *q4src = (device const float4 *)q;
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 8u;
+    if (row0 >= n) return;
+
+    const uint last = n - 1u;
+    const uint b0 = row0;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+    const uint r4 = min(row0 + 4u, last);
+    const uint r5 = min(row0 + 5u, last);
+    const uint r6 = min(row0 + 6u, last);
+    const uint r7 = min(row0 + 7u, last);
+
+    float4 k0, k1, k2, k3, k4, k5, k6, k7;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)b0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+        k4 = float4(kh[(uint64_t)r4 * 32u + lane]);
+        k5 = float4(kh[(uint64_t)r5 * 32u + lane]);
+        k6 = float4(kh[(uint64_t)r6 * 32u + lane]);
+        k7 = float4(kh[(uint64_t)r7 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)b0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+        k4 = kf[(uint64_t)r4 * 32u + lane];
+        k5 = kf[(uint64_t)r5 * 32u + lane];
+        k6 = kf[(uint64_t)r6 * 32u + lane];
+        k7 = kf[(uint64_t)r7 * 32u + lane];
+    }
+
+    /* Arithmetic order copied verbatim from kernel_glm_indexer_score_one_stream:
+     * one accumulator per row carried through heads 0..31 in ascending order,
+     * the scale multiply and relu before the head weight, and fma(x, w, 0.0f)
+     * pinning the correctly rounded product out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    for (uint h = 0; h < 32u; h++) {
+        const float4 qv = q4src[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+        a4 = a4 + fma(max(simd_sum(dot(qv, k4)) * args.scale, 0.0f), w, 0.0f);
+        a5 = a5 + fma(max(simd_sum(dot(qv, k5)) * args.scale, 0.0f), w, 0.0f);
+        a6 = a6 + fma(max(simd_sum(dot(qv, k6)) * args.scale, 0.0f), w, 0.0f);
+        a7 = a7 + fma(max(simd_sum(dot(qv, k7)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+        if (row0 + 4u < n) scores[row0 + 4u] = a4;
+        if (row0 + 5u < n) scores[row0 + 5u] = a5;
+        if (row0 + 6u < n) scores[row0 + 6u] = a6;
+        if (row0 + 7u < n) scores[row0 + 7u] = a7;
     }
 }
 
@@ -2409,12 +3269,15 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52(
     }
 }
 
-// Coalesced GLM 5.2 decode qk-low: one simdgroup per pair of output rows,
-// lanes split the 192-wide dot so the 204-byte Q8 rows are read with
-// consecutive per-lane bytes. The thread-per-row variant above issues
-// strided scalar byte loads from only 64 threadgroups and measures ~7.5x
-// off the weight-bandwidth floor.
-kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
+// Coalesced GLM decode qk-low: one simdgroup per pair of output rows, lanes
+// split the QK_NOPE-wide dot so the quantised rows are read with consecutive
+// per-lane bytes. The thread-per-row variant above issues strided scalar byte
+// loads from only 64 threadgroups and measures ~7.5x off the weight-bandwidth
+// floor. QK_NOPE is a template parameter so both the GLM 5.2 shape (192, six
+// 32-element blocks, 204/108-byte rows) and the GLM 5.3 shape (256, eight
+// blocks, 272/144-byte rows) get the same coalesced body.
+template<uint QK_NOPE, uint QK_DIM>
+kernel void kernel_glm_qk_lowrank_q8_0_sg_impl(
         constant ds4_metal_args_glm_qk_lowrank & args,
         device const char *weight,
         device const char *q,
@@ -2424,8 +3287,7 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint kv_lora_dim = 512u;
-    constexpr uint qk_nope = 192u;
-    constexpr uint qk_dim = 256u;
+    constexpr uint NB = QK_NOPE / 32u;
     constexpr uint NR = 2u;
 
     const uint head = tgpig.x;
@@ -2433,10 +3295,10 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
     if (head >= args.n_head ||
         (args.n_head != 32u && args.n_head != 64u) ||
         args.kv_lora_dim != kv_lora_dim ||
-        args.qk_nope != qk_nope ||
-        args.qk_dim != qk_dim ||
-        !((wt == DS4_METAL_GGUF_Q8_0 && args.row_bytes == 204u) ||
-          (wt == DS4_METAL_GGUF_Q4_0 && args.row_bytes == 108u))) {
+        args.qk_nope != QK_NOPE ||
+        args.qk_dim != QK_DIM ||
+        !((wt == DS4_METAL_GGUF_Q8_0 && args.row_bytes == NB * 34u) ||
+          (wt == DS4_METAL_GGUF_Q4_0 && args.row_bytes == NB * 18u))) {
         return;
     }
     const uint row_bytes = args.row_bytes;
@@ -2446,9 +3308,9 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
     if (row0 >= kv_lora_dim) return;
 
     device const float *qh =
-        (device const float *)(q + (uint64_t)head * qk_dim * sizeof(float));
-    float qv[6];
-    FOR_UNROLL (uint b = 0; b < 6u; b++) {
+        (device const float *)(q + (uint64_t)head * QK_DIM * sizeof(float));
+    float qv[NB];
+    FOR_UNROLL (uint b = 0; b < NB; b++) {
         qv[b] = qh[(b << 5) + tiisg];
     }
 
@@ -2460,7 +3322,7 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
             weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
         float acc = 0.0f;
         if (wt == DS4_METAL_GGUF_Q8_0) {
-            FOR_UNROLL (uint b = 0; b < 6u; b++) {
+            FOR_UNROLL (uint b = 0; b < NB; b++) {
                 device const char *block_base = row + (uint64_t)b * 34u;
                 const float d = (float)(*((device const half *)block_base));
                 device const int8_t *qs = (device const int8_t *)(block_base + 2u);
@@ -2468,7 +3330,7 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
             }
         } else {
             /* Q4_0: 18B blocks; elems 0..15 = low nibbles, 16..31 = high. */
-            FOR_UNROLL (uint b = 0; b < 6u; b++) {
+            FOR_UNROLL (uint b = 0; b < NB; b++) {
                 device const char *block_base = row + (uint64_t)b * 18u;
                 const float d = (float)(*((device const half *)block_base));
                 device const uint8_t *qs = (device const uint8_t *)(block_base + 2u);
@@ -2483,6 +3345,18 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
         }
     }
 }
+
+typedef decltype(kernel_glm_qk_lowrank_q8_0_sg_impl<192u, 256u>)
+        glm_qk_lowrank_q8_0_sg_t;
+
+template [[host_name("kernel_glm_qk_lowrank_q8_0_glm52_sg")]]
+kernel glm_qk_lowrank_q8_0_sg_t
+kernel_glm_qk_lowrank_q8_0_sg_impl<192u, 256u>;
+
+/* GLM 5.3: n_rot = 0, so qk_nope == qk_dim == n_key_mla == 256. */
+template [[host_name("kernel_glm_qk_lowrank_q8_0_glm53_sg")]]
+kernel glm_qk_lowrank_q8_0_sg_t
+kernel_glm_qk_lowrank_q8_0_sg_impl<256u, 256u>;
 
 kernel void kernel_glm_qk_lowrank_q8_0_batch(
         constant ds4_metal_args_glm_qk_lowrank_batch & args,
@@ -2868,7 +3742,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     if (args.n_selected == 0u ||
         args.cache_f16 == 0u ||
         args.kv_lora_dim != 512u ||
-        args.qk_rope != 64u ||
+        (args.qk_rope != 64u && args.qk_rope != 0u) ||
         args.block_rows == 0u ||
         block >= args.n_blocks) {
         return;
@@ -3042,7 +3916,7 @@ template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_v
 kernel glm_attention_indexed_decode_split_group8_partial_t
 kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true>;
 
-template<uint FIXED_BLOCKS>
+template<uint FIXED_BLOCKS, bool Q8_U16>
 static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *partial_lora,
@@ -3065,9 +3939,14 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
     }
 
     const uint nth = ntg_u.x;
+    /* Scratch is laid out relative to nth so the host can widen the
+     * threadgroup past 256: red needs one slot per thread, block_scale one per
+     * runtime block (<= 64).  The reduction trees stay bit-identical when nth
+     * grows because the extra leaves are the max/sum identities (-FLT_MAX/2
+     * and 0.0f) and only prepend no-op steps to the same binary tree. */
     threadgroup float *red = scratch;
-    threadgroup float *block_scale = scratch + 256u;
-    threadgroup float *lora_sum = scratch + 320u;
+    threadgroup float *block_scale = scratch + nth;
+    threadgroup float *lora_sum = block_scale + 64u;
 
     float local_m = -FLT_MAX / 2.0f;
     if (tid < n_blocks) {
@@ -3143,7 +4022,12 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         for (uint d = tid; d < args.value_dim; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
-            out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);
+            /* Q8_U16 reads the same row as ushort pairs in the same order. */
+            out[d] = (Q8_U16 && args.value_type == DS4_METAL_GGUF_Q8_0 &&
+                      args.kv_lora_dim == 512u)
+                         ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
+                         : glm_quant_dot_row_tg_f32(args.value_type, row,
+                                                    lora_sum, args.kv_lora_dim);
         }
     }
 }
@@ -3158,7 +4042,25 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_reduce(
         uint tid [[thread_index_in_threadgroup]],
         ushort3 ntg_u [[threads_per_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0>(
+    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0, false>(
+            args, partial_lora, partial_ms, value_weight, heads, scratch,
+            tid, ntg_u, tgpig);
+}
+
+/* Identical to the kernel above except that its Q8_0 value rows are read as
+ * ushort pairs in the same element order; the host selects it unless
+ * DS4_GLM_DISABLE_REDUCE_Q8_U16 is set. */
+kernel void kernel_glm_attention_indexed_decode_split_group8_reduce_u16(
+        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
+        device const char *partial_lora,
+        device const char *partial_ms,
+        device const char *value_weight,
+        device char *heads,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0, true>(
             args, partial_lora, partial_ms, value_weight, heads, scratch,
             tid, ntg_u, tgpig);
 }
@@ -3173,7 +4075,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_reduce16(
         uint tid [[thread_index_in_threadgroup]],
         ushort3 ntg_u [[threads_per_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<16>(
+    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<16, false>(
             args, partial_lora, partial_ms, value_weight, heads, scratch,
             tid, ntg_u, tgpig);
 }
@@ -4829,6 +5731,456 @@ kernel void kernel_glm_router_select_one(
         sum = max(sum, 6.103515625e-5f);
         token_weights[tid] = token_probs[(uint)token_selected[tid]] / sum * args.expert_weight_scale;
     }
+}
+
+// Register-pair form of ds4_glm_router_better. The expression is character for
+// character the same comparison, so the two agree on every input.
+static inline bool ds4_glm_router_better_pair(
+        float   sa,
+        int32_t a,
+        float   sb,
+        int32_t b) {
+    return sa > sb || (sa == sb && a < b);
+}
+
+// Empty / already-extracted slot. -INFINITY with the largest possible index is
+// the unique minimum of the comparator's order: it never beats a real expert,
+// because a real expert either wins on score or (when its score is also
+// -INFINITY) wins the `a < b` tie-break with an index below n_expert.
+#define DS4_GLM_ROUTER_FAST_EMPTY_IDX 0x7fffffff
+
+// Threadgroup shape, mirrored by ds4_gpu_glm_router_select_tensor. 128 threads
+// is 4 simdgroups: enough lanes to cover the sigmoid loads, few enough that
+// stage 1 does not publish more candidates than one simdgroup can re-reduce.
+// Measured on M3 Ultra with n_expert=288, k_used=8 this is the flat part of the
+// curve (96..256 threads all land within ~0.3 us of each other).
+#define DS4_GLM_ROUTER_FAST_THREADS 128
+// Experts per thread in stage 1: 128 * 4 = 512 covers n_expert <= 512.
+#define DS4_GLM_ROUTER_FAST_SLOTS 4
+// Candidates per lane in stage 2: 4 simdgroups * k_used(<= 32) = 128 = 32 * 4.
+#define DS4_GLM_ROUTER_FAST_CAND_SLOTS 4
+
+// Drop-in replacement for kernel_glm_router_select_one that extracts the top
+// k_used experts instead of fully sorting all 512 slots. Same arguments, same
+// buffers, bit-identical outputs, and exactly ONE barrier instead of ~45.
+//
+// Shape. The n_expert scores are strided across the threadgroup, so each
+// simdgroup owns a disjoint slice of experts, held in registers.
+//   Stage 1 (no barrier): every simdgroup extracts its own top-k_used by
+//     k_used butterfly reductions -- simd shuffles only, and a simdgroup is
+//     lock-step, so no barrier is needed -- masking each winner out of the
+//     registers afterwards. Lane 0 publishes the resulting descending list.
+//   One barrier.
+//   Stage 2: simdgroup 0 loads all nsg * k_used candidates into registers and
+//     repeats the same butterfly extraction k_used times, which yields the
+//     global top-k_used in descending order. Lanes 0..k_used-1 write the
+//     outputs. Deliberately array-free: a per-list cursor array would be
+//     dynamically indexed thread storage, which Metal spills off-chip.
+//
+// Why the result is *provably* identical to the bitonic sort, not merely close:
+//
+//  1. ds4_glm_router_better is a strict total order on the (score, index)
+//     pairs: indices are pairwise distinct, so `sa == sb && a < b` resolves
+//     every score tie (including +/-INFINITY ties). A strict total order admits
+//     exactly one descending arrangement, so the old kernel's sorted prefix is
+//     the unique top-k_used sequence; any scheme that also yields "the k_used
+//     greatest elements in descending order" must yield the same ids in the
+//     same order.
+//  2. The old kernel padded slots [n_expert, sort_width) with -INFINITY and
+//     index >= n_expert. Every real expert beats every pad slot (on score, or
+//     on the lower-index tie-break when a real score is also -INFINITY), so all
+//     n_expert real experts precede all pads. With k_used <= n_expert the
+//     top-k_used never touches a pad, so dropping the pad cannot change the
+//     result. The empty slots here use the same encoding and lose for the same
+//     reason; an extracted expert is reset to that encoding, so nothing can be
+//     picked twice.
+//  3. The slice decomposition is exact: if an expert is the j-th greatest
+//     overall (j <= k_used) then at most j-1 experts outrank it anywhere, hence
+//     at most j-1 inside its own slice, so it is in its slice's top-k_used.
+//     Therefore stage 1's candidate union contains the whole global top-k_used,
+//     and it also contains everything ranked above each of them, so the union's
+//     j-th greatest IS the global j-th greatest for every j <= k_used. Stage 2
+//     enumerates the union in descending order, so it reproduces exactly the
+//     global descending prefix. The union holds at least k_used real experts,
+//     and the sentinel is the order's unique minimum, so no sentinel can be
+//     selected.
+//  4. Every comparison in both stages is ds4_glm_router_better_pair, and a
+//     maximum under a strict total order is unique and independent of
+//     evaluation order, so nothing depends on lane order or reduction shape.
+//
+// token_probs is written for all n_expert experts exactly as before, and the
+// weight arithmetic is the original's verbatim: the same accumulation of
+// probs[selected[i]] for i = 0..k_used-1 in ascending i (which step 1 shows is
+// the same descending comparator order), the same max() clamp, the same divide
+// and the same scale -- so the weights are byte-identical too.
+//
+// Body is factored out so the router-tail fusion
+// (kernel_glm_router_logits_select_tail) executes this exact source, and hence
+// the exact same instruction structure, rather than a copy that could drift.
+// The body reads nothing from the launch shape beyond (tid, ntg, nsg, sgitg,
+// tiisg), and point 4 above is what makes it shape-independent: every
+// comparison is the same strict total order, whose maximum is unique and
+// independent of how the experts are sliced across lanes. It therefore returns
+// the same ids, probs and weights for any (ntg, nsg) with
+// ntg * DS4_GLM_ROUTER_FAST_SLOTS >= n_expert and
+// nsg * k_used <= 32 * DS4_GLM_ROUTER_FAST_CAND_SLOTS.
+static inline void ds4_glm_router_select_one_fast_body(
+        constant ds4_metal_args_glm_router_select_one & args,
+        device const float *logits,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        threadgroup float *scratch,
+        uint token,
+        uint tid,
+        uint ntg,
+        uint nsg,
+        uint sgitg,
+        uint tiisg) {
+    device const float *token_logits = logits + (uint64_t)token * args.n_expert;
+    device int32_t *token_selected = selected + (uint64_t)token * args.n_expert_used;
+    device float *token_weights = weights + (uint64_t)token * args.n_expert_used;
+    device float *token_probs = probs + (uint64_t)token * args.n_expert;
+
+    const uint n_expert = min(args.n_expert, 512u);
+    const uint k_used = min(args.n_expert_used, n_expert);
+
+    // scratch layout: [n_expert] probs mirror, then [nsg][k_used] candidate
+    // scores, then [nsg][k_used] candidate indices. The mirror keeps stage 2
+    // off the device path, so the lone barrier needs no device memory fence.
+    threadgroup float   *tg_prob    = scratch;
+    threadgroup float   *cand_score = scratch + n_expert;
+    threadgroup int32_t *cand_idx   = (threadgroup int32_t *)(cand_score + nsg * k_used);
+
+    float   s_loc[DS4_GLM_ROUTER_FAST_SLOTS];
+    int32_t i_loc[DS4_GLM_ROUTER_FAST_SLOTS];
+    for (uint t = 0; t < DS4_GLM_ROUTER_FAST_SLOTS; t++) {
+        const uint i = tid + t * ntg;
+        if (i < n_expert) {
+            const float p = ds4_glm_router_sigmoid(token_logits[i]);
+            token_probs[i] = p;
+            tg_prob[i] = p;
+            s_loc[t] = p + bias[i];
+            i_loc[t] = (int32_t)i;
+        } else {
+            s_loc[t] = -INFINITY;
+            i_loc[t] = DS4_GLM_ROUTER_FAST_EMPTY_IDX;
+        }
+    }
+
+    // Stage 1: per-simdgroup top-k_used, barrier-free.
+    for (uint it = 0; it < k_used; it++) {
+        float   best_score = s_loc[0];
+        int32_t best_idx   = i_loc[0];
+        for (uint t = 1; t < DS4_GLM_ROUTER_FAST_SLOTS; t++) {
+            if (ds4_glm_router_better_pair(s_loc[t], i_loc[t], best_score, best_idx)) {
+                best_score = s_loc[t];
+                best_idx   = i_loc[t];
+            }
+        }
+        // Butterfly all-reduce over a full 32-wide simdgroup: every lane ends
+        // up holding the slice winner, so no broadcast step is needed.
+        for (uint off = 16; off > 0; off >>= 1) {
+            const float   other_score = simd_shuffle_xor(best_score, (ushort)off);
+            const int32_t other_idx   = simd_shuffle_xor(best_idx, (ushort)off);
+            if (ds4_glm_router_better_pair(other_score, other_idx, best_score, best_idx)) {
+                best_score = other_score;
+                best_idx   = other_idx;
+            }
+        }
+        if (tiisg == 0) {
+            cand_score[sgitg * k_used + it] = best_score;
+            cand_idx[sgitg * k_used + it]   = best_idx;
+        }
+        // Slices are disjoint and each list entry is distinct, so exactly one
+        // register slot in the whole threadgroup matches the winner.
+        for (uint t = 0; t < DS4_GLM_ROUTER_FAST_SLOTS; t++) {
+            if (i_loc[t] == best_idx) {
+                s_loc[t] = -INFINITY;
+                i_loc[t] = DS4_GLM_ROUTER_FAST_EMPTY_IDX;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2: one simdgroup merges the candidates. k_used <= 32 is enforced by
+    // the host, so lanes 0..k_used-1 cover every output slot.
+    if (sgitg != 0) return;
+
+    const uint n_cand = nsg * k_used;
+    float   c_s[DS4_GLM_ROUTER_FAST_CAND_SLOTS];
+    int32_t c_i[DS4_GLM_ROUTER_FAST_CAND_SLOTS];
+    for (uint t = 0; t < DS4_GLM_ROUTER_FAST_CAND_SLOTS; t++) {
+        const uint j = tiisg + t * 32u;
+        if (j < n_cand) {
+            c_s[t] = cand_score[j];
+            c_i[t] = cand_idx[j];
+        } else {
+            c_s[t] = -INFINITY;
+            c_i[t] = DS4_GLM_ROUTER_FAST_EMPTY_IDX;
+        }
+    }
+
+    float   sum     = 0.0f;
+    int32_t my_sel  = 0;
+    float   my_prob = 0.0f;
+    for (uint it = 0; it < k_used; it++) {
+        float   best_score = c_s[0];
+        int32_t best_idx   = c_i[0];
+        for (uint t = 1; t < DS4_GLM_ROUTER_FAST_CAND_SLOTS; t++) {
+            if (ds4_glm_router_better_pair(c_s[t], c_i[t], best_score, best_idx)) {
+                best_score = c_s[t];
+                best_idx   = c_i[t];
+            }
+        }
+        for (uint off = 16; off > 0; off >>= 1) {
+            const float   other_score = simd_shuffle_xor(best_score, (ushort)off);
+            const int32_t other_idx   = simd_shuffle_xor(best_idx, (ushort)off);
+            if (ds4_glm_router_better_pair(other_score, other_idx, best_score, best_idx)) {
+                best_score = other_score;
+                best_idx   = other_idx;
+            }
+        }
+        const float p = tg_prob[(uint)best_idx];
+        sum += p;
+        if (it == tiisg) {
+            my_sel  = best_idx;
+            my_prob = p;
+        }
+        for (uint t = 0; t < DS4_GLM_ROUTER_FAST_CAND_SLOTS; t++) {
+            if (c_i[t] == best_idx) {
+                c_s[t] = -INFINITY;
+                c_i[t] = DS4_GLM_ROUTER_FAST_EMPTY_IDX;
+            }
+        }
+    }
+
+    if (tiisg < k_used) {
+        sum = max(sum, 6.103515625e-5f);
+        token_selected[tiisg] = my_sel;
+        token_weights[tiisg] = my_prob / sum * args.expert_weight_scale;
+    }
+}
+
+kernel void kernel_glm_router_select_one_fast(
+        constant ds4_metal_args_glm_router_select_one & args,
+        device const float *logits,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]],
+        uint nsg [[simdgroups_per_threadgroup]],
+        uint sgitg [[simdgroup_index_in_threadgroup]],
+        uint tiisg [[thread_index_in_simdgroup]]) {
+    ds4_glm_router_select_one_fast_body(args, logits, bias, selected, weights,
+                                       probs, scratch, token, tid, ntg, nsg,
+                                       sgitg, tiisg);
+}
+
+// GLM decode router: the 4096 -> n_expert logits matvec with the top-k
+// selection folded onto its TAIL, so the two dispatches become one.
+//
+// Every threadgroup runs the ordinary F32 matvec over its own row pair, exactly
+// as kernel_mul_mv_f32_f32_4 does (same template instantiation, same nr0, same
+// function-constant nsg, same reduction), then takes a ticket from a device
+// atomic. The threadgroup that draws the last ticket -- which by construction
+// is the one that finishes last, so every logit has already been written and
+// made device-visible -- runs the router selection body in place. This is the
+// classic "last block" device reduction; no threadgroup ever waits on another,
+// so it needs no forward-progress guarantee between threadgroups.
+//
+// The elected threadgroup resets the counter before it selects, which leaves the
+// buffer at zero for the next layer's dispatch. The host zero-initializes it
+// once at graph allocation.
+//
+// Bit-exactness:
+//   logits  - the matvec instantiation, nr0, nsg, lane traversal and two-stage
+//             reduction are unchanged, so every logit is byte-identical.
+//   probs / selected / weights - the tail calls
+//             ds4_glm_router_select_one_fast_body, the same source the
+//             standalone kernel calls, with (ntg, nsg) = (32*nsg, nsg) instead
+//             of (128, 4). The body's own proof (see above) makes it
+//             shape-independent: every comparison is the same strict total
+//             order, whose maximum is unique and order-free, and the weight
+//             accumulation runs over the same unique descending prefix in the
+//             same ascending order.
+//
+// Threadgroup memory is shared between the two phases: the matvec's reduction
+// scratch (NW*nr0 floats) is dead by the time the tail starts, and the barrier
+// after the matvec orders the reuse.
+kernel void kernel_glm_router_logits_select_tail(
+        constant ds4_metal_args_mul_mv & mv_args,
+        constant ds4_metal_args_glm_router_select_one & args,
+        constant uint & n_groups,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        device atomic_uint *counter,
+        threadgroup char *shmem [[threadgroup(0)]],
+        threadgroup uint *elected [[threadgroup(1)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        uint   tid  [[thread_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    // COHERENT_STORE: the logits go out through relaxed device atomics so the
+    // elected threadgroup can read back rows written by other threadgroups.
+    // Plain stores are NOT enough here -- measured on M3 Ultra, a seq_cst device
+    // fence on both sides still left exactly half the rows (one die's worth)
+    // invisible to the reader. Same bit pattern, so the logits stay identical.
+    kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2,
+                             constant ds4_metal_args_mul_mv &, true>(
+        mv_args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+
+    // Release the matvec's threadgroup scratch before the tail reuses it, then
+    // publish this threadgroup's logits before its ticket is taken.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0u) {
+        const uint ticket = atomic_fetch_add_explicit(counter, 1u,
+                                                      memory_order_relaxed);
+        elected[0] = (ticket + 1u == n_groups) ? 1u : 0u;
+        if (elected[0] != 0u) {
+            // Leaves the counter ready for the next layer's dispatch.
+            atomic_store_explicit(counter, 0u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (elected[0] == 0u) return;
+
+    // Every other threadgroup finished before releasing its ticket, so all the
+    // logits are in coherent memory now. Pull them through the coherent path and
+    // write them back as plain values so the unmodified selection body -- which
+    // takes a plain device pointer -- reads what the matvec computed. Same bits,
+    // same address, so the buffer's contents are unchanged.
+    {
+        device atomic_uint *slots = (device atomic_uint *)dst;
+        device float *plain = (device float *)dst;
+        const uint total = min(args.n_expert, 512u);
+        for (uint i = tid; i < total; i += 32u * (uint)nsg) {
+            plain[i] = as_type<float>(
+                atomic_load_explicit(&slots[i], memory_order_relaxed));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    ds4_glm_router_select_one_fast_body(args,
+                                       (device const float *)dst,
+                                       bias,
+                                       selected,
+                                       weights,
+                                       probs,
+                                       (threadgroup float *)shmem,
+                                       0u,
+                                       tid,
+                                       32u * (uint)nsg,
+                                       (uint)nsg,
+                                       (uint)sgitg,
+                                       (uint)tiisg);
+}
+
+// Geometry-only sibling of kernel_glm_router_logits_select_tail: a verbatim
+// copy whose matvec half is instantiated with NR0 = 1 instead of 2, so the
+// 288-row router weight is covered by 288 threadgroups of one row each rather
+// than 144 of two.  144 threadgroups leave most of the machine idle on a 4.7 MB
+// F32 stream (measured ~210 GB/s); doubling them doubles the memory-level
+// parallelism over the same bytes.
+//
+// Bit-exact by construction on both halves.  For the logits: NR0 chooses only
+// how many rows one threadgroup carries; the float4 tile loop
+// (ib0 = sgitg*NF + ix, stride NSG*NF), the per-row `dot` chain and
+// helper_mv_reduce_and_write's simd_sum / shmem / simd_sum tree depend on NSG
+// and the lane layout, not on NR0 or the row-to-threadgroup map.  For the
+// selection tail: it calls ds4_glm_router_select_one_fast_body, the same source
+// the standalone kernel calls, and that body's own proof (see above) makes it
+// shape-independent -- the only thing that changes is that the ticket total
+// n_groups doubles, so a different threadgroup happens to be the elected one.
+// kernel_glm_router_logits_select_tail itself is left byte-identical so the two
+// arms of the fidelity comparison cannot move together.
+kernel void kernel_glm_router_logits_select_tail_nr1(
+        constant ds4_metal_args_mul_mv & mv_args,
+        constant ds4_metal_args_glm_router_select_one & args,
+        constant uint & n_groups,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        device atomic_uint *counter,
+        threadgroup char *shmem [[threadgroup(0)]],
+        threadgroup uint *elected [[threadgroup(1)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        uint   tid  [[thread_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    // COHERENT_STORE: the logits go out through relaxed device atomics so the
+    // elected threadgroup can read back rows written by other threadgroups.
+    // Plain stores are NOT enough here -- measured on M3 Ultra, a seq_cst device
+    // fence on both sides still left exactly half the rows (one die's worth)
+    // invisible to the reader. Same bit pattern, so the logits stay identical.
+    kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 1,
+                             constant ds4_metal_args_mul_mv &, true>(
+        mv_args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+
+    // Release the matvec's threadgroup scratch before the tail reuses it, then
+    // publish this threadgroup's logits before its ticket is taken.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0u) {
+        const uint ticket = atomic_fetch_add_explicit(counter, 1u,
+                                                      memory_order_relaxed);
+        elected[0] = (ticket + 1u == n_groups) ? 1u : 0u;
+        if (elected[0] != 0u) {
+            // Leaves the counter ready for the next layer's dispatch.
+            atomic_store_explicit(counter, 0u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (elected[0] == 0u) return;
+
+    // Every other threadgroup finished before releasing its ticket, so all the
+    // logits are in coherent memory now. Pull them through the coherent path and
+    // write them back as plain values so the unmodified selection body -- which
+    // takes a plain device pointer -- reads what the matvec computed. Same bits,
+    // same address, so the buffer's contents are unchanged.
+    {
+        device atomic_uint *slots = (device atomic_uint *)dst;
+        device float *plain = (device float *)dst;
+        const uint total = min(args.n_expert, 512u);
+        for (uint i = tid; i < total; i += 32u * (uint)nsg) {
+            plain[i] = as_type<float>(
+                atomic_load_explicit(&slots[i], memory_order_relaxed));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    ds4_glm_router_select_one_fast_body(args,
+                                       (device const float *)dst,
+                                       bias,
+                                       selected,
+                                       weights,
+                                       probs,
+                                       (threadgroup float *)shmem,
+                                       0u,
+                                       tid,
+                                       32u * (uint)nsg,
+                                       (uint)nsg,
+                                       (uint)sgitg,
+                                       (uint)tiisg);
 }
 
 // Batched Flash-router weight finalization after selection is already known.
@@ -7083,4 +8435,2697 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
     }
 
     dst[ic * args.head_dim + id] = acc/sum;
+}
+/* =====================================================================
+ * Lever `scorer-xreduce` (Tier 2, worktree only, 2026-09-05).
+ *
+ * These kernels compute the SAME score as
+ * kernel_glm_indexer_score_one_stream above -- same 32 heads, same F32
+ * query, same F16 pooled keys, same head weights, same
+ *      score(row) = sum_h max(dot(q_h, k_row) * scale, 0) * w_h
+ * -- in a DIFFERENT floating-point summation ORDER.  They are therefore a
+ * Tier 2 change under bench/FIDELITY.md: opt in with
+ * DS4_GLM_ENABLE_SCORER_XREDUCE=1, kill with DS4_GLM_DISABLE_SCORER_XREDUCE=1,
+ * and DS4_GLM_EXACT=1 forces them off.  The production kernel above is left
+ * byte-identical and is what exact mode runs.
+ *
+ * What changes, precisely:
+ *
+ * (1) The 32-lane dot for one head is no longer a separate simd_sum() per
+ *     head.  Each lane first computes all 32 per-head partial dots for its
+ *     four key dims and holds them in registers, indexed by a SLOT j, with
+ *
+ *          slot j of lane l holds the partial dot of head (j ^ (l & (GRP-1)))
+ *
+ *     (a per-lane XOR permutation of the head index -- this is what keeps
+ *     every later register index a compile-time constant).  A butterfly over
+ *     the simdgroup then halves the live slot count at every stage:
+ *
+ *          for each stage mask s:  v[j] += simd_shuffle_xor(v[j ^ s], s)
+ *                                  for the slots j whose bit s is clear
+ *
+ *     After log2(GRP) stages, slot 0 of lane l holds the COMPLETE dot of head
+ *     (l & (GRP-1)) summed over the GRP lanes of its block.  With GRP = 32
+ *     that is the whole simdgroup and h(l) = l -- the head permutation is the
+ *     IDENTITY: lane l ends holding head l.  With GRP = 8 a further plain
+ *     butterfly over masks 8 and 16 completes the sum across the four blocks,
+ *     and lane l then holds the four heads {0,8,16,24} + (l & 7).
+ *
+ *     Cost per key row per lane: 31 shuffles + 31 adds (GRP = 32) instead of
+ *     32 x simd_sum = 160 shuffles + 160 adds.  The 128 dot FMAs are
+ *     unchanged and every head still contributes exactly once.
+ *
+ * (2) The head sum becomes a tree instead of a 32-step sequential chain.
+ *     Each lane applies the epilogue to the head(s) it owns, in exactly
+ *     production's order and rounding --
+ *          p = max(s * scale, 0.0f);  t = fma(p, w, 0.0f)
+ *     -- and one simd_sum(t) (GRP = 32) or a 3-stage butterfly (GRP = 8)
+ *     produces sum_h p_h * w_h.
+ *
+ * Nothing else moves: the query staging is production's (a byte copy of the
+ * device F32 query into threadgroup memory), the key widening is the same
+ * float4(half4), the scale multiply is still before the relu, and the head
+ * weight is still applied through fma(p, w, 0.0f).
+ * ===================================================================== */
+
+/* xr: ROWS=4, GRP=32 heads transposed at once, ascending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xr(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 4u;
+    if (row0 >= n) return;
+
+    /* tail rows clamp onto the last valid row, exactly as production */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*32 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 31u;
+    float v0[32];
+    float v1[32];
+    float v2[32];
+    float v3[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+      v1[0] = dot(qv, k1);
+      v2[0] = dot(qv, k2);
+      v3[0] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+      v1[1] = dot(qv, k1);
+      v2[1] = dot(qv, k2);
+      v3[1] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+      v1[2] = dot(qv, k1);
+      v2[2] = dot(qv, k2);
+      v3[2] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+      v1[3] = dot(qv, k1);
+      v2[3] = dot(qv, k2);
+      v3[3] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+      v1[4] = dot(qv, k1);
+      v2[4] = dot(qv, k2);
+      v3[4] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+      v1[5] = dot(qv, k1);
+      v2[5] = dot(qv, k2);
+      v3[5] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+      v1[6] = dot(qv, k1);
+      v2[6] = dot(qv, k2);
+      v3[6] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+      v1[7] = dot(qv, k1);
+      v2[7] = dot(qv, k2);
+      v3[7] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((8u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+      v1[8] = dot(qv, k1);
+      v2[8] = dot(qv, k2);
+      v3[8] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((9u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+      v1[9] = dot(qv, k1);
+      v2[9] = dot(qv, k2);
+      v3[9] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((10u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+      v1[10] = dot(qv, k1);
+      v2[10] = dot(qv, k2);
+      v3[10] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((11u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+      v1[11] = dot(qv, k1);
+      v2[11] = dot(qv, k2);
+      v3[11] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((12u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+      v1[12] = dot(qv, k1);
+      v2[12] = dot(qv, k2);
+      v3[12] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((13u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+      v1[13] = dot(qv, k1);
+      v2[13] = dot(qv, k2);
+      v3[13] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((14u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+      v1[14] = dot(qv, k1);
+      v2[14] = dot(qv, k2);
+      v3[14] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((15u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+      v1[15] = dot(qv, k1);
+      v2[15] = dot(qv, k2);
+      v3[15] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((16u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+      v1[16] = dot(qv, k1);
+      v2[16] = dot(qv, k2);
+      v3[16] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((17u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+      v1[17] = dot(qv, k1);
+      v2[17] = dot(qv, k2);
+      v3[17] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((18u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+      v1[18] = dot(qv, k1);
+      v2[18] = dot(qv, k2);
+      v3[18] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((19u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+      v1[19] = dot(qv, k1);
+      v2[19] = dot(qv, k2);
+      v3[19] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((20u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+      v1[20] = dot(qv, k1);
+      v2[20] = dot(qv, k2);
+      v3[20] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((21u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+      v1[21] = dot(qv, k1);
+      v2[21] = dot(qv, k2);
+      v3[21] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((22u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+      v1[22] = dot(qv, k1);
+      v2[22] = dot(qv, k2);
+      v3[22] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((23u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+      v1[23] = dot(qv, k1);
+      v2[23] = dot(qv, k2);
+      v3[23] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((24u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+      v1[24] = dot(qv, k1);
+      v2[24] = dot(qv, k2);
+      v3[24] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((25u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+      v1[25] = dot(qv, k1);
+      v2[25] = dot(qv, k2);
+      v3[25] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((26u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+      v1[26] = dot(qv, k1);
+      v2[26] = dot(qv, k2);
+      v3[26] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((27u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+      v1[27] = dot(qv, k1);
+      v2[27] = dot(qv, k2);
+      v3[27] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((28u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+      v1[28] = dot(qv, k1);
+      v2[28] = dot(qv, k2);
+      v3[28] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((29u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+      v1[29] = dot(qv, k1);
+      v2[29] = dot(qv, k2);
+      v3[29] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((30u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+      v1[30] = dot(qv, k1);
+      v2[30] = dot(qv, k2);
+      v3[30] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((31u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+      v1[31] = dot(qv, k1);
+      v2[31] = dot(qv, k2);
+      v3[31] = dot(qv, k3);
+    }
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v1[0] += simd_shuffle_xor(v1[1], 1u);
+    v2[0] += simd_shuffle_xor(v2[1], 1u);
+    v3[0] += simd_shuffle_xor(v3[1], 1u);
+    v0[2] += simd_shuffle_xor(v0[3], 1u);
+    v1[2] += simd_shuffle_xor(v1[3], 1u);
+    v2[2] += simd_shuffle_xor(v2[3], 1u);
+    v3[2] += simd_shuffle_xor(v3[3], 1u);
+    v0[4] += simd_shuffle_xor(v0[5], 1u);
+    v1[4] += simd_shuffle_xor(v1[5], 1u);
+    v2[4] += simd_shuffle_xor(v2[5], 1u);
+    v3[4] += simd_shuffle_xor(v3[5], 1u);
+    v0[6] += simd_shuffle_xor(v0[7], 1u);
+    v1[6] += simd_shuffle_xor(v1[7], 1u);
+    v2[6] += simd_shuffle_xor(v2[7], 1u);
+    v3[6] += simd_shuffle_xor(v3[7], 1u);
+    v0[8] += simd_shuffle_xor(v0[9], 1u);
+    v1[8] += simd_shuffle_xor(v1[9], 1u);
+    v2[8] += simd_shuffle_xor(v2[9], 1u);
+    v3[8] += simd_shuffle_xor(v3[9], 1u);
+    v0[10] += simd_shuffle_xor(v0[11], 1u);
+    v1[10] += simd_shuffle_xor(v1[11], 1u);
+    v2[10] += simd_shuffle_xor(v2[11], 1u);
+    v3[10] += simd_shuffle_xor(v3[11], 1u);
+    v0[12] += simd_shuffle_xor(v0[13], 1u);
+    v1[12] += simd_shuffle_xor(v1[13], 1u);
+    v2[12] += simd_shuffle_xor(v2[13], 1u);
+    v3[12] += simd_shuffle_xor(v3[13], 1u);
+    v0[14] += simd_shuffle_xor(v0[15], 1u);
+    v1[14] += simd_shuffle_xor(v1[15], 1u);
+    v2[14] += simd_shuffle_xor(v2[15], 1u);
+    v3[14] += simd_shuffle_xor(v3[15], 1u);
+    v0[16] += simd_shuffle_xor(v0[17], 1u);
+    v1[16] += simd_shuffle_xor(v1[17], 1u);
+    v2[16] += simd_shuffle_xor(v2[17], 1u);
+    v3[16] += simd_shuffle_xor(v3[17], 1u);
+    v0[18] += simd_shuffle_xor(v0[19], 1u);
+    v1[18] += simd_shuffle_xor(v1[19], 1u);
+    v2[18] += simd_shuffle_xor(v2[19], 1u);
+    v3[18] += simd_shuffle_xor(v3[19], 1u);
+    v0[20] += simd_shuffle_xor(v0[21], 1u);
+    v1[20] += simd_shuffle_xor(v1[21], 1u);
+    v2[20] += simd_shuffle_xor(v2[21], 1u);
+    v3[20] += simd_shuffle_xor(v3[21], 1u);
+    v0[22] += simd_shuffle_xor(v0[23], 1u);
+    v1[22] += simd_shuffle_xor(v1[23], 1u);
+    v2[22] += simd_shuffle_xor(v2[23], 1u);
+    v3[22] += simd_shuffle_xor(v3[23], 1u);
+    v0[24] += simd_shuffle_xor(v0[25], 1u);
+    v1[24] += simd_shuffle_xor(v1[25], 1u);
+    v2[24] += simd_shuffle_xor(v2[25], 1u);
+    v3[24] += simd_shuffle_xor(v3[25], 1u);
+    v0[26] += simd_shuffle_xor(v0[27], 1u);
+    v1[26] += simd_shuffle_xor(v1[27], 1u);
+    v2[26] += simd_shuffle_xor(v2[27], 1u);
+    v3[26] += simd_shuffle_xor(v3[27], 1u);
+    v0[28] += simd_shuffle_xor(v0[29], 1u);
+    v1[28] += simd_shuffle_xor(v1[29], 1u);
+    v2[28] += simd_shuffle_xor(v2[29], 1u);
+    v3[28] += simd_shuffle_xor(v3[29], 1u);
+    v0[30] += simd_shuffle_xor(v0[31], 1u);
+    v1[30] += simd_shuffle_xor(v1[31], 1u);
+    v2[30] += simd_shuffle_xor(v2[31], 1u);
+    v3[30] += simd_shuffle_xor(v3[31], 1u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v1[0] += simd_shuffle_xor(v1[2], 2u);
+    v2[0] += simd_shuffle_xor(v2[2], 2u);
+    v3[0] += simd_shuffle_xor(v3[2], 2u);
+    v0[4] += simd_shuffle_xor(v0[6], 2u);
+    v1[4] += simd_shuffle_xor(v1[6], 2u);
+    v2[4] += simd_shuffle_xor(v2[6], 2u);
+    v3[4] += simd_shuffle_xor(v3[6], 2u);
+    v0[8] += simd_shuffle_xor(v0[10], 2u);
+    v1[8] += simd_shuffle_xor(v1[10], 2u);
+    v2[8] += simd_shuffle_xor(v2[10], 2u);
+    v3[8] += simd_shuffle_xor(v3[10], 2u);
+    v0[12] += simd_shuffle_xor(v0[14], 2u);
+    v1[12] += simd_shuffle_xor(v1[14], 2u);
+    v2[12] += simd_shuffle_xor(v2[14], 2u);
+    v3[12] += simd_shuffle_xor(v3[14], 2u);
+    v0[16] += simd_shuffle_xor(v0[18], 2u);
+    v1[16] += simd_shuffle_xor(v1[18], 2u);
+    v2[16] += simd_shuffle_xor(v2[18], 2u);
+    v3[16] += simd_shuffle_xor(v3[18], 2u);
+    v0[20] += simd_shuffle_xor(v0[22], 2u);
+    v1[20] += simd_shuffle_xor(v1[22], 2u);
+    v2[20] += simd_shuffle_xor(v2[22], 2u);
+    v3[20] += simd_shuffle_xor(v3[22], 2u);
+    v0[24] += simd_shuffle_xor(v0[26], 2u);
+    v1[24] += simd_shuffle_xor(v1[26], 2u);
+    v2[24] += simd_shuffle_xor(v2[26], 2u);
+    v3[24] += simd_shuffle_xor(v3[26], 2u);
+    v0[28] += simd_shuffle_xor(v0[30], 2u);
+    v1[28] += simd_shuffle_xor(v1[30], 2u);
+    v2[28] += simd_shuffle_xor(v2[30], 2u);
+    v3[28] += simd_shuffle_xor(v3[30], 2u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v1[0] += simd_shuffle_xor(v1[4], 4u);
+    v2[0] += simd_shuffle_xor(v2[4], 4u);
+    v3[0] += simd_shuffle_xor(v3[4], 4u);
+    v0[8] += simd_shuffle_xor(v0[12], 4u);
+    v1[8] += simd_shuffle_xor(v1[12], 4u);
+    v2[8] += simd_shuffle_xor(v2[12], 4u);
+    v3[8] += simd_shuffle_xor(v3[12], 4u);
+    v0[16] += simd_shuffle_xor(v0[20], 4u);
+    v1[16] += simd_shuffle_xor(v1[20], 4u);
+    v2[16] += simd_shuffle_xor(v2[20], 4u);
+    v3[16] += simd_shuffle_xor(v3[20], 4u);
+    v0[24] += simd_shuffle_xor(v0[28], 4u);
+    v1[24] += simd_shuffle_xor(v1[28], 4u);
+    v2[24] += simd_shuffle_xor(v2[28], 4u);
+    v3[24] += simd_shuffle_xor(v3[28], 4u);
+    /* block 0 stage mask 8 */
+    v0[0] += simd_shuffle_xor(v0[8], 8u);
+    v1[0] += simd_shuffle_xor(v1[8], 8u);
+    v2[0] += simd_shuffle_xor(v2[8], 8u);
+    v3[0] += simd_shuffle_xor(v3[8], 8u);
+    v0[16] += simd_shuffle_xor(v0[24], 8u);
+    v1[16] += simd_shuffle_xor(v1[24], 8u);
+    v2[16] += simd_shuffle_xor(v2[24], 8u);
+    v3[16] += simd_shuffle_xor(v3[24], 8u);
+    /* block 0 stage mask 16 */
+    v0[0] += simd_shuffle_xor(v0[16], 16u);
+    v1[0] += simd_shuffle_xor(v1[16], 16u);
+    v2[0] += simd_shuffle_xor(v2[16], 16u);
+    v3[0] += simd_shuffle_xor(v3[16], 16u);
+
+    /* lane l now holds the complete 32-lane dot of head l (h(l) = l) */
+    const float w = weights[lm];
+    const float p0 = max(v0[0] * args.scale, 0.0f);
+    const float t0 = fma(p0, w, 0.0f);
+    const float s0 = simd_sum(t0);
+    const float p1 = max(v1[0] * args.scale, 0.0f);
+    const float t1 = fma(p1, w, 0.0f);
+    const float s1 = simd_sum(t1);
+    const float p2 = max(v2[0] * args.scale, 0.0f);
+    const float t2 = fma(p2, w, 0.0f);
+    const float s2 = simd_sum(t2);
+    const float p3 = max(v3[0] * args.scale, 0.0f);
+    const float t3 = fma(p3, w, 0.0f);
+    const float s3 = simd_sum(t3);
+
+    if (lane == 0) {
+        scores[row0] = s0;
+        if (row0 + 1u < n) scores[row0 + 1u] = s1;
+        if (row0 + 2u < n) scores[row0 + 2u] = s2;
+        if (row0 + 3u < n) scores[row0 + 3u] = s3;
+    }
+}
+
+/* xr_r2: ROWS=2, GRP=32 heads transposed at once, ascending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xr_r2(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 2u;
+    if (row0 >= n) return;
+
+    /* tail rows clamp onto the last valid row, exactly as production */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+
+    float4 k0, k1;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*32 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 31u;
+    float v0[32];
+    float v1[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+      v1[0] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+      v1[1] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+      v1[2] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+      v1[3] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+      v1[4] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+      v1[5] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+      v1[6] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+      v1[7] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((8u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+      v1[8] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((9u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+      v1[9] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((10u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+      v1[10] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((11u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+      v1[11] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((12u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+      v1[12] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((13u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+      v1[13] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((14u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+      v1[14] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((15u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+      v1[15] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((16u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+      v1[16] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((17u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+      v1[17] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((18u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+      v1[18] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((19u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+      v1[19] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((20u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+      v1[20] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((21u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+      v1[21] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((22u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+      v1[22] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((23u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+      v1[23] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((24u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+      v1[24] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((25u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+      v1[25] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((26u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+      v1[26] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((27u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+      v1[27] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((28u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+      v1[28] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((29u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+      v1[29] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((30u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+      v1[30] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((31u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+      v1[31] = dot(qv, k1);
+    }
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v1[0] += simd_shuffle_xor(v1[1], 1u);
+    v0[2] += simd_shuffle_xor(v0[3], 1u);
+    v1[2] += simd_shuffle_xor(v1[3], 1u);
+    v0[4] += simd_shuffle_xor(v0[5], 1u);
+    v1[4] += simd_shuffle_xor(v1[5], 1u);
+    v0[6] += simd_shuffle_xor(v0[7], 1u);
+    v1[6] += simd_shuffle_xor(v1[7], 1u);
+    v0[8] += simd_shuffle_xor(v0[9], 1u);
+    v1[8] += simd_shuffle_xor(v1[9], 1u);
+    v0[10] += simd_shuffle_xor(v0[11], 1u);
+    v1[10] += simd_shuffle_xor(v1[11], 1u);
+    v0[12] += simd_shuffle_xor(v0[13], 1u);
+    v1[12] += simd_shuffle_xor(v1[13], 1u);
+    v0[14] += simd_shuffle_xor(v0[15], 1u);
+    v1[14] += simd_shuffle_xor(v1[15], 1u);
+    v0[16] += simd_shuffle_xor(v0[17], 1u);
+    v1[16] += simd_shuffle_xor(v1[17], 1u);
+    v0[18] += simd_shuffle_xor(v0[19], 1u);
+    v1[18] += simd_shuffle_xor(v1[19], 1u);
+    v0[20] += simd_shuffle_xor(v0[21], 1u);
+    v1[20] += simd_shuffle_xor(v1[21], 1u);
+    v0[22] += simd_shuffle_xor(v0[23], 1u);
+    v1[22] += simd_shuffle_xor(v1[23], 1u);
+    v0[24] += simd_shuffle_xor(v0[25], 1u);
+    v1[24] += simd_shuffle_xor(v1[25], 1u);
+    v0[26] += simd_shuffle_xor(v0[27], 1u);
+    v1[26] += simd_shuffle_xor(v1[27], 1u);
+    v0[28] += simd_shuffle_xor(v0[29], 1u);
+    v1[28] += simd_shuffle_xor(v1[29], 1u);
+    v0[30] += simd_shuffle_xor(v0[31], 1u);
+    v1[30] += simd_shuffle_xor(v1[31], 1u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v1[0] += simd_shuffle_xor(v1[2], 2u);
+    v0[4] += simd_shuffle_xor(v0[6], 2u);
+    v1[4] += simd_shuffle_xor(v1[6], 2u);
+    v0[8] += simd_shuffle_xor(v0[10], 2u);
+    v1[8] += simd_shuffle_xor(v1[10], 2u);
+    v0[12] += simd_shuffle_xor(v0[14], 2u);
+    v1[12] += simd_shuffle_xor(v1[14], 2u);
+    v0[16] += simd_shuffle_xor(v0[18], 2u);
+    v1[16] += simd_shuffle_xor(v1[18], 2u);
+    v0[20] += simd_shuffle_xor(v0[22], 2u);
+    v1[20] += simd_shuffle_xor(v1[22], 2u);
+    v0[24] += simd_shuffle_xor(v0[26], 2u);
+    v1[24] += simd_shuffle_xor(v1[26], 2u);
+    v0[28] += simd_shuffle_xor(v0[30], 2u);
+    v1[28] += simd_shuffle_xor(v1[30], 2u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v1[0] += simd_shuffle_xor(v1[4], 4u);
+    v0[8] += simd_shuffle_xor(v0[12], 4u);
+    v1[8] += simd_shuffle_xor(v1[12], 4u);
+    v0[16] += simd_shuffle_xor(v0[20], 4u);
+    v1[16] += simd_shuffle_xor(v1[20], 4u);
+    v0[24] += simd_shuffle_xor(v0[28], 4u);
+    v1[24] += simd_shuffle_xor(v1[28], 4u);
+    /* block 0 stage mask 8 */
+    v0[0] += simd_shuffle_xor(v0[8], 8u);
+    v1[0] += simd_shuffle_xor(v1[8], 8u);
+    v0[16] += simd_shuffle_xor(v0[24], 8u);
+    v1[16] += simd_shuffle_xor(v1[24], 8u);
+    /* block 0 stage mask 16 */
+    v0[0] += simd_shuffle_xor(v0[16], 16u);
+    v1[0] += simd_shuffle_xor(v1[16], 16u);
+
+    /* lane l now holds the complete 32-lane dot of head l (h(l) = l) */
+    const float w = weights[lm];
+    const float p0 = max(v0[0] * args.scale, 0.0f);
+    const float t0 = fma(p0, w, 0.0f);
+    const float s0 = simd_sum(t0);
+    const float p1 = max(v1[0] * args.scale, 0.0f);
+    const float t1 = fma(p1, w, 0.0f);
+    const float s1 = simd_sum(t1);
+
+    if (lane == 0) {
+        scores[row0] = s0;
+        if (row0 + 1u < n) scores[row0 + 1u] = s1;
+    }
+}
+
+/* xr_r1: ROWS=1, GRP=32 heads transposed at once, ascending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xr_r1(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 1u;
+    if (row0 >= n) return;
+
+    float4 k0;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*32 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 31u;
+    float v0[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((8u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((9u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((10u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((11u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((12u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((13u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((14u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((15u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((16u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((17u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((18u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((19u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((20u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((21u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((22u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((23u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((24u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((25u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((26u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((27u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((28u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((29u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((30u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((31u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+    }
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v0[2] += simd_shuffle_xor(v0[3], 1u);
+    v0[4] += simd_shuffle_xor(v0[5], 1u);
+    v0[6] += simd_shuffle_xor(v0[7], 1u);
+    v0[8] += simd_shuffle_xor(v0[9], 1u);
+    v0[10] += simd_shuffle_xor(v0[11], 1u);
+    v0[12] += simd_shuffle_xor(v0[13], 1u);
+    v0[14] += simd_shuffle_xor(v0[15], 1u);
+    v0[16] += simd_shuffle_xor(v0[17], 1u);
+    v0[18] += simd_shuffle_xor(v0[19], 1u);
+    v0[20] += simd_shuffle_xor(v0[21], 1u);
+    v0[22] += simd_shuffle_xor(v0[23], 1u);
+    v0[24] += simd_shuffle_xor(v0[25], 1u);
+    v0[26] += simd_shuffle_xor(v0[27], 1u);
+    v0[28] += simd_shuffle_xor(v0[29], 1u);
+    v0[30] += simd_shuffle_xor(v0[31], 1u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v0[4] += simd_shuffle_xor(v0[6], 2u);
+    v0[8] += simd_shuffle_xor(v0[10], 2u);
+    v0[12] += simd_shuffle_xor(v0[14], 2u);
+    v0[16] += simd_shuffle_xor(v0[18], 2u);
+    v0[20] += simd_shuffle_xor(v0[22], 2u);
+    v0[24] += simd_shuffle_xor(v0[26], 2u);
+    v0[28] += simd_shuffle_xor(v0[30], 2u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v0[8] += simd_shuffle_xor(v0[12], 4u);
+    v0[16] += simd_shuffle_xor(v0[20], 4u);
+    v0[24] += simd_shuffle_xor(v0[28], 4u);
+    /* block 0 stage mask 8 */
+    v0[0] += simd_shuffle_xor(v0[8], 8u);
+    v0[16] += simd_shuffle_xor(v0[24], 8u);
+    /* block 0 stage mask 16 */
+    v0[0] += simd_shuffle_xor(v0[16], 16u);
+
+    /* lane l now holds the complete 32-lane dot of head l (h(l) = l) */
+    const float w = weights[lm];
+    const float p0 = max(v0[0] * args.scale, 0.0f);
+    const float t0 = fma(p0, w, 0.0f);
+    const float s0 = simd_sum(t0);
+
+    if (lane == 0) {
+        scores[row0] = s0;
+    }
+}
+
+/* xrd: ROWS=4, GRP=32 heads transposed at once, descending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xrd(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 4u;
+    if (row0 >= n) return;
+
+    /* tail rows clamp onto the last valid row, exactly as production */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*32 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 31u;
+    float v0[32];
+    float v1[32];
+    float v2[32];
+    float v3[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+      v1[0] = dot(qv, k1);
+      v2[0] = dot(qv, k2);
+      v3[0] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+      v1[1] = dot(qv, k1);
+      v2[1] = dot(qv, k2);
+      v3[1] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+      v1[2] = dot(qv, k1);
+      v2[2] = dot(qv, k2);
+      v3[2] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+      v1[3] = dot(qv, k1);
+      v2[3] = dot(qv, k2);
+      v3[3] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+      v1[4] = dot(qv, k1);
+      v2[4] = dot(qv, k2);
+      v3[4] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+      v1[5] = dot(qv, k1);
+      v2[5] = dot(qv, k2);
+      v3[5] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+      v1[6] = dot(qv, k1);
+      v2[6] = dot(qv, k2);
+      v3[6] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+      v1[7] = dot(qv, k1);
+      v2[7] = dot(qv, k2);
+      v3[7] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((8u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+      v1[8] = dot(qv, k1);
+      v2[8] = dot(qv, k2);
+      v3[8] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((9u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+      v1[9] = dot(qv, k1);
+      v2[9] = dot(qv, k2);
+      v3[9] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((10u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+      v1[10] = dot(qv, k1);
+      v2[10] = dot(qv, k2);
+      v3[10] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((11u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+      v1[11] = dot(qv, k1);
+      v2[11] = dot(qv, k2);
+      v3[11] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((12u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+      v1[12] = dot(qv, k1);
+      v2[12] = dot(qv, k2);
+      v3[12] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((13u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+      v1[13] = dot(qv, k1);
+      v2[13] = dot(qv, k2);
+      v3[13] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((14u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+      v1[14] = dot(qv, k1);
+      v2[14] = dot(qv, k2);
+      v3[14] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((15u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+      v1[15] = dot(qv, k1);
+      v2[15] = dot(qv, k2);
+      v3[15] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((16u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+      v1[16] = dot(qv, k1);
+      v2[16] = dot(qv, k2);
+      v3[16] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((17u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+      v1[17] = dot(qv, k1);
+      v2[17] = dot(qv, k2);
+      v3[17] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((18u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+      v1[18] = dot(qv, k1);
+      v2[18] = dot(qv, k2);
+      v3[18] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((19u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+      v1[19] = dot(qv, k1);
+      v2[19] = dot(qv, k2);
+      v3[19] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((20u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+      v1[20] = dot(qv, k1);
+      v2[20] = dot(qv, k2);
+      v3[20] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((21u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+      v1[21] = dot(qv, k1);
+      v2[21] = dot(qv, k2);
+      v3[21] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((22u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+      v1[22] = dot(qv, k1);
+      v2[22] = dot(qv, k2);
+      v3[22] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((23u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+      v1[23] = dot(qv, k1);
+      v2[23] = dot(qv, k2);
+      v3[23] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((24u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+      v1[24] = dot(qv, k1);
+      v2[24] = dot(qv, k2);
+      v3[24] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((25u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+      v1[25] = dot(qv, k1);
+      v2[25] = dot(qv, k2);
+      v3[25] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((26u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+      v1[26] = dot(qv, k1);
+      v2[26] = dot(qv, k2);
+      v3[26] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((27u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+      v1[27] = dot(qv, k1);
+      v2[27] = dot(qv, k2);
+      v3[27] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((28u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+      v1[28] = dot(qv, k1);
+      v2[28] = dot(qv, k2);
+      v3[28] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((29u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+      v1[29] = dot(qv, k1);
+      v2[29] = dot(qv, k2);
+      v3[29] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((30u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+      v1[30] = dot(qv, k1);
+      v2[30] = dot(qv, k2);
+      v3[30] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((31u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+      v1[31] = dot(qv, k1);
+      v2[31] = dot(qv, k2);
+      v3[31] = dot(qv, k3);
+    }
+    /* block 0 stage mask 16 */
+    v0[0] += simd_shuffle_xor(v0[16], 16u);
+    v1[0] += simd_shuffle_xor(v1[16], 16u);
+    v2[0] += simd_shuffle_xor(v2[16], 16u);
+    v3[0] += simd_shuffle_xor(v3[16], 16u);
+    v0[1] += simd_shuffle_xor(v0[17], 16u);
+    v1[1] += simd_shuffle_xor(v1[17], 16u);
+    v2[1] += simd_shuffle_xor(v2[17], 16u);
+    v3[1] += simd_shuffle_xor(v3[17], 16u);
+    v0[2] += simd_shuffle_xor(v0[18], 16u);
+    v1[2] += simd_shuffle_xor(v1[18], 16u);
+    v2[2] += simd_shuffle_xor(v2[18], 16u);
+    v3[2] += simd_shuffle_xor(v3[18], 16u);
+    v0[3] += simd_shuffle_xor(v0[19], 16u);
+    v1[3] += simd_shuffle_xor(v1[19], 16u);
+    v2[3] += simd_shuffle_xor(v2[19], 16u);
+    v3[3] += simd_shuffle_xor(v3[19], 16u);
+    v0[4] += simd_shuffle_xor(v0[20], 16u);
+    v1[4] += simd_shuffle_xor(v1[20], 16u);
+    v2[4] += simd_shuffle_xor(v2[20], 16u);
+    v3[4] += simd_shuffle_xor(v3[20], 16u);
+    v0[5] += simd_shuffle_xor(v0[21], 16u);
+    v1[5] += simd_shuffle_xor(v1[21], 16u);
+    v2[5] += simd_shuffle_xor(v2[21], 16u);
+    v3[5] += simd_shuffle_xor(v3[21], 16u);
+    v0[6] += simd_shuffle_xor(v0[22], 16u);
+    v1[6] += simd_shuffle_xor(v1[22], 16u);
+    v2[6] += simd_shuffle_xor(v2[22], 16u);
+    v3[6] += simd_shuffle_xor(v3[22], 16u);
+    v0[7] += simd_shuffle_xor(v0[23], 16u);
+    v1[7] += simd_shuffle_xor(v1[23], 16u);
+    v2[7] += simd_shuffle_xor(v2[23], 16u);
+    v3[7] += simd_shuffle_xor(v3[23], 16u);
+    v0[8] += simd_shuffle_xor(v0[24], 16u);
+    v1[8] += simd_shuffle_xor(v1[24], 16u);
+    v2[8] += simd_shuffle_xor(v2[24], 16u);
+    v3[8] += simd_shuffle_xor(v3[24], 16u);
+    v0[9] += simd_shuffle_xor(v0[25], 16u);
+    v1[9] += simd_shuffle_xor(v1[25], 16u);
+    v2[9] += simd_shuffle_xor(v2[25], 16u);
+    v3[9] += simd_shuffle_xor(v3[25], 16u);
+    v0[10] += simd_shuffle_xor(v0[26], 16u);
+    v1[10] += simd_shuffle_xor(v1[26], 16u);
+    v2[10] += simd_shuffle_xor(v2[26], 16u);
+    v3[10] += simd_shuffle_xor(v3[26], 16u);
+    v0[11] += simd_shuffle_xor(v0[27], 16u);
+    v1[11] += simd_shuffle_xor(v1[27], 16u);
+    v2[11] += simd_shuffle_xor(v2[27], 16u);
+    v3[11] += simd_shuffle_xor(v3[27], 16u);
+    v0[12] += simd_shuffle_xor(v0[28], 16u);
+    v1[12] += simd_shuffle_xor(v1[28], 16u);
+    v2[12] += simd_shuffle_xor(v2[28], 16u);
+    v3[12] += simd_shuffle_xor(v3[28], 16u);
+    v0[13] += simd_shuffle_xor(v0[29], 16u);
+    v1[13] += simd_shuffle_xor(v1[29], 16u);
+    v2[13] += simd_shuffle_xor(v2[29], 16u);
+    v3[13] += simd_shuffle_xor(v3[29], 16u);
+    v0[14] += simd_shuffle_xor(v0[30], 16u);
+    v1[14] += simd_shuffle_xor(v1[30], 16u);
+    v2[14] += simd_shuffle_xor(v2[30], 16u);
+    v3[14] += simd_shuffle_xor(v3[30], 16u);
+    v0[15] += simd_shuffle_xor(v0[31], 16u);
+    v1[15] += simd_shuffle_xor(v1[31], 16u);
+    v2[15] += simd_shuffle_xor(v2[31], 16u);
+    v3[15] += simd_shuffle_xor(v3[31], 16u);
+    /* block 0 stage mask 8 */
+    v0[0] += simd_shuffle_xor(v0[8], 8u);
+    v1[0] += simd_shuffle_xor(v1[8], 8u);
+    v2[0] += simd_shuffle_xor(v2[8], 8u);
+    v3[0] += simd_shuffle_xor(v3[8], 8u);
+    v0[1] += simd_shuffle_xor(v0[9], 8u);
+    v1[1] += simd_shuffle_xor(v1[9], 8u);
+    v2[1] += simd_shuffle_xor(v2[9], 8u);
+    v3[1] += simd_shuffle_xor(v3[9], 8u);
+    v0[2] += simd_shuffle_xor(v0[10], 8u);
+    v1[2] += simd_shuffle_xor(v1[10], 8u);
+    v2[2] += simd_shuffle_xor(v2[10], 8u);
+    v3[2] += simd_shuffle_xor(v3[10], 8u);
+    v0[3] += simd_shuffle_xor(v0[11], 8u);
+    v1[3] += simd_shuffle_xor(v1[11], 8u);
+    v2[3] += simd_shuffle_xor(v2[11], 8u);
+    v3[3] += simd_shuffle_xor(v3[11], 8u);
+    v0[4] += simd_shuffle_xor(v0[12], 8u);
+    v1[4] += simd_shuffle_xor(v1[12], 8u);
+    v2[4] += simd_shuffle_xor(v2[12], 8u);
+    v3[4] += simd_shuffle_xor(v3[12], 8u);
+    v0[5] += simd_shuffle_xor(v0[13], 8u);
+    v1[5] += simd_shuffle_xor(v1[13], 8u);
+    v2[5] += simd_shuffle_xor(v2[13], 8u);
+    v3[5] += simd_shuffle_xor(v3[13], 8u);
+    v0[6] += simd_shuffle_xor(v0[14], 8u);
+    v1[6] += simd_shuffle_xor(v1[14], 8u);
+    v2[6] += simd_shuffle_xor(v2[14], 8u);
+    v3[6] += simd_shuffle_xor(v3[14], 8u);
+    v0[7] += simd_shuffle_xor(v0[15], 8u);
+    v1[7] += simd_shuffle_xor(v1[15], 8u);
+    v2[7] += simd_shuffle_xor(v2[15], 8u);
+    v3[7] += simd_shuffle_xor(v3[15], 8u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v1[0] += simd_shuffle_xor(v1[4], 4u);
+    v2[0] += simd_shuffle_xor(v2[4], 4u);
+    v3[0] += simd_shuffle_xor(v3[4], 4u);
+    v0[1] += simd_shuffle_xor(v0[5], 4u);
+    v1[1] += simd_shuffle_xor(v1[5], 4u);
+    v2[1] += simd_shuffle_xor(v2[5], 4u);
+    v3[1] += simd_shuffle_xor(v3[5], 4u);
+    v0[2] += simd_shuffle_xor(v0[6], 4u);
+    v1[2] += simd_shuffle_xor(v1[6], 4u);
+    v2[2] += simd_shuffle_xor(v2[6], 4u);
+    v3[2] += simd_shuffle_xor(v3[6], 4u);
+    v0[3] += simd_shuffle_xor(v0[7], 4u);
+    v1[3] += simd_shuffle_xor(v1[7], 4u);
+    v2[3] += simd_shuffle_xor(v2[7], 4u);
+    v3[3] += simd_shuffle_xor(v3[7], 4u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v1[0] += simd_shuffle_xor(v1[2], 2u);
+    v2[0] += simd_shuffle_xor(v2[2], 2u);
+    v3[0] += simd_shuffle_xor(v3[2], 2u);
+    v0[1] += simd_shuffle_xor(v0[3], 2u);
+    v1[1] += simd_shuffle_xor(v1[3], 2u);
+    v2[1] += simd_shuffle_xor(v2[3], 2u);
+    v3[1] += simd_shuffle_xor(v3[3], 2u);
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v1[0] += simd_shuffle_xor(v1[1], 1u);
+    v2[0] += simd_shuffle_xor(v2[1], 1u);
+    v3[0] += simd_shuffle_xor(v3[1], 1u);
+
+    /* lane l now holds the complete 32-lane dot of head l (h(l) = l) */
+    const float w = weights[lm];
+    const float p0 = max(v0[0] * args.scale, 0.0f);
+    const float t0 = fma(p0, w, 0.0f);
+    const float s0 = simd_sum(t0);
+    const float p1 = max(v1[0] * args.scale, 0.0f);
+    const float t1 = fma(p1, w, 0.0f);
+    const float s1 = simd_sum(t1);
+    const float p2 = max(v2[0] * args.scale, 0.0f);
+    const float t2 = fma(p2, w, 0.0f);
+    const float s2 = simd_sum(t2);
+    const float p3 = max(v3[0] * args.scale, 0.0f);
+    const float t3 = fma(p3, w, 0.0f);
+    const float s3 = simd_sum(t3);
+
+    if (lane == 0) {
+        scores[row0] = s0;
+        if (row0 + 1u < n) scores[row0 + 1u] = s1;
+        if (row0 + 2u < n) scores[row0 + 2u] = s2;
+        if (row0 + 3u < n) scores[row0 + 3u] = s3;
+    }
+}
+
+/* xrd_r2: ROWS=2, GRP=32 heads transposed at once, descending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xrd_r2(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 2u;
+    if (row0 >= n) return;
+
+    /* tail rows clamp onto the last valid row, exactly as production */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+
+    float4 k0, k1;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*32 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 31u;
+    float v0[32];
+    float v1[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+      v1[0] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+      v1[1] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+      v1[2] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+      v1[3] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+      v1[4] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+      v1[5] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+      v1[6] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+      v1[7] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((8u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+      v1[8] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((9u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+      v1[9] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((10u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+      v1[10] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((11u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+      v1[11] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((12u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+      v1[12] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((13u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+      v1[13] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((14u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+      v1[14] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((15u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+      v1[15] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((16u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+      v1[16] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((17u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+      v1[17] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((18u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+      v1[18] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((19u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+      v1[19] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((20u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+      v1[20] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((21u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+      v1[21] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((22u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+      v1[22] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((23u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+      v1[23] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((24u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+      v1[24] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((25u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+      v1[25] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((26u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+      v1[26] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((27u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+      v1[27] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((28u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+      v1[28] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((29u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+      v1[29] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((30u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+      v1[30] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((31u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+      v1[31] = dot(qv, k1);
+    }
+    /* block 0 stage mask 16 */
+    v0[0] += simd_shuffle_xor(v0[16], 16u);
+    v1[0] += simd_shuffle_xor(v1[16], 16u);
+    v0[1] += simd_shuffle_xor(v0[17], 16u);
+    v1[1] += simd_shuffle_xor(v1[17], 16u);
+    v0[2] += simd_shuffle_xor(v0[18], 16u);
+    v1[2] += simd_shuffle_xor(v1[18], 16u);
+    v0[3] += simd_shuffle_xor(v0[19], 16u);
+    v1[3] += simd_shuffle_xor(v1[19], 16u);
+    v0[4] += simd_shuffle_xor(v0[20], 16u);
+    v1[4] += simd_shuffle_xor(v1[20], 16u);
+    v0[5] += simd_shuffle_xor(v0[21], 16u);
+    v1[5] += simd_shuffle_xor(v1[21], 16u);
+    v0[6] += simd_shuffle_xor(v0[22], 16u);
+    v1[6] += simd_shuffle_xor(v1[22], 16u);
+    v0[7] += simd_shuffle_xor(v0[23], 16u);
+    v1[7] += simd_shuffle_xor(v1[23], 16u);
+    v0[8] += simd_shuffle_xor(v0[24], 16u);
+    v1[8] += simd_shuffle_xor(v1[24], 16u);
+    v0[9] += simd_shuffle_xor(v0[25], 16u);
+    v1[9] += simd_shuffle_xor(v1[25], 16u);
+    v0[10] += simd_shuffle_xor(v0[26], 16u);
+    v1[10] += simd_shuffle_xor(v1[26], 16u);
+    v0[11] += simd_shuffle_xor(v0[27], 16u);
+    v1[11] += simd_shuffle_xor(v1[27], 16u);
+    v0[12] += simd_shuffle_xor(v0[28], 16u);
+    v1[12] += simd_shuffle_xor(v1[28], 16u);
+    v0[13] += simd_shuffle_xor(v0[29], 16u);
+    v1[13] += simd_shuffle_xor(v1[29], 16u);
+    v0[14] += simd_shuffle_xor(v0[30], 16u);
+    v1[14] += simd_shuffle_xor(v1[30], 16u);
+    v0[15] += simd_shuffle_xor(v0[31], 16u);
+    v1[15] += simd_shuffle_xor(v1[31], 16u);
+    /* block 0 stage mask 8 */
+    v0[0] += simd_shuffle_xor(v0[8], 8u);
+    v1[0] += simd_shuffle_xor(v1[8], 8u);
+    v0[1] += simd_shuffle_xor(v0[9], 8u);
+    v1[1] += simd_shuffle_xor(v1[9], 8u);
+    v0[2] += simd_shuffle_xor(v0[10], 8u);
+    v1[2] += simd_shuffle_xor(v1[10], 8u);
+    v0[3] += simd_shuffle_xor(v0[11], 8u);
+    v1[3] += simd_shuffle_xor(v1[11], 8u);
+    v0[4] += simd_shuffle_xor(v0[12], 8u);
+    v1[4] += simd_shuffle_xor(v1[12], 8u);
+    v0[5] += simd_shuffle_xor(v0[13], 8u);
+    v1[5] += simd_shuffle_xor(v1[13], 8u);
+    v0[6] += simd_shuffle_xor(v0[14], 8u);
+    v1[6] += simd_shuffle_xor(v1[14], 8u);
+    v0[7] += simd_shuffle_xor(v0[15], 8u);
+    v1[7] += simd_shuffle_xor(v1[15], 8u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v1[0] += simd_shuffle_xor(v1[4], 4u);
+    v0[1] += simd_shuffle_xor(v0[5], 4u);
+    v1[1] += simd_shuffle_xor(v1[5], 4u);
+    v0[2] += simd_shuffle_xor(v0[6], 4u);
+    v1[2] += simd_shuffle_xor(v1[6], 4u);
+    v0[3] += simd_shuffle_xor(v0[7], 4u);
+    v1[3] += simd_shuffle_xor(v1[7], 4u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v1[0] += simd_shuffle_xor(v1[2], 2u);
+    v0[1] += simd_shuffle_xor(v0[3], 2u);
+    v1[1] += simd_shuffle_xor(v1[3], 2u);
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v1[0] += simd_shuffle_xor(v1[1], 1u);
+
+    /* lane l now holds the complete 32-lane dot of head l (h(l) = l) */
+    const float w = weights[lm];
+    const float p0 = max(v0[0] * args.scale, 0.0f);
+    const float t0 = fma(p0, w, 0.0f);
+    const float s0 = simd_sum(t0);
+    const float p1 = max(v1[0] * args.scale, 0.0f);
+    const float t1 = fma(p1, w, 0.0f);
+    const float s1 = simd_sum(t1);
+
+    if (lane == 0) {
+        scores[row0] = s0;
+        if (row0 + 1u < n) scores[row0 + 1u] = s1;
+    }
+}
+
+/* xrd_r1: ROWS=1, GRP=32 heads transposed at once, descending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xrd_r1(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 1u;
+    if (row0 >= n) return;
+
+    float4 k0;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*32 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 31u;
+    float v0[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((8u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((9u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((10u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((11u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((12u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((13u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((14u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((15u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((16u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((17u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((18u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((19u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((20u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((21u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((22u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((23u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((24u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((25u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((26u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((27u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((28u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((29u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((30u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((31u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+    }
+    /* block 0 stage mask 16 */
+    v0[0] += simd_shuffle_xor(v0[16], 16u);
+    v0[1] += simd_shuffle_xor(v0[17], 16u);
+    v0[2] += simd_shuffle_xor(v0[18], 16u);
+    v0[3] += simd_shuffle_xor(v0[19], 16u);
+    v0[4] += simd_shuffle_xor(v0[20], 16u);
+    v0[5] += simd_shuffle_xor(v0[21], 16u);
+    v0[6] += simd_shuffle_xor(v0[22], 16u);
+    v0[7] += simd_shuffle_xor(v0[23], 16u);
+    v0[8] += simd_shuffle_xor(v0[24], 16u);
+    v0[9] += simd_shuffle_xor(v0[25], 16u);
+    v0[10] += simd_shuffle_xor(v0[26], 16u);
+    v0[11] += simd_shuffle_xor(v0[27], 16u);
+    v0[12] += simd_shuffle_xor(v0[28], 16u);
+    v0[13] += simd_shuffle_xor(v0[29], 16u);
+    v0[14] += simd_shuffle_xor(v0[30], 16u);
+    v0[15] += simd_shuffle_xor(v0[31], 16u);
+    /* block 0 stage mask 8 */
+    v0[0] += simd_shuffle_xor(v0[8], 8u);
+    v0[1] += simd_shuffle_xor(v0[9], 8u);
+    v0[2] += simd_shuffle_xor(v0[10], 8u);
+    v0[3] += simd_shuffle_xor(v0[11], 8u);
+    v0[4] += simd_shuffle_xor(v0[12], 8u);
+    v0[5] += simd_shuffle_xor(v0[13], 8u);
+    v0[6] += simd_shuffle_xor(v0[14], 8u);
+    v0[7] += simd_shuffle_xor(v0[15], 8u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v0[1] += simd_shuffle_xor(v0[5], 4u);
+    v0[2] += simd_shuffle_xor(v0[6], 4u);
+    v0[3] += simd_shuffle_xor(v0[7], 4u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v0[1] += simd_shuffle_xor(v0[3], 2u);
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+
+    /* lane l now holds the complete 32-lane dot of head l (h(l) = l) */
+    const float w = weights[lm];
+    const float p0 = max(v0[0] * args.scale, 0.0f);
+    const float t0 = fma(p0, w, 0.0f);
+    const float s0 = simd_sum(t0);
+
+    if (lane == 0) {
+        scores[row0] = s0;
+    }
+}
+
+/* xr8: ROWS=4, GRP=8 heads transposed at once, ascending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xr8(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 4u;
+    if (row0 >= n) return;
+
+    /* tail rows clamp onto the last valid row, exactly as production */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2 * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+        k2 = kf[(uint64_t)r2 * 32u + lane];
+        k3 = kf[(uint64_t)r3 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*8 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 7u;
+    float v0[32];
+    float v1[32];
+    float v2[32];
+    float v3[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+      v1[0] = dot(qv, k1);
+      v2[0] = dot(qv, k2);
+      v3[0] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+      v1[1] = dot(qv, k1);
+      v2[1] = dot(qv, k2);
+      v3[1] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+      v1[2] = dot(qv, k1);
+      v2[2] = dot(qv, k2);
+      v3[2] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+      v1[3] = dot(qv, k1);
+      v2[3] = dot(qv, k2);
+      v3[3] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+      v1[4] = dot(qv, k1);
+      v2[4] = dot(qv, k2);
+      v3[4] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+      v1[5] = dot(qv, k1);
+      v2[5] = dot(qv, k2);
+      v3[5] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+      v1[6] = dot(qv, k1);
+      v2[6] = dot(qv, k2);
+      v3[6] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+      v1[7] = dot(qv, k1);
+      v2[7] = dot(qv, k2);
+      v3[7] = dot(qv, k3);
+    }
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v1[0] += simd_shuffle_xor(v1[1], 1u);
+    v2[0] += simd_shuffle_xor(v2[1], 1u);
+    v3[0] += simd_shuffle_xor(v3[1], 1u);
+    v0[2] += simd_shuffle_xor(v0[3], 1u);
+    v1[2] += simd_shuffle_xor(v1[3], 1u);
+    v2[2] += simd_shuffle_xor(v2[3], 1u);
+    v3[2] += simd_shuffle_xor(v3[3], 1u);
+    v0[4] += simd_shuffle_xor(v0[5], 1u);
+    v1[4] += simd_shuffle_xor(v1[5], 1u);
+    v2[4] += simd_shuffle_xor(v2[5], 1u);
+    v3[4] += simd_shuffle_xor(v3[5], 1u);
+    v0[6] += simd_shuffle_xor(v0[7], 1u);
+    v1[6] += simd_shuffle_xor(v1[7], 1u);
+    v2[6] += simd_shuffle_xor(v2[7], 1u);
+    v3[6] += simd_shuffle_xor(v3[7], 1u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v1[0] += simd_shuffle_xor(v1[2], 2u);
+    v2[0] += simd_shuffle_xor(v2[2], 2u);
+    v3[0] += simd_shuffle_xor(v3[2], 2u);
+    v0[4] += simd_shuffle_xor(v0[6], 2u);
+    v1[4] += simd_shuffle_xor(v1[6], 2u);
+    v2[4] += simd_shuffle_xor(v2[6], 2u);
+    v3[4] += simd_shuffle_xor(v3[6], 2u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v1[0] += simd_shuffle_xor(v1[4], 4u);
+    v2[0] += simd_shuffle_xor(v2[4], 4u);
+    v3[0] += simd_shuffle_xor(v3[4], 4u);
+    v0[0] += simd_shuffle_xor(v0[0], 8u);
+    v1[0] += simd_shuffle_xor(v1[0], 8u);
+    v2[0] += simd_shuffle_xor(v2[0], 8u);
+    v3[0] += simd_shuffle_xor(v3[0], 8u);
+    v0[0] += simd_shuffle_xor(v0[0], 16u);
+    v1[0] += simd_shuffle_xor(v1[0], 16u);
+    v2[0] += simd_shuffle_xor(v2[0], 16u);
+    v3[0] += simd_shuffle_xor(v3[0], 16u);
+
+    { const float4 qv = q4tg[(8u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+      v1[8] = dot(qv, k1);
+      v2[8] = dot(qv, k2);
+      v3[8] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+      v1[9] = dot(qv, k1);
+      v2[9] = dot(qv, k2);
+      v3[9] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+      v1[10] = dot(qv, k1);
+      v2[10] = dot(qv, k2);
+      v3[10] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+      v1[11] = dot(qv, k1);
+      v2[11] = dot(qv, k2);
+      v3[11] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+      v1[12] = dot(qv, k1);
+      v2[12] = dot(qv, k2);
+      v3[12] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+      v1[13] = dot(qv, k1);
+      v2[13] = dot(qv, k2);
+      v3[13] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+      v1[14] = dot(qv, k1);
+      v2[14] = dot(qv, k2);
+      v3[14] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(8u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+      v1[15] = dot(qv, k1);
+      v2[15] = dot(qv, k2);
+      v3[15] = dot(qv, k3);
+    }
+    /* block 1 stage mask 1 */
+    v0[8] += simd_shuffle_xor(v0[9], 1u);
+    v1[8] += simd_shuffle_xor(v1[9], 1u);
+    v2[8] += simd_shuffle_xor(v2[9], 1u);
+    v3[8] += simd_shuffle_xor(v3[9], 1u);
+    v0[10] += simd_shuffle_xor(v0[11], 1u);
+    v1[10] += simd_shuffle_xor(v1[11], 1u);
+    v2[10] += simd_shuffle_xor(v2[11], 1u);
+    v3[10] += simd_shuffle_xor(v3[11], 1u);
+    v0[12] += simd_shuffle_xor(v0[13], 1u);
+    v1[12] += simd_shuffle_xor(v1[13], 1u);
+    v2[12] += simd_shuffle_xor(v2[13], 1u);
+    v3[12] += simd_shuffle_xor(v3[13], 1u);
+    v0[14] += simd_shuffle_xor(v0[15], 1u);
+    v1[14] += simd_shuffle_xor(v1[15], 1u);
+    v2[14] += simd_shuffle_xor(v2[15], 1u);
+    v3[14] += simd_shuffle_xor(v3[15], 1u);
+    /* block 1 stage mask 2 */
+    v0[8] += simd_shuffle_xor(v0[10], 2u);
+    v1[8] += simd_shuffle_xor(v1[10], 2u);
+    v2[8] += simd_shuffle_xor(v2[10], 2u);
+    v3[8] += simd_shuffle_xor(v3[10], 2u);
+    v0[12] += simd_shuffle_xor(v0[14], 2u);
+    v1[12] += simd_shuffle_xor(v1[14], 2u);
+    v2[12] += simd_shuffle_xor(v2[14], 2u);
+    v3[12] += simd_shuffle_xor(v3[14], 2u);
+    /* block 1 stage mask 4 */
+    v0[8] += simd_shuffle_xor(v0[12], 4u);
+    v1[8] += simd_shuffle_xor(v1[12], 4u);
+    v2[8] += simd_shuffle_xor(v2[12], 4u);
+    v3[8] += simd_shuffle_xor(v3[12], 4u);
+    v0[8] += simd_shuffle_xor(v0[8], 8u);
+    v1[8] += simd_shuffle_xor(v1[8], 8u);
+    v2[8] += simd_shuffle_xor(v2[8], 8u);
+    v3[8] += simd_shuffle_xor(v3[8], 8u);
+    v0[8] += simd_shuffle_xor(v0[8], 16u);
+    v1[8] += simd_shuffle_xor(v1[8], 16u);
+    v2[8] += simd_shuffle_xor(v2[8], 16u);
+    v3[8] += simd_shuffle_xor(v3[8], 16u);
+
+    { const float4 qv = q4tg[(16u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+      v1[16] = dot(qv, k1);
+      v2[16] = dot(qv, k2);
+      v3[16] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+      v1[17] = dot(qv, k1);
+      v2[17] = dot(qv, k2);
+      v3[17] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+      v1[18] = dot(qv, k1);
+      v2[18] = dot(qv, k2);
+      v3[18] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+      v1[19] = dot(qv, k1);
+      v2[19] = dot(qv, k2);
+      v3[19] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+      v1[20] = dot(qv, k1);
+      v2[20] = dot(qv, k2);
+      v3[20] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+      v1[21] = dot(qv, k1);
+      v2[21] = dot(qv, k2);
+      v3[21] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+      v1[22] = dot(qv, k1);
+      v2[22] = dot(qv, k2);
+      v3[22] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(16u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+      v1[23] = dot(qv, k1);
+      v2[23] = dot(qv, k2);
+      v3[23] = dot(qv, k3);
+    }
+    /* block 2 stage mask 1 */
+    v0[16] += simd_shuffle_xor(v0[17], 1u);
+    v1[16] += simd_shuffle_xor(v1[17], 1u);
+    v2[16] += simd_shuffle_xor(v2[17], 1u);
+    v3[16] += simd_shuffle_xor(v3[17], 1u);
+    v0[18] += simd_shuffle_xor(v0[19], 1u);
+    v1[18] += simd_shuffle_xor(v1[19], 1u);
+    v2[18] += simd_shuffle_xor(v2[19], 1u);
+    v3[18] += simd_shuffle_xor(v3[19], 1u);
+    v0[20] += simd_shuffle_xor(v0[21], 1u);
+    v1[20] += simd_shuffle_xor(v1[21], 1u);
+    v2[20] += simd_shuffle_xor(v2[21], 1u);
+    v3[20] += simd_shuffle_xor(v3[21], 1u);
+    v0[22] += simd_shuffle_xor(v0[23], 1u);
+    v1[22] += simd_shuffle_xor(v1[23], 1u);
+    v2[22] += simd_shuffle_xor(v2[23], 1u);
+    v3[22] += simd_shuffle_xor(v3[23], 1u);
+    /* block 2 stage mask 2 */
+    v0[16] += simd_shuffle_xor(v0[18], 2u);
+    v1[16] += simd_shuffle_xor(v1[18], 2u);
+    v2[16] += simd_shuffle_xor(v2[18], 2u);
+    v3[16] += simd_shuffle_xor(v3[18], 2u);
+    v0[20] += simd_shuffle_xor(v0[22], 2u);
+    v1[20] += simd_shuffle_xor(v1[22], 2u);
+    v2[20] += simd_shuffle_xor(v2[22], 2u);
+    v3[20] += simd_shuffle_xor(v3[22], 2u);
+    /* block 2 stage mask 4 */
+    v0[16] += simd_shuffle_xor(v0[20], 4u);
+    v1[16] += simd_shuffle_xor(v1[20], 4u);
+    v2[16] += simd_shuffle_xor(v2[20], 4u);
+    v3[16] += simd_shuffle_xor(v3[20], 4u);
+    v0[16] += simd_shuffle_xor(v0[16], 8u);
+    v1[16] += simd_shuffle_xor(v1[16], 8u);
+    v2[16] += simd_shuffle_xor(v2[16], 8u);
+    v3[16] += simd_shuffle_xor(v3[16], 8u);
+    v0[16] += simd_shuffle_xor(v0[16], 16u);
+    v1[16] += simd_shuffle_xor(v1[16], 16u);
+    v2[16] += simd_shuffle_xor(v2[16], 16u);
+    v3[16] += simd_shuffle_xor(v3[16], 16u);
+
+    { const float4 qv = q4tg[(24u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+      v1[24] = dot(qv, k1);
+      v2[24] = dot(qv, k2);
+      v3[24] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+      v1[25] = dot(qv, k1);
+      v2[25] = dot(qv, k2);
+      v3[25] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+      v1[26] = dot(qv, k1);
+      v2[26] = dot(qv, k2);
+      v3[26] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+      v1[27] = dot(qv, k1);
+      v2[27] = dot(qv, k2);
+      v3[27] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+      v1[28] = dot(qv, k1);
+      v2[28] = dot(qv, k2);
+      v3[28] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+      v1[29] = dot(qv, k1);
+      v2[29] = dot(qv, k2);
+      v3[29] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+      v1[30] = dot(qv, k1);
+      v2[30] = dot(qv, k2);
+      v3[30] = dot(qv, k3);
+    }
+    { const float4 qv = q4tg[(24u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+      v1[31] = dot(qv, k1);
+      v2[31] = dot(qv, k2);
+      v3[31] = dot(qv, k3);
+    }
+    /* block 3 stage mask 1 */
+    v0[24] += simd_shuffle_xor(v0[25], 1u);
+    v1[24] += simd_shuffle_xor(v1[25], 1u);
+    v2[24] += simd_shuffle_xor(v2[25], 1u);
+    v3[24] += simd_shuffle_xor(v3[25], 1u);
+    v0[26] += simd_shuffle_xor(v0[27], 1u);
+    v1[26] += simd_shuffle_xor(v1[27], 1u);
+    v2[26] += simd_shuffle_xor(v2[27], 1u);
+    v3[26] += simd_shuffle_xor(v3[27], 1u);
+    v0[28] += simd_shuffle_xor(v0[29], 1u);
+    v1[28] += simd_shuffle_xor(v1[29], 1u);
+    v2[28] += simd_shuffle_xor(v2[29], 1u);
+    v3[28] += simd_shuffle_xor(v3[29], 1u);
+    v0[30] += simd_shuffle_xor(v0[31], 1u);
+    v1[30] += simd_shuffle_xor(v1[31], 1u);
+    v2[30] += simd_shuffle_xor(v2[31], 1u);
+    v3[30] += simd_shuffle_xor(v3[31], 1u);
+    /* block 3 stage mask 2 */
+    v0[24] += simd_shuffle_xor(v0[26], 2u);
+    v1[24] += simd_shuffle_xor(v1[26], 2u);
+    v2[24] += simd_shuffle_xor(v2[26], 2u);
+    v3[24] += simd_shuffle_xor(v3[26], 2u);
+    v0[28] += simd_shuffle_xor(v0[30], 2u);
+    v1[28] += simd_shuffle_xor(v1[30], 2u);
+    v2[28] += simd_shuffle_xor(v2[30], 2u);
+    v3[28] += simd_shuffle_xor(v3[30], 2u);
+    /* block 3 stage mask 4 */
+    v0[24] += simd_shuffle_xor(v0[28], 4u);
+    v1[24] += simd_shuffle_xor(v1[28], 4u);
+    v2[24] += simd_shuffle_xor(v2[28], 4u);
+    v3[24] += simd_shuffle_xor(v3[28], 4u);
+    v0[24] += simd_shuffle_xor(v0[24], 8u);
+    v1[24] += simd_shuffle_xor(v1[24], 8u);
+    v2[24] += simd_shuffle_xor(v2[24], 8u);
+    v3[24] += simd_shuffle_xor(v3[24], 8u);
+    v0[24] += simd_shuffle_xor(v0[24], 16u);
+    v1[24] += simd_shuffle_xor(v1[24], 16u);
+    v2[24] += simd_shuffle_xor(v2[24], 16u);
+    v3[24] += simd_shuffle_xor(v3[24], 16u);
+
+    /* lane l holds heads {0, 8, 16, 24} + (l & 7), ascending, one accumulator */
+    const float w0 = weights[0u + lm];
+    const float w1 = weights[8u + lm];
+    const float w2 = weights[16u + lm];
+    const float w3 = weights[24u + lm];
+    float a0 = 0.0f;
+    a0 = a0 + fma(max(v0[0] * args.scale, 0.0f), w0, 0.0f);
+    a0 = a0 + fma(max(v0[8] * args.scale, 0.0f), w1, 0.0f);
+    a0 = a0 + fma(max(v0[16] * args.scale, 0.0f), w2, 0.0f);
+    a0 = a0 + fma(max(v0[24] * args.scale, 0.0f), w3, 0.0f);
+    float a1 = 0.0f;
+    a1 = a1 + fma(max(v1[0] * args.scale, 0.0f), w0, 0.0f);
+    a1 = a1 + fma(max(v1[8] * args.scale, 0.0f), w1, 0.0f);
+    a1 = a1 + fma(max(v1[16] * args.scale, 0.0f), w2, 0.0f);
+    a1 = a1 + fma(max(v1[24] * args.scale, 0.0f), w3, 0.0f);
+    float a2 = 0.0f;
+    a2 = a2 + fma(max(v2[0] * args.scale, 0.0f), w0, 0.0f);
+    a2 = a2 + fma(max(v2[8] * args.scale, 0.0f), w1, 0.0f);
+    a2 = a2 + fma(max(v2[16] * args.scale, 0.0f), w2, 0.0f);
+    a2 = a2 + fma(max(v2[24] * args.scale, 0.0f), w3, 0.0f);
+    float a3 = 0.0f;
+    a3 = a3 + fma(max(v3[0] * args.scale, 0.0f), w0, 0.0f);
+    a3 = a3 + fma(max(v3[8] * args.scale, 0.0f), w1, 0.0f);
+    a3 = a3 + fma(max(v3[16] * args.scale, 0.0f), w2, 0.0f);
+    a3 = a3 + fma(max(v3[24] * args.scale, 0.0f), w3, 0.0f);
+    a0 += simd_shuffle_xor(a0, 1u);
+    a1 += simd_shuffle_xor(a1, 1u);
+    a2 += simd_shuffle_xor(a2, 1u);
+    a3 += simd_shuffle_xor(a3, 1u);
+    a0 += simd_shuffle_xor(a0, 2u);
+    a1 += simd_shuffle_xor(a1, 2u);
+    a2 += simd_shuffle_xor(a2, 2u);
+    a3 += simd_shuffle_xor(a3, 2u);
+    a0 += simd_shuffle_xor(a0, 4u);
+    a1 += simd_shuffle_xor(a1, 4u);
+    a2 += simd_shuffle_xor(a2, 4u);
+    a3 += simd_shuffle_xor(a3, 4u);
+    const float s0 = a0;
+    const float s1 = a1;
+    const float s2 = a2;
+    const float s3 = a3;
+
+    if (lane == 0) {
+        scores[row0] = s0;
+        if (row0 + 1u < n) scores[row0 + 1u] = s1;
+        if (row0 + 2u < n) scores[row0 + 2u] = s2;
+        if (row0 + 3u < n) scores[row0 + 3u] = s3;
+    }
+}
+
+/* xr8_r2: ROWS=2, GRP=8 heads transposed at once, ascending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xr8_r2(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 2u;
+    if (row0 >= n) return;
+
+    /* tail rows clamp onto the last valid row, exactly as production */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+
+    float4 k0, k1;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*8 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 7u;
+    float v0[32];
+    float v1[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+      v1[0] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+      v1[1] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+      v1[2] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+      v1[3] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+      v1[4] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+      v1[5] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+      v1[6] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+      v1[7] = dot(qv, k1);
+    }
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v1[0] += simd_shuffle_xor(v1[1], 1u);
+    v0[2] += simd_shuffle_xor(v0[3], 1u);
+    v1[2] += simd_shuffle_xor(v1[3], 1u);
+    v0[4] += simd_shuffle_xor(v0[5], 1u);
+    v1[4] += simd_shuffle_xor(v1[5], 1u);
+    v0[6] += simd_shuffle_xor(v0[7], 1u);
+    v1[6] += simd_shuffle_xor(v1[7], 1u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v1[0] += simd_shuffle_xor(v1[2], 2u);
+    v0[4] += simd_shuffle_xor(v0[6], 2u);
+    v1[4] += simd_shuffle_xor(v1[6], 2u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v1[0] += simd_shuffle_xor(v1[4], 4u);
+    v0[0] += simd_shuffle_xor(v0[0], 8u);
+    v1[0] += simd_shuffle_xor(v1[0], 8u);
+    v0[0] += simd_shuffle_xor(v0[0], 16u);
+    v1[0] += simd_shuffle_xor(v1[0], 16u);
+
+    { const float4 qv = q4tg[(8u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+      v1[8] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+      v1[9] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+      v1[10] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+      v1[11] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+      v1[12] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+      v1[13] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+      v1[14] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(8u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+      v1[15] = dot(qv, k1);
+    }
+    /* block 1 stage mask 1 */
+    v0[8] += simd_shuffle_xor(v0[9], 1u);
+    v1[8] += simd_shuffle_xor(v1[9], 1u);
+    v0[10] += simd_shuffle_xor(v0[11], 1u);
+    v1[10] += simd_shuffle_xor(v1[11], 1u);
+    v0[12] += simd_shuffle_xor(v0[13], 1u);
+    v1[12] += simd_shuffle_xor(v1[13], 1u);
+    v0[14] += simd_shuffle_xor(v0[15], 1u);
+    v1[14] += simd_shuffle_xor(v1[15], 1u);
+    /* block 1 stage mask 2 */
+    v0[8] += simd_shuffle_xor(v0[10], 2u);
+    v1[8] += simd_shuffle_xor(v1[10], 2u);
+    v0[12] += simd_shuffle_xor(v0[14], 2u);
+    v1[12] += simd_shuffle_xor(v1[14], 2u);
+    /* block 1 stage mask 4 */
+    v0[8] += simd_shuffle_xor(v0[12], 4u);
+    v1[8] += simd_shuffle_xor(v1[12], 4u);
+    v0[8] += simd_shuffle_xor(v0[8], 8u);
+    v1[8] += simd_shuffle_xor(v1[8], 8u);
+    v0[8] += simd_shuffle_xor(v0[8], 16u);
+    v1[8] += simd_shuffle_xor(v1[8], 16u);
+
+    { const float4 qv = q4tg[(16u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+      v1[16] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+      v1[17] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+      v1[18] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+      v1[19] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+      v1[20] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+      v1[21] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+      v1[22] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(16u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+      v1[23] = dot(qv, k1);
+    }
+    /* block 2 stage mask 1 */
+    v0[16] += simd_shuffle_xor(v0[17], 1u);
+    v1[16] += simd_shuffle_xor(v1[17], 1u);
+    v0[18] += simd_shuffle_xor(v0[19], 1u);
+    v1[18] += simd_shuffle_xor(v1[19], 1u);
+    v0[20] += simd_shuffle_xor(v0[21], 1u);
+    v1[20] += simd_shuffle_xor(v1[21], 1u);
+    v0[22] += simd_shuffle_xor(v0[23], 1u);
+    v1[22] += simd_shuffle_xor(v1[23], 1u);
+    /* block 2 stage mask 2 */
+    v0[16] += simd_shuffle_xor(v0[18], 2u);
+    v1[16] += simd_shuffle_xor(v1[18], 2u);
+    v0[20] += simd_shuffle_xor(v0[22], 2u);
+    v1[20] += simd_shuffle_xor(v1[22], 2u);
+    /* block 2 stage mask 4 */
+    v0[16] += simd_shuffle_xor(v0[20], 4u);
+    v1[16] += simd_shuffle_xor(v1[20], 4u);
+    v0[16] += simd_shuffle_xor(v0[16], 8u);
+    v1[16] += simd_shuffle_xor(v1[16], 8u);
+    v0[16] += simd_shuffle_xor(v0[16], 16u);
+    v1[16] += simd_shuffle_xor(v1[16], 16u);
+
+    { const float4 qv = q4tg[(24u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+      v1[24] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+      v1[25] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+      v1[26] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+      v1[27] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+      v1[28] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+      v1[29] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+      v1[30] = dot(qv, k1);
+    }
+    { const float4 qv = q4tg[(24u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+      v1[31] = dot(qv, k1);
+    }
+    /* block 3 stage mask 1 */
+    v0[24] += simd_shuffle_xor(v0[25], 1u);
+    v1[24] += simd_shuffle_xor(v1[25], 1u);
+    v0[26] += simd_shuffle_xor(v0[27], 1u);
+    v1[26] += simd_shuffle_xor(v1[27], 1u);
+    v0[28] += simd_shuffle_xor(v0[29], 1u);
+    v1[28] += simd_shuffle_xor(v1[29], 1u);
+    v0[30] += simd_shuffle_xor(v0[31], 1u);
+    v1[30] += simd_shuffle_xor(v1[31], 1u);
+    /* block 3 stage mask 2 */
+    v0[24] += simd_shuffle_xor(v0[26], 2u);
+    v1[24] += simd_shuffle_xor(v1[26], 2u);
+    v0[28] += simd_shuffle_xor(v0[30], 2u);
+    v1[28] += simd_shuffle_xor(v1[30], 2u);
+    /* block 3 stage mask 4 */
+    v0[24] += simd_shuffle_xor(v0[28], 4u);
+    v1[24] += simd_shuffle_xor(v1[28], 4u);
+    v0[24] += simd_shuffle_xor(v0[24], 8u);
+    v1[24] += simd_shuffle_xor(v1[24], 8u);
+    v0[24] += simd_shuffle_xor(v0[24], 16u);
+    v1[24] += simd_shuffle_xor(v1[24], 16u);
+
+    /* lane l holds heads {0, 8, 16, 24} + (l & 7), ascending, one accumulator */
+    const float w0 = weights[0u + lm];
+    const float w1 = weights[8u + lm];
+    const float w2 = weights[16u + lm];
+    const float w3 = weights[24u + lm];
+    float a0 = 0.0f;
+    a0 = a0 + fma(max(v0[0] * args.scale, 0.0f), w0, 0.0f);
+    a0 = a0 + fma(max(v0[8] * args.scale, 0.0f), w1, 0.0f);
+    a0 = a0 + fma(max(v0[16] * args.scale, 0.0f), w2, 0.0f);
+    a0 = a0 + fma(max(v0[24] * args.scale, 0.0f), w3, 0.0f);
+    float a1 = 0.0f;
+    a1 = a1 + fma(max(v1[0] * args.scale, 0.0f), w0, 0.0f);
+    a1 = a1 + fma(max(v1[8] * args.scale, 0.0f), w1, 0.0f);
+    a1 = a1 + fma(max(v1[16] * args.scale, 0.0f), w2, 0.0f);
+    a1 = a1 + fma(max(v1[24] * args.scale, 0.0f), w3, 0.0f);
+    a0 += simd_shuffle_xor(a0, 1u);
+    a1 += simd_shuffle_xor(a1, 1u);
+    a0 += simd_shuffle_xor(a0, 2u);
+    a1 += simd_shuffle_xor(a1, 2u);
+    a0 += simd_shuffle_xor(a0, 4u);
+    a1 += simd_shuffle_xor(a1, 4u);
+    const float s0 = a0;
+    const float s1 = a1;
+
+    if (lane == 0) {
+        scores[row0] = s0;
+        if (row0 + 1u < n) scores[row0 + 1u] = s1;
+    }
+}
+
+/* xr8_r1: ROWS=1, GRP=8 heads transposed at once, ascending XOR masks. */
+kernel void kernel_glm_indexer_score_one_stream_xr8_r1(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint   tgid [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint row0 = ((uint)tgid * n_sg + (uint)sg) * 1u;
+    if (row0 >= n) return;
+
+    float4 k0;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+    }
+
+    /* slot j of block b holds head b*8 + (j ^ lm) for this lane */
+    const uint lm = (uint)lane & 7u;
+    float v0[32];
+
+    { const float4 qv = q4tg[((0u ^ lm)) * 32u + (uint)lane];
+      v0[0] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((1u ^ lm)) * 32u + (uint)lane];
+      v0[1] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((2u ^ lm)) * 32u + (uint)lane];
+      v0[2] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((3u ^ lm)) * 32u + (uint)lane];
+      v0[3] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((4u ^ lm)) * 32u + (uint)lane];
+      v0[4] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((5u ^ lm)) * 32u + (uint)lane];
+      v0[5] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((6u ^ lm)) * 32u + (uint)lane];
+      v0[6] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[((7u ^ lm)) * 32u + (uint)lane];
+      v0[7] = dot(qv, k0);
+    }
+    /* block 0 stage mask 1 */
+    v0[0] += simd_shuffle_xor(v0[1], 1u);
+    v0[2] += simd_shuffle_xor(v0[3], 1u);
+    v0[4] += simd_shuffle_xor(v0[5], 1u);
+    v0[6] += simd_shuffle_xor(v0[7], 1u);
+    /* block 0 stage mask 2 */
+    v0[0] += simd_shuffle_xor(v0[2], 2u);
+    v0[4] += simd_shuffle_xor(v0[6], 2u);
+    /* block 0 stage mask 4 */
+    v0[0] += simd_shuffle_xor(v0[4], 4u);
+    v0[0] += simd_shuffle_xor(v0[0], 8u);
+    v0[0] += simd_shuffle_xor(v0[0], 16u);
+
+    { const float4 qv = q4tg[(8u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[8] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[9] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[10] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[11] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[12] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[13] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[14] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(8u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[15] = dot(qv, k0);
+    }
+    /* block 1 stage mask 1 */
+    v0[8] += simd_shuffle_xor(v0[9], 1u);
+    v0[10] += simd_shuffle_xor(v0[11], 1u);
+    v0[12] += simd_shuffle_xor(v0[13], 1u);
+    v0[14] += simd_shuffle_xor(v0[15], 1u);
+    /* block 1 stage mask 2 */
+    v0[8] += simd_shuffle_xor(v0[10], 2u);
+    v0[12] += simd_shuffle_xor(v0[14], 2u);
+    /* block 1 stage mask 4 */
+    v0[8] += simd_shuffle_xor(v0[12], 4u);
+    v0[8] += simd_shuffle_xor(v0[8], 8u);
+    v0[8] += simd_shuffle_xor(v0[8], 16u);
+
+    { const float4 qv = q4tg[(16u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[16] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[17] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[18] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[19] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[20] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[21] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[22] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(16u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[23] = dot(qv, k0);
+    }
+    /* block 2 stage mask 1 */
+    v0[16] += simd_shuffle_xor(v0[17], 1u);
+    v0[18] += simd_shuffle_xor(v0[19], 1u);
+    v0[20] += simd_shuffle_xor(v0[21], 1u);
+    v0[22] += simd_shuffle_xor(v0[23], 1u);
+    /* block 2 stage mask 2 */
+    v0[16] += simd_shuffle_xor(v0[18], 2u);
+    v0[20] += simd_shuffle_xor(v0[22], 2u);
+    /* block 2 stage mask 4 */
+    v0[16] += simd_shuffle_xor(v0[20], 4u);
+    v0[16] += simd_shuffle_xor(v0[16], 8u);
+    v0[16] += simd_shuffle_xor(v0[16], 16u);
+
+    { const float4 qv = q4tg[(24u + (0u ^ lm)) * 32u + (uint)lane];
+      v0[24] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (1u ^ lm)) * 32u + (uint)lane];
+      v0[25] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (2u ^ lm)) * 32u + (uint)lane];
+      v0[26] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (3u ^ lm)) * 32u + (uint)lane];
+      v0[27] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (4u ^ lm)) * 32u + (uint)lane];
+      v0[28] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (5u ^ lm)) * 32u + (uint)lane];
+      v0[29] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (6u ^ lm)) * 32u + (uint)lane];
+      v0[30] = dot(qv, k0);
+    }
+    { const float4 qv = q4tg[(24u + (7u ^ lm)) * 32u + (uint)lane];
+      v0[31] = dot(qv, k0);
+    }
+    /* block 3 stage mask 1 */
+    v0[24] += simd_shuffle_xor(v0[25], 1u);
+    v0[26] += simd_shuffle_xor(v0[27], 1u);
+    v0[28] += simd_shuffle_xor(v0[29], 1u);
+    v0[30] += simd_shuffle_xor(v0[31], 1u);
+    /* block 3 stage mask 2 */
+    v0[24] += simd_shuffle_xor(v0[26], 2u);
+    v0[28] += simd_shuffle_xor(v0[30], 2u);
+    /* block 3 stage mask 4 */
+    v0[24] += simd_shuffle_xor(v0[28], 4u);
+    v0[24] += simd_shuffle_xor(v0[24], 8u);
+    v0[24] += simd_shuffle_xor(v0[24], 16u);
+
+    /* lane l holds heads {0, 8, 16, 24} + (l & 7), ascending, one accumulator */
+    const float w0 = weights[0u + lm];
+    const float w1 = weights[8u + lm];
+    const float w2 = weights[16u + lm];
+    const float w3 = weights[24u + lm];
+    float a0 = 0.0f;
+    a0 = a0 + fma(max(v0[0] * args.scale, 0.0f), w0, 0.0f);
+    a0 = a0 + fma(max(v0[8] * args.scale, 0.0f), w1, 0.0f);
+    a0 = a0 + fma(max(v0[16] * args.scale, 0.0f), w2, 0.0f);
+    a0 = a0 + fma(max(v0[24] * args.scale, 0.0f), w3, 0.0f);
+    a0 += simd_shuffle_xor(a0, 1u);
+    a0 += simd_shuffle_xor(a0, 2u);
+    a0 += simd_shuffle_xor(a0, 4u);
+    const float s0 = a0;
+
+    if (lane == 0) {
+        scores[row0] = s0;
+    }
 }

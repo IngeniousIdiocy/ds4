@@ -39,6 +39,7 @@
 /tests/test_session_state_gpu
 /tests/test_tp_commands
 /tests/test_glm53_kda
+/tests/test_glm53_kda_q8
 /tests/test_glm53_vision_engine
 /tests/test_glm_attention
 /tests/test_glm_attention_rocm

@@ -29534,6 +29534,26 @@ __global__ static void glm53_expand_pool_selection_kernel(
     raw_selected[gid] = value;
 }
 
+/* The Metal backend folds the pool expansion into the fused merge dispatch;
+ * the CUDA graph keeps the two-kernel sequence, so refuse and let the caller
+ * fall back. */
+extern "C" int ds4_gpu_glm53_indexer_topk_expand_tensor(
+        ds4_gpu_tensor       *raw_selected,
+        ds4_gpu_tensor       *pool_selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t              n_comp,
+        uint32_t              n_tokens,
+        uint32_t              selected_pools,
+        uint32_t              pos0,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              output_width) {
+    (void)raw_selected; (void)pool_selected; (void)scores; (void)n_comp;
+    (void)n_tokens; (void)selected_pools; (void)pos0; (void)index_topk;
+    (void)pool_size; (void)output_width;
+    return 0;
+}
+
 extern "C" int ds4_gpu_glm53_expand_pool_selection_tensor(
         ds4_gpu_tensor       *raw_selected,
         const ds4_gpu_tensor *pool_selected,

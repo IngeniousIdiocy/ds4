@@ -587,6 +587,12 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/* Bench/identity hook for the GLM DSA indexer fast paths (Metal only).
+ * Each argument: -1 keep current, 0 force the legacy kernel chain, 1 force the
+ * fused kernel.  Production code never calls this; the shipping default comes
+ * from DS4_GLM_DISABLE_INDEXER_SCORE_STREAM / DS4_GLM_DISABLE_TOPK_ONESHOT. */
+void ds4_gpu_glm_indexer_select_override(int score_stream, int topk_oneshot);
+
 int ds4_gpu_indexer_top1_value_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
@@ -724,6 +730,48 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* Same shared-input Q8_0 pair, but over a flat concatenated row space instead
+ * of a max-extent grid, so no threadgroup retires without work.  Requires both
+ * output extents to be multiples of the matvec's rows per simdgroup; returns 0
+ * without encoding anything when that does not hold, so callers can fall back
+ * to the two standalone dispatches. */
+int ds4_gpu_matmul_q8_0_pair_flat_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              in_dim,
+        uint64_t              out0_dim,
+        uint64_t              out1_dim,
+        const ds4_gpu_tensor *x);
+
+/* GLM-5.3 DSA only: the same flat Q8_0 pair (q_a + kv_a) with the indexer's
+ * three BF16 projections over the same input row folded into the head of the
+ * grid, one dispatch instead of three.  Returns 0 without encoding anything if
+ * any shape or range check fails, so the caller can emit the production
+ * ladder unchanged. */
+int ds4_gpu_glm53_dsa_qakv_indexer_fold_tensor(
+        ds4_gpu_tensor       *out_q_a,
+        ds4_gpu_tensor       *out_kv_a,
+        ds4_gpu_tensor       *out_indexer_k,
+        ds4_gpu_tensor       *out_indexer_gate,
+        ds4_gpu_tensor       *out_indexer_proj,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_a_offset,
+        uint64_t              kv_a_offset,
+        uint64_t              indexer_k_offset,
+        uint64_t              indexer_gate_offset,
+        uint64_t              indexer_proj_offset,
+        uint64_t              in_dim,
+        uint64_t              q_a_dim,
+        uint64_t              kv_a_dim,
+        uint64_t              indexer_dim,
+        uint64_t              indexer_proj_dim,
+        const ds4_gpu_tensor *x);
 
 int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         ds4_gpu_tensor       *out0,
@@ -1371,6 +1419,21 @@ int ds4_gpu_glm53_expand_pool_selection_tensor(
         uint32_t              n_tokens,
         uint32_t              pos0,
         uint32_t              selected_pools,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              output_width);
+
+/* GLM-5.3 DSA decode selection with the pool expansion folded into the final
+ * merge dispatch.  Returns 0 when the fused path is unavailable, in which case
+ * the caller runs ds4_gpu_indexer_topk_tensor + the expansion separately. */
+int ds4_gpu_glm53_indexer_topk_expand_tensor(
+        ds4_gpu_tensor       *raw_selected,
+        ds4_gpu_tensor       *pool_selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t              n_comp,
+        uint32_t              n_tokens,
+        uint32_t              selected_pools,
+        uint32_t              pos0,
         uint32_t              index_topk,
         uint32_t              pool_size,
         uint32_t              output_width);
@@ -2511,6 +2574,112 @@ int ds4_gpu_glm_router_select_tensor(
         uint32_t                n_expert_used,
         float                   expert_weight_scale);
 
+/* Decode router: the logits matvec with the top-k selection folded onto its
+ * tail, in one dispatch. `counter` is a 4-byte device tensor the caller zeroes
+ * once; the electing threadgroup resets it, so it stays zero between
+ * dispatches. Returns 0 without encoding anything when the shape does not fit
+ * the fused launch, so callers fall back to the two separate primitives. */
+int ds4_gpu_glm_router_logits_select_tail_tensor(
+        ds4_gpu_tensor       *logits,
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        ds4_gpu_tensor       *counter,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              bias_offset,
+        uint64_t              in_dim,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        float                 expert_weight_scale,
+        const ds4_gpu_tensor *x);
+
+/* The GLM-5.3 decode router folded into the HEAD of the shared expert's
+ * gate+up grid: ONE dispatch of (n_expert/2 + n_ff_exp/4) threadgroups of 256
+ * threads replaces the router logits+select tail fold and the shared expert's
+ * fused gate/up SwiGLU.  The ticket is counted over the router threadgroups
+ * only, so the elected threadgroup's selection tail runs under the shared
+ * expert's weight stream.  Bit-exact with the two dispatches it replaces.
+ * `counter` is the same 4-byte tensor the router tail fold uses (zeroed once
+ * by the caller; the electing threadgroup re-arms it) and `shared_mid` is a
+ * separate n_ff_exp-float tensor, NOT `ffn_mid`, because the fold puts the
+ * shared gate/up in front of the routed gate+up.  Returns 0 without encoding
+ * anything on any refusal, so the caller emits the two-dispatch ladder
+ * unchanged.  Kill switch DS4_GLM_DISABLE_ROUTER_SHARED_FOLD=1. */
+int ds4_gpu_glm_router_shared_gateup_fold_enabled(void);
+int ds4_gpu_glm_router_shared_gateup_fold_tensor(
+        ds4_gpu_tensor       *logits,
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        ds4_gpu_tensor       *counter,
+        ds4_gpu_tensor       *shared_mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              router_weight_offset,
+        uint64_t              router_bias_offset,
+        uint64_t              sh_gate_offset,
+        uint64_t              sh_up_offset,
+        uint64_t              in_dim,
+        uint32_t              n_ff_exp,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        float                 expert_weight_scale,
+        float                 swiglu_clamp,
+        const ds4_gpu_tensor *x);
+
+/* The whole GLM-5.3 sparse FFN block -- router, shared expert gate/up and
+ * down, the eight routed experts' gate/up and down, the per-slot sum, the
+ * residual add and hc_expand4 -- in ONE persistent dispatch of
+ * DS4_GLM_MOE_BLOCK_GRID (default 240) threadgroups of 256 threads, instead of
+ * the five dependent dispatches.  Bit-exact with them.  `counters` is a
+ * 672-word device tensor the caller zeroes once; the kernel re-arms it.
+ * Returns 0 without encoding anything when anything does not fit, so the
+ * caller emits the production ladder unchanged.  Opt-in:
+ * DS4_GLM_ENABLE_MOE_BLOCK_DATAFLOW=1; kill switch
+ * DS4_GLM_DISABLE_MOE_BLOCK_DATAFLOW=1 wins over it. */
+int ds4_gpu_glm53_moe_block_dataflow_enabled(void);
+int ds4_gpu_glm53_moe_block_dataflow_poisoned(const ds4_gpu_tensor *counters);
+int ds4_gpu_glm53_moe_block_dataflow_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        ds4_gpu_tensor       *logits,
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        ds4_gpu_tensor       *counters,
+        ds4_gpu_tensor       *shared_mid,
+        ds4_gpu_tensor       *routed_mid,
+        ds4_gpu_tensor       *routed_partials,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              router_weight_offset,
+        uint64_t              router_bias_offset,
+        uint64_t              sh_gate_offset,
+        uint64_t              sh_up_offset,
+        uint64_t              sh_down_offset,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              n_embd,
+        uint32_t              n_ff_exp,
+        uint32_t              expert_mid_dim,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              n_hc,
+        float                 expert_weight_scale,
+        float                 swiglu_clamp,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split);
+
 int ds4_gpu_glm_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
@@ -2551,7 +2720,15 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
-        bool                    force_resident);
+        bool                    force_resident,
+        /* Expert-parallel routed down (item B).  When routed_partials is
+         * non-NULL and the shape qualifies, the Q4_K down matvec runs one
+         * expert slot per threadgroup and writes per-slot partials there
+         * instead of the summed row into `out`; *used_split is set to 1 and the
+         * caller must consume the partials with the slot-summing shared-down
+         * epilogue.  Pass NULL / NULL for the unsplit behaviour. */
+        ds4_gpu_tensor       *routed_partials,
+        int                    *used_split);
 
 int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -2927,6 +3104,33 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         float                 hc_eps,
         float                 norm_eps);
 
+/* Whole decode HC-pre (RMSNorm + HC-mix matvec + gated four-stream collapse +
+ * output RMSNorm) in a single 1024-thread threadgroup. weight_bf16 picks the
+ * BF16 mixer flavour instead of F16. Bit-identical to the dispatch ladder it
+ * replaces in both flavours; single-row decode shapes only. */
+int ds4_gpu_hc_pre_decode_fused_available(int weight_bf16);
+int ds4_gpu_hc_pre_decode_fused_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps,
+        int                   weight_bf16);
+
 #endif
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
@@ -3014,7 +3218,12 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        /* Non-NULL when the routed down ran expert-parallel: the epilogue then
+         * sums n_slots per-expert partials at each row, in ascending slot
+         * order, instead of reading routed_out. */
+        const ds4_gpu_tensor *routed_partials,
+        uint32_t                n_slots);
 
 int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -3083,6 +3292,131 @@ int ds4_gpu_glm53_matmul_bf16(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+/* Inner-dimension slices used by ds4_gpu_glm53_matmul_bf16_splitk. The caller
+ * sizes the partials scratch as out_dim * n_rows * this many floats. */
+#define DS4_GLM53_BF16_SPLITK_SLICES 8u
+
+/* The decode HC-pre pair (ds4_gpu_glm53_hc_pre_splitk_fused_tensor) can run its
+ * split-K matvec at a slice count other than the one above, selected at run
+ * time by DS4_GLM_HC_PRE_SLICES; see ds4_gpu_glm53_hc_pre_slices() in
+ * ds4_metal.m. The partials scratch is therefore sized for the widest legal
+ * count, which costs 24 * 32 floats = 3 KB. */
+#define DS4_GLM53_HC_PRE_SLICES_MAX 32u
+
+/* Extra floats the caller must leave past the end of the partials array for
+ * the hc_pre algebra lever's per-slice sums of squares (half A publishes one
+ * per split-K slice at partials[out_dim*n_slices*n_rows + slice]; the tail
+ * reads all 32 slots with one load per lane of one simdgroup). */
+#define DS4_GLM53_HC_PRE_SUMSQ_SLOTS 32u
+
+int ds4_gpu_glm53_matmul_bf16_splitk(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *partials,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
+/* Whole decode HC-pre with the split-K HC mixer in two dispatches: RMSNorm +
+ * split-K partials, then split-K reduce + gated four-stream collapse + output
+ * RMSNorm. Bit-identical to the four-dispatch ladder it replaces
+ * (ds4_gpu_rms_norm_plain_tensor + ds4_gpu_glm53_matmul_bf16_splitk +
+ * ds4_gpu_hc_split_weighted_sum_norm_tensor), including the split-K partials
+ * themselves. Single-row decode shapes only. */
+int ds4_gpu_glm53_hc_pre_splitk_fused_available(void);
+int ds4_gpu_glm53_hc_pre_splitk_single_available(void);
+int ds4_gpu_glm53_hc_pre_splitk_single_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *partials,
+        ds4_gpu_tensor       *ticket,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
+int ds4_gpu_glm53_hc_pre_splitk_fused_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *partials,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *tail_counters,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
+
+/* Two same-shape BF16 matvecs over one shared input in a single dispatch;
+ * bit-identical to two ds4_gpu_glm53_matmul_bf16 calls with n_rows = 1. */
+int ds4_gpu_glm53_matmul_bf16_pair(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x);
+
+/* KDA BF16 low-rank projection pack. flat3 runs f_a + g_a + beta (shared
+ * input, different output extents) over one flat row space; pair2in runs
+ * f_b + g_b (same shape, different input rows). Both are bit-identical to the
+ * separate ds4_gpu_glm53_matmul_bf16 dispatches they replace. */
+int ds4_gpu_glm53_matmul_bf16_flat3(
+        ds4_gpu_tensor       *out_0,
+        ds4_gpu_tensor       *out_1,
+        ds4_gpu_tensor       *out_2,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_0_offset,
+        uint64_t              weight_1_offset,
+        uint64_t              weight_2_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim_0,
+        uint32_t              out_dim_1,
+        uint32_t              out_dim_2,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_glm53_matmul_bf16_pair2in(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x_a,
+        const ds4_gpu_tensor *x_b);
 
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
@@ -3229,6 +3563,108 @@ int ds4_gpu_glm53_kda_decode(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+#ifdef __APPLE__
+/* Three-dispatch form of the decode recurrence: same math, same bits, but
+ * the 128-row state pass runs on 8x the threadgroups. `split_scratch` must
+ * hold n_rows * n_heads * (516 + 128) floats. Returns 0 having encoded
+ * nothing when the arguments or the scratch are unusable, or when a KDA
+ * snapshot is armed, so the caller can fall back to the fused kernel. */
+int ds4_gpu_glm53_kda_decode_split(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *split_scratch,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps);
+
+/* Two-dispatch form: phases 1-3 in one threadgroup per head, as wide as the
+ * device allows, then the same out kernel. Same math, same bits, one fewer
+ * dispatch than the split above. Same scratch requirement (only the trailing
+ * so[] half is touched) and the same fall-back-to-caller contract. */
+int ds4_gpu_glm53_kda_decode_split2(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *split_scratch,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps);
+
+/* Glued form: the f_b/g_b BF16 expansions folded into the per-head
+ * threadgroup's prologue (do_prologue -- the caller must then skip the
+ * pair2in dispatch) and the out kernel folded into its tail (do_out).  Both
+ * bit-identical to the dispatches they replace; each is independently
+ * selectable, and when do_out is 0 the standalone out kernel is emitted after
+ * it.  lr_q8 selects the prologue's row body: 0 for BF16 f_b/g_b, 1 for Q8_0
+ * (refused unless lr_in_dim is a multiple of 32 and lr_in_dim/32 <= 8, which
+ * is what keeps the Q8_0 body bit-identical to the standalone matvec).  With
+ * do_prologue 0 none of the f_b/g_b or low-rank arguments are touched, so the
+ * out-tail fold runs on any lower-projection encoding.  Returns 0 without
+ * encoding anything if it refuses. */
+int ds4_gpu_glm53_kda_decode_glue(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *split_scratch,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        ds4_gpu_tensor       *output_gate,
+        const ds4_gpu_tensor *lowrank_f,
+        const ds4_gpu_tensor *lowrank_g,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint64_t              f_b_offset,
+        uint64_t              g_b_offset,
+        uint32_t              lr_in_dim,
+        int                   lr_q8,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        int                   do_prologue,
+        int                   do_out,
+        float                 gate_lower_bound,
+        float                 norm_eps);
+#endif
+
 int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -3279,6 +3715,99 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+
+/* Scoped concurrent dispatch group for the batch pass (Metal only; other
+ * backends may stub to 0). See ds4_metal.m for the ordering contract. */
+int ds4_gpu_matmul_q8_0_qkv_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x);
+
+/* Q8_0 q/k/v with the three BF16 KDA low-rank rows (f_a, g_a, beta) folded in
+ * as extra threadgroups of the same dispatch. Bit-identical to
+ * ds4_gpu_matmul_q8_0_qkv_tensor + ds4_gpu_glm53_matmul_bf16_flat3. */
+int ds4_gpu_matmul_q8_0_qkv_bf16_lowrank_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        ds4_gpu_tensor       *out_lr_0,
+        ds4_gpu_tensor       *out_lr_1,
+        ds4_gpu_tensor       *out_lr_2,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              weight_lr_0_offset,
+        uint64_t              weight_lr_1_offset,
+        uint64_t              weight_lr_2_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        uint32_t              lr_dim_0,
+        uint32_t              lr_dim_1,
+        uint32_t              lr_dim_2,
+        const ds4_gpu_tensor *x);
+/* Six-way fusion of the GLM-5.3 KDA projections that share the attention-norm
+ * row: q, k, v, f_a, beta, g_a. Output extents differ per slice, so each is
+ * passed alongside its weight offset (index order must match). */
+int ds4_gpu_matmul_q8_0_kda6_tensor(
+        ds4_gpu_tensor       *outs[6],
+        const void           *model_map,
+        uint64_t              model_size,
+        const uint64_t        weight_offsets[6],
+        uint64_t              in_dim,
+        const uint64_t        out_dims[6],
+        const ds4_gpu_tensor *x);
+/* Same fusion over a flat concatenated row space, so no threadgroup retires
+ * without work. Every out_dim must be a multiple of the matvec row count. */
+int ds4_gpu_matmul_q8_0_kda6_flat_tensor(
+        ds4_gpu_tensor       *outs[6],
+        const void           *model_map,
+        uint64_t              model_size,
+        const uint64_t        weight_offsets[6],
+        uint64_t              in_dim,
+        const uint64_t        out_dims[6],
+        const ds4_gpu_tensor *x);
+/* Two same-shaped Q8_0 projections over two different input rows in one
+ * dispatch (GLM-5.3 KDA f_b and g_b over their low-rank vectors). */
+int ds4_gpu_matmul_q8_0_pair2in_tensor(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x_a,
+        const ds4_gpu_tensor *x_b);
+/* --------------------------------------------------------------------------
+ * Tier-2 screening instrumentation.
+ *
+ * Every screened candidate announces, on its FIRST dispatch, the exact shape
+ * that was selected, and prints a per-tag dispatch count at exit.  A recorded
+ * trial that does not carry both lines is not evidence about which variant ran
+ * (candidate selection is cached in statics at first use, so an env change
+ * inside one process does not switch it: one process per arm, always).
+ * Not thread safe by design -- the decode encoder is single threaded and the
+ * counter must cost nothing on the dispatch path.
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    const char        *tag;
+    int                announced;
+    unsigned long long count;
+} ds4_t2s_slot;
+
+void ds4_t2s_hit(ds4_t2s_slot *slot, const char *fmt, ...);
+
 
 #ifdef __cplusplus
 }

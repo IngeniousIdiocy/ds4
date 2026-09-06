@@ -25,6 +25,35 @@ struct ds4_metal_args_mul_mv {
     short r3;
 };
 
+// Extended matvec args for the six-way KDA projection fusion. The six weights
+// share one input row and one row stride (in_dim is common), so only the output
+// extent differs per grid-z slice.
+struct ds4_metal_args_mul_mv_kda6 {
+    ds4_metal_args_mul_mv mv;
+    uint out_dims[6];
+};
+
+// Extended matvec args for the flat-row-space KDA projection fusion. The six
+// output extents are concatenated into one row space so the dispatch is 2-D and
+// no threadgroup is wasted: row_starts[i]..row_starts[i+1] is tensor i, and
+// row_starts[6] is the total row count.
+struct ds4_metal_args_mul_mv_kda6_flat {
+    ds4_metal_args_mul_mv mv;
+    uint row_starts[7];
+    uint pad0;
+};
+
+// Flat-row-space args for the two-way Q8_0 projection fusion (GLM-5.3 DSA
+// attn_q_a + attn_kv_a_mqa). Both weights share in_dim and therefore the row
+// stride; only the output extent differs, so the two extents are concatenated
+// into one row space: row_starts[0] = 0, row_starts[1] = out0, row_starts[2] =
+// out0 + out1.
+struct ds4_metal_args_mul_mv_pair_flat {
+    ds4_metal_args_mul_mv mv;
+    uint row_starts[3];
+    uint pad0;
+};
+
 struct ds4_metal_args_compressor_pair_store {
     uint32_t width;
     uint32_t ratio;
@@ -70,7 +99,16 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0>
+// COHERENT_STORE routes the final row store through a relaxed device atomic
+// instead of a plain store. The stored bit pattern is the same float, and the
+// whole reduction above it is untouched, so results are bit-identical; the only
+// difference is that an atomic store is device-coherent, which is what lets a
+// same-dispatch tail fusion in another threadgroup read the value back. Apple
+// silicon does NOT make plain device stores visible across threadgroups within
+// one dispatch (measured on M3 Ultra: a seq_cst device fence still left half the
+// rows invisible to the reader, one die's worth), so a tail fusion must use this.
+// The default is false, so every existing instantiation is unchanged.
+template<short NR0, bool COHERENT_STORE = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -107,7 +145,14 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            if (COHERENT_STORE) {
+                device atomic_uint *slot =
+                    (device atomic_uint *)(dst_f32 + r0 + row);
+                atomic_store_explicit(slot, as_type<uint>(tot),
+                                      memory_order_relaxed);
+            } else {
+                dst_f32[r0 + row] = tot;
+            }
         }
     }
 }
@@ -180,6 +225,256 @@ void kernel_mul_mv_q8_0_f32_impl(
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+// Fused decode-time Q8_0 matvec over three same-shaped weights sharing one
+// input (GLM-5.3 KDA q/k/v): threadgroup z selects the matrix, so the three
+// projections cost one dispatch instead of three. Per-row math is identical
+// to kernel_mul_mv_q8_0_f32.
+[[host_name("kernel_mul_mv_q8_0_f32_qkv")]]
+kernel void kernel_mul_mv_q8_0_f32_qkv(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_q,
+        device const char * src0_k,
+        device const char * src0_v,
+        device const char * src1,
+        device       char * dst_q,
+        device       char * dst_k,
+        device       char * dst_v,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    device const char * src0 = tgpig.z == 0u ? src0_q :
+                               (tgpig.z == 1u ? src0_k : src0_v);
+    device       char * dst  = tgpig.z == 0u ? dst_q :
+                               (tgpig.z == 1u ? dst_k : dst_v);
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, uint3(tgpig.x, tgpig.y, 0u), tiisg, sgitg);
+}
+
+// Fused decode-time Q8_0 matvec over the six GLM-5.3 KDA projections that all
+// read the same attention-norm row: q, k, v (in_dim -> projection), f_a, beta,
+// g_a (in_dim -> small ranks). Threadgroup z selects the matrix, so six
+// projections cost one dispatch. The grid x extent covers the largest output
+// extent; threadgroups whose row range is past their own slice's output extent
+// retire before touching any weight. Per-row math delegates to the same
+// kernel_mul_mv_q8_0_f32_impl the standalone kernel uses, with only ne01/ne0
+// swapped for the slice, so outputs are bit-identical.
+[[host_name("kernel_mul_mv_q8_0_f32_kda6")]]
+kernel void kernel_mul_mv_q8_0_f32_kda6(
+        constant ds4_metal_args_mul_mv_kda6 & args,
+        device const char * src0_q,
+        device const char * src0_k,
+        device const char * src0_v,
+        device const char * src0_f_a,
+        device const char * src0_beta,
+        device const char * src0_g_a,
+        device const char * src1,
+        device       char * dst_q,
+        device       char * dst_k,
+        device       char * dst_v,
+        device       char * dst_f_a,
+        device       char * dst_beta,
+        device       char * dst_g_a,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint z = tgpig.z;
+    const uint out_dim = args.out_dims[z];
+
+    // Uniform across the threadgroup, so retiring here cannot desynchronize the
+    // barriers inside the shared implementation.
+    if (tgpig.x * (uint) N_R0_Q8_0 >= out_dim) {
+        return;
+    }
+
+    device const char * src0 = z == 0u ? src0_q :
+                               (z == 1u ? src0_k :
+                               (z == 2u ? src0_v :
+                               (z == 3u ? src0_f_a :
+                               (z == 4u ? src0_beta : src0_g_a))));
+    device       char * dst  = z == 0u ? dst_q :
+                               (z == 1u ? dst_k :
+                               (z == 2u ? dst_v :
+                               (z == 3u ? dst_f_a :
+                               (z == 4u ? dst_beta : dst_g_a))));
+
+    // Only the output extent varies per slice; every other field is shared,
+    // which keeps the per-row traversal and reduction identical to the
+    // standalone kernel.
+    ds4_metal_args_mul_mv slice = args.mv;
+    slice.ne01 = (int) out_dim;
+    slice.ne0  = (int) out_dim;
+
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+        slice, src0, src1, dst, shmem, uint3(tgpig.x, tgpig.y, 0u), tiisg, sgitg);
+}
+
+// Same six-way KDA projection fusion, but over a FLAT row space instead of a
+// z-sliced grid. The z-sliced variant above has to size grid.x for the largest
+// output extent, so the three small slices (f_a, beta, g_a) retire ~75% of all
+// threadgroups without doing work; the launch savings did not pay for that.
+// Here the six output extents are concatenated (8192+8192+8192+128+64+128 =
+// 24896 rows for GLM-5.3), grid.x covers the concatenation, and every
+// threadgroup owns a real row pair -- one big dispatch that reaches steady-state
+// bandwidth.
+//
+// No-straddle property: every KDA output extent is even, so every cumulative
+// row start is even too. A threadgroup owns rows [tgpig.x*NR0, tgpig.x*NR0+NR0)
+// with NR0 = 2, so its first row is even; an even row below an even boundary is
+// at most boundary-2, hence the pair's last row is at most boundary-1. A row
+// pair can therefore never straddle a tensor boundary, and the local row pair
+// start is always a multiple of NR0. The host dispatcher rejects any out_dim
+// that is not a multiple of NR0, which is what makes this hold.
+//
+// Per-row math delegates to the same kernel_mul_mv_q8_0_f32_impl the standalone
+// kernel uses, with only ne01/ne0 swapped for the owning tensor, so outputs are
+// bit-identical.
+[[host_name("kernel_mul_mv_q8_0_f32_kda6_flat")]]
+kernel void kernel_mul_mv_q8_0_f32_kda6_flat(
+        constant ds4_metal_args_mul_mv_kda6_flat & args,
+        device const char * src0_q,
+        device const char * src0_k,
+        device const char * src0_v,
+        device const char * src0_f_a,
+        device const char * src0_beta,
+        device const char * src0_g_a,
+        device const char * src1,
+        device       char * dst_q,
+        device       char * dst_k,
+        device       char * dst_v,
+        device       char * dst_f_a,
+        device       char * dst_beta,
+        device       char * dst_g_a,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint flat_row = tgpig.x * (uint) N_R0_Q8_0;
+
+    // Only fires when the total row count is not a multiple of NR0, which the
+    // host rejects; kept so a bad grid can never read past a weight range.
+    if (flat_row >= args.row_starts[6]) {
+        return;
+    }
+
+    // Unrolled compare chain over the six boundaries.
+    uint t = 0u;
+    if (flat_row >= args.row_starts[1]) t = 1u;
+    if (flat_row >= args.row_starts[2]) t = 2u;
+    if (flat_row >= args.row_starts[3]) t = 3u;
+    if (flat_row >= args.row_starts[4]) t = 4u;
+    if (flat_row >= args.row_starts[5]) t = 5u;
+
+    const uint local_row = flat_row - args.row_starts[t];
+    const uint out_dim   = args.row_starts[t + 1] - args.row_starts[t];
+
+    device const char * src0 = t == 0u ? src0_q :
+                               (t == 1u ? src0_k :
+                               (t == 2u ? src0_v :
+                               (t == 3u ? src0_f_a :
+                               (t == 4u ? src0_beta : src0_g_a))));
+    device       char * dst  = t == 0u ? dst_q :
+                               (t == 1u ? dst_k :
+                               (t == 2u ? dst_v :
+                               (t == 3u ? dst_f_a :
+                               (t == 4u ? dst_beta : dst_g_a))));
+
+    // Only the output extent varies per tensor; every other field is shared,
+    // which keeps the per-row traversal and reduction identical to the
+    // standalone kernel.
+    ds4_metal_args_mul_mv slice = args.mv;
+    slice.ne01 = (int) out_dim;
+    slice.ne0  = (int) out_dim;
+
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+        slice, src0, src1, dst, shmem,
+        uint3(local_row / (uint) N_R0_Q8_0, tgpig.y, 0u), tiisg, sgitg);
+}
+
+// Two-way Q8_0 projection fusion over a FLAT row space, for the GLM-5.3 DSA
+// decode pair attn_q_a (4096 -> 1536) and attn_kv_a_mqa (4096 -> 512). Both
+// read the same attention-norm row and write disjoint outputs, so one dispatch
+// replaces two dependent ones.
+//
+// Flat rather than z-sliced or max-extent: a z-slice/max-extent grid has to
+// size grid.x for the larger output extent, so the smaller slice retires most
+// of its threadgroups without work and the launch savings are eaten by the
+// resulting load imbalance (that is exactly what kernel_mul_mv_q8_0_f32_kda6
+// lost to kernel_mul_mv_q8_0_f32_kda6_flat). Here the two extents are
+// concatenated, grid.x covers the concatenation, and every threadgroup owns a
+// real row pair.
+//
+// No-straddle property: the host rejects any out_dim that is not a multiple of
+// N_R0_Q8_0, so every cumulative row start is a multiple of NR0 and a
+// threadgroup's row pair [tgpig.x*NR0, tgpig.x*NR0+NR0) can never cross the
+// tensor boundary; the local row pair start is always a multiple of NR0 too.
+//
+// Per-row math delegates to the same kernel_mul_mv_q8_0_f32_impl the standalone
+// kernel uses, with only ne01/ne0 swapped for the owning tensor. in_dim, the
+// row stride, the lane/block traversal (ix/il/ib0, NSG*NQ stride) and the
+// two-stage reduction are all untouched, so outputs are bit-identical to the
+// two standalone dispatches.
+[[host_name("kernel_mul_mv_q8_0_f32_pair_flat")]]
+kernel void kernel_mul_mv_q8_0_f32_pair_flat(
+        constant ds4_metal_args_mul_mv_pair_flat & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint flat_row = tgpig.x * (uint) N_R0_Q8_0;
+
+    // Only fires when the total row count is not a multiple of NR0, which the
+    // host rejects; kept so a bad grid can never read past a weight range.
+    if (flat_row >= args.row_starts[2]) {
+        return;
+    }
+
+    const uint t = flat_row >= args.row_starts[1] ? 1u : 0u;
+    const uint local_row = flat_row - args.row_starts[t];
+    const uint out_dim   = args.row_starts[t + 1] - args.row_starts[t];
+
+    device const char * src0 = t == 0u ? src0_a : src0_b;
+    device       char * dst  = t == 0u ? dst_a  : dst_b;
+
+    ds4_metal_args_mul_mv slice = args.mv;
+    slice.ne01 = (int) out_dim;
+    slice.ne0  = (int) out_dim;
+
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+        slice, src0, src1, dst, shmem,
+        uint3(local_row / (uint) N_R0_Q8_0, tgpig.y, 0u), tiisg, sgitg);
+}
+
+// Fused decode-time Q8_0 matvec over two same-shaped weights with *different*
+// input rows (GLM-5.3 KDA f_b over the f_a rank and g_b over the g_a rank).
+// Threadgroup z selects the (weight, input, output) triple. Per-row math
+// delegates to the standalone implementation unchanged.
+[[host_name("kernel_mul_mv_q8_0_f32_pair2in")]]
+kernel void kernel_mul_mv_q8_0_f32_pair2in(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1_a,
+        device const char * src1_b,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    device const char * src0 = tgpig.z == 0u ? src0_a : src0_b;
+    device const char * src1 = tgpig.z == 0u ? src1_a : src1_b;
+    device       char * dst  = tgpig.z == 0u ? dst_a  : dst_b;
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, uint3(tgpig.x, tgpig.y, 0u), tiisg, sgitg);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -1129,6 +1424,41 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0(
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
+// Geometry-only sibling of kernel_dsv4_shared_mid_swiglu_q8_0: the SAME impl,
+// instantiated with NR0 = 1 instead of N_R0_Q8_0 = 2, so a launch that covers
+// out_dim rows uses twice as many threadgroups, each owning one output row.
+// The shared expert's 2048 rows only give 1024 threadgroups at NR0 = 2, which
+// is below the ~480-threadgroup saturation knee by too little to keep the
+// memory system busy; 2048 threadgroups of the same shape stream the same
+// bytes with twice the memory-level parallelism.
+//
+// Bit-exact by construction.  NR0 selects only how many independent output
+// rows one threadgroup carries.  Each row's tile loop (ib0 = sgitg*NQ + ix,
+// stride NSG*NQ, eight-wide unrolled products, one `sumq * d` per block), its
+// two simd_sum reductions and the sh_gate/sh_up threadgroup tree all depend on
+// NSG and the (NW, NQ) lane layout, never on NR0 and never on which
+// threadgroup owns which row.  kernel_dsv4_shared_mid_swiglu_q8_0 above is
+// deliberately left byte-identical so the two arms of the fidelity comparison
+// cannot move together.
+[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_nr1")]]
+kernel void kernel_dsv4_shared_mid_swiglu_q8_0_nr1(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<1, false>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
 
 template<typename T0, typename T1, short NR0, typename args_t>
 void kernel_mul_mv_t_t_impl(
@@ -1244,7 +1574,8 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
-template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t,
+         bool COHERENT_STORE = false>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,
         device const char * src0,
@@ -1322,7 +1653,7 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, COHERENT_STORE>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 template<typename T0, typename T04, typename T1, typename T14, typename args_t>
@@ -2171,6 +2502,7 @@ template [[host_name("kernel_mul_mv_ext_f32_f32_r1_2")]]  kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_f32_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, float4,     4,  dequantize_f32_t4>;
 template [[host_name("kernel_mul_mv_ext_f32_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, float4,     4,  dequantize_f32_t4>;
 template [[host_name("kernel_mul_mv_ext_f32_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, float4,     4,  dequantize_f32_t4>;
+template [[host_name("kernel_mul_mv_ext_f32_f32_r1_8")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, float4,     4,  dequantize_f32_t4>;
 
 template<short r1ptg>
 void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
@@ -2330,28 +2662,33 @@ template [[host_name("kernel_mul_mv_ext_f16_f32_r1_2")]]  kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_f16_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, half4,      4,  dequantize_f16_t4>;
 template [[host_name("kernel_mul_mv_ext_f16_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, half4,      4,  dequantize_f16_t4>;
 template [[host_name("kernel_mul_mv_ext_f16_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, half4,      4,  dequantize_f16_t4>;
+template [[host_name("kernel_mul_mv_ext_f16_f32_r1_8")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, half4,      4,  dequantize_f16_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_8")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, block_q8_0, 32, dequantize_q8_0_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_8")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_8")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_2")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<2>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_3")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<3>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_4")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_5")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<5>;
+template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_8")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<8>;
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];

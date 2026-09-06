@@ -948,6 +948,45 @@ int main(void) {
                                        PROJECTION * sizeof(float)), "decode output read");
     }
 
+#if defined(__APPLE__)
+    /* The three-dispatch split and the two-dispatch (prep+state fused) pair
+     * must reproduce the fused kernel's decode bit for bit. */
+    for (int variant = 0; variant < 2; variant++) {
+        const char *name = variant ? "KDA decode split2" : "KDA decode split";
+        ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc(
+            (uint64_t)HEADS * (516u + D) * sizeof(float));
+        require_ok(scratch != NULL, "split scratch allocation");
+        require_ok(ds4_gpu_tensor_fill_f32(conv, 0.0f, 9u * PROJECTION),
+                   "split conv reset");
+        require_ok(ds4_gpu_tensor_fill_f32(state, 0.0f,
+                                           (uint64_t)HEADS * D * D),
+                   "split state reset");
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            const uint32_t off = t * PROJECTION;
+            require_ok(ds4_gpu_tensor_write(q, 0, qs + off, PROJECTION * sizeof(float)), "split Q write");
+            require_ok(ds4_gpu_tensor_write(k, 0, ks + off, PROJECTION * sizeof(float)), "split K write");
+            require_ok(ds4_gpu_tensor_write(v, 0, vs + off, PROJECTION * sizeof(float)), "split V write");
+            require_ok(ds4_gpu_tensor_write(gate, 0, gates + off, PROJECTION * sizeof(float)), "split gate write");
+            require_ok(ds4_gpu_tensor_write(output_gate, 0, output_gates + off, PROJECTION * sizeof(float)), "split output gate write");
+            require_ok(ds4_gpu_tensor_write(beta, 0, betas + t * HEADS, HEADS * sizeof(float)), "split beta write");
+            require_ok((variant ? ds4_gpu_glm53_kda_decode_split2
+                                : ds4_gpu_glm53_kda_decode_split)(
+                out, conv, state, scratch, q, k, v, gate, beta, output_gate,
+                model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
+                A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
+                HEADS, 1, -5.0f, 1e-5f), name);
+            float got[PROJECTION];
+            require_ok(ds4_gpu_tensor_read(out, 0, got, sizeof(got)),
+                       "split output read");
+            if (memcmp(got, decode_outputs + off, sizeof(got)) != 0) {
+                fprintf(stderr, "%s is not bit-identical at token %u\n", name, t);
+                return 1;
+            }
+        }
+        ds4_gpu_tensor_free(scratch);
+    }
+#endif
+
     ds4_gpu_tensor *pq = ds4_gpu_tensor_alloc(sizeof(qs));
     ds4_gpu_tensor *pk = ds4_gpu_tensor_alloc(sizeof(ks));
     ds4_gpu_tensor *pv = ds4_gpu_tensor_alloc(sizeof(vs));
