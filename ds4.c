@@ -8692,6 +8692,8 @@ static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, cons
     }
 }
 
+#include "ds4_dflash2.inc"
+
 static float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i) {
     if (i >= t->elements) ds4_die("tensor scalar index is out of bounds");
     if (t->type == 0) {
@@ -38997,6 +38999,9 @@ typedef enum {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    ds4_model dflash_model;
+    ds4_dflash2_weights dflash_weights;
+    bool dflash_ready;
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
@@ -41566,6 +41571,10 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_concat;
     ds4_gpu_tensor *mtp_selected;
     ds4_gpu_tensor *mtp_state_backup;
+    ds4_gpu_tensor *mtp_kda_rowsnap;
+    ds4_gpu_tensor *dflash_stepsnap;
+    ds4_gpu_tensor *dflash_capture;
+    ds4_gpu_tensor *dflash_hcrows;
     float          *mtp_logits_host;
     int             mtp_ready;
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
@@ -43408,12 +43417,20 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_concat);
     ds4_gpu_tensor_free(g->mtp_selected);
     ds4_gpu_tensor_free(g->mtp_state_backup);
+    ds4_gpu_tensor_free(g->mtp_kda_rowsnap);
+    ds4_gpu_tensor_free(g->dflash_stepsnap);
+    ds4_gpu_tensor_free(g->dflash_capture);
+    ds4_gpu_tensor_free(g->dflash_hcrows);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
     g->mtp_concat = NULL;
     g->mtp_selected = NULL;
     g->mtp_state_backup = NULL;
+    g->mtp_kda_rowsnap = NULL;
+    g->dflash_stepsnap = NULL;
+    g->dflash_capture = NULL;
+    g->dflash_hcrows = NULL;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -49088,6 +49105,60 @@ static uint32_t glm_graph_mtp_cache_cap(const ds4_glm_gpu_graph *g) {
     return g->compact_cache_cap != 0 ? g->compact_cache_cap : g->ctx_size;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* DFlash target-feature capture: while armed, the GLM batch forward writes
+ * the stream-mean-collapsed post-layer hidden of each tap layer for every
+ * row into cap_buf[row][tap][embd] (matches the drafter fc concat order and
+ * SGLang's hc_contract-of-(hidden+residual) capture). */
+typedef struct {
+    int enabled;
+    ds4_gpu_tensor *buf;
+    uint32_t n_rows;
+    uint32_t n_taps;
+    uint32_t taps[DS4_DFLASH2_MAX_TARGET];
+} ds4_glm_dflash_capture;
+static ds4_glm_dflash_capture g_glm_dflash_cap;
+
+static int glm_dflash_capture_tap_index(uint32_t il) {
+    if (!g_glm_dflash_cap.enabled) return -1;
+    for (uint32_t j = 0; j < g_glm_dflash_cap.n_taps; j++) {
+        if (g_glm_dflash_cap.taps[j] == il) return (int)j;
+    }
+    return -1;
+}
+
+static bool glm_dflash_capture_rows(
+        ds4_glm_gpu_graph *g,
+        const ds4_gpu_tensor *hc_rows,
+        uint32_t il,
+        uint32_t n_rows) {
+    const int tap = glm_dflash_capture_tap_index(il);
+    if (tap < 0) return true;
+    if (n_rows > g_glm_dflash_cap.n_rows) return false;
+    const uint64_t hc_row = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t out_row = (uint64_t)g_glm_dflash_cap.n_taps * DS4_N_EMBD;
+    bool ok = true;
+    for (uint32_t r = 0; ok && r < n_rows; r++) {
+        ds4_gpu_tensor *src = glm_graph_tensor_row_view_strided(
+                (ds4_gpu_tensor *)hc_rows, r, hc_row, hc_row);
+        ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
+                g_glm_dflash_cap.buf,
+                ((uint64_t)r * out_row + (uint64_t)tap * DS4_N_EMBD) *
+                    sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        ok = src && dst &&
+             ds4_gpu_hc_weighted_sum_tensor(dst, src, g->hc_mean_weights,
+                                            DS4_N_EMBD, DS4_N_HC) != 0;
+        ds4_gpu_tensor_free(src);
+        ds4_gpu_tensor_free(dst);
+    }
+    return ok;
+}
+#endif
+
+
+#include "ds4_dflash_seed.inc"
+
 static void glm53_graph_spec_state_tensors(const ds4_glm_gpu_graph *g,
                                           uint32_t il,
                                           ds4_gpu_tensor *state[2]) {
@@ -49112,6 +49183,26 @@ static uint64_t glm53_graph_spec_state_bytes(const ds4_glm_gpu_graph *g) {
             if (bytes > UINT64_MAX - total) return 0;
             total += bytes;
         }
+    }
+    return total;
+}
+
+/* Bytes of the KDA conv + recurrent state alone. The DFlash2 draft/verify
+ * paths and the row-boundary snapshot address only that subset, so they need
+ * their own size rather than the wider speculative-state total above (which
+ * also covers the indexer tail K+gate ring). */
+static uint64_t glm53_graph_kda_state_bytes(const ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53) return 0;
+    uint64_t total = 0;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        const uint64_t conv = ds4_gpu_tensor_bytes(g->layer_kda_conv_state[il]);
+        const uint64_t recurrent =
+            ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[il]);
+        if (conv > UINT64_MAX - total) return 0;
+        total += conv;
+        if (recurrent > UINT64_MAX - total) return 0;
+        total += recurrent;
     }
     return total;
 }
@@ -49153,6 +49244,58 @@ static bool glm53_graph_copy_spec_state(
     return ok && offset == expected;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* metal-only: row-boundary KDA snapshot captured inside a speculative
+ * verify forward (see ds4_metal.m). */
+extern void ds4_gpu_glm53_kda_rowsnap_begin(ds4_gpu_tensor *base, int row);
+extern void ds4_gpu_glm53_kda_stepsnap_begin(ds4_gpu_tensor *base,
+                                             uint32_t stride_floats,
+                                             uint32_t n_steps);
+extern void ds4_gpu_glm53_kda_rowsnap_end(void);
+#define DS4_GLM53_KDA_ROWSNAP 1
+#endif
+
+#if defined(DS4_GLM53_KDA_ROWSNAP)
+static bool glm53_graph_rowsnap_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_GLM_MTP_NO_ROWSNAP") == NULL;
+    return cached == 1;
+}
+
+/* Restore conv + recurrent KDA state from the row-boundary snapshot the
+ * last speculative verify captured. Walks layers in the same order the
+ * snapshot was written (forward layer order = copy_kda_state order). */
+static bool glm53_graph_restore_kda_rowsnap(ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53 || !g->mtp_kda_rowsnap) return false;
+    const uint64_t expected = glm53_graph_kda_state_bytes(g);
+    if (expected == 0 ||
+        ds4_gpu_tensor_bytes(g->mtp_kda_rowsnap) < expected) {
+        return false;
+    }
+    bool ok = glm_graph_begin_commands_if_needed();
+    uint64_t offset = 0;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        ds4_gpu_tensor *state[2] = {
+            g->layer_kda_conv_state[il],
+            g->layer_kda_recurrent_state[il],
+        };
+        for (uint32_t i = 0; ok && i < 2; i++) {
+            const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
+            ok = ds4_gpu_tensor_copy(state[i],
+                                     0,
+                                     g->mtp_kda_rowsnap,
+                                     offset,
+                                     bytes) != 0;
+            offset += bytes;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok && offset == expected;
+}
+#endif
+
 static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     if (g->mtp_ready) return true;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
@@ -49170,6 +49313,14 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t state_backup_bytes = glm53_graph_spec_state_bytes(g);
     if (g->glm53 && state_backup_bytes != 0) {
         g->mtp_state_backup = ds4_gpu_tensor_alloc(state_backup_bytes);
+#if defined(DS4_GLM53_KDA_ROWSNAP)
+        const uint64_t rowsnap_bytes = glm53_graph_kda_state_bytes(g);
+        if (rowsnap_bytes != 0 && glm53_graph_rowsnap_enabled()) {
+            /* Optional: reject path falls back to restore+replay if this
+             * allocation fails. */
+            g->mtp_kda_rowsnap = ds4_gpu_tensor_alloc(rowsnap_bytes);
+        }
+#endif
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
@@ -49960,6 +50111,474 @@ static bool glm_graph_verify_rows(
     return ok;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* GLM-5.3 decode-style verify pass (DFlash block verify). Same overhead
+ * class as the GLM-5.2 pass above: the indexed batch fn costs ~107ms for
+ * n=8 at small positions (per-layer encoder boundaries, split hc_pre
+ * dispatches, indexer machinery) while serial decode is ~34ms/token.
+ * This pass runs the batch-row encoders in ONE command buffer with a
+ * commit-without-wait every 8 layers (the cadence
+ * glm_graph_full_prefill_layer_flush_interval picks for n<=8 verify) and
+ * attends causally over the compact caches, valid only while pos+n fits
+ * the dense window (ctx_cap, the 4K indexer work window); the indexer
+ * score/top-k stage is skipped entirely there, exactly like the batch
+ * path's use_causal_range_select branch. Outside that regime, or when
+ * any precondition fails, the ready check returns false and the caller
+ * falls back to the indexed batch path.
+ *
+ * Cache mirror contract — the batch path writes exactly these device
+ * caches per layer for n<=8, and this pass mirrors every one:
+ *   KDA layers (ds4_glm53_layer_is_kda, il % 4 != 3):
+ *     - layer_kda_conv_state[il] / layer_kda_recurrent_state[il],
+ *       updated in-kernel by ds4_gpu_glm53_kda_prefill via
+ *       glm53_graph_kda_attention_rows (rows are sequential in-kernel;
+ *       the armed dflash per-step snapshot, snapshot_row = -2, is
+ *       honored by the same dispatcher).
+ *   DSA layers (the rest):
+ *     - layer_indexer_key_cache[il] + layer_indexer_tail_k[il] +
+ *       layer_indexer_tail_gate[il] via
+ *       ds4_gpu_glm53_indexer_pool_update_tensor;
+ *     - layer_kv_lora_cache[il] + layer_k_rope_cache[il] via
+ *       ds4_gpu_glm_store_compact_kv_tensor.
+ * The dense/full KV cache is never written by the indexed batch path;
+ * glm53_graph_use_indexed_prefill in the ready check excludes graphs
+ * where the full-KV path would have been taken instead. */
+static bool glm53_graph_verify_rows_ready(
+        const ds4_glm_gpu_graph *g,
+        uint32_t                 pos,
+        uint32_t                 n) {
+    return g && g->glm53 && n != 0 && n <= 8u &&
+           !g->ssd_streaming &&
+           !g->placement &&
+           /* small-batch TP replicates attention but splits the routed
+            * FFN; keep the verified batch path under TP */
+           g->tp_world <= 1u &&
+           g->has_token_embd &&
+           glm53_graph_use_indexed_prefill(g) &&
+           glm_graph_indexed_prefill_batch_available(g) &&
+           g->prefill_tokens != NULL &&
+           n <= g->indexed_prefill_cap &&
+           glm_graph_span_fits_context(g, pos, n) &&
+           pos + n <= glm_graph_dense_compact_attention_limit(g) &&
+           glm_graph_ensure_compact_cache(g, pos + n);
+}
+
+/* Rows variant of the decode ladder's fused hc_pre (glm53_graph_hc_pre).
+ * The fused norm+mix kernel (ds4_gpu_hc_rms_norm_mix_f16_tensor) is
+ * strictly single-row — its dispatcher hardcodes n == 16384 as one row —
+ * so the norm+mix half stays split (2 dispatches, same as
+ * glm53_graph_hc_pre_rows). The split/weighted-sum/norm tail IS
+ * rows-capable (the dispatcher derives the row count from the collapsed
+ * tensor's size), replacing hc_pre_rows' last two dispatches with one.
+ * `collapsed` must therefore be an exact n-row view. */
+static bool glm53_graph_verify_hc_pre_rows(
+        ds4_glm_gpu_graph    *g,
+        const ds4_model      *model,
+        const ds4_tensor     *fn,
+        const ds4_tensor     *scale,
+        const ds4_tensor     *base,
+        const ds4_tensor     *norm,
+        const ds4_gpu_tensor *residual_hc,
+        ds4_gpu_tensor       *collapsed,
+        ds4_gpu_tensor       *normalized,
+        uint32_t              rows) {
+    const bool fuse_norm = DS4_N_HC == 4 &&
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_use_reference_hc_norm_decode() &&
+        getenv("DS4_GLM_DISABLE_HC_NORM_FUSE") == NULL;
+    if (!fuse_norm) {
+        return glm53_graph_hc_pre_rows(g, model, fn, scale, base, norm,
+                                       residual_hc, collapsed, normalized,
+                                       g->batch_hc_flat, g->batch_hc_mix,
+                                       g->batch_hc_split, NULL, rows);
+    }
+    const uint32_t hc_dim = DS4_N_HC * DS4_N_EMBD;
+    const uint32_t hc_mix = DS4_N_HC * (DS4_N_HC + 2u);
+    bool ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_hc_flat,
+                                                 residual_hc,
+                                                 hc_dim,
+                                                 rows,
+                                                 DS4_RMS_EPS) != 0;
+    if (ok) ok = glm53_graph_matmul_rows(g->batch_hc_mix,
+                                         model,
+                                         fn,
+                                         hc_dim,
+                                         hc_mix,
+                                         g->batch_hc_flat,
+                                         rows);
+    if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            collapsed,
+            normalized,
+            g->batch_hc_split,
+            g->batch_hc_mix,
+            residual_hc,
+            model->map,
+            model->size,
+            scale->abs_offset,
+            base->abs_offset,
+            norm->abs_offset,
+            DS4_N_EMBD,
+            DS4_N_HC,
+            DS4_N_HC_SINKHORN_ITER,
+            DS4_HC_EPS,
+            DS4_RMS_EPS) != 0;
+    return ok;
+}
+
+static bool glm53_graph_verify_rows(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           pos,
+        uint32_t           n,
+        float             *output_hc,
+        float             *logits_out) {
+    if (!model || !weights || !tokens ||
+        !glm53_graph_verify_rows_ready(g, pos, n)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (tokens[i] < 0 || tokens[i] >= (int)DS4_N_VOCAB) return false;
+    }
+    if (logits_out && !g->has_output_head) return false;
+    if (!glm_graph_batch_rows_ensure(g, n) ||
+        !glm53_graph_prefill_workspace_ensure(g, n)) return false;
+    const uint64_t plain_bytes = (uint64_t)n * DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_bytes = plain_bytes * DS4_N_HC;
+    ds4_gpu_tensor *cur = ds4_gpu_tensor_view(g->batch_cur, 0, plain_bytes);
+    ds4_gpu_tensor *next = ds4_gpu_tensor_view(g->batch_next, 0, plain_bytes);
+    ds4_gpu_tensor *after_attn =
+        ds4_gpu_tensor_view(g->batch_after_attn, 0, plain_bytes);
+    ds4_gpu_tensor *hc_cur = ds4_gpu_tensor_view(g->batch_hc_cur, 0, hc_bytes);
+    ds4_gpu_tensor *hc_next =
+        ds4_gpu_tensor_view(g->batch_hc_next, 0, hc_bytes);
+    ds4_gpu_tensor *hc_after_attn =
+        ds4_gpu_tensor_view(g->batch_hc_after_attn, 0, hc_bytes);
+    /* Everything up to the begin_commands below issues no GPU work, so a
+     * false return keeps the caller free to fall back to the batch path. */
+    if (!cur || !next || !after_attn || !hc_cur || !hc_next ||
+        !hc_after_attn ||
+        !glm_graph_upload_tokens(g->prefill_tokens, tokens, n)) {
+        ds4_gpu_tensor_free(hc_after_attn);
+        ds4_gpu_tensor_free(hc_next);
+        ds4_gpu_tensor_free(hc_cur);
+        ds4_gpu_tensor_free(after_attn);
+        ds4_gpu_tensor_free(next);
+        ds4_gpu_tensor_free(cur);
+        return false;
+    }
+    glm_graph_reset_prefill_seed_capture(g);
+    uint32_t failed_layer = UINT32_MAX;
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (ok) {
+        if (weights->token_embd->type == DS4_TENSOR_BF16) {
+            ok = ds4_gpu_glm53_embedding_bf16(cur,
+                                              model->map,
+                                              model->size,
+                                              weights->token_embd->abs_offset,
+                                              g->prefill_tokens,
+                                              n,
+                                              DS4_N_EMBD,
+                                              DS4_N_VOCAB) != 0;
+        } else {
+            ok = ds4_gpu_embed_tokens_quant_tensor(cur,
+                                                   g->prefill_tokens,
+                                                   model->map,
+                                                   model->size,
+                                                   weights->token_embd->abs_offset,
+                                                   weights->token_embd->type,
+                                                   DS4_N_VOCAB,
+                                                   n,
+                                                   DS4_N_EMBD) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_repeat_hc_rows_tensor(hc_cur,
+                                               cur,
+                                               n,
+                                               DS4_N_EMBD,
+                                               DS4_N_HC) != 0;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        failed_layer = il;
+        const ds4_layer_weights *l = &weights->layer[il];
+        const bool kda = ds4_glm53_layer_is_kda(il);
+        ok = glm53_graph_verify_hc_pre_rows(g,
+                                            model,
+                                            l->hc_attn_fn,
+                                            l->hc_attn_scale,
+                                            l->hc_attn_base,
+                                            l->attn_norm,
+                                            hc_cur,
+                                            cur,
+                                            g->batch_attn_norm,
+                                            n);
+        if (ok && kda) {
+            /* KDA: 3-kernel prefill chain; rows are sequential in-kernel.
+             * Cache writes: layer_kda_conv_state / layer_kda_recurrent_state
+             * (plus the armed per-step snapshot), same as the batch path. */
+            ok = glm53_graph_kda_attention_rows(g,
+                                                model,
+                                                l,
+                                                il,
+                                                pos,
+                                                n,
+                                                g->batch_attn_out);
+        } else if (ok) {
+            const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
+            const float rope_base = layer_rope_freq_base(il);
+            const float rope_scale = layer_rope_freq_scale(il);
+            ok = glm_graph_matmul_q8_0_tensor(g->batch_q_rank,
+                                              model,
+                                              l->attn_q_a->abs_offset,
+                                              DS4_N_EMBD,
+                                              DS4_N_LORA_Q,
+                                              g->batch_attn_norm,
+                                              n);
+            if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                    g->batch_q_rank_norm,
+                    g->batch_q_rank,
+                    model->map,
+                    model->size,
+                    l->attn_q_a_norm->abs_offset,
+                    DS4_N_LORA_Q,
+                    n,
+                    DS4_RMS_EPS) != 0;
+            if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_q,
+                                                      model,
+                                                      l->attn_q_b->abs_offset,
+                                                      DS4_N_LORA_Q,
+                                                      g->q_dim,
+                                                      g->batch_q_rank_norm,
+                                                      n);
+            if (ok && DS4_N_ROT != 0) ok = ds4_gpu_rope_tail_tensor(
+                    g->batch_q,
+                    n,
+                    DS4_N_HEAD,
+                    DS4_N_KEY_MLA,
+                    DS4_N_ROT,
+                    pos,
+                    0,
+                    false,
+                    rope_base,
+                    rope_scale,
+                    0.0f,
+                    1.0f,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+            /* Indexer K/gate + pooled store. Cache writes:
+             * layer_indexer_key_cache + layer_indexer_tail_k +
+             * layer_indexer_tail_gate. The indexer q/weights projection and
+             * score/top-k stages are skipped: pos+n is inside the dense
+             * window, so attention below is causal over [0, pos+row]. */
+            if (ok) ok = glm53_graph_matmul_rows(g->batch_indexer_k,
+                                                 model,
+                                                 l->indexer_attn_k,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_INDEXER_HEAD_DIM,
+                                                 g->batch_attn_norm,
+                                                 n);
+            if (ok) ok = glm53_graph_matmul_rows(g->batch_indexer_gate,
+                                                 model,
+                                                 l->indexer_compressor_gate,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_INDEXER_HEAD_DIM,
+                                                 g->batch_attn_norm,
+                                                 n);
+            if (ok) ok = ds4_gpu_glm53_indexer_pool_update_tensor(
+                    g->layer_indexer_key_cache[il],
+                    g->layer_indexer_tail_k[il],
+                    g->layer_indexer_tail_gate[il],
+                    g->batch_indexer_k,
+                    g->batch_indexer_gate,
+                    model->map,
+                    model->size,
+                    l->indexer_k_norm->abs_offset,
+                    l->indexer_k_norm_b->abs_offset,
+                    l->indexer_compressor_ape->abs_offset,
+                    pos,
+                    n,
+                    g->compact_cache_cap,
+                    DS4_N_INDEXER_HEAD_DIM,
+                    DS4_GLM53_INDEX_POOL_SIZE,
+                    1.0e-6f,
+                    glm_graph_compact_cache_is_f16()) != 0;
+            /* KV path + compact store. Cache writes: layer_kv_lora_cache +
+             * layer_k_rope_cache. */
+            if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_kv_raw,
+                                                      model,
+                                                      l->attn_kv_a_mqa->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      kv_raw_dim,
+                                                      g->batch_attn_norm,
+                                                      n);
+            if (ok) ok = ds4_gpu_glm_kv_lora_rms_norm_tensor(
+                    g->batch_kv_norm,
+                    g->batch_kv_raw,
+                    model->map,
+                    model->size,
+                    l->attn_kv_a_norm->abs_offset,
+                    n,
+                    kv_raw_dim,
+                    DS4_N_KV_LORA,
+                    DS4_RMS_EPS) != 0;
+            if (ok) ok = ds4_gpu_glm_store_compact_kv_tensor(
+                    g->layer_kv_lora_cache[il],
+                    g->layer_k_rope_cache[il],
+                    g->batch_kv_norm,
+                    g->batch_kv_raw,
+                    pos,
+                    n,
+                    g->compact_cache_cap,
+                    kv_raw_dim,
+                    DS4_N_KV_LORA,
+                    DS4_N_ROT,
+                    glm_graph_compact_cache_is_f16()) != 0;
+            if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
+                    g->batch_qk_low,
+                    g->batch_q,
+                    model->map,
+                    model->size,
+                    l->attn_k_b->abs_offset,
+                    l->attn_k_b->type,
+                    n,
+                    DS4_N_HEAD,
+                    DS4_N_KV_LORA,
+                    (uint32_t)g->q_nope,
+                    DS4_N_KEY_MLA) != 0;
+            /* Flash prefill needs >= 24 rows, so at n <= 8 the batch path
+             * always lands on the lora-causal kernel; mirror that. */
+            if (ok) ok = ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                    g->batch_attn_lora,
+                    g->batch_q,
+                    g->batch_qk_low,
+                    g->layer_kv_lora_cache[il],
+                    g->layer_k_rope_cache[il],
+                    n,
+                    pos,
+                    pos + n,
+                    g->compact_cache_cap,
+                    glm_graph_compact_cache_is_f16(),
+                    DS4_N_HEAD,
+                    DS4_N_KV_LORA,
+                    (uint32_t)g->q_nope,
+                    DS4_N_ROT,
+                    0,
+                    rope_base,
+                    rope_scale,
+                    0.0f,
+                    1.0f,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+                    g->batch_heads,
+                    g->batch_attn_lora,
+                    model->map,
+                    model->size,
+                    l->attn_v_b->abs_offset,
+                    l->attn_v_b->type,
+                    n,
+                    DS4_N_HEAD,
+                    DS4_N_KV_LORA,
+                    DS4_N_VALUE_MLA) != 0;
+            if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_attn_out,
+                                                      model,
+                                                      l->attn_output->abs_offset,
+                                                      g->heads_dim,
+                                                      DS4_N_EMBD,
+                                                      g->batch_heads,
+                                                      n);
+        }
+        if (ok) ok = ds4_gpu_hc_expand_split_tensor(hc_after_attn,
+                                                    g->batch_attn_out,
+                                                    hc_cur,
+                                                    g->batch_hc_split,
+                                                    DS4_N_EMBD,
+                                                    DS4_N_HC) != 0;
+        if (ok) ok = glm53_graph_verify_hc_pre_rows(g,
+                                                    model,
+                                                    l->hc_ffn_fn,
+                                                    l->hc_ffn_scale,
+                                                    l->hc_ffn_base,
+                                                    l->ffn_norm,
+                                                    hc_after_attn,
+                                                    after_attn,
+                                                    g->batch_ffn_norm,
+                                                    n);
+        if (ok) ok = glm_graph_encode_ffn_batch(g,
+                                                model,
+                                                weights,
+                                                l,
+                                                il,
+                                                pos,
+                                                after_attn,
+                                                next,
+                                                n,
+                                                false,
+                                                false,
+                                                false,
+                                                NULL,
+                                                NULL);
+        if (ok) ok = ds4_gpu_hc_expand_split_tensor(hc_next,
+                                                    next,
+                                                    hc_after_attn,
+                                                    g->batch_hc_split,
+                                                    DS4_N_EMBD,
+                                                    DS4_N_HC) != 0;
+        if (ok) {
+            ds4_gpu_tensor *tmp = hc_cur;
+            hc_cur = hc_next;
+            hc_next = tmp;
+        }
+        if (ok && g_glm_dflash_cap.enabled) {
+            ok = glm_dflash_capture_rows(g, hc_cur, il, n);
+        }
+        /* Commit-without-wait every 8 layers so CPU encoding overlaps GPU
+         * execution instead of adding to it serially. */
+        if (ok && il < g->layer_end &&
+            ((il - g->layer_start + 1u) % 8u) == 0u) {
+            ok = ds4_gpu_flush_commands() != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: GLM-5.3 verify rows failed at layer %u (pos %u, rows %u)\n",
+                failed_layer, pos, n);
+    }
+    if (ok && output_hc) {
+        ok = ds4_gpu_tensor_read(hc_cur,
+                                 0,
+                                 output_hc,
+                                 (uint64_t)n * DS4_N_HC * DS4_N_EMBD *
+                                     sizeof(float)) != 0;
+    }
+    if (ok && logits_out) {
+        ds4_gpu_tensor *last_hc = glm_graph_tensor_row_view_strided(
+                hc_cur,
+                n - 1u,
+                (uint64_t)DS4_N_HC * DS4_N_EMBD,
+                (uint64_t)DS4_N_HC * DS4_N_EMBD);
+        ok = last_hc != NULL &&
+             ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
+                                            last_hc,
+                                            g->hc_mean_weights,
+                                            DS4_N_EMBD,
+                                            DS4_N_HC) != 0;
+        ds4_gpu_tensor_free(last_hc);
+        if (ok) ok = glm_graph_forward_output_head(g, model, weights,
+                                                   g->hc_output, logits_out);
+    }
+    ds4_gpu_tensor_free(hc_after_attn);
+    ds4_gpu_tensor_free(hc_next);
+    ds4_gpu_tensor_free(hc_cur);
+    ds4_gpu_tensor_free(after_attn);
+    ds4_gpu_tensor_free(next);
+    ds4_gpu_tensor_free(cur);
+    return ok;
+}
+#endif /* __APPLE__ && !DS4_NO_GPU */
+
 typedef struct {
     uint32_t dst_row;
     uint32_t src_row;
@@ -50086,6 +50705,11 @@ static bool glm_graph_forward_tokens(
         !glm_graph_span_fits_context(g, pos0, n_tokens)) {
         return false;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool dflash_seed_armed =
+        !g_glm_dflash_cap.enabled && g->glm53 &&
+        glm_dflash_seed_chunk_begin(n_tokens);
+#endif
     if (!glm_graph_span_fits_full_attention(g, pos0, n_tokens)) {
         glm_graph_log_full_attention_limit(g, pos0, n_tokens);
         return false;
@@ -51123,6 +51747,11 @@ glm53_batch_attention_done:
                 hc_cur = hc_next;
                 hc_next = tmp;
             }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && g_glm_dflash_cap.enabled) {
+                ok = glm_dflash_capture_rows(g, hc_cur, il, n_tokens);
+            }
+#endif
         } else if (ok) {
             ds4_gpu_tensor *tmp = cur;
             cur = next;
@@ -51421,6 +52050,11 @@ glm53_batch_attention_done:
                 pos0,
                 n_tokens);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (dflash_seed_armed) {
+        glm_dflash_seed_chunk_end(n_tokens, pos0 + n_tokens, ok);
+    }
+#endif
     return ok;
 }
 
@@ -51506,6 +52140,12 @@ static bool glm_graph_forward_indexed_tokens(
         !glm_graph_span_fits_context(g, pos0, n_tokens)) {
         return false;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool dflash_seed_armed =
+        !g_glm_dflash_cap.enabled && g->glm53 &&
+        glm_dflash_seed_chunk_begin(n_tokens);
+#endif
+    if (!glm_graph_batch_rows_ensure(g, n_tokens)) return false;
     if (g->glm53 && !glm53_graph_prefill_workspace_ensure(g, n_tokens)) {
         return false;
     }
@@ -53008,6 +53648,11 @@ glm53_indexed_attention_done:
                 hc_cur = hc_next;
                 hc_next = tmp;
             }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && g_glm_dflash_cap.enabled) {
+                ok = glm_dflash_capture_rows(g, hc_cur, il, n_tokens);
+            }
+#endif
         } else if (ok) {
             ds4_gpu_tensor *tmp = cur;
             cur = next;
@@ -53242,6 +53887,11 @@ glm53_indexed_attention_done:
     ds4_gpu_tensor_free(cur_view);
     glm_vision_overlay_free(&vision_overlay);
     ds4_gpu_set_glm_streaming_prefill_full_layer(false);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (dflash_seed_armed) {
+        glm_dflash_seed_chunk_end(n_tokens, pos0 + n_tokens, ok);
+    }
+#endif
     return ok;
 }
 
@@ -54816,6 +55466,11 @@ glm53_attention_done:
                 g->hc_cur = g->hc_next;
                 g->hc_next = tmp;
             }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && g_glm_dflash_cap.enabled) {
+                ok = glm_dflash_capture_rows(g, g->hc_cur, il, 1);
+            }
+#endif
         } else if (ok) {
             ok = glm_graph_encode_ffn_one_normed_from(g,
                                                       model,
@@ -56585,6 +57240,18 @@ struct ds4_session {
     /* GLM MTP speculative state.  parent is the token that conditioned the
      * pending point-mass draft; sampled decoding discards a draft when its
      * boundary token differs from that parent. */
+    ds4_dflash_cache dflash_cache;
+    float *dflash_pending;          /* [rows][n_target*embd] verify features */
+    uint32_t dflash_pending_rows;
+    uint32_t dflash_pending_cap;
+    int dflash_warm;
+    float dflash_ema;               /* EMA of committed tokens per cycle */
+    uint32_t dflash_lowrun;         /* cycles spent in low-acceptance mode */
+    uint32_t dflash_probe_fails;    /* consecutive failed probes (backoff) */
+    uint32_t dflash_cycles;         /* full speculation cycles run */
+    uint32_t dflash_last_pos;       /* rewind detector (server slot reuse) */
+    float dflash_cycle_ms;          /* EMA of full-cycle wall time */
+    float dflash_serial_ms;         /* EMA of serial fallback token time */
     int glm_mtp_draft;
     int glm_mtp_parent;
     int glm_mtp_have;
@@ -58490,6 +59157,8 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        if (e->dflash_ready && !getenv("DS4_DFLASH_DISABLE"))
+            return (int)e->dflash_weights.block_size;
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
@@ -65700,7 +66369,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
-    if (opt->mtp_path && opt->mtp_path[0] &&
+    if (opt->dflash_path && opt->dflash_path[0] &&
+        opt->distributed.role == DS4_DISTRIBUTED_NONE &&
+        e->backend != DS4_BACKEND_CPU) {
+        model_open(&e->dflash_model, opt->dflash_path, graph_backend, true);
+        if (dflash2_bind(&e->dflash_weights, &e->dflash_model) &&
+            e->dflash_weights.n_embd == DS4_N_EMBD &&
+            ds4_model_is_glm53() &&
+            ds4_gpu_set_model_map_range(e->dflash_model.map,
+                                        e->dflash_model.size,
+                                        0,
+                                        e->dflash_model.size,
+                                        0) &&
+            dflash_pool_init(e->dflash_weights.n_embd)) {
+            e->dflash_ready = true;
+            glm_dflash_seed_configure(&e->dflash_weights);
+#if defined(__APPLE__)
+            dflash2_golden_selftest(&e->dflash_model, &e->dflash_weights,
+                                    &e->model, &e->weights);
+#endif
+            fprintf(stderr,
+                    "ds4: DFlash%s draft model loaded: %s "
+                    "(layers=%u block=%u targets=%u window=%u)\n",
+                    e->dflash_weights.classic ? "" : "2",
+                    opt->dflash_path,
+                    e->dflash_weights.n_layer,
+                    e->dflash_weights.block_size,
+                    e->dflash_weights.n_target,
+                    e->dflash_weights.sliding_window);
+        } else {
+            fprintf(stderr, "ds4: --dflash model rejected: %s\n",
+                    opt->dflash_path);
+            model_close(&e->dflash_model);
+        }
+    }
+        if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
         if (e->ssd_streaming) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
@@ -67514,6 +68217,9 @@ void ds4_session_free(ds4_session *s) {
     free(s->logits);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
+    dflash_cache_free(&s->dflash_cache);
+    free(s->dflash_pending);
+    s->dflash_pending = NULL;
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
 #endif
@@ -67850,10 +68556,19 @@ static int ds4_session_glm_spec_cycle_impl(
     int toks[2] = { first_token, d };
     bool verified = false;
     bool state_saved = false;
+    bool rowsnap_ready = false;
     if (g->glm53) {
         state_saved = glm_graph_mtp_ensure(g) &&
                     glm53_graph_copy_spec_state(g, true);
         if (state_saved) {
+#if defined(DS4_GLM53_KDA_ROWSNAP)
+            const bool rowsnap_armed = glm53_graph_rowsnap_enabled() &&
+                g->mtp_kda_rowsnap != NULL &&
+                e->backend != DS4_BACKEND_CPU;
+            if (rowsnap_armed) {
+                ds4_gpu_glm53_kda_rowsnap_begin(g->mtp_kda_rowsnap, 0);
+            }
+#endif
             if (!glm53_graph_use_indexed_prefill(g) &&
                 glm_graph_span_fits_full_attention(g, pos, 2u)) {
                 verified = glm_graph_forward_tokens(g,
@@ -67890,6 +68605,13 @@ static int ds4_session_glm_spec_cycle_impl(
                                                              0,
                                                              2);
             }
+#if defined(DS4_GLM53_KDA_ROWSNAP)
+            ds4_gpu_glm53_kda_rowsnap_end();
+            rowsnap_ready = verified &&
+                glm53_graph_rowsnap_enabled() &&
+                g->mtp_kda_rowsnap != NULL &&
+                e->backend != DS4_BACKEND_CPU;
+#endif
         }
     } else if (pos + 2u <= glm_graph_indexer_top_k_limit()) {
         /* GLM-5.2 verification must use the compact caches populated by
@@ -68025,16 +68747,38 @@ static int ds4_session_glm_spec_cycle_impl(
     } else {
         bool replay_ok = true;
         if (g->glm53) {
-            replay_ok = glm53_graph_copy_spec_state(g, false) &&
-                        glm_graph_forward_token(g,
-                                                &e->model,
-                                                &e->weights,
-                                                first_token,
-                                                NULL,
-                                                pos,
-                                                NULL,
-                                                s->logits,
-                                                false);
+            bool rowsnap_done = false;
+#if defined(DS4_GLM53_KDA_ROWSNAP)
+            /* The row-boundary snapshot covers the KDA conv/recurrent state
+             * only, while the speculative save/restore also covers the indexer
+             * tail K+gate ring. The fast path is therefore sound only when the
+             * two cover the same bytes (no full-indexer layers in this graph);
+             * otherwise fall back to the full restore + replay below. */
+            if (rowsnap_ready &&
+                glm53_graph_spec_state_bytes(g) ==
+                    glm53_graph_kda_state_bytes(g) &&
+                glm53_graph_restore_kda_rowsnap(g)) {
+                /* KDA state restored to the row-0 boundary captured inside
+                 * the verify forward; row-0 logits already came through the
+                 * shared head. The accepted-prefix replay forward is
+                 * unnecessary. */
+                memcpy(s->logits, s->glm_mtp_logits0,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
+                rowsnap_done = true;
+            }
+#endif
+            if (!rowsnap_done) {
+                replay_ok = glm53_graph_copy_spec_state(g, false) &&
+                            glm_graph_forward_token(g,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    first_token,
+                                                    NULL,
+                                                    pos,
+                                                    NULL,
+                                                    s->logits,
+                                                    false);
+            }
         } else {
             memcpy(s->logits, s->glm_mtp_logits0,
                    (size_t)DS4_N_VOCAB * sizeof(float));
@@ -68113,6 +68857,7 @@ static int ds4_session_glm_spec_cycle_impl(
         free(dt);
         free(nt);
     }
+    (void)rowsnap_ready;
     if (g->glm53 && state_saved && n_committed == 2) {
         s->glm_mtp_rollback_pos = pos;
         s->glm_mtp_rollback_dense_len = dense_before;
@@ -68151,6 +68896,8 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     s->glm_mtp_have = 0;
     return ok;
 }
+
+#include "ds4_dflash_glm.inc"
 
 static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
                                       int *accepted, int accepted_cap,
@@ -76539,6 +77286,14 @@ static int ds4_session_eval_speculative_argmax_impl(
             accepted[0] = first_token;
             return 1;
         }
+#if defined(__APPLE__)
+        if (s->engine->dflash_ready && s->glm_graph_ready &&
+            !s->engine->tp.active) {
+            return ds4_session_glm_dflash_cycle_argmax(s, first_token,
+                                                       accepted, accepted_cap,
+                                                       err, errlen);
+        }
+#endif
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
             s->glm_graph_ready) {
             if (ds4_session_tp_leader(s)) {
@@ -77380,6 +78135,14 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 #else
     ds4_engine *e = s->engine;
     if (ds4_session_is_glm(s)) {
+#if defined(__APPLE__)
+        if (e && e->dflash_ready && !getenv("DS4_DFLASH_DISABLE") &&
+            s->glm_graph_ready && !e->tp.active) {
+            return ds4_session_glm_dflash_cycle_impl(
+                    s, first_token, temperature, top_k, top_p, min_p, rng,
+                    accepted, accepted_cap, err, errlen);
+        }
+#endif
         if (!e || !e->glm_mtp || DS4_N_NEXTN_PREDICT == 0 ||
             !s->glm_graph_ready ||
             (e->dspark_exact_sampling && e->tp.active)) {
