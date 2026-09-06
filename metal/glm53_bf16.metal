@@ -601,3 +601,430 @@ kernel glm53_mul_mm_bf16_t kernel_mul_mm<
         half, half2x4, simdgroup_half8x8,
         glm53_bf16_block16, 1, glm53_dequantize_bf16,
         half, half4x4, float, float2x4>;
+
+/* ===================================================================
+ * Prefill split-K for the parallelism-starved BF16 low-rank GEMMs.
+ *
+ * kernel_glm53_mul_mm_bf16_f32 (the kernel_mul_mm instantiation above) is a
+ * 64x32x32 simdgroup_half8x8 tile on a grid of ceil(n/32) x ceil(out_dim/64)
+ * threadgroups. GLM-5.3's BF16 prefill callers are tiny-M, huge-K:
+ * the hyper-connection mixer (16384 -> 24, 90 dispatches per prefill, 4
+ * threadgroups), the KDA decay/gate low-rank pair f_a and g_a and the DSA
+ * indexer k / pool_gate (4096 -> 128, 90 dispatches, 8 threadgroups) and the
+ * KDA beta head vector (4096 -> 64, 34 dispatches, 4 threadgroups). At 111
+ * tokens that grid is 4-8 threadgroups of 128 threads on an 80-core machine,
+ * and each of them walks the whole inner dimension in 128 (or 512) serial
+ * k-steps whose device load for the next A tile is never overlapped with
+ * anything: the measured cost is ~1.2 us per k-step, i.e. one exposed memory
+ * latency per step, and 472 us per dispatch on average -- 7% of a 111-token
+ * prefill for 0.25 GFLOP/token (Phase 1 report section 6).
+ *
+ * Widening the grid along the token axis (a narrower NR1) does not touch that
+ * chain: it makes more threadgroups, each still 128 or 512 steps long, and the
+ * measured per-dispatch cost of this kernel is flat in the threadgroup count
+ * (472 us at n=111 with 4 threadgroups, 475 us at n=512 with 16). The chain
+ * itself has to be cut, which is what split-K does: slice the inner dimension
+ * into n_slices independent runs, give each its own threadgroup, and sum the
+ * partials afterwards. Every slice keeps the production tile: the same
+ * dequantize-to-half staging, the same double simdgroup_barrier, the same
+ * simdgroup_multiply_accumulate order over its own k range, so a partial is
+ * exactly the production kernel restricted to [k0, kend).
+ *
+ * The reduce sums each output element's slices in fixed ascending slice order,
+ * so the result is reproducible run to run, but the accumulation is n_slices
+ * partial chains instead of one -- this is a floating-point reassociation
+ * (Tier 2 in bench/FIDELITY.md), registered with the DS4_GLM_EXACT umbrella
+ * and killable with DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK=1.
+ *
+ * Partials are slice-major: slice s owns a whole [n_rows][out_dim] float
+ * plane, so the tile epilogue is the production one with the destination
+ * shifted by s*ne1*ne0, and the reduce's threads read consecutive addresses
+ * within each slice (the section 3.13d contiguity rule applies to the lane's
+ * own run of slots; here the run is across threads, and slice-major is what
+ * makes THAT coalesced).
+ * =================================================================== */
+struct glm53_bf16_mm_splitk_args {
+    int32_t  ne00;      /* inner dimension                                 */
+    uint64_t nb01;      /* weight row stride in bytes (in_dim * 2)         */
+    uint64_t nb11;      /* activation row stride in bytes (in_dim * 4)     */
+    int32_t  ne0;       /* out_dim                                         */
+    int32_t  ne1;       /* n_rows (tokens)                                 */
+    uint32_t n_slices;
+    uint32_t k_per;     /* inner elements per slice; multiple of 32        */
+};
+
+kernel void kernel_glm53_mul_mm_bf16_f32_splitk(
+        constant glm53_bf16_mm_splitk_args & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const uint slice = tgpig.z;
+    const int  r0 = (int)tgpig.y*NR0;
+    const int  r1 = (int)tgpig.x*NR1;
+
+    const int k0 = (int)(slice * args.k_per);
+    if (k0 >= args.ne00) return;
+    const int kend = min(k0 + (int)args.k_per, args.ne00);
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (short)(args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (short)(args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    /* one glm53_bf16_block16 is 16 BF16 weights, so the slice's first block is
+     * k0/16 (k_per is a multiple of 32, so this is exact) */
+    device const glm53_bf16_block16 * x =
+        (device const glm53_bf16_block16 *)(src0 + args.nb01*(uint)(r0 + lr0))
+        + (k0/16) + il0;
+
+    const short iy = 8*(tiitg % NL1);
+    device const float * y =
+        (device const float *)(src1 + args.nb11*(uint)(r1 + lr1)) + (k0 + iy);
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_half8x8  mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = k0; loop_k < kend; loop_k += NK) {
+        half4x4 temp_a;
+        glm53_dequantize_bf16(x, 0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            const short ib = 4*sx + sy;
+
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) =
+                (half2x4)(*((device float2x4 *) y));
+        }
+
+        x += 2;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    /* slice-major partial plane */
+    const ulong plane = (ulong)args.ne1 * (ulong)args.ne0;
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) + \
+            (r1 + 16*(sgitg >> 1)) * args.ne0 + (ulong)slice*plane;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + (ulong)slice*plane;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
+/* Prefill lever 28, pass SCALE (item ii): kernel_glm53_mul_mm_bf16_f32_splitk
+ * with a per-row RMS scale applied at the existing F32-to-F16 RHS staging
+ * boundary, so the HC mixer can read the raw HC row and the RMSNorm that used
+ * to materialize a second 64 KB normalized copy of it only has to publish one
+ * float per row.
+ *
+ * Every other line is the shipped kernel's, character for character (this
+ * source was generated from it by three edits: the extra buffer, the row_scale
+ * fetch beside the y pointer, and the staging store).  The staged half values
+ * are identical to the shipped pair's because the shipped pair rounds x*scale
+ * in F32 inside kernel_rms_norm_fuse_impl, stores it, and reloads it here
+ * before the same F32-to-F16 narrowing -- the same lane-wise F32 product, and
+ * nothing between the two can contract it into the MMA.  The clamped row index
+ * r1 + lr1 is the one the y pointer itself uses, so a partially filled token
+ * tile reads the same row's scale as its data.  Same pattern as
+ * kernel_mul_mm_f16_f32_scaled in metal/dense.metal.
+ *
+ * With args.n_slices == 1 this is the whole-K tile and the host writes it
+ * straight to the destination with no reduce, which is what makes it usable in
+ * exact mode where the split-K reassociation is off: slice 0's plane offset is
+ * zero, and the body is kernel_mul_mm's BF16 instantiation (nl == 1, so that
+ * template's `il` never advances and its `x` steps by 2 blocks per NK, exactly
+ * as this one does).
+ */
+kernel void kernel_glm53_mul_mm_bf16_f32_splitk_scale(
+        constant glm53_bf16_mm_splitk_args & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const float * scales,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const uint slice = tgpig.z;
+    const int  r0 = (int)tgpig.y*NR0;
+    const int  r1 = (int)tgpig.x*NR1;
+
+    const int k0 = (int)(slice * args.k_per);
+    if (k0 >= args.ne00) return;
+    const int kend = min(k0 + (int)args.k_per, args.ne00);
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (short)(args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (short)(args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    /* one glm53_bf16_block16 is 16 BF16 weights, so the slice's first block is
+     * k0/16 (k_per is a multiple of 32, so this is exact) */
+    device const glm53_bf16_block16 * x =
+        (device const glm53_bf16_block16 *)(src0 + args.nb01*(uint)(r0 + lr0))
+        + (k0/16) + il0;
+
+    const short iy = 8*(tiitg % NL1);
+    device const float * y =
+        (device const float *)(src1 + args.nb11*(uint)(r1 + lr1)) + (k0 + iy);
+    const float row_scale = scales[r1 + lr1];
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_half8x8  mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = k0; loop_k < kend; loop_k += NK) {
+        half4x4 temp_a;
+        glm53_dequantize_bf16(x, 0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            const short ib = 4*sx + sy;
+
+            const float2x4 raw = *((device float2x4 *) y);
+            float2x4 scaled;
+            scaled[0] = raw[0] * row_scale;
+            scaled[1] = raw[1] * row_scale;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = (half2x4)scaled;
+        }
+
+        x += 2;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    /* slice-major partial plane */
+    const ulong plane = (ulong)args.ne1 * (ulong)args.ne0;
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) + \
+            (r1 + 16*(sgitg >> 1)) * args.ne0 + (ulong)slice*plane;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + (ulong)slice*plane;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
+/* Fixed ascending slice order, one thread per output element (float4 per
+ * thread when the element count allows -- the per-element summation order is
+ * identical either way, so the two paths agree bit for bit). */
+kernel void kernel_glm53_mul_mm_bf16_splitk_reduce(
+        constant glm53_bf16_mm_splitk_args & args,
+        device const float * partials,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = (uint)args.ne0 * (uint)args.ne1;
+    if ((n & 3u) == 0u) {
+        const uint n4 = n >> 2;
+        if (gid >= n4) return;
+        device const float4 *p = (device const float4 *)partials + gid;
+        float4 sum = 0.0f;
+        for (uint s = 0; s < args.n_slices; s++) {
+            sum += p[(ulong)s * n4];
+        }
+        ((device float4 *)out)[gid] = sum;
+    } else {
+        if (gid >= n) return;
+        device const float *p = partials + gid;
+        float sum = 0.0f;
+        for (uint s = 0; s < args.n_slices; s++) {
+            sum += p[(ulong)s * n];
+        }
+        out[gid] = sum;
+    }
+}

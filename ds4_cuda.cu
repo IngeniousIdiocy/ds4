@@ -28517,6 +28517,30 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
     return cuda_ok(cudaGetLastError(), "glm attn lora selected launch");
 }
 
+/* The pooled selection contract (see ds4_gpu.h).  This backend has no kernel
+ * that exploits a guaranteed prefix, so it bounds-tests every row exactly like
+ * ..._batch_lora_tensor. */
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_pooled_tensor(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens, uint32_t n_selected, uint32_t guaranteed_prefix,
+        uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    (void)guaranteed_prefix;
+    return ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+        lora_out, q, qk_low, kv_lora_cache, k_rope_cache, selected,
+        n_tokens, n_selected, cache_cap, cache_f16, n_head, kv_lora_dim,
+        qk_nope, qk_rope, n_ctx_orig, freq_base, freq_scale, ext_factor,
+        attn_factor, beta_fast, beta_slow);
+}
+
 extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         ds4_gpu_tensor *lora_out,
         const ds4_gpu_tensor *q,
@@ -28582,6 +28606,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         const ds4_gpu_tensor *selected,
         uint32_t              n_selected,
         bool                  selected_rows_valid,
+        uint32_t              guaranteed_prefix,
         uint32_t              cache_cap,
         bool                  cache_f16,
         uint32_t              n_head,
@@ -28598,6 +28623,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow) {
+    (void)guaranteed_prefix;
     fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor\n");
     return 0;
 }

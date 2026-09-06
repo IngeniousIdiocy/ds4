@@ -617,6 +617,177 @@ kernel void kernel_dsv4_hc_split_weighted_sum_norm4(
     }
 }
 
+// Prefill lever 28, pass COLLAPSE: the batched HC collapse and the weighted
+// RMSNorm that follows it, in one pass, with the collapsed row held in
+// REGISTERS rather than in threadgroup memory.
+//
+// kernel_dsv4_hc_split_weighted_sum_norm4 above does the same fusion for
+// decode, but it stages the whole n_embd row in threadgroup memory (16 KB at
+// n_embd 4096), which prefill lever 18 measured to be far past the occupancy
+// step this kernel wants.  Here the host is required to dispatch exactly
+// n_embd/4 threads per row, so each thread owns exactly one float4 of the
+// collapsed row and can keep it in a register from the collapse to the norm
+// epilogue; threadgroup memory is 4 floats for the pre gates plus the 32-slot
+// reduction exchange, i.e. 144 bytes.
+//
+// Every value is the shipped pair's value, evaluated in the shipped order:
+//  * the split/Sinkhorn tail on lane 0 is kernel_dsv4_hc_split_weighted_sum's,
+//    verbatim;
+//  * the collapse accumulates the four HC streams in ascending stream order
+//    into an accumulator that starts at zero, which is that kernel's per-element
+//    `acc = 0; acc += x_k * pre_k` widened to four lanes;
+//  * the reduction, the mean, the scale and the weighted store are
+//    kernel_rms_norm_fuse_impl<float4,2>'s, and with ne00_t == ntg == n_embd/4
+//    its thread t owns float4 index t only -- the same one element this thread
+//    holds.
+kernel void kernel_dsv4_hc_split_wsum_norm_reg(
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & args,
+        device  const char  * mixes,
+        device  const float * scale,
+        device  const float * base,
+        device  const char  * x,
+        device        char  * split,
+        device        char  * dst,
+        device  const char  * norm_weight,
+        device        char  * norm_dst,
+        threadgroup   float * shared [[threadgroup(0)]],
+        uint   row   [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    if ((int64_t)row >= args.n_rows || args.n_hc != 4 ||
+        (args.n_embd & 3) != 0 || args.n_rows <= 1) {
+        return;
+    }
+
+    const uint n_embd = uint(args.n_embd);
+    const uint n4 = n_embd >> 2;
+    if ((uint)ntg != n4) {
+        return;
+    }
+
+    threadgroup float *pre_shmem = shared;
+    threadgroup float *sum_shmem = pre_shmem + 4;
+
+    device const float *mix = (device const float *)(mixes + (uint64_t)row * args.nb_mix1);
+    device float *out = (device float *)(split + (uint64_t)row * args.nb_split1);
+
+    if (sgitg == 0) {
+        sum_shmem[tiisg] = 0.0f;
+    }
+
+    if (tid == 0) {
+        const float epsv = args.eps;
+        const float pre_scale = scale[0];
+        const float post_scale = scale[1];
+        const float comb_scale = scale[2];
+
+        const float4 pre_z =
+            *((device const float4 *)mix) * pre_scale +
+            *((device const float4 *)base);
+        const float4 pre = 1.0f / (1.0f + exp(-pre_z)) + epsv;
+        *((device float4 *)out) = pre;
+        pre_shmem[0] = pre.x;
+        pre_shmem[1] = pre.y;
+        pre_shmem[2] = pre.z;
+        pre_shmem[3] = pre.w;
+
+        const float4 post_z =
+            *((device const float4 *)(mix + 4)) * post_scale +
+            *((device const float4 *)(base + 4));
+        *((device float4 *)(out + 4)) = 2.0f / (1.0f + exp(-post_z));
+
+        float4 r0 =
+            *((device const float4 *)(mix + 8)) * comb_scale +
+            *((device const float4 *)(base + 8));
+        float4 r1 =
+            *((device const float4 *)(mix + 12)) * comb_scale +
+            *((device const float4 *)(base + 12));
+        float4 r2 =
+            *((device const float4 *)(mix + 16)) * comb_scale +
+            *((device const float4 *)(base + 16));
+        float4 r3 =
+            *((device const float4 *)(mix + 20)) * comb_scale +
+            *((device const float4 *)(base + 20));
+
+        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
+        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
+        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
+        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
+
+        r0 = exp(r0 - m0);
+        r1 = exp(r1 - m1);
+        r2 = exp(r2 - m2);
+        r3 = exp(r3 - m3);
+
+        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
+        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
+        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
+        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
+
+        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col_inv;
+        r1 *= col_inv;
+        r2 *= col_inv;
+        r3 *= col_inv;
+
+        for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
+            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+
+            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+            r0 *= col_inv;
+            r1 *= col_inv;
+            r2 *= col_inv;
+            r3 *= col_inv;
+        }
+
+        *((device float4 *)(out + 8)) = r0;
+        *((device float4 *)(out + 12)) = r1;
+        *((device float4 *)(out + 16)) = r2;
+        *((device float4 *)(out + 20)) = r3;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint i = (uint)tid;
+    device const float4 *x0 = (device const float4 *)(x + 0 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+    device const float4 *x1 = (device const float4 *)(x + 1 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+    device const float4 *x2 = (device const float4 *)(x + 2 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+    device const float4 *x3 = (device const float4 *)(x + 3 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+    // Preserve the standalone HC collapse's explicit accumulation order.
+    float4 v = 0.0f;
+    v += x0[i] * pre_shmem[0];
+    v += x1[i] * pre_shmem[1];
+    v += x2[i] * pre_shmem[2];
+    v += x3[i] * pre_shmem[3];
+
+    float sumf = dot(v, v);
+
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sum_shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = sum_shmem[tiisg];
+    sumf = simd_sum(sumf);
+
+    // Batched shape only (the host refuses n_rows == 1), so this is
+    // kernel_rms_norm_fuse_impl's 1.0f/sqrt form.
+    const float norm_scale = 1.0f / sqrt(sumf / float(n_embd) + args.norm_eps);
+
+    device float4 *dst4 = (device float4 *)(dst + (uint64_t)row * args.nb1);
+    device const float4 *w4 = (device const float4 *)norm_weight;
+    device float4 *norm4 = (device float4 *)(norm_dst + (uint64_t)row * args.nb_norm1);
+    dst4[i] = v;
+    norm4[i] = (v * norm_scale) * w4[i];
+}
+
 // Expands an embedding-sized block back into HC channels after attention/FFN.
 // The post gate scales the current block, while the Sinkhorn combination matrix
 // mixes residual HC channels from the previous state.
@@ -698,6 +869,168 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
         *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+    }
+}
+
+// Prefill lever 20, fold HCEXPAND: width-4 form of kernel_dsv4_hc_expand4.
+// One thread owns four consecutive embedding lanes instead of one.  The five
+// activation streams (block, four residual HC streams) and the four output
+// streams then move in 16-byte accesses, and the twenty per-token broadcast
+// scalars (post[4] and comb[4][4]) are fetched once per four lanes instead of
+// once per lane.  Every lane evaluates the SAME expression in the SAME order
+// as the scalar kernel — a float4 multiply by a broadcast scalar is the scalar
+// multiply per component, and the four `acc +=` steps keep their order — so
+// the output is bit-identical.  The host selects this variant only when every
+// stream is contiguous along the embedding axis (nb*0 == sizeof(float)),
+// n_embd is a multiple of four and every base offset is 16-byte aligned.
+kernel void kernel_dsv4_hc_expand4_w4(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * block_add,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) {
+        return;
+    }
+
+    const int64_t n_embd4 = args.n_embd >> 2;
+    const int64_t n_elem  = n_embd4 * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d4 = ((int64_t) gid) % n_embd4;
+    const int64_t t  = ((int64_t) gid) / n_embd4;
+
+    float4 block_v = ((device const float4 *) (block_out + t*args.nb_block1))[d4];
+    if (args.has_add) {
+        block_v += ((device const float4 *) (block_add + t*args.nb_add1))[d4];
+    }
+
+    device const char * res_t = residual + t*args.nb_res2;
+    const float4 r0 = ((device const float4 *) (res_t + 0*args.nb_res1))[d4];
+    const float4 r1 = ((device const float4 *) (res_t + 1*args.nb_res1))[d4];
+    const float4 r2 = ((device const float4 *) (res_t + 2*args.nb_res1))[d4];
+    const float4 r3 = ((device const float4 *) (res_t + 3*args.nb_res1))[d4];
+
+    device const char * post_t = post + t*args.nb_post1;
+    device const char * comb_t = comb + t*args.nb_comb2;
+
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float4 acc = block_v * *((device const float *) (post_t + dst_hc*args.nb_post0));
+
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 0*args.nb_comb1)) * r0;
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 1*args.nb_comb1)) * r1;
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 2*args.nb_comb1)) * r2;
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 3*args.nb_comb1)) * r3;
+
+        ((device float4 *) (dst + dst_hc*args.nb1 + t*args.nb2))[d4] = acc;
+    }
+}
+
+// Prefill lever 28, pass SCALE: kernel_dsv4_hc_expand4_w4 with the RMS
+// reduction of the norm that immediately follows it folded in.
+//
+// The shipped chain writes the expanded HC row, then kernel_rms_norm_f32_4
+// reads all 16384 floats of it back and writes a second, normalized copy of
+// the same size, which only the HC mixer reads.  This kernel keeps the row in
+// registers between the two: one threadgroup of n_embd/4 threads owns one
+// token, thread t computes the four HC output float4s at embedding lanes
+// 4t..4t+3 exactly as _w4 does, and accumulates dot(v,v) over the flat HC
+// row's float4 indices t, t+n4, t+2*n4, t+3*n4.  That is precisely the set,
+// and the ascending order, that kernel_rms_norm_fuse_impl's thread t visits
+// when the host hands it ne00_t = n_embd*n_hc/4 elements and n_embd/4 threads
+// (ds4_gpu_rms_norm_threads(16384) == 1024 == 4096/4), so the reduction tree,
+// the simd_sum calls, the 32-slot threadgroup exchange and the scale
+// expression below are that kernel's, verbatim.  Only ONE float per row is
+// written instead of the 64 KB normalized row; the HC mixer applies the scale
+// while staging its RHS tile.
+//
+// Threadgroup memory: 32 floats, the same 128 bytes rms_norm_f32_4 asks for.
+kernel void kernel_dsv4_hc_expand4_w4_scale(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char  * block_out,
+        device  const char  * residual,
+        device  const char  * post,
+        device  const char  * comb,
+        device  const char  * block_add,
+        device        char  * dst,
+        device        float * dst_scale,
+        constant      float & norm_eps,
+        threadgroup   float * shmem_f32 [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    // Uniform gates: every thread of the threadgroup takes the same branch.
+    if (args.n_hc != 4 || (args.n_embd & 3) != 0) {
+        return;
+    }
+    const int64_t n_embd4 = args.n_embd >> 2;
+    if ((int64_t) ntg != n_embd4 || (int64_t) tgpig >= args.n_tokens) {
+        return;
+    }
+
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int64_t t  = (int64_t) tgpig;
+    const int64_t d4 = (int64_t) tpitg;
+
+    float4 block_v = ((device const float4 *) (block_out + t*args.nb_block1))[d4];
+    if (args.has_add) {
+        block_v += ((device const float4 *) (block_add + t*args.nb_add1))[d4];
+    }
+
+    device const char * res_t = residual + t*args.nb_res2;
+    const float4 r0 = ((device const float4 *) (res_t + 0*args.nb_res1))[d4];
+    const float4 r1 = ((device const float4 *) (res_t + 1*args.nb_res1))[d4];
+    const float4 r2 = ((device const float4 *) (res_t + 2*args.nb_res1))[d4];
+    const float4 r3 = ((device const float4 *) (res_t + 3*args.nb_res1))[d4];
+
+    device const char * post_t = post + t*args.nb_post1;
+    device const char * comb_t = comb + t*args.nb_comb2;
+
+    // The four HC streams are visited in ascending dst_hc, which is ascending
+    // flat float4 index, which is rms_norm_f32_4's summation order for this
+    // thread.
+    float sumf = 0.0f;
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float4 acc = block_v * *((device const float *) (post_t + dst_hc*args.nb_post0));
+
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 0*args.nb_comb1)) * r0;
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 1*args.nb_comb1)) * r1;
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 2*args.nb_comb1)) * r2;
+        acc += *((device const float *) (comb_t + dst_hc*args.nb_comb0 + 3*args.nb_comb1)) * r3;
+
+        ((device float4 *) (dst + dst_hc*args.nb1 + t*args.nb2))[d4] = acc;
+
+        sumf += dot(acc, acc);
+    }
+
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/(float)(args.n_embd*args.n_hc);
+    const float scale = 1.0f/sqrt(mean + norm_eps);
+
+    if (tpitg == 0) {
+        dst_scale[t] = scale;
     }
 }
 

@@ -2,6 +2,8 @@
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+constant short FC_mul_mv_ntok  [[function_constant(FC_MUL_MV + 2)]];
+constant short FC_mul_mv_nrow  [[function_constant(FC_MUL_MV + 3)]];
 
 struct ds4_metal_args_mul_mv {
     int ne00;
@@ -1693,6 +1695,246 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 
+/* ---------------------------------------------------------------------------
+ * Prefill lever 7 — the batched F32 router as a token-tiled matvec.
+ *
+ * In the batched prefill graph the F32 router (ffn_gate_inp, 4096 -> 288, the
+ * only F32 weight in GLM-5.3) is computed by kernel_mul_mv_f32_f32_4 on a grid
+ * of ceil(288/NR0) x n_tok threadgroups — one per (row pair, token) — so every
+ * threadgroup re-reads its NR0 16 KB F32 weight rows for a single token.  At a
+ * 2048-token chunk that is 2048 x 4.7 MB of (cache-served) weight traffic per
+ * layer for 0.1 GFLOP/token: 60.8 us/token at 62k, 1.5 TFLOPS.
+ *
+ * This kernel is the same matvec with one threadgroup per (row block of NR0,
+ * token block of NT).  Each thread stages its NR0 weight chunks in registers
+ * ONCE per inner block and accumulates NT independent sums whose per-output
+ * arithmetic — the NF4 dot(float4, float4) sequence, sumq, sumf[row] += sumq,
+ * the NSG*NF block stride, the scalar tail and helper_mv_reduce_and_write's
+ * reduce tree — is character-identical to kernel_mul_mv_t_t_4_impl above.  The
+ * only changes are the SOURCE of the operands (staged registers instead of a
+ * direct device load, same values) and NT independent accumulator chains, so
+ * every logit word is bit-identical to the production kernel.  That matters:
+ * the router logits drive expert selection, which is 1-ULP sensitive.
+ *
+ * Traffic per token per layer is 288*16 KB * (1/NT + 1/NR0) against the
+ * production kernel's 288*16 KB * (1/1 + 1/2), so NR0 and NT trade off
+ * symmetrically; the host picks the pair from the swept optimum.
+ *
+ * Both tile factors are function constants (FC_MUL_MV+2 and +3) so a pipeline
+ * is specialized to one (NSG, NT, NR0) triple.  Tokens past ne11 in the last
+ * block read a clamped (valid) activation row and are never stored.
+ * ------------------------------------------------------------------------- */
+
+template<typename T0, typename T04, typename T1, typename T14,
+         short NR0, short NT, typename args_t>
+void kernel_mul_mv_t_t_4_tokens_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+
+    const int r0  = tgpig.x*NR0;
+    const int r1b = tgpig.y*NT;
+    const int im  = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    // Base pointers plus a stride, NOT per-token / per-row pointer arrays: at
+    // NT = 8 the three NT-long device-pointer arrays of the first draft cost
+    // ~48 registers by themselves, and this kernel is limited by occupancy
+    // (threads in flight per core -> memory-level parallelism), not by
+    // arithmetic.  Padding tokens in the last block re-read token r1b's row so
+    // no thread addresses past the activation buffer; their sums are computed
+    // and never stored.
+    const uint64_t offset1 = (uint64_t)r1b*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+    const uint64_t offset0 = (uint64_t)r0*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    device const T1  * ay  = (device const T1  *) (src1 + offset1);
+    device const T14 * ay4 = (device const T14 *) (src1 + offset1);
+    device const T0  * ax  = (device const T0  *) ((device char *) src0 + offset0);
+    device const T04 * ax4 = (device const T04 *) ((device char *) src0 + offset0);
+
+    const uint ystride  = (uint)(args.nb11/sizeof(T1));
+    const uint ystride4 = (uint)(args.nb11/sizeof(T14));
+    const uint xstride  = (uint)(args.nb01/sizeof(T0));
+    const uint xstride4 = (uint)(args.nb01/sizeof(T04));
+
+    float sumf[NT][NR0];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sumf[t][row] = 0.f;
+        }
+    }
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        const int coff = (ib*NB + il*NF)/4;
+
+        // The whole point of the tile: each weight chunk is loaded ONCE and
+        // reused by all NT tokens.
+        T04 xl4[NR0][NF4];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const T04 * xb4 = ax4 + (uint)row*xstride4 + coff;
+
+            for (short i = 0; i < NF4; ++i) {
+                xl4[row][i] = xb4[i];
+            }
+        }
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            const uint ts = ((r1b + t) < args.ne11) ? (uint)t : 0u;
+
+            device const T14 * yb4 = ay4 + ts*ystride4 + coff;
+
+            T14 yl4[NF4];
+            for (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[i];
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xl4[row][i]), float4(yl4[i]));
+                }
+
+                sumf[t][row] += sumq;
+            }
+        }
+    }
+
+    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            const uint ts = ((r1b + t) < args.ne11) ? (uint)t : 0u;
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                sumf[t][row] += ax[(uint)row*xstride + i] * ay[ts*ystride + i];
+            }
+        }
+    }
+
+    // helper_mv_reduce_and_write, replicated per token with the threadgroup
+    // scratch indexed by token so the whole tile needs TWO barriers instead of
+    // two per token (per-token barriers cost more than the tile saves: the
+    // first draft of this kernel measured 0.44x at NT=8 for exactly that
+    // reason).  Each (token, row) reduction is the identical pair of
+    // simd_sums over the identical values, so every stored word is
+    // bit-identical to the production helper.  The second simd_sum is run
+    // only by simdgroup 0 because only simdgroup 0's copy is ever stored;
+    // the condition is simdgroup-uniform, so the intrinsic is well formed and
+    // the value it produces is unchanged.
+    threadgroup float * sh = (threadgroup float *) shmem;
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (sgitg == 0) {
+                sh[NW*(t*NR0 + row) + tiisg] = 0.0f;
+            }
+
+            sumf[t][row] = simd_sum(sumf[t][row]);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) {
+                sh[NW*(t*NR0 + row) + sgitg] = sumf[t][row];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            if ((r1b + t) < args.ne11) {
+                device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(r1b + t)*args.ne0;
+
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    if (r0 + row < args.ne01) {
+                        float tot = simd_sum(sh[NW*(t*NR0 + row) + tiisg]);
+
+                        if (tiisg == 0) {
+                            dst_f32[r0 + row] = tot;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template<typename T0, typename T04, typename T1, typename T14, short NT, typename args_t>
+void kernel_mul_mv_t_t_4_tokens_disp_nr0(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    switch (FC_mul_mv_nrow) {
+        case 2: kernel_mul_mv_t_t_4_tokens_impl<T0, T04, T1, T14, 2, NT, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_tokens_impl<T0, T04, T1, T14, 4, NT, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 8: kernel_mul_mv_t_t_4_tokens_impl<T0, T04, T1, T14, 8, NT, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    };
+}
+
+template<typename T0, typename T04, typename T1, typename T14, typename args_t>
+void kernel_mul_mv_t_t_4_tokens_disp(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    switch (FC_mul_mv_ntok) {
+        case 2:  kernel_mul_mv_t_t_4_tokens_disp_nr0<T0, T04, T1, T14, 2,  args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4:  kernel_mul_mv_t_t_4_tokens_disp_nr0<T0, T04, T1, T14, 4,  args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 8:  kernel_mul_mv_t_t_4_tokens_disp_nr0<T0, T04, T1, T14, 8,  args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 16: kernel_mul_mv_t_t_4_tokens_disp_nr0<T0, T04, T1, T14, 16, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 32: kernel_mul_mv_t_t_4_tokens_disp_nr0<T0, T04, T1, T14, 32, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    };
+}
+
+template<typename T0, typename T04, typename T1, typename T14>
+kernel void kernel_mul_mv_t_t_4_tokens(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_4_tokens_disp<T0, T04, T1, T14, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_t_t_4_tokens<half, half4, half, half4>) mul_mv_t_t_4_tokens;
+
+template [[host_name("kernel_mul_mv_f32_f32_4_tokens")]] kernel mul_mv_t_t_4_tokens kernel_mul_mv_t_t_4_tokens<float, float4, float, float4>;
+
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape
@@ -3250,3 +3492,55 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+/*
+ * Prefill lever 19: dense Q8_0 weight -> half, once per prefill chunk.
+ *
+ * The dense prefill GEMM (kernel_mul_mm_q8_0_f32) re-dequantizes every 64x32
+ * weight tile once per 32-token output column, i.e. ceil(n_tok/32) times per
+ * tile.  Phase 0 measured that in-loop dequant at a flat 4.0-4.2% of the
+ * kernel at every large shape.  When the token count is large enough to
+ * amortize one pass over the weight, the host instead dequantizes the whole
+ * matrix into a half scratch copy with this kernel and runs the existing
+ * kernel_mul_mm_f16_f32 over it.
+ *
+ * The half copy is produced by dequantize_q8_0 itself, so every element is the
+ * SAME half bit pattern the in-loop dequant would have written into threadgroup
+ * memory.  kernel_mul_mm_f16_f32 is the same kernel_mul_mm template with
+ * dequantize_f16 (a plain half load) and nl = 1, and its k-element mapping,
+ * threadgroup tile layout, barrier sequence, simdgroup_load order, MMA order
+ * and epilogue are identical to the Q8_0 instantiation's.  The staged A tile is
+ * therefore bit-identical and so is the product: Tier 1, no floating-point
+ * order change.
+ *
+ * Layout: dst is row-major half[n_rows][32*blocks_per_row], contiguous, so the
+ * host passes nb01 = in_dim * sizeof(half).
+ */
+struct ds4_metal_args_dense_q8_half {
+    uint32_t blocks_per_row;
+    uint32_t total_blocks;
+    uint64_t src_row_bytes;
+};
+
+kernel void kernel_glm53_dense_q8_0_to_half(
+        constant ds4_metal_args_dense_q8_half & args,
+        device const char * src,
+        device       half * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.total_blocks) return;
+
+    const uint row = gid / args.blocks_per_row;
+    const uint blk = gid - row*args.blocks_per_row;
+
+    device const block_q8_0 * xb =
+        (device const block_q8_0 *)(src + args.src_row_bytes*(ulong)row) + blk;
+
+    half4x4 lo, hi;
+    dequantize_q8_0(xb, 0, lo);
+    dequantize_q8_0(xb, 1, hi);
+
+    device half4 * o = (device half4 *)(dst +
+        (ulong)row*(ulong)args.blocks_per_row*32ul + (ulong)blk*32ul);
+    o[0] = lo[0]; o[1] = lo[1]; o[2] = lo[2]; o[3] = lo[3];
+    o[4] = hi[0]; o[5] = hi[1]; o[6] = hi[2]; o[7] = hi[3];
+}

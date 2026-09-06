@@ -343,6 +343,7 @@ struct ds4_metal_args_glm_attention_indexed_decode {
 };
 
 struct ds4_metal_args_glm_attention_indexed_decode_split {
+    uint32_t guaranteed_prefix;   /* slots below it index live rows; 0 = unused */
     uint32_t n_selected;
     uint32_t cache_cap;
     uint32_t cache_f16;
@@ -3483,6 +3484,117 @@ kernel void kernel_glm_qk_lowrank_q8_0_batch_glm52_t4(
     }
 }
 
+
+/* GLM 5.3 batched qk low-rank projection, token-tiled (prefill lever 2).
+ *
+ * kernel_glm_qk_lowrank_q8_0_batch above runs one 256-thread threadgroup per
+ * (head, token), so every threadgroup re-walks the head's whole 512x256 Q8_0
+ * matrix (139 KB) and no weight byte is reused across tokens: at a 2048-token
+ * chunk that is 131,072 threadgroups and it measures 240-244 us/token at every
+ * prefill size from 111 tokens to 62k (0.76 TFLOPS, Phase 1 report S4/S6).
+ *
+ * This is the GLM 5.3 shape of the GLM 5.2 _t4 kernel: TT tokens' 256-float q
+ * slices are staged in threadgroup memory, each thread owns output rows
+ * j = tid, tid + NTH, ... and walks its Q8_0 row ONCE while accumulating TT
+ * outputs, so the weight traffic per token is divided by TT.  All TT threads
+ * of a simdgroup read the same staged x element in the same step, which is a
+ * threadgroup-memory broadcast.
+ *
+ * The per-output arithmetic is character for character the production
+ * expression from glm_q8_0_dot_row_dev_f32 -- acc += d * (float)qs[qi] * x[col]
+ * with one accumulator per output, ascending qi inside ascending block -- so
+ * every output word is bit-identical to kernel_glm_qk_lowrank_q8_0_batch.
+ * Tiles past n_tokens are staged as zeros and never stored, exactly as _t4.
+ *
+ * TT was swept cold at 2, 3, 4, 6, 8, 16 and 32 tokens per threadgroup and at
+ * 256 and 512 threads (lever harness, 2026-09-02): per dispatch at n = 2048 the
+ * production kernel is 43.23 ms and the tiles are 6.52 / 4.79 / 4.06 / 5.05 /
+ * 4.31 / 5.77 / 5.09 ms, i.e. TT = 4 at 256 threads is the optimum at every
+ * token count from 4 to 2048 (weight traffic falls as 1/TT but the staged-x
+ * broadcast reads and the threadgroup-memory footprint, hence residency, grow
+ * with it).  Only that instantiation is kept in the shipping library.
+ */
+template<uint TT, uint NTH>
+kernel void kernel_glm_qk_lowrank_q8_0_batch_glm53_tile_impl(
+        constant ds4_metal_args_glm_qk_lowrank_batch & args,
+        device const char *weight,
+        device const char *q,
+        device char *qk_low,
+        threadgroup float *x [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint n_head = 64u;
+    constexpr uint kv_lora_dim = 512u;
+    constexpr uint qk_nope = 256u;
+    constexpr uint qk_dim = 256u;
+    constexpr uint row_bytes = 272u;
+    constexpr uint n_blocks = qk_nope / 32u;
+
+    const uint head = tgpig.x + args.head_base;
+    const uint token0 = tgpig.y * TT;
+    if (head >= n_head || token0 >= args.n_tokens) return;
+
+    const uint64_t q_token_stride = (uint64_t)n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride = (uint64_t)n_head * kv_lora_dim * sizeof(float);
+
+    for (uint t = 0; t < TT; t++) {
+        const uint token = token0 + t;
+        threadgroup float *xt = x + t * qk_nope;
+        if (token < args.n_tokens) {
+            device const float *qh =
+                (device const float *)(q +
+                    (uint64_t)token * q_token_stride +
+                    (uint64_t)head * qk_dim * sizeof(float));
+            for (uint d = tid; d < qk_nope; d += NTH) {
+                xt[d] = qh[d];
+            }
+        } else {
+            for (uint d = tid; d < qk_nope; d += NTH) {
+                xt[d] = 0.0f;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = tid; j < kv_lora_dim; j += NTH) {
+        device const char *row =
+            weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
+        float acc[TT];
+        FOR_UNROLL (uint t = 0; t < TT; t++) {
+            acc[t] = 0.0f;
+        }
+        for (uint block = 0; block < n_blocks; block++) {
+            device const char *block_base = row + (uint64_t)block * 34u;
+            const float d = (float)(*((device const half *)block_base));
+            device const int8_t *qs = (device const int8_t *)(block_base + 2u);
+            const uint base = block << 5;
+            for (uint qi = 0; qi < 32u; qi++) {
+                const uint col = base + qi;
+                FOR_UNROLL (uint t = 0; t < TT; t++) {
+                    acc[t] += d * (float)qs[qi] * x[t * qk_nope + col];
+                }
+            }
+        }
+        FOR_UNROLL (uint t = 0; t < TT; t++) {
+            const uint token = token0 + t;
+            if (token < args.n_tokens) {
+                device float *out =
+                    (device float *)(qk_low +
+                        (uint64_t)token * low_token_stride +
+                        (uint64_t)head * kv_lora_dim * sizeof(float));
+                out[j] = acc[t];
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_glm_qk_lowrank_q8_0_batch_glm53_tile_impl<4u, 256u>)
+        glm_qk_lowrank_batch_tile_t;
+
+template [[host_name("kernel_glm_qk_lowrank_q8_0_batch_glm53_t4")]]
+kernel glm_qk_lowrank_batch_tile_t
+kernel_glm_qk_lowrank_q8_0_batch_glm53_tile_impl<4u, 256u>;
+
 kernel void kernel_glm_value_project_q8_0(
         constant ds4_metal_args_glm_qk_lowrank & args,
         device const char *weight,
@@ -3717,7 +3829,17 @@ kernel void kernel_glm_value_project_q8_0_batch_heads_mma(
     }
 }
 
-template <bool assume_valid_rows, bool assume_valid_heads>
+/* prefix_checked: the caller guarantees only slots [0, args.guaranteed_prefix)
+ * index live cache rows and may have padded the rest with 0xffffffff.  One
+ * threadgroup owns one whole block, and block_end is threadgroup-uniform, so
+ * the decision below is uniform: a block that ends inside the guaranteed prefix
+ * runs exactly the assume_valid_rows code it ran before, and only the blocks
+ * that reach past the prefix -- at the shipped GLM-5.3 geometry that is the
+ * single final block of at most 3 rows -- pay the per-row bounds test.  A pad
+ * row is then masked out of the softmax entirely (score -FLT_MAX/2, no
+ * accumulator update), never admitted as a zero-valued member. */
+template <bool assume_valid_rows, bool assume_valid_heads,
+          bool prefix_checked = false>
 kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *q,
@@ -3755,6 +3877,9 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     const uint qk_dim = args.qk_nope + args.qk_rope;
     const uint block_start = block * args.block_rows;
     const uint block_end = min(args.n_selected, block_start + args.block_rows);
+    /* threadgroup-uniform; see the template comment */
+    const bool rows_all_valid =
+        assume_valid_rows && (!prefix_checked || block_end <= args.guaranteed_prefix);
 
     threadgroup half4 *kv_shared = scratch;
     threadgroup float4 *rope_shared =
@@ -3804,7 +3929,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
             const uint rr = off / kv_vecs;
             const uint vv = off - rr * kv_vecs;
             const uint row = selected[base + rr];
-            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            const bool valid_row = rows_all_valid || row < args.cache_cap;
             if (valid_row) {
                 device const half4 *src =
                     (device const half4 *)((device const half *)kv_lora_cache +
@@ -3819,7 +3944,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
             const uint vv = off - rr * rope_vecs;
             const uint r = vv * 4u;
             const uint row = selected[base + rr];
-            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            const bool valid_row = rows_all_valid || row < args.cache_cap;
             if (valid_row) {
                 const uint64_t rope_base = (uint64_t)row * args.qk_rope;
                 const float2 y0 =
@@ -3855,7 +3980,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
 
         for (uint rr = 0u; rr < rows; rr++) {
             const uint row = selected[base + rr];
-            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            const bool valid_row = rows_all_valid || row < args.cache_cap;
             threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
             threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
             float partial = 0.0f;
@@ -3915,6 +4040,13 @@ kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false>;
 template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_valid_fullheads")]]
 kernel glm_attention_indexed_decode_split_group8_partial_t
 kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true>;
+
+/* The GLM-5.3 pooled selection: guaranteed live below args.guaranteed_prefix,
+ * possibly padded above it.  Identical to the _valid_fullheads instantiation on
+ * every block that ends inside the prefix. */
+template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_prefix_fullheads")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true>;
 
 template<uint FIXED_BLOCKS, bool Q8_U16>
 static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
@@ -4887,6 +5019,1054 @@ kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, false>;
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads")]]
 kernel glm_attention_indexed_batch_lora_group8_vec_t
 kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, true>;
+
+/* ---------------------------------------------------------------------------
+ * Prefill lever 9 -- Tier 1 instruction-count trims for the batched sparse DSA
+ * attention kernel.  The body below is `kernel_glm_attention_indexed_batch_
+ * lora_group8_vec_impl` copied verbatim (generated by a script that asserts
+ * on every
+ * substitution site) with four compile-time switches and nothing else.
+ *
+ * SKIP_RESCALE.  The online-softmax update per row is
+ *     new_m = max(M, score); old = exp(M - new_m); row = exp(score - new_m);
+ *     o = o*old + kv*row;  S = S*old + row;  M = new_m;
+ * Over 2,051 rows the running max moves only O(log n) times.  On every other
+ * row M - new_m is exactly +/-0.0f, exp of which is exactly 1.0f, so o*old and
+ * S*old are the identity in IEEE arithmetic: one exp and (once the surviving
+ * add contracts into the product's fma) sixteen scalar multiplies per lane per
+ * row are pure no-ops.  The test is `M - new_m == 0.0f`, NOT `score > M`:
+ * when M is +/-infinity and equal to new_m the difference is NaN and the
+ * production kernel poisons o with it, so that case must -- and does -- take
+ * the verbatim arm.  The rare max-moving arm is the production expression
+ * character for character.
+ *
+ * PIN_PRODUCT.  `o*old + kv*row` can be contracted two ways: mul then
+ * fma(o, old, round(kv*row)), or mul then fma(kv, row, round(o*old)).  With
+ * old == 1.0f the first rounds the product before adding and the second does
+ * not.  PIN_PRODUCT = 0 writes `o + kv*row` (contracts, single rounding);
+ * PIN_PRODUCT = 1 writes `o + fma(kv, row, -0.0f)` (pins the correctly rounded
+ * product, then a plain add -- -0.0f rather than 0.0f so a negative-zero
+ * product keeps its sign).  Exactly one matches production; the poisoned
+ * campaign decides which, and the other is deleted.
+ *
+ * HOIST.  `(float4)kv_row[lane + k*32]` is read twice per row, once in the dot
+ * and once in the value accumulate, and the half4->float4 conversion is ALU
+ * work.  HOIST converts once into a register.  It also replaces the gather
+ * loop's `off / kv_vecs` and `off % kv_vecs` with a shift and a mask, which is
+ * exact because the early return guarantees kv_lora_dim == 512.
+ *
+ * NOROPE.  GLM-5.3-Flash has n_rot == 0, so rope_vecs is 0 and `lane <
+ * rope_vecs` is false on every lane of every row -- a per-row compare that the
+ * compiler cannot fold because rope_vecs is a runtime argument.  NOROPE makes
+ * it a compile-time 0.  The host only selects a NOROPE instantiation when
+ * qk_rope == 0 and the kernel's guard refuses it otherwise.
+ *
+ * None of the four moves any floating-point operation, changes any lane
+ * assignment, or changes the row visitation order.  That is the Tier 1 claim;
+ * it is verified, not assumed.
+ * --------------------------------------------------------------------------- */
+template <bool assume_valid_rows, bool assume_valid_heads,
+          bool SKIP_RESCALE, bool PIN_PRODUCT, bool HOIST, bool NOROPE>
+kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *q,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const char *k_rope_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        threadgroup half4 *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint group_heads = 8u;
+    constexpr uint stage_rows = 16u;
+    const uint token = tgpig.y;
+    const uint tid = (uint)tid_u;
+    const uint lane = (uint)lane_u;
+    const uint head_in_group = (uint)sg_u;
+    const uint head = tgpig.x * group_heads + head_in_group + args.head_base;
+    if (token >= args.n_tokens ||
+        args.n_selected == 0u ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != 512u ||
+        (args.qk_rope != 0u && args.qk_rope != 64u) ||
+        (NOROPE && args.qk_rope != 0u)) {
+        return;
+    }
+
+    const bool valid_head = assume_valid_heads || head < args.n_head;
+    const uint safe_head = valid_head ? head : 0u;
+    const uint kv_vecs = args.kv_lora_dim >> 2;
+    /* NOROPE: the host only selects this instantiation when qk_rope == 0,
+     * and the guard above refuses it otherwise, so rope_vecs is the
+     * compile-time constant 0 and every rope test folds away. */
+    const uint rope_vecs = NOROPE ? 0u : (args.qk_rope >> 2);
+    const uint qk_dim = args.qk_nope + args.qk_rope;
+    const uint64_t q_token_stride = (uint64_t)args.n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride =
+        (uint64_t)args.n_head * args.kv_lora_dim * sizeof(float);
+
+    threadgroup half4 *kv_shared = scratch;
+    threadgroup float4 *rope_shared =
+        (threadgroup float4 *)(kv_shared + stage_rows * kv_vecs);
+
+    device const float *qh =
+        (device const float *)(q +
+            (uint64_t)token * q_token_stride +
+            (uint64_t)safe_head * qk_dim * sizeof(float));
+    device const float4 *low4 =
+        (device const float4 *)(qk_low +
+            (uint64_t)token * low_token_stride +
+            (uint64_t)safe_head * args.kv_lora_dim * sizeof(float));
+    device const uint32_t *token_selected =
+        selected + (uint64_t)token * args.n_selected;
+
+    float4 low0 = 0.0f;
+    float4 low1 = 0.0f;
+    float4 low2 = 0.0f;
+    float4 low3 = 0.0f;
+    float4 qrope = 0.0f;
+    if (valid_head) {
+        low0 = low4[lane + 0u];
+        low1 = low4[lane + 32u];
+        low2 = low4[lane + 64u];
+        low3 = low4[lane + 96u];
+        if (lane < rope_vecs) {
+            qrope = *((device const float4 *)(qh + args.qk_nope + lane * 4u));
+        }
+    }
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.qk_rope != 0u && args.ext_factor != 0.0f) {
+        glm_rope_yarn_corr_dims((int)args.qk_rope,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+    }
+
+    float M = -FLT_MAX / 2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    for (uint base = 0u; base < args.n_selected; base += stage_rows) {
+        const uint rows = min(stage_rows, args.n_selected - base);
+        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+            /* HOIST: the early return above guarantees kv_lora_dim == 512, so
+             * kv_vecs is exactly 128 wherever this body runs.  Same indices,
+             * no integer divide. */
+            const uint rr = HOIST ? (off >> 7) : (off / kv_vecs);
+            const uint vv = HOIST ? (off & 127u) : (off - rr * kv_vecs);
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            if (valid_row) {
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)row * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            } else {
+                kv_shared[off] = half4(half(0.0f));
+            }
+        }
+        for (uint off = tid; off < rows * rope_vecs; off += 256u) {
+            /* reached only when qk_rope == 64, i.e. rope_vecs == 16. */
+            const uint rr = HOIST ? (off >> 4) : (off / rope_vecs);
+            const uint vv = HOIST ? (off & 15u) : (off - rr * rope_vecs);
+            const uint r = vv * 4u;
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            if (valid_row) {
+                const uint64_t rope_base = (uint64_t)row * args.qk_rope;
+                const float2 y0 =
+                    glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
+                                                              rope_base,
+                                                              r,
+                                                              row,
+                                                              args.qk_rope,
+                                                              args.freq_base,
+                                                              args.freq_scale,
+                                                              args.ext_factor,
+                                                              args.attn_factor,
+                                                              corr_dims[0],
+                                                              corr_dims[1]);
+                const float2 y1 =
+                    glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
+                                                              rope_base,
+                                                              r + 2u,
+                                                              row,
+                                                              args.qk_rope,
+                                                              args.freq_base,
+                                                              args.freq_scale,
+                                                              args.ext_factor,
+                                                              args.attn_factor,
+                                                              corr_dims[0],
+                                                              corr_dims[1]);
+                rope_shared[off] = float4(y0.x, y0.y, y1.x, y1.y);
+            } else {
+                rope_shared[off] = float4(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rr = 0u; rr < rows; rr++) {
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+            float4 h0 = 0.0f, h1 = 0.0f, h2 = 0.0f, h3 = 0.0f;
+            float partial = 0.0f;
+            if (valid_head && valid_row) {
+                if (HOIST) {
+                    /* one half4->float4 conversion per vector per row instead
+                     * of two: the conversion is exact, so every consumer sees
+                     * the same bits. */
+                    h0 = (float4)kv_row[lane + 0u];
+                    h1 = (float4)kv_row[lane + 32u];
+                    h2 = (float4)kv_row[lane + 64u];
+                    h3 = (float4)kv_row[lane + 96u];
+                    partial += dot(low0, h0);
+                    partial += dot(low1, h1);
+                    partial += dot(low2, h2);
+                    partial += dot(low3, h3);
+                } else {
+                    partial += dot(low0, (float4)kv_row[lane + 0u]);
+                    partial += dot(low1, (float4)kv_row[lane + 32u]);
+                    partial += dot(low2, (float4)kv_row[lane + 64u]);
+                    partial += dot(low3, (float4)kv_row[lane + 96u]);
+                }
+                if (lane < rope_vecs) {
+                    partial += dot(qrope, rope_row[lane]);
+                }
+            }
+            const float sum = simd_sum(partial);
+            const float score =
+                (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+            if (valid_head && valid_row) {
+                const float4 v0 = HOIST ? h0 : (float4)kv_row[lane + 0u];
+                const float4 v1 = HOIST ? h1 : (float4)kv_row[lane + 32u];
+                const float4 v2 = HOIST ? h2 : (float4)kv_row[lane + 64u];
+                const float4 v3 = HOIST ? h3 : (float4)kv_row[lane + 96u];
+                const float new_m = max(M, score);
+                const float dm = M - new_m;
+                if (SKIP_RESCALE && dm == 0.0f) {
+                    /* The running max did not move.  dm is exactly +/-0.0f
+                     * (and NOT NaN -- an infinite M equal to new_m gives NaN,
+                     * which fails this test and takes the verbatim arm), so
+                     * exp(dm) is exactly 1.0f and o*1.0f / S*1.0f are the
+                     * identity.  PIN_PRODUCT selects between the two ways the
+                     * production expression can be contracted; exactly one of
+                     * them is bit-identical and the campaign decides which. */
+                    const float row_scale = exp(score - new_m);
+                    if (PIN_PRODUCT) {
+                        o0 = o0 + fma(v0, float4(row_scale), float4(-0.0f));
+                        o1 = o1 + fma(v1, float4(row_scale), float4(-0.0f));
+                        o2 = o2 + fma(v2, float4(row_scale), float4(-0.0f));
+                        o3 = o3 + fma(v3, float4(row_scale), float4(-0.0f));
+                    } else {
+                        o0 = o0 + v0 * row_scale;
+                        o1 = o1 + v1 * row_scale;
+                        o2 = o2 + v2 * row_scale;
+                        o3 = o3 + v3 * row_scale;
+                    }
+                    S = S + row_scale;
+                    M = new_m;
+                } else {
+                    const float old_scale = exp(dm);
+                    const float row_scale = exp(score - new_m);
+                    o0 = o0 * old_scale + v0 * row_scale;
+                    o1 = o1 * old_scale + v1 * row_scale;
+                    o2 = o2 * old_scale + v2 * row_scale;
+                    o3 = o3 * old_scale + v3 * row_scale;
+                    S = S * old_scale + row_scale;
+                    M = new_m;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_head) {
+        const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
+        device float4 *out4 =
+            (device float4 *)(lora_out +
+                ((uint64_t)token * args.n_head + head) *
+                    args.kv_lora_dim * sizeof(float));
+        out4[lane + 0u] = o0 * inv_s;
+        out4[lane + 32u] = o1 * inv_s;
+        out4[lane + 64u] = o2 * inv_s;
+        out4[lane + 96u] = o3 * inv_s;
+    }
+}
+
+typedef decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<false, false, true, false, true, false>)
+        glm_attention_indexed_batch_lora_group8_vec_t1_t;
+
+/* fullheads: the only variant the GLM-5.3 depth path actually dispatches */
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipA_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, true, false, false, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipB_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, true, true, false, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_hoist_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, false, false, true, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_norope_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, false, false, false, true>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipAh_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, true, false, true, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipBh_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, true, true, true, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipAhn_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, true, false, true, true>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipBhn_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, true, true, true, true, true>;
+
+/* the two remaining validity levels, for the shipped combinations only */
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipAh_valid")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, false, true, false, true, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipBh_valid")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<true, false, true, true, true, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipAh")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<false, false, true, false, true, false>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_t1_skipBh")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t1_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_t1_impl<false, false, true, true, true, false>;
+
+/* ---------------------------------------------------------------------------
+ * Prefill lever 14 -- BLOCKED online softmax for the batched sparse DSA
+ * attention kernel.  Tier 2: this is a floating-point REASSOCIATION, not a
+ * rewriting of the same operations, so it ships behind
+ * DS4_GLM_DISABLE_DSA_BLOCKED_SOFTMAX and is registered in glm53_exact_mode().
+ *
+ * Production (and lever 9's t1 kernel) walk the 2,051 selected rows one at a
+ * time, and each row carries the whole online-softmax bookkeeping:
+ *     new_m = max(M, score);  old = exp(M - new_m);  row = exp(score - new_m);
+ *     o = o*old + kv*row;     S = S*old + row;       M = new_m;
+ * The exp and the 16-wide rescale sit between the row's simd_sum and the next
+ * row's, so the score reductions cannot overlap.
+ *
+ * This kernel processes the BLOCK rows of one gather stage together:
+ *   A  compute all BLOCK scores (BLOCK independent simd_sum reductions, which
+ *      can overlap because nothing between them depends on M);
+ *   B  blk_m = max over the block, new_m = max(M, blk_m);
+ *   C  ONE rescale of the 16-float accumulator and of S by exp(M - new_m);
+ *   D  BLOCK accumulates with exp(score - new_m), all independent of each other.
+ * Per row that removes one exp, one compare-and-branch and (amortised) the
+ * sixteen rescale multiplies; it adds one more threadgroup read and half4 ->
+ * float4 conversion of the staged row, because the value accumulate can no
+ * longer share the conversion the dot performed (BLOCK * 16 live floats will
+ * not fit in registers).  Whether that trade wins is a measurement, not an
+ * argument.
+ *
+ * Numerically the blocked form performs FEWER roundings of the accumulator:
+ * production rescales it once per max move, this rescales it at most once per
+ * block, and within a block the weights are all formed against one max.  The
+ * prediction -- verified in E1, not assumed -- is that it is at least as
+ * accurate as production against an FP64 sequential reference.
+ *
+ * Template parameters
+ *   BLOCK  rows per softmax block; equals the gather stage height, so BLOCK*512
+ *          halves of threadgroup memory (16 -> 16 KB, 32 -> 32 KB = the device
+ *          maximum).  The host sizes the threadgroup allocation to match.
+ *   BSKIP  skip phase C when M - new_m is exactly +/-0.0f.  Over 2,051 rows the
+ *          running max moves O(log n) times, so on ~122 of 129 blocks the
+ *          rescale is the identity in IEEE arithmetic.  The test is on the
+ *          difference being zero, NOT on blk_m > M: when M is +/-infinity and
+ *          equal to new_m the difference is NaN, and that case must fall
+ *          through to the multiply (lever 9, section 3).
+ *   PART   accumulate the block into a fresh partial (p0..p3, Sp) and fold it
+ *          into o and S once per block.  This shortens the serial fma chain
+ *          through the accumulator from n_selected to n_selected/BLOCK + blocks
+ *          and makes the block sum a second-level (pairwise-like) summation.
+ *   CTRL   0 production semantics.  1 = DEGRADE: round every softmax weight
+ *          through fp16 -- the known-different control arm E1 requires, which
+ *          MUST fail the gate.  2 = WRONGMAX: use only the block's first score
+ *          as the block max instead of the true block max.
+ *
+ * Only the (assume_valid_rows, assume_valid_heads) = (true, true) level exists:
+ * GLM-5.3 has n_head 64 and the caller validates the selected rows, so that is
+ * the only level its depth path dispatches, and pinning both to compile-time
+ * true keeps every `valid_row` test out of the blocked phases.  The host
+ * refuses to select this kernel at any other level and falls back to lever 9's
+ * t1 kernel, which is bit-identical to production.
+ *
+ * The parameter list, the guard, the staging pointers, the gather loop, the
+ * per-row score expression, the tail's row-serial update and the epilogue below
+ * are the production body character for character, lifted by a generator
+ * that asserts that
+ * every site it copies occurs exactly once.
+ * --------------------------------------------------------------------------- */
+template <uint BLOCK, bool BSKIP, bool PART, bool ONEPASS, uint SUB, bool NOP, int CTRL,
+          uint GATH = 0u, bool TAILCHK = false>
+kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *q,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const char *k_rope_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        threadgroup half4 *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    /* pinned to the only level GLM-5.3 dispatches; see the header comment */
+    constexpr bool assume_valid_rows = true;
+    constexpr bool assume_valid_heads = true;
+    constexpr uint group_heads = 8u;
+    constexpr uint stage_rows = BLOCK;
+    const uint token = tgpig.y;
+    const uint tid = (uint)tid_u;
+    const uint lane = (uint)lane_u;
+    const uint head_in_group = (uint)sg_u;
+    const uint head = tgpig.x * group_heads + head_in_group + args.head_base;
+    if (token >= args.n_tokens ||
+        args.n_selected == 0u ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != 512u ||
+        args.qk_rope != 0u) {
+        return;
+    }
+
+    const bool valid_head = assume_valid_heads || head < args.n_head;
+    const uint safe_head = valid_head ? head : 0u;
+    const uint kv_vecs = args.kv_lora_dim >> 2;
+    /* NOROPE by construction: the guard above returns unless
+     * qk_rope == 0, so rope_vecs is a compile-time 0 and the rope
+     * staging loop, the rope threadgroup region and the per-row
+     * `lane < rope_vecs` predicate all fold away (prefill lever 9
+     * measured that predicate alone at 4% of this kernel). */
+    const uint rope_vecs = 0u;
+    const uint qk_dim = args.qk_nope + args.qk_rope;
+    const uint64_t q_token_stride = (uint64_t)args.n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride =
+        (uint64_t)args.n_head * args.kv_lora_dim * sizeof(float);
+
+    threadgroup half4 *kv_shared = scratch;
+    threadgroup float4 *rope_shared =
+        (threadgroup float4 *)(kv_shared + stage_rows * kv_vecs);
+
+    device const float *qh =
+        (device const float *)(q +
+            (uint64_t)token * q_token_stride +
+            (uint64_t)safe_head * qk_dim * sizeof(float));
+    device const float4 *low4 =
+        (device const float4 *)(qk_low +
+            (uint64_t)token * low_token_stride +
+            (uint64_t)safe_head * args.kv_lora_dim * sizeof(float));
+    device const uint32_t *token_selected =
+        selected + (uint64_t)token * args.n_selected;
+
+    float4 low0 = 0.0f;
+    float4 low1 = 0.0f;
+    float4 low2 = 0.0f;
+    float4 low3 = 0.0f;
+    float4 qrope = 0.0f;
+    if (valid_head) {
+        low0 = low4[lane + 0u];
+        low1 = low4[lane + 32u];
+        low2 = low4[lane + 64u];
+        low3 = low4[lane + 96u];
+        if (lane < rope_vecs) {
+            qrope = *((device const float4 *)(qh + args.qk_nope + lane * 4u));
+        }
+    }
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.qk_rope != 0u && args.ext_factor != 0.0f) {
+        glm_rope_yarn_corr_dims((int)args.qk_rope,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+    }
+
+    float M = -FLT_MAX / 2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    /* ---- blocked main loop: the full BLOCK-row stages ---------------------- */
+    const uint n_full = (args.n_selected / BLOCK) * BLOCK;
+    for (uint base = 0u; base < n_full; base += BLOCK) {
+        const uint rows = BLOCK;
+        if (GATH == 0u) {
+            for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+                /* the early return guarantees kv_lora_dim == 512, so kv_vecs is
+                 * exactly 128 here: same indices, no integer divide (lever 9's
+                 * HOIST, campaigned bit-identical over 50,000 draws). */
+                const uint rr = off >> 7;
+                const uint vv = off & 127u;
+                const uint row = token_selected[base + rr];
+                const bool valid_row = assume_valid_rows || row < args.cache_cap;
+                if (valid_row) {
+                    device const half4 *src =
+                        (device const half4 *)((device const half *)kv_lora_cache +
+                            (uint64_t)row * args.kv_lora_dim);
+                    kv_shared[off] = src[vv];
+                } else {
+                    kv_shared[off] = half4(half(0.0f));
+                }
+            }
+        } else {
+            /* AUDIT EXPERIMENT 3 / prefill lever 27: the same staged bytes at the
+             * same addresses, copied 32 bytes per thread per loop unit instead of
+             * 8.  Staged values, staged addresses, the threadgroup allocation and
+             * every barrier are production's, so this is bit-identical by
+             * construction and measured so: 0 differing of 655,360,000 words
+             * against GATH 0, with a known-different control arm detected on draw
+             * 1.  Worth -10.8% on this kernel and +1.5% at 62k.  This is the ONLY
+             * alternative DS4_GLM_DISABLE_DSA_GATHER_WIDE switches between; the
+             * width and addressing sweep that chose 32 bytes, and the
+             * deliberately-wrong control arm that certified it, are
+             * harness-only. */
+            for (uint off = tid; off < BLOCK * 32u; off += 256u) {
+                const uint rr = off >> 5, w = off & 31u;
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)token_selected[base + rr] * args.kv_lora_dim);
+                for (uint m = 0; m < 4u; m++)
+                    kv_shared[rr * 128u + w * 4u + m] = src[w * 4u + m];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (ONEPASS) {
+            /* ---- ONEPASS: one read of the staged row, one exp, and all of the
+             * softmax bookkeeping amortised over a SUB-row sub-block ----------
+             * The sub-block's weights are formed against M, the running max over
+             * every PREVIOUS row, which is known before the sub-block starts, so
+             * the dot and the weighted accumulate share one threadgroup read and
+             * one half4 -> float4 conversion.  Because o and the partial p are
+             * then referenced to the SAME M, one multiply by exp(M - new_m)
+             * rescales both:  o <- (o + p) * exp(M - new_m).  On the blocks where
+             * the running max does not move -- about 122 of 129 at SUB 16 over
+             * 2,051 rows -- that multiply is the identity and is skipped.
+             *
+             * SUB is the SOFTMAX sub-block and BLOCK is the GATHER stage; they
+             * are separate on purpose.  Tying them together (SUB == BLOCK) makes
+             * the block size set the threadgroup allocation, so a block-size
+             * sweep is really an occupancy sweep and cannot answer what the
+             * softmax structure costs.  With BLOCK pinned at production's 16 the
+             * threadgroup memory, the barrier count and the occupancy are
+             * production's by construction and only SUB varies.
+             *
+             * The cost of this form is that exp(score - M) can overflow when a
+             * sub-block contains a score far above everything before it -- and on
+             * the FIRST one M is -FLT_MAX/2, so it always does.  The guard reads
+             * that hazard off the sub-block max, which the weights cannot corrupt
+             * because it is computed from the scores alone, and recomputes
+             * against the correct reference, discarding the poisoned partial.
+             * exp(60) * 65504 * 32 is 2.4e32, six decades inside FLT_MAX, so the
+             * fast path cannot overflow when the guard does not fire, and the
+             * spelling `!(x <= 60)` rather than `x > 60` sends a NaN difference
+             * down the safe arm too. */
+            for (uint sb = 0u; sb < BLOCK; sb += SUB) {
+                float blk_m = -FLT_MAX / 2.0f;
+            if (NOP) {
+                /* REGISTER-PRESSURE PROBE, TIMING ONLY -- never selected by the
+                 * host, never scored.  Accumulating straight into o removes the
+                 * sixteen accumulator registers the partial p occupies, which is
+                 * the only question this arm exists to answer.  It is NOT
+                 * shippable: with no partial there is nothing to discard, so it
+                 * cannot recover from a sub-block whose max jumps more than 60
+                 * above the running max, and the min() below merely keeps the
+                 * arithmetic finite (it costs the first stage's contribution,
+                 * which is deliberate and is why this arm is timing-only). */
+#pragma clang loop unroll(full)
+                for (uint u = 0u; u < SUB; u++) {
+                    const uint rr = sb + u;
+                    float4 h0 = 0.0f, h1 = 0.0f, h2 = 0.0f, h3 = 0.0f;
+                    const uint row = token_selected[base + rr];
+                    const bool valid_row = assume_valid_rows || row < args.cache_cap;
+                    threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                    threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+                    float partial = 0.0f;
+                    if (valid_head && valid_row) {
+                        h0 = (float4)kv_row[lane + 0u];
+                        h1 = (float4)kv_row[lane + 32u];
+                        h2 = (float4)kv_row[lane + 64u];
+                        h3 = (float4)kv_row[lane + 96u];
+                        partial += dot(low0, h0);
+                        partial += dot(low1, h1);
+                        partial += dot(low2, h2);
+                        partial += dot(low3, h3);
+                        if (lane < rope_vecs) {
+                            partial += dot(qrope, rope_row[lane]);
+                        }
+                    }
+                    const float sum = simd_sum(partial);
+                    const float score =
+                        (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+                    const float row_scale = exp(min(score - M, 60.0f));
+                    o0 = o0 + h0 * row_scale;
+                    o1 = o1 + h1 * row_scale;
+                    o2 = o2 + h2 * row_scale;
+                    o3 = o3 + h3 * row_scale;
+                    S = S + row_scale;
+                    blk_m = max(blk_m, score);
+                }
+                const float nm = max(M, blk_m);
+                const float dm = M - nm;
+                if (!(BSKIP && dm == 0.0f)) {
+                    const float old_scale = exp(dm);
+                    o0 = o0 * old_scale;
+                    o1 = o1 * old_scale;
+                    o2 = o2 * old_scale;
+                    o3 = o3 * old_scale;
+                    S = S * old_scale;
+                }
+                M = nm;
+            } else {
+            float4 p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+            float Sp = 0.0f;
+#pragma clang loop unroll(full)
+                for (uint u = 0u; u < SUB; u++) {
+                    const uint rr = sb + u;
+                    float4 h0 = 0.0f, h1 = 0.0f, h2 = 0.0f, h3 = 0.0f;
+                    const uint row = token_selected[base + rr];
+                    const bool valid_row = assume_valid_rows || row < args.cache_cap;
+                    threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                    threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+                    float partial = 0.0f;
+                    if (valid_head && valid_row) {
+                        h0 = (float4)kv_row[lane + 0u];
+                        h1 = (float4)kv_row[lane + 32u];
+                        h2 = (float4)kv_row[lane + 64u];
+                        h3 = (float4)kv_row[lane + 96u];
+                        partial += dot(low0, h0);
+                        partial += dot(low1, h1);
+                        partial += dot(low2, h2);
+                        partial += dot(low3, h3);
+                        if (lane < rope_vecs) {
+                            partial += dot(qrope, rope_row[lane]);
+                        }
+                    }
+                    const float sum = simd_sum(partial);
+                    const float score =
+                        (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+                    float row_scale = exp(score - M);
+                    if (CTRL == 1) row_scale = (float)(half)row_scale;
+                    p0 = p0 + h0 * row_scale;
+                    p1 = p1 + h1 * row_scale;
+                    p2 = p2 + h2 * row_scale;
+                    p3 = p3 + h3 * row_scale;
+                    Sp = Sp + row_scale;
+                    blk_m = max(blk_m, score);
+                }
+                if (!(blk_m - M <= 60.0f)) {
+                    const float nm = max(M, blk_m);
+                    p0 = 0.0f; p1 = 0.0f; p2 = 0.0f; p3 = 0.0f;
+                    Sp = 0.0f;
+#pragma clang loop unroll(full)
+                    for (uint u = 0u; u < SUB; u++) {
+                        const uint rr = sb + u;
+                        float4 h0 = 0.0f, h1 = 0.0f, h2 = 0.0f, h3 = 0.0f;
+                        const uint row = token_selected[base + rr];
+                        const bool valid_row = assume_valid_rows || row < args.cache_cap;
+                        threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                        threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+                        float partial = 0.0f;
+                        if (valid_head && valid_row) {
+                            h0 = (float4)kv_row[lane + 0u];
+                            h1 = (float4)kv_row[lane + 32u];
+                            h2 = (float4)kv_row[lane + 64u];
+                            h3 = (float4)kv_row[lane + 96u];
+                            partial += dot(low0, h0);
+                            partial += dot(low1, h1);
+                            partial += dot(low2, h2);
+                            partial += dot(low3, h3);
+                            if (lane < rope_vecs) {
+                                partial += dot(qrope, rope_row[lane]);
+                            }
+                        }
+                        const float sum = simd_sum(partial);
+                        const float score =
+                            (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+                        float row_scale = exp(score - nm);
+                        if (CTRL == 1) row_scale = (float)(half)row_scale;
+                        p0 = p0 + h0 * row_scale;
+                        p1 = p1 + h1 * row_scale;
+                        p2 = p2 + h2 * row_scale;
+                        p3 = p3 + h3 * row_scale;
+                        Sp = Sp + row_scale;
+                    }
+                    const float old_scale = exp(M - nm);
+                    o0 = o0 * old_scale + p0;
+                    o1 = o1 * old_scale + p1;
+                    o2 = o2 * old_scale + p2;
+                    o3 = o3 * old_scale + p3;
+                    S = S * old_scale + Sp;
+                    M = nm;
+                } else {
+                    const float nm = max(M, blk_m);
+                    const float dm = M - nm;
+                    if (BSKIP && dm == 0.0f) {
+                        o0 = o0 + p0;
+                        o1 = o1 + p1;
+                        o2 = o2 + p2;
+                        o3 = o3 + p3;
+                        S = S + Sp;
+                    } else {
+                        /* o and p are referenced to the same M, so ONE multiply
+                         * rescales both.  dm is NaN when M is +/-infinity and
+                         * equal to nm, which is exactly the case production
+                         * poisons o in, and this arm poisons it the same way. */
+                        const float sc = exp(dm);
+                        o0 = (o0 + p0) * sc;
+                        o1 = (o1 + p1) * sc;
+                        o2 = (o2 + p2) * sc;
+                        o3 = (o3 + p3) * sc;
+                        S = (S + Sp) * sc;
+                    }
+                    M = nm;
+                }
+            }
+            }
+        } else {
+        /* phase A -- BLOCK independent scores.  Fully unrolled so sc[] is a
+         * register file and not a stack array; the harness asserts the
+         * pipeline still admits 256 threads per threadgroup. */
+        float sc[BLOCK];
+#pragma clang loop unroll(full)
+        for (uint rr = 0u; rr < BLOCK; rr++) {
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+            float partial = 0.0f;
+            if (valid_head && valid_row) {
+                partial += dot(low0, (float4)kv_row[lane + 0u]);
+                partial += dot(low1, (float4)kv_row[lane + 32u]);
+                partial += dot(low2, (float4)kv_row[lane + 64u]);
+                partial += dot(low3, (float4)kv_row[lane + 96u]);
+                if (lane < rope_vecs) {
+                    partial += dot(qrope, rope_row[lane]);
+                }
+            }
+            const float sum = simd_sum(partial);
+            const float score =
+                (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+            sc[rr] = score;
+        }
+
+        /* phase B -- the block max.  The accumulator is ALWAYS the first
+         * argument of max(), exactly as production writes max(M, score), so a
+         * NaN score is dropped here in the same way and in the same direction.
+         * blk_m starts at production's own initial M, and M is monotone
+         * non-decreasing, so max(M, max(-FLT_MAX/2, sc...)) is the running max. */
+        float blk_m = -FLT_MAX / 2.0f;
+#pragma clang loop unroll(full)
+        for (uint rr = 0u; rr < BLOCK; rr++) {
+            blk_m = max(blk_m, sc[rr]);
+        }
+        if (CTRL == 2) {
+            /* WRONGMAX control: the first score of the block instead of its max. */
+            blk_m = sc[0];
+        }
+        const float new_m = max(M, blk_m);
+        const float dm = M - new_m;
+        if (PART) {
+            float4 p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+            float Sp = 0.0f;
+#pragma clang loop unroll(full)
+            for (uint rr = 0u; rr < BLOCK; rr++) {
+                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                float row_scale = exp(sc[rr] - new_m);
+                if (CTRL == 1) row_scale = (float)(half)row_scale;
+                p0 = p0 + (float4)kv_row[lane + 0u] * row_scale;
+                p1 = p1 + (float4)kv_row[lane + 32u] * row_scale;
+                p2 = p2 + (float4)kv_row[lane + 64u] * row_scale;
+                p3 = p3 + (float4)kv_row[lane + 96u] * row_scale;
+                Sp = Sp + row_scale;
+            }
+            if (BSKIP && dm == 0.0f) {
+                o0 = o0 + p0;
+                o1 = o1 + p1;
+                o2 = o2 + p2;
+                o3 = o3 + p3;
+                S = S + Sp;
+            } else {
+                const float old_scale = exp(dm);
+                o0 = o0 * old_scale + p0;
+                o1 = o1 * old_scale + p1;
+                o2 = o2 * old_scale + p2;
+                o3 = o3 * old_scale + p3;
+                S = S * old_scale + Sp;
+            }
+        } else {
+            if (!(BSKIP && dm == 0.0f)) {
+                const float old_scale = exp(dm);
+                o0 = o0 * old_scale;
+                o1 = o1 * old_scale;
+                o2 = o2 * old_scale;
+                o3 = o3 * old_scale;
+                S = S * old_scale;
+            }
+#pragma clang loop unroll(full)
+            for (uint rr = 0u; rr < BLOCK; rr++) {
+                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                float row_scale = exp(sc[rr] - new_m);
+                if (CTRL == 1) row_scale = (float)(half)row_scale;
+                o0 = o0 + (float4)kv_row[lane + 0u] * row_scale;
+                o1 = o1 + (float4)kv_row[lane + 32u] * row_scale;
+                o2 = o2 + (float4)kv_row[lane + 64u] * row_scale;
+                o3 = o3 + (float4)kv_row[lane + 96u] * row_scale;
+                S = S + row_scale;
+            }
+        }
+        M = new_m;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* ---- tail: the fewer-than-BLOCK rows the blocking cannot cover.  This is
+     * production's row-serial online softmax, character for character, so at
+     * n_selected < BLOCK this kernel IS production. ------------------------- */
+    if (n_full < args.n_selected) {
+        const uint base = n_full;
+        const uint rows = args.n_selected - n_full;
+        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+            /* the early return guarantees kv_lora_dim == 512, so kv_vecs is
+             * exactly 128 here: same indices, no integer divide (lever 9's
+             * HOIST, campaigned bit-identical over 50,000 draws). */
+            const uint rr = off >> 7;
+            const uint vv = off & 127u;
+            const uint row = token_selected[base + rr];
+            /* AUDIT EXPERIMENT 3 (B) / DS4_GLM_DSA_TAIL_CHECKED: the pool
+             * expansion writes 0xffffffff into every unused tail slot and the
+             * graph passes the full 2,051-slot width, so with TAILCHK off this
+             * loop reads an out-of-range row on 3 of every 4 tokens (measured:
+             * 319 of 319 dispatches of a 62k prefill).  The
+             * 85 full 24-row blocks above are entirely inside the pooled
+             * prefix, which the trace shows is always valid; only this ragged
+             * stage can carry a sentinel, so only this stage is checked.  An
+             * invalid row stages zeros and its softmax and accumulator update
+             * are skipped entirely -- no probability mass, no value -- while
+             * the barriers and the valid rows' arithmetic order are untouched. */
+            const bool valid_row = (assume_valid_rows && !TAILCHK) || row < args.cache_cap;
+            if (valid_row) {
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)row * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            } else {
+                kv_shared[off] = half4(half(0.0f));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint rr = 0u; rr < rows; rr++) {
+            const uint row = token_selected[base + rr];
+            const bool valid_row = (assume_valid_rows && !TAILCHK) || row < args.cache_cap;
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+            float partial = 0.0f;
+            if (valid_head && valid_row) {
+                partial += dot(low0, (float4)kv_row[lane + 0u]);
+                partial += dot(low1, (float4)kv_row[lane + 32u]);
+                partial += dot(low2, (float4)kv_row[lane + 64u]);
+                partial += dot(low3, (float4)kv_row[lane + 96u]);
+                if (lane < rope_vecs) {
+                    partial += dot(qrope, rope_row[lane]);
+                }
+            }
+            const float sum = simd_sum(partial);
+            const float score =
+                (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+            if (valid_head && valid_row) {
+                const float new_m = max(M, score);
+                const float old_scale = exp(M - new_m);
+                const float row_scale = exp(score - new_m);
+                o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                S = S * old_scale + row_scale;
+                M = new_m;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_head) {
+        const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
+        device float4 *out4 =
+            (device float4 *)(lora_out +
+                ((uint64_t)token * args.n_head + head) *
+                    args.kv_lora_dim * sizeof(float));
+        out4[lane + 0u] = o0 * inv_s;
+        out4[lane + 32u] = o1 * inv_s;
+        out4[lane + 64u] = o2 * inv_s;
+        out4[lane + 96u] = o3 * inv_s;
+    }
+}
+
+typedef decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, false, 16u, false, 0>)
+        glm_attention_indexed_batch_lora_group8_vec_blk_t;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk16_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, false, false, false, 16u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk16s_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, false, false, 16u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk16p_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, false, true, false, 16u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk16sp_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, false, 16u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk32s_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<32u, true, false, false, 32u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk32sp_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<32u, true, true, false, 32u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk8sp_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<8u, true, true, false, 8u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_one8_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<8u, true, true, true, 8u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_one16_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 16u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_one32_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<32u, true, true, true, 32u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_sub2_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 2u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_sub4_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 4u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_sub8_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 8u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_nop16_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 16u, true, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_nop4_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 4u, true, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_sub1_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 1u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g8s2_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<8u, true, true, true, 2u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g8s4_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<8u, true, true, true, 4u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g12s3_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<12u, true, true, true, 3u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g12s4_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<12u, true, true, true, 4u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g12s6_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<12u, true, true, true, 6u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g20s5_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<20u, true, true, true, 5u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g24s4_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<24u, true, true, true, 4u, false, 0>;
+
+/* AUDIT EXPERIMENT 3 / prefill lever 27: the shipped blocked-softmax kernel
+ * with only its GATHER widened.  Default on; DS4_GLM_DISABLE_DSA_GATHER_WIDE=1
+ * selects the GATH 0 instantiations above. */
+template [[host_name("kernel_glm_attn_ib_lora_g8_g24s4w32_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<24u, true, true, true, 4u, false, 0, 1u>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g20s5w32_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<20u, true, true, true, 5u, false, 0, 1u>;
+
+/* AUDIT EXPERIMENT 3 (B): the same kernels with the RAGGED TAIL checked.
+ * DS4_GLM_DSA_TAIL_CHECKED=1, default OFF until the semantic change is
+ * assessed on its own.  Narrow and wide are both provided so that lever 27 can
+ * be isolated by byte identity between them under the correction. */
+template [[host_name("kernel_glm_attn_ib_lora_g8_g24s4c_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<24u, true, true, true, 4u, false, 0, 0u, true>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g24s4w32c_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<24u, true, true, true, 4u, false, 0, 1u, true>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_g32s4_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<32u, true, true, true, 4u, false, 0>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_sub4_deg_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 4u, false, 1>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk16sp_deg_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, false, 16u, false, 1>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_blk16sp_wmax_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, false, 16u, false, 2>;
+
+template [[host_name("kernel_glm_attn_ib_lora_g8_one16_deg_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_blk_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_blk_impl<16u, true, true, true, 16u, false, 1>;
 
 template <bool assume_valid_heads>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(
@@ -8436,6 +9616,2863 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// ---- BEGIN prefill lever 12 (indexer causal grid) ----
+
+/* Number of TN-wide row tiles that hold at least one causally visible score for
+ * token tile `ytile`.  glm_indexer_batch_visible_rows() is monotone in the
+ * token, so the last token of the tile bounds the whole tile -- exactly the
+ * bound the production kernel's own early-out uses.  The host mirrors this
+ * function bit for bit in idxgrid_xtiles(). */
+static inline uint glm_indexer_causal_xtiles(
+        constant ds4_metal_args_glm_indexer_scores_batch &args,
+        uint ytile,
+        uint tm,
+        uint tn) {
+    const uint token_base = ytile * tm;
+    const uint last_token = min(token_base + tm, args.n_tokens);
+    if (last_token <= token_base) return 0u;
+    const uint vis = glm_indexer_batch_visible_rows(args, last_token - 1u);
+    return (vis + tn - 1u) / tn;
+}
+
+kernel void kernel_glm53_indexer_scores_tiled_causal(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head = 0; head < args.n_head; head++) {
+        for (uint i = tid; i < TM*D; i += 128) {
+            const uint tr = i / D;
+            const uint d = i - tr*D;
+            const uint token = token_base + tr;
+            half v = half(0.0f);
+            if (token < args.n_tokens) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (uint db = 0; db < D/TS; db++) {
+            simdgroup_half8x8 mq;
+            simdgroup_half8x8 mk;
+            simdgroup_load(mq, qtg + db*TS, D, 0, false);
+            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+            simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+        }
+
+        simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (token0 < args.n_tokens && row0 < args.n_rows) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token0 * args.weights_token_stride);
+            const float s = dot[token_row0*TN + col0];
+            acc0 += max(s * args.scale, 0.0f) * w[head];
+        }
+        if (token1 < args.n_tokens && row1 < args.n_rows) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token1 * args.weights_token_stride);
+            const float s = dot[token_row1*TN + col1];
+            acc1 += max(s * args.scale, 0.0f) * w[head];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+/* The -INFINITY tail the packed grid no longer covers.  For each token the
+ * scoring kernels write [0, xtiles*TN) and the top-k reads [0, n_rows), so this
+ * fills [xtiles*TN, n_rows) -- contiguous, disjoint from every cell any live
+ * tile touches, and every word of it is the same -INFINITY the production
+ * kernel's dead threadgroups wrote. */
+kernel void kernel_glm53_indexer_scores_fill_dead(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device char *scores,
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint NTH = 256;
+    constexpr uint PER_TG = 4096;
+
+    const uint token = tgpig.y;
+    if (token >= args.n_tokens) return;
+    const uint start = glm_indexer_causal_xtiles(args, token / TM, TM, TN) * TN;
+    if (start >= args.n_rows) return;
+    const uint base = start + tgpig.x * PER_TG;
+    if (base >= args.n_rows) return;
+    const uint end = min(base + PER_TG, args.n_rows);
+    device float *dst = (device float *)(scores +
+        (uint64_t)token * args.score_token_stride);
+    for (uint r = base + tid; r < end; r += NTH) dst[r] = -INFINITY;
+}
+// ---- END prefill lever 12 ----
+
+// ---- BEGIN prefill lever 18 (indexer head fold) ----
+/* head fold g1e1: HF_G=1 heads staged, HF_E=1 row groups per matmul round,
+ * dot tile separate, 11264 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g1e1(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 1u;
+    constexpr uint HF_E = 1u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g1e1a: HF_G=1 heads staged, HF_E=1 row groups per matmul round,
+ * dot tile aliased over the Q stage, 10240 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g1e1a(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 1u;
+    constexpr uint HF_E = 1u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)shared;
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g2e2: HF_G=2 heads staged, HF_E=2 row groups per matmul round,
+ * dot tile separate, 14336 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g2e2(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 2u;
+    constexpr uint HF_E = 2u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g2e2a: HF_G=2 heads staged, HF_E=2 row groups per matmul round,
+ * dot tile aliased over the Q stage, 12288 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g2e2a(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 2u;
+    constexpr uint HF_E = 2u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)shared;
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g4e2: HF_G=4 heads staged, HF_E=2 row groups per matmul round,
+ * dot tile separate, 18432 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g4e2(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 4u;
+    constexpr uint HF_E = 2u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g4e4: HF_G=4 heads staged, HF_E=4 row groups per matmul round,
+ * dot tile separate, 20480 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g4e4(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 4u;
+    constexpr uint HF_E = 4u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g4e4a: HF_G=4 heads staged, HF_E=4 row groups per matmul round,
+ * dot tile aliased over the Q stage, 16384 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g4e4a(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 4u;
+    constexpr uint HF_E = 4u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)shared;
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g8e2: HF_G=8 heads staged, HF_E=2 row groups per matmul round,
+ * dot tile separate, 26624 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g8e2(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 8u;
+    constexpr uint HF_E = 2u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g8e4: HF_G=8 heads staged, HF_E=4 row groups per matmul round,
+ * dot tile separate, 28672 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g8e4(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 8u;
+    constexpr uint HF_E = 4u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g8e8: HF_G=8 heads staged, HF_E=8 row groups per matmul round,
+ * dot tile separate, 32768 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g8e8(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 8u;
+    constexpr uint HF_E = 8u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g8e8a: HF_G=8 heads staged, HF_E=8 row groups per matmul round,
+ * dot tile aliased over the Q stage, 24576 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g8e8a(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 8u;
+    constexpr uint HF_E = 8u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)shared;
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold ctl: HF_G=4 heads staged, HF_E=4 row groups per matmul round,
+ * dot tile separate, 20480 threadgroup bytes, DESCENDING head order (control arm only). */
+
+kernel void kernel_glm53_indexer_scores_headfold_ctl(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 4u;
+    constexpr uint HF_E = 4u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = (n_hblk - 1u - hb) * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = (HF_G/HF_E - 1u - rb) * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = (HF_E - 1u - uu);
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g1e1s: HF_G=1 heads staged, HF_E=1 row groups per matmul round,
+ * dot tile separate, 11264 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g1e1s(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 1u;
+    constexpr uint HF_E = 1u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g1e1as: HF_G=1 heads staged, HF_E=1 row groups per matmul round,
+ * dot tile aliased over the Q stage, 10240 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g1e1as(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 1u;
+    constexpr uint HF_E = 1u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)shared;
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+
+/* head fold g2e2as: HF_G=2 heads staged, HF_E=2 row groups per matmul round,
+ * dot tile aliased over the Q stage, 12288 threadgroup bytes. */
+
+kernel void kernel_glm53_indexer_scores_headfold_g2e2as(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 32;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint HF_G = 2u;
+    constexpr uint HF_E = 2u;
+
+    const uint n_ytiles = (args.n_tokens + TM - 1u) / TM;
+    const uint y0 = tgpig.y;
+    const uint y1 = n_ytiles - 1u - tgpig.y;
+    const uint l0 = glm_indexer_causal_xtiles(args, y0, TM, TN);
+    uint xtile;
+    uint ytile;
+    if (tgpig.x < l0) {
+        xtile = tgpig.x;
+        ytile = y0;
+    } else {
+        if (y1 <= y0) return;
+        xtile = tgpig.x - l0;
+        if (xtile >= glm_indexer_causal_xtiles(args, y1, TM, TN)) return;
+        ytile = y1;
+    }
+    const uint row_base = xtile * TN;
+    const uint token_base = ytile * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;
+    threadgroup half *ktg = qtg + TM*HF_G*D;
+    threadgroup float *dot = (threadgroup float *)shared;
+
+    const uint last_token = min(token_base + TM, args.n_tokens);
+    const uint max_visible = last_token > token_base ?
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
+
+    if (row_base >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += 128) {
+            const uint tr = i / TN;
+            const uint rc = i - tr*TN;
+            const uint token = token_base + tr;
+            const uint row = row_base + rc;
+            if (token < args.n_tokens && row < args.n_rows) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + row;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += 128) {
+        const uint rc = i / D;
+        const uint d = i - rc*D;
+        const uint row = row_base + rc;
+        half v = half(0.0f);
+        if (row < args.n_rows) {
+            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                               (uint64_t)row * args.head_dim + d,
+                                               args.cache_f16));
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = lane;
+    const uint cell1 = lane + 32u;
+    const uint token_row0 = cell0 >> 3;
+    const uint token_row1 = cell1 >> 3;
+    const uint sub0 = cell0 & 7u;
+    const uint sub1 = cell1 & 7u;
+    const uint col0 = (uint)sg * TS + sub0;
+    const uint col1 = (uint)sg * TS + sub1;
+    const uint token0 = token_base + token_row0;
+    const uint token1 = token_base + token_row1;
+    const uint row0 = row_base + col0;
+    const uint row1 = row_base + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_hblk = (args.n_head + HF_G - 1u) / HF_G;
+    for (uint hb = 0; hb < n_hblk; hb++) {
+        const uint head0 = hb * HF_G;
+        for (uint i = tid; i < TM*HF_G*D; i += 128) {
+            const uint hr = i / (TM*D);
+            const uint ii = i - hr*(TM*D);
+            const uint tr = ii / D;
+            const uint d = ii - tr*D;
+            const uint token = token_base + tr;
+            const uint head = head0 + hr;
+            half v = half(0.0f);
+            if (token < args.n_tokens && head < args.n_head) {
+                device const float *qrow = (device const float *)(q +
+                    (uint64_t)token * args.q_token_stride +
+                    (uint64_t)head  * args.q_head_stride);
+                v = half(qrow[d]);
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rb = 0; rb < HF_G/HF_E; rb++) {
+            const uint r0 = rb * HF_E;
+            simdgroup_float8x8 mdot[HF_E];
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                mdot[u] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+#pragma clang loop unroll(full)
+                for (uint u = 0; u < HF_E; u++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_load(mq, qtg + (r0 + u)*TM*D + db*TS, D, 0, false);
+                    simdgroup_multiply_accumulate(mdot[u], mq, mk, mdot[u]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+            for (uint u = 0; u < HF_E; u++) {
+                simdgroup_store(mdot[u], dot + u*(TM*TN) + (uint)sg * TS, TN, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint uu = 0; uu < HF_E; uu++) {
+                const uint u = uu;
+                const uint head = head0 + r0 + u;
+                if (head >= args.n_head) continue;
+                if (token0 < args.n_tokens && row0 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token0 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row0*TN + col0];
+                    acc0 += max(s * args.scale, 0.0f) * w[head];
+                }
+                if (token1 < args.n_tokens && row1 < args.n_rows) {
+                    device const float *w = (device const float *)(weights +
+                        (uint64_t)token1 * args.weights_token_stride);
+                    const float s = dot[u*(TM*TN) + token_row1*TN + col1];
+                    acc1 += max(s * args.scale, 0.0f) * w[head];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (token0 < args.n_tokens && row0 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + row0;
+        *dst = row0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && row1 < args.n_rows) {
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + row1;
+        *dst = row1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+// ---- END prefill lever 18 ----
+
+
 /* =====================================================================
  * Lever `scorer-xreduce` (Tier 2, worktree only, 2026-09-05).
  *

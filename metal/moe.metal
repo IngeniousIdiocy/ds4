@@ -549,6 +549,45 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
     }
 }
 
+// Prefill lever 20, fold MOESWIGLU: width-4 form of
+// kernel_dsv4_moe_swiglu_weight_f16.  One thread owns four consecutive lanes of
+// the expert row, so the two f32 reads are 16-byte and the half store is
+// 8-byte instead of 2-byte.  Each lane runs the same expression in the same
+// order as the scalar kernel, so the stored halves are bit-identical.  The
+// diagnostic write_clamped path is not reproduced here; the host falls back to
+// the scalar kernel when it is requested, or when the width is not a multiple
+// of four or a row base is not 16-byte aligned.
+kernel void kernel_dsv4_moe_swiglu_weight_f16_w4(
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &args,
+        device char *gate,
+        device char *up,
+        device char *mid,
+        device const char *weights,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    if (row >= args.rows) return;
+
+    device const float4 *gate_row = (device const float4 *)(gate + (uint64_t)row * args.gate_row_stride);
+    device const float4 *up_row   = (device const float4 *)(up   + (uint64_t)row * args.up_row_stride);
+    device       half4  *mid_row  = (device       half4  *)(mid  + (uint64_t)row * args.mid_row_stride);
+    device const float  *w        = (device const float  *)(weights + (uint64_t)row * args.weight_stride);
+    const float route_weight = w[0];
+    const float c = args.clamp_value;
+    const uint width4 = args.width >> 2;
+
+    for (uint i = tid; i < width4; i += ntg) {
+        float4 g = gate_row[i];
+        float4 u = up_row[i];
+        if (c > 1.0e-6f) {
+            g = min(g, float4(c));
+            u = clamp(u, float4(-c), float4(c));
+        }
+        const float4 silu = g / (1.0f + exp(-g));
+        mid_row[i] = (half4)(silu * u * route_weight);
+    }
+}
+
 kernel void kernel_dsv4_moe_sum6_f32(
         constant ds4_metal_dsv4_moe_sum6_args &args,
         device const char *src,
@@ -3061,6 +3100,81 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 &reg)
     for (int i = 0; i < 16; ++i) {
         reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Prefill lever 6, candidate (c): pure load widening of the Q4_K A-stage.
+ *
+ * `dequantize_q4_K` above issues 16 scalar `uchar` loads for the 16 quant bytes
+ * a lane needs.  The two functions below read exactly the same 16 bytes from
+ * exactly the same address with one 16 B load (`_w16`) or four 4 B loads
+ * (`_w4`), and then evaluate the SAME textual expression
+ * `dl * (q[i] & mask) - ml` on the SAME values in the SAME order, so fast math
+ * sees an identical tree and the result is bit-identical (Tier 1, harness
+ * proven).  Nothing is unpacked and no select is added -- the decode lever
+ * (megakernel notes 3.14a) found that only "pure" widenings pay.
+ *
+ * `q` is `xb->qs + (il/4)*32 + 16*(il&1)`, i.e. always 16 B past a 16 B
+ * multiple from the block base, so the load alignment requirement is the
+ * alignment of the block base.  Q4_K row and expert strides are multiples of
+ * 144 and the host checks the buffer offsets before selecting these
+ * pipelines (same rule as the decode gate+up wide kernels).
+ * ------------------------------------------------------------------------ */
+template <typename type4x4>
+void dequantize_q4_K_w16(device const block_q4_K *xb, short il, thread type4x4 &reg) {
+    device const uchar *q = xb->qs;
+
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il / 2, xb->scales);
+    const float d = il < 2 ?
+        (float)xb->d :
+        (float)xb->d * (1.0f / 16.0f);
+    const float min = (float)xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    /* One 16 B load, then four free bitcasts.  MSL has no 16-component vector
+     * type, and unpacking a uint4 with shifts would add the selects the decode
+     * lever measured as a loss, so the bytes are taken with as_type<>. */
+    const uint4 raw = *((device const uint4 *) q);
+    const uchar4 b0 = as_type<uchar4>(raw.x);
+    const uchar4 b1 = as_type<uchar4>(raw.y);
+    const uchar4 b2 = as_type<uchar4>(raw.z);
+    const uchar4 b3 = as_type<uchar4>(raw.w);
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[0][j] = dl * (b0[j] & mask) - ml;
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[1][j] = dl * (b1[j] & mask) - ml;
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[2][j] = dl * (b2[j] & mask) - ml;
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[3][j] = dl * (b3[j] & mask) - ml;
+}
+
+template <typename type4x4>
+void dequantize_q4_K_w4(device const block_q4_K *xb, short il, thread type4x4 &reg) {
+    device const uchar *q = xb->qs;
+
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il / 2, xb->scales);
+    const float d = il < 2 ?
+        (float)xb->d :
+        (float)xb->d * (1.0f / 16.0f);
+    const float min = (float)xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    device const uchar4 *q4 = (device const uchar4 *) q;
+    const uchar4 b0 = q4[0];
+    const uchar4 b1 = q4[1];
+    const uchar4 b2 = q4[2];
+    const uchar4 b3 = q4[3];
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[0][j] = dl * (b0[j] & mask) - ml;
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[1][j] = dl * (b1[j] & mask) - ml;
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[2][j] = dl * (b2[j] & mask) - ml;
+    FOR_UNROLL (short j = 0; j < 4; ++j) reg[3][j] = dl * (b3[j] & mask) - ml;
 }
 
 template <typename type4x4>
@@ -8384,7 +8498,7 @@ kernel void kernel_mul_mv_group24_q4_K_sum6_f32(
 // Builds the compact per-expert work map used by batched MoE matmul. DS4 routes
 // each token to a small fixed top-k list, so this turns token-major ids into
 // expert-major slices that the tiled matmul can consume.
-template<short ne20>
+template<short ne20, short NR1>
 kernel void kernel_mul_mm_id_map0(
         constant ds4_metal_args_mul_mm_id_map0 & args,
         device  const char * src2,
@@ -8443,7 +8557,10 @@ kernel void kernel_mul_mm_id_map0(
     // every possible token tile for every expert, even though most experts
     // receive only a small fraction of the prompt rows.
     threadgroup uint16_t * tile_counts = (threadgroup uint16_t *) shmem;
-    const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
+    /* NR1 is the routed-row height of the consuming matmul tile. It is 32 for
+     * the historical kernel and 8 or 16 for the narrow-tile prefill variants;
+     * the work-list format (expert, first routed row) is unchanged. */
+    const uint16_t n_tiles = (uint16_t)((n_all + (uint32_t)NR1 - 1u) / (uint32_t)NR1);
     tile_counts[ide] = n_tiles;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -8455,26 +8572,150 @@ kernel void kernel_mul_mm_id_map0(
     device uint32_t * work_count = (device uint32_t *) work;
     device uint2 * work_items = (device uint2 *)(work + 8);
     for (uint32_t tile = 0; tile < n_tiles; tile++) {
-        work_items[tile_base + tile] = uint2((uint32_t)ide, tile * 32u);
+        work_items[tile_base + tile] = uint2((uint32_t)ide, tile * (uint32_t)NR1);
     }
     if (ide + 1u == ntg) {
         work_count[0] = tile_base + n_tiles;
     }
 }
 
-typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
+typedef decltype(kernel_mul_mm_id_map0<1, 32>) kernel_mul_mm_id_map0_t;
 
 // Host-visible map builders for the routed-expert counts used by DS4 graph
 // shapes. Some arities are generic leftovers retained for nearby batch sizes.
-template [[host_name("kernel_mul_mm_id_map0_ne20_1" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_2" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<2>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_4" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<4>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_5" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<5>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_6" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_8" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
-template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_1" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_2" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<2, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_4" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<4, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_5" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<5, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_6" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_8" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16, 32>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22, 32>;
+
+// Narrow-tile work maps for the GLM top-8 routed prefill: identical map, only
+// the routed-row height of the emitted tiles differs.
+template [[host_name("kernel_mul_mm_id_map0_ne20_8_nr1_8" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8,  8>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_8_nr1_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8, 16>;
+
+// Prefill lever 20, fold MOEMAP, pass 1: the per-expert routed-row list.
+//
+// The shipped kernel_mul_mm_id_map0 runs in ONE threadgroup: thread `ide` owns
+// expert `ide` and scans every routed id of every token serially, so an 8192-row
+// chunk costs ~0.8 ms on a single core while the rest of the GPU idles.  This
+// variant gives each expert its own threadgroup and compacts that expert's
+// matching rows with a threadgroup-wide exclusive prefix sum over 256 tokens at
+// a time.  The emitted list is the SAME list in the SAME ascending-token order,
+// so `hids` and `htpe` are byte-identical to the shipped kernel's.  The work
+// list, which needs every expert's count, is built by the tiny second pass
+// below.
+template<short ne20>
+kernel void kernel_mul_mm_id_map0_rows(
+        constant ds4_metal_args_mul_mm_id_map0 & args,
+        device  const char * src2,
+        device        char * htpe,
+        device        char * hids,
+        threadgroup   uint32_t * sg_shmem [[threadgroup(0)]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort   nsg[[simdgroups_per_threadgroup]],
+        uint   tgpig[[threadgroup_position_in_grid]]) {
+    const short ide = (short)tgpig;
+
+    device int32_t * ids_i32 = (device int32_t *) hids + (uint64_t)ide*args.ne21;
+
+    uint32_t n_all = 0;
+
+    for (int base = 0; base < args.ne21; base += (int)ntg) {
+        const int i21 = base + (int)tpitg;
+
+        short sel = 0;
+        if (i21 < args.ne21) {
+            device const int32_t * src2_i32 = (device const int32_t *) (src2 + (uint64_t)i21*args.nb21);
+            // The shipped kernel stages the ids through uint16_t threadgroup
+            // memory before comparing, so match that truncation exactly.
+            #pragma unroll(ne20)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                sel += ((uint16_t)src2_i32[i20] == (uint16_t)ide)*(i20 + 1);
+            }
+        }
+
+        const uint32_t hit = sel > 0 ? 1u : 0u;
+
+        const uint32_t lane_prefix = simd_prefix_exclusive_sum(hit);
+        const uint32_t simd_total  = simd_sum(hit);
+        if (tiisg == 0) {
+            sg_shmem[sgitg] = simd_total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint32_t simd_base  = 0;
+        uint32_t round_total = 0;
+        for (ushort s = 0; s < nsg; ++s) {
+            const uint32_t v = sg_shmem[s];
+            if (s < sgitg) simd_base += v;
+            round_total += v;
+        }
+
+        if (hit) {
+            ids_i32[n_all + simd_base + lane_prefix] = i21*ne20 + sel - 1;
+        }
+        n_all += round_total;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tpitg == 0) {
+        device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+        tpe_u32[ide] = n_all;
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_map0_rows<8>) kernel_mul_mm_id_map0_rows_t;
+template [[host_name("kernel_mul_mm_id_map0_rows_ne20_8")]] kernel kernel_mul_mm_id_map0_rows_t kernel_mul_mm_id_map0_rows<8>;
+
+// Prefill lever 20, fold MOEMAP, pass 2: the compact non-empty-tile work list.
+// Byte-for-byte the tail of kernel_mul_mm_id_map0, reading the counts pass 1
+// wrote instead of recomputing them.  One threadgroup, one thread per expert.
+template<short NR1>
+kernel void kernel_mul_mm_id_map0_tiles(
+        constant ds4_metal_args_mul_mm_id_map0 & args,
+        device  const char * htpe,
+        device        char * work,
+        threadgroup   uint16_t * tile_counts [[threadgroup(0)]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const short ide = (short)tpitg;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    const uint32_t n_all = tpe_u32[ide];
+
+    const uint16_t n_tiles = (uint16_t)((n_all + (uint32_t)NR1 - 1u) / (uint32_t)NR1);
+    tile_counts[ide] = n_tiles;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t tile_base = 0;
+    for (ushort i = 0; i < ide; i++) {
+        tile_base += tile_counts[i];
+    }
+
+    device uint32_t * work_count = (device uint32_t *) work;
+    device uint2 * work_items = (device uint2 *)(work + 8);
+    for (uint32_t tile = 0; tile < n_tiles; tile++) {
+        work_items[tile_base + tile] = uint2((uint32_t)ide, tile * (uint32_t)NR1);
+    }
+    if (ide + 1u == ntg) {
+        work_count[0] = tile_base + n_tiles;
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_map0_tiles<32>) kernel_mul_mm_id_map0_tiles_t;
+template [[host_name("kernel_mul_mm_id_map0_tiles_nr1_8" )]] kernel kernel_mul_mm_id_map0_tiles_t kernel_mul_mm_id_map0_tiles<8>;
+template [[host_name("kernel_mul_mm_id_map0_tiles_nr1_16")]] kernel kernel_mul_mm_id_map0_tiles_t kernel_mul_mm_id_map0_tiles<16>;
+template [[host_name("kernel_mul_mm_id_map0_tiles_nr1_32")]] kernel kernel_mul_mm_id_map0_tiles_t kernel_mul_mm_id_map0_tiles<32>;
+
 
 // Token-centric map builder for the common six-route MXFP4 prefill shape.
 // Each selected route reserves one expert-local row instead of making every
@@ -8566,7 +8807,72 @@ kernel kernel_mul_mm_id_map_scatter_work_t
 // Batched routed-expert matmul. It reads the expert-major map produced above,
 // loads selected expert weights, and writes results back to token-major slots
 // so the DS4 FFN can apply SwiGLU, weighting, and the down projection.
-template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false>
+/* Prefill lever 6, candidate (b): A/B stage double buffering.
+ *
+ * With A_DOUBLE_BUFFER the threadgroup stages k-step n+1's tiles into the
+ * spare half of threadgroup memory while the MMA of step n reads the current
+ * half, so a k-step costs ONE threadgroup barrier instead of two.  The words
+ * staged, the lane that stages each of them, the simdgroup_load order and the
+ * simdgroup_multiply_accumulate sequence per output element are all unchanged,
+ * so the result is bit-identical to the single-buffered loop (Tier 1).  The
+ * cost is threadgroup memory: 2*SA + 2*SB = 12 KB at NR1 = 32 instead of the
+ * 8 KB the epilogue already needs, which may cost occupancy -- measured, not
+ * assumed. */
+#define DS4_MMID_STAGE_A(DST_, K_) do {                                        \
+    if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {                 \
+        for (short i = 0; i < 16; i++) {                                       \
+            const short sx = 2*il0 + i/8;                                      \
+            const short sy = (tiitg/NL0)/8;                                    \
+            const short lx = (tiitg/NL0)%8;                                    \
+            const short ly = i%8;                                              \
+            const short ib = 8*sx + sy;                                        \
+            *((DST_) + 64*ib + 8*ly + lx) =                                    \
+                (K_) + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;     \
+        }                                                                      \
+    } else {                                                                   \
+        S0_4x4 temp_a;                                                         \
+        dequantize_func(x, il, temp_a);                                        \
+        FOR_UNROLL (short i = 0; i < 16; i++) {                                \
+            const short sx = 2*il0 + i/8;                                      \
+            const short sy = (tiitg/NL0)/8;                                    \
+            const short lx = (tiitg/NL0)%8;                                    \
+            const short ly = i%8;                                              \
+            const short ib = 8*sx + sy;                                        \
+            *((DST_) + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];                  \
+        }                                                                      \
+    }                                                                          \
+} while (0)
+
+#define DS4_MMID_STAGE_B(DST_, K_) do {                                        \
+    if (NR1 == 32 || (short)(tiitg/NL1) < NR1) {                               \
+        if (FC_mul_mm_bc_inp) {                                                \
+            for (short i = 0; i < 8; ++i) {                                    \
+                const short sx = (tiitg%NL1);                                  \
+                const short sy = (tiitg/NL1)/8;                                \
+                const short lx = i;                                            \
+                const short ly = (tiitg/NL1)%8;                                \
+                const short ib = NB*sx + sy;                                   \
+                *((DST_) + 64*ib + 8*ly + lx) =                                \
+                    (K_) + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;\
+            }                                                                  \
+        } else {                                                               \
+            const short sx = (tiitg%NL1);                                      \
+            const short sy = (tiitg/NL1)/8;                                    \
+            const short ly = (tiitg/NL1)%8;                                    \
+            const short ib = NB*sx + sy;                                       \
+            *(threadgroup S1_2x4 *)((DST_) + 64*ib + 8*ly) =                   \
+                (S1_2x4)(*((device T1_2x4 *) y));                              \
+        }                                                                      \
+    }                                                                          \
+} while (0)
+
+#define DS4_MMID_ADVANCE() do {                                                \
+    il = (il + 2 < nl) ? il + 2 : il % 2;                                      \
+    x  = (il < 2) ? x + (2 + nl - 1)/nl : x;                                   \
+    y += NK;                                                                   \
+} while (0)
+
+template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false, short MB_ROWS = 0, bool A_DOUBLE_BUFFER = false>
 kernel void kernel_mul_mm_id(
         constant ds4_metal_args_mul_mm_id & args,
         device const char * src0,
@@ -8581,15 +8887,43 @@ kernel void kernel_mul_mm_id(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     constexpr int NR0 = 64;
-    static_assert(NR1 == 32, "kernel_mul_mm_id accumulator layout supports only 32 routed rows");
+    static_assert(NR1 == 8 || NR1 == 16 || NR1 == 32,
+                  "kernel_mul_mm_id accumulator layout supports 8, 16 or 32 routed rows");
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
-    constexpr int SA_BYTES = NR0 * NR1 * (int)sizeof(S0);
+    /* The A stage is NR0 rows x NK columns of S0 and does NOT depend on NR1.
+     * (At NR1 = 32 this is the same 4096 bytes the fixed-width kernel used.) */
+    constexpr int SA_BYTES = NR0 * NK * (int)sizeof(S0);
 
+    /* Row-tile geometry. The routed tile is NR1 rows tall = NB blocks of 8;
+     * the four simdgroups split the NR0 = 64 output rows SG_A ways and the
+     * routed rows SG_B ways. At NR1 = 32 this reduces to the historical
+     * 2 x 2 split (4 A blocks and 2 B blocks per simdgroup, mc[8]) and issues
+     * the same MMA sequence per output element. Narrower tiles keep the same
+     * per-element k order, so their results stay bit-identical. */
+    constexpr int NB   = NR1/8;
+    /* MB_ROWS overrides how many routed rows one simdgroup owns.  The point of
+     * a smaller value at NR1 = 32 is CULL granularity: with 8 rows per
+     * simdgroup an expert with 3 routed rows leaves three of the four
+     * simdgroups with no MMA to issue at all, i.e. the MMA work of an 8-row
+     * tile at the tile count of a 32-row one. */
+    constexpr int MB_N = MB_ROWS ? MB_ROWS/8 : ((NR1 == 32) ? 2 : NB);
+    constexpr int SG_B = NB/MB_N;                /* simdgroups over routed rows */
+    constexpr int SG_A = 4/SG_B;                 /* simdgroups over output rows */
+    constexpr int MA_N = 8/SG_A;                 /* A blocks per simdgroup */
+    constexpr int MC_N = MA_N*MB_N;              /* accumulators per simdgroup */
+    const short sg_a = (short)(sgitg % SG_A);
+    const short sg_b = (short)(sgitg / SG_A);
+
+    constexpr int SB_BYTES = NR1 * NK * (int)sizeof(S1);
+    /* Single-buffered layout: [A][B].  Double-buffered: [A0][A1][B0][B1]. */
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + (A_DOUBLE_BUFFER ? 2*SA_BYTES : SA_BYTES));
+    /* Never dereferenced unless A_DOUBLE_BUFFER; folded away otherwise. */
+    threadgroup S0 * sa1 = (threadgroup S0 *)(shmem + (A_DOUBLE_BUFFER ? SA_BYTES : 0));
+    threadgroup S1 * sb1 = (threadgroup S1 *)(shmem + (A_DOUBLE_BUFFER ? 2*SA_BYTES + SB_BYTES : 0));
 
     device const uint32_t * work_count = (device const uint32_t *) work;
     const uint32_t work_index = tgpig.x;
@@ -8613,11 +8947,13 @@ kernel void kernel_mul_mm_id(
 
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
-    // SIMDgroups 0/1 own routed rows 0..15 and SIMDgroups 2/3 own rows
-    // 16..31. Keep all threads in staging and at every threadgroup barrier,
-    // but let the second row-half skip MMA on short final expert tiles.
+    // Each simdgroup owns routed rows [8*MB_N*sg_b, +8*MB_N). Keep all
+    // threads in staging and at every threadgroup barrier, but let a
+    // simdgroup whose rows all lie past the end skip MMA on short final
+    // expert tiles. (At NR1 = 32, SG_B = 2 and this is the historical
+    // "second row-half" cull.)
     const bool mma_active =
-        !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
+        !CULL_TAIL_SIMDGROUPS || (short)(8*MB_N)*sg_b < nr1;
 
     if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert under the TP split: zero this tile's output rows so
@@ -8664,15 +9000,72 @@ kernel void kernel_mul_mm_id(
         + args.nb11*i11
         + args.nb10*iy);
 
-    S0_8x8 ma[4];
-    S1_8x8 mb[2];
+    S0_8x8 ma[MA_N];
+    S1_8x8 mb[MB_N];
 
-    simdgroup_float8x8 mc[8];
+    simdgroup_float8x8 mc[MC_N];
 
-    for (short i = 0; i < 8; i++){
+    for (short i = 0; i < MC_N; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
+    if (A_DOUBLE_BUFFER) {
+        /* Stage k = 0, then in every iteration stage k+1 into the spare half
+         * while the MMA consumes the current half.  One barrier per k-step. */
+        int stage_k = 0;
+        DS4_MMID_STAGE_A(sa, stage_k);
+        DS4_MMID_STAGE_B(sb, stage_k);
+        DS4_MMID_ADVANCE();
+        stage_k += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool ph = false;
+        for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+            threadgroup S0 * nxt_a = ph ? sa  : sa1;
+            threadgroup S1 * nxt_b = ph ? sb  : sb1;
+            threadgroup const S0 * cur_a = ph ? sa1 : sa;
+            threadgroup const S1 * cur_b = ph ? sb1 : sb;
+
+            if (stage_k < args.ne00) {
+                DS4_MMID_STAGE_A(nxt_a, stage_k);
+                DS4_MMID_STAGE_B(nxt_b, stage_k);
+                DS4_MMID_ADVANCE();
+                stage_k += NK;
+            }
+
+            threadgroup const S0 * lsma = (cur_a + MA_N*64*sg_a);
+            threadgroup const S1 * lsmb = (cur_b + MB_N*64*sg_b);
+
+            if (mma_active) {
+                FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                    simdgroup_barrier(mem_flags::mem_none);
+
+                    FOR_UNROLL (short i = 0; i < MA_N; i++) {
+                        simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                    }
+
+                    simdgroup_barrier(mem_flags::mem_none);
+
+                    FOR_UNROLL (short i = 0; i < MB_N; i++) {
+                        simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                    }
+
+                    simdgroup_barrier(mem_flags::mem_none);
+
+                    FOR_UNROLL (short i = 0; i < MC_N; i++){
+                        simdgroup_multiply_accumulate(mc[i], mb[i/MA_N], ma[i%MA_N], mc[i]);
+                    }
+
+                    lsma += 8*64;
+                    lsmb += NB*64;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ph = !ph;
+        }
+    } else {
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -8707,27 +9100,32 @@ kernel void kernel_mul_mm_id(
             }
         }
 
-        if (FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 8; ++i) {
+        /* Threads whose routed row lies outside the (narrow) tile stage
+         * nothing; at NR1 = 32 every thread of the 128-thread threadgroup
+         * owns a row and the guard folds away at compile time. */
+        if (NR1 == 32 || (short)(tiitg/NL1) < NR1) {
+            if (FC_mul_mm_bc_inp) {
+                for (short i = 0; i < 8; ++i) {
+                    const short sx = (tiitg%NL1);
+                    const short sy = (tiitg/NL1)/8;
+
+                    const short lx = i;
+                    const short ly = (tiitg/NL1)%8;
+
+                    const short ib = NB*sx + sy;
+
+                    *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                }
+            } else {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
 
-                const short lx = i;
                 const short ly = (tiitg/NL1)%8;
 
-                const short ib = 4*sx + sy;
+                const short ib = NB*sx + sy;
 
-                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
             }
-        } else {
-            const short sx = (tiitg%NL1);
-            const short sy = (tiitg/NL1)/8;
-
-            const short ly = (tiitg/NL1)%8;
-
-            const short ib = 4*sx + sy;
-
-            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -8737,42 +9135,44 @@ kernel void kernel_mul_mm_id(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
-        threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
+        threadgroup const S0 * lsma = (sa + MA_N*64*sg_a);
+        threadgroup const S1 * lsmb = (sb + MB_N*64*sg_b);
 
         if (mma_active) {
             FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 4; i++) {
+                FOR_UNROLL (short i = 0; i < MA_N; i++) {
                     simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
                 }
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 2; i++) {
+                FOR_UNROLL (short i = 0; i < MB_N; i++) {
                     simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
                 }
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 8; i++){
-                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+                FOR_UNROLL (short i = 0; i < MC_N; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[i/MA_N], ma[i%MA_N], mc[i]);
                 }
 
                 lsma += 8*64;
-                lsmb += 4*64;
+                lsmb += NB*64;
             }
         }
+    }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+        + (8*MA_N)*sg_a + ((8*MB_N)*sg_b)*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        for (short i = 0; i < MC_N; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%MA_N) + 8*NR0*(i/MA_N), NR0, 0, false);
         }
     }
 
@@ -8801,6 +9201,10 @@ kernel void kernel_mul_mm_id(
         }
     }
 }
+
+#undef DS4_MMID_STAGE_A
+#undef DS4_MMID_STAGE_B
+#undef DS4_MMID_ADVANCE
 
 // Address-table variant used by SSD streaming.  The routing ids remain the
 // model's original expert ids, but each expert's resident buffer is found via a
@@ -9487,6 +9891,44 @@ template [[host_name("kernel_mul_mm_id_q6_K_f16")]]         kernel mul_mm_id_f16
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]]      kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f16")]]        kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4,   2,     dequantize_mxfp4,   half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f16_tail_cull")]] kernel mul_mm_id_mxfp4_f16_rhs_tail_cull kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4, true>;
+
+/* Narrow routed tiles for the short-prefill regime. At ~3 routed rows per
+ * expert the 32-row tile does 10x the necessary MMA work and the machine
+ * charges full price for it. These instantiations keep NR0 = 64, NK = 32, the
+ * same simdgroup_half8x8 MMA and the same per-output-element k order, so their
+ * output is bit-identical to the 32-row kernel; only the routed-row height of
+ * a work item changes (the map0 variants above emit matching tiles).
+ * The _tail_cull pair is the cheap half-measure: 32-row tiles that skip the
+ * MMA of the second routed row-half when the expert has 16 rows or fewer. */
+template [[host_name("kernel_mul_mm_id_q4_K_f32_nr1_8" )]]    kernel mul_mm_id         kernel_mul_mm_id< 8, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_nr1_16")]]    kernel mul_mm_id         kernel_mul_mm_id<16, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_nr1_8" )]]    kernel mul_mm_id_f16_rhs kernel_mul_mm_id< 8, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half,  half4x4,  half,  half2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_nr1_16")]]    kernel mul_mm_id_f16_rhs kernel_mul_mm_id<16, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half,  half4x4,  half,  half2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_tail_cull")]] kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, true>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_tail_cull")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half,  half4x4,  half,  half2x4,  true>;
+/* 32-row tiles culled at 8-row granularity: one 8-row routed block per
+ * simdgroup, so an expert with r routed rows issues MMA for ceil(r/8)*8 rows
+ * instead of 32 -- the MMA work of an 8-row tile with the work-list length,
+ * the weight stream and the map of the 32-row tile, decided per expert inside
+ * the kernel with no host threshold. */
+template [[host_name("kernel_mul_mm_id_q4_K_f32_cull4")]] kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, true, 8>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_cull4")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half,  half4x4,  half,  half2x4,  true, 8>;
+/* Prefill lever 6 variants of the shipping cull4 routed kernel.  Every one of
+ * them keeps NR0 = 64, NK = 32, the 8-row cull granularity and the per-output-
+ * element MMA and k order, so all are Tier 1 candidates:
+ *   _db      A/B stage double buffering (one barrier per k-step)
+ *   _w4      the A-stage Q4_K dequant reads its 16 quant bytes as four uchar4
+ *   _w16     ... as one 16 B uint4, bitcast to bytes
+ *   _db_w16  both */
+template [[host_name("kernel_mul_mm_id_q4_K_f32_cull4_db")]]     kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K,     float, float4x4, float, float2x4, true, 8, true>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_cull4_db")]]     kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K,     half,  half4x4,  half,  half2x4,  true, 8, true>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_cull4_w4")]]     kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K_w4,  float, float4x4, float, float2x4, true, 8>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_cull4_w4")]]     kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K_w4,  half,  half4x4,  half,  half2x4,  true, 8>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_cull4_w16")]]    kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K_w16, float, float4x4, float, float2x4, true, 8>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_cull4_w16")]]    kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K_w16, half,  half4x4,  half,  half2x4,  true, 8>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_cull4_db_w16")]] kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K_w16, float, float4x4, float, float2x4, true, 8, true>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_cull4_db_w16")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K_w16, half,  half4x4,  half,  half2x4,  true, 8, true>;
+
 template [[host_name("kernel_mul_mm_id_mxfp4_f16_half_lut")]] kernel mul_mm_id_mxfp4_f16_rhs_half_lut kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f16_half_lut_tail_cull")]] kernel mul_mm_id_mxfp4_f16_rhs_half_lut_tail_cull kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4, true>;
 

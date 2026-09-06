@@ -61,3 +61,33 @@ kernel void kernel_swiglu_flat_f32(
     const float silu = x0 / (1.0f + exp(-x0));
     dst_f32[i] = silu*x1*args.alpha;
 }
+
+// Prefill lever 20, fold MOESWIGLU: width-4 form of kernel_swiglu_flat_f32 for
+// the shared/dense expert.  One thread owns four consecutive lanes; the two
+// reads and the store become 16-byte accesses and each lane runs the same
+// expression in the same order, so the result is bit-identical.  The host
+// selects it only when i00 and i10 are zero, ne0 is a multiple of four and the
+// three base offsets are 16-byte aligned.
+kernel void kernel_swiglu_flat_f32_w4(
+        constant ds4_metal_args_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint i [[thread_position_in_grid]]) {
+    const uint n4 = ((uint) args.ne0) >> 2;
+    if (i >= n4) return;
+
+    device const float4 * src0_f32 = (device const float4 *) src0;
+    device const float4 * src1_f32 = (device const float4 *) src1;
+    device       float4 * dst_f32  = (device       float4 *) dst;
+
+    float4 x0 = src0_f32[i];
+    float4 x1 = src1_f32[i];
+    if (args.limit > 1.0e-6f) {
+        x0 = min(x0, float4(args.limit));
+        x1 = clamp(x1, float4(-args.limit), float4(args.limit));
+    }
+
+    const float4 silu = x0 / (1.0f + exp(-x0));
+    dst_f32[i] = silu*x1*args.alpha;
+}

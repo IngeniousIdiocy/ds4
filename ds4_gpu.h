@@ -1704,6 +1704,9 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
+/* guaranteed_prefix: when selected_rows_valid is false, the number of leading
+ * selected slots that are known to index live cache rows (0 = no such claim,
+ * every row bounds-tested).  Ignored when selected_rows_valid is true. */
 int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *partial_lora,
@@ -1718,6 +1721,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
         const ds4_gpu_tensor *selected,
         uint32_t              n_selected,
         bool                  selected_rows_valid,
+        uint32_t              guaranteed_prefix,
         uint32_t              cache_cap,
         bool                  cache_f16,
         uint32_t              n_head,
@@ -1750,6 +1754,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         const ds4_gpu_tensor *selected,
         uint32_t              n_selected,
         bool                  selected_rows_valid,
+        uint32_t              guaranteed_prefix,
         uint32_t              cache_cap,
         bool                  cache_f16,
         uint32_t              n_head,
@@ -1888,6 +1893,34 @@ int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              qk_dim);
+
+/* Selected rows [0, guaranteed_prefix) are known to index live cache rows;
+ * slots at or above it may hold the pooled producer's 0xffffffff pad.  A
+ * strictly weaker claim than ..._valid_tensor's; backends that have no kernel
+ * able to exploit it must behave exactly like ..._tensor. */
+int ds4_gpu_glm_attention_indexed_batch_lora_pooled_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              guaranteed_prefix,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow);
 
 int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         ds4_gpu_tensor       *lora_out,
@@ -3179,6 +3212,52 @@ int ds4_gpu_hc_expand_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* Prefill lever 28, pass SCALE: the split-form HC expands that also publish
+ * the following RMSNorm's per-row scale.  Return 0 without encoding anything
+ * when the fold is switched off or the shape does not qualify, so the caller
+ * can fall back to the plain form. */
+int ds4_gpu_hc_expand_split_scale_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *scale_out,
+        float                   norm_eps,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_hc_expand_add_split_scale_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *scale_out,
+        float                   norm_eps,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_hc_chain_scale_enabled(void);
+int ds4_gpu_hc_chain_collapse_enabled(void);
+
+int ds4_gpu_rms_norm_scale_rows_tensor(
+        ds4_gpu_tensor       *scale_out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
+int ds4_gpu_glm53_matmul_bf16_scaled(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *scales,
+        uint32_t                n_rows);
+
 int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out_h,
@@ -3789,6 +3868,19 @@ int ds4_gpu_matmul_q8_0_pair2in_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x_a,
         const ds4_gpu_tensor *x_b);
+/* prefill lever 24: fill the three-slot dense half-copy ring from `count`
+ * same-shaped Q8_0 weights on the current serial encoder, right before a
+ * concurrent dispatch group is opened over their GEMMs. Returns 1 when armed;
+ * release() disarms it after the group closes. */
+int ds4_gpu_dense_half_ring_prepare(const void *model_map,
+                                    uint64_t    model_size,
+                                    const uint64_t *weight_offsets,
+                                    int         count,
+                                    uint32_t    weight_type,
+                                    uint64_t    in_dim,
+                                    uint64_t    out_dim,
+                                    uint64_t    rows);
+void ds4_gpu_dense_half_ring_release(void);
 /* --------------------------------------------------------------------------
  * Tier-2 screening instrumentation.
  *
@@ -3808,6 +3900,9 @@ typedef struct {
 
 void ds4_t2s_hit(ds4_t2s_slot *slot, const char *fmt, ...);
 
+int ds4_gpu_concurrent_group_begin(void);
+int ds4_gpu_concurrent_group_barrier(void);
+int ds4_gpu_concurrent_group_end(void);
 
 #ifdef __cplusplus
 }

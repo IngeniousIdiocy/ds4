@@ -76,6 +76,80 @@ static void attention_reference(float *out, const float *low, const float *kv,
     free(weights);
 }
 
+/* The GLM-5.3 pooled selection contract, at the geometry the graph dispatches:
+ * 64 heads, kv_lora 512, no RoPE, f16 cache, width 2051 = indexer_top_k 2048 +
+ * (pool size 4 - 1) causal-tail slots, of which `tail_valid` carry real rows
+ * and the rest carry the 0xffffffff pad.  A backend may only exploit the
+ * declared prefix on a kernel that still bounds-tests the ragged tail, so the
+ * pooled entry point must agree with (a) the masked host reference and (b) the
+ * fully row-checked entry point on the same operands.  `full_end_over_prefix`
+ * builds a width whose full blocks would run past the declared prefix, which
+ * every backend must refuse to specialise on. */
+static void pooled_tail_case(uint32_t tail_valid, bool full_end_over_prefix) {
+    const uint32_t tokens = 2, heads = 64, dim = 512, nope = 256, cap = 4096;
+    const uint32_t topk = 2048;
+    const uint32_t count = full_end_over_prefix ? 2072 : 2051;
+    const size_t out_n = (size_t)tokens * heads * dim;
+    const size_t kv_n = (size_t)cap * dim;
+    float *q = calloc((size_t)tokens * heads * nope, sizeof(float));
+    float *low = calloc(out_n, sizeof(float));
+    float *kv = malloc(kv_n * sizeof(float));
+    int32_t *ids = malloc((size_t)tokens * count * sizeof(int32_t));
+    float *ref = malloc(out_n * sizeof(float));
+    float *pooled = malloc(out_n * sizeof(float));
+    float *checked = malloc(out_n * sizeof(float));
+    check(q && low && kv && ids && ref && pooled && checked, "pooled allocation");
+    for (size_t i = 0; i < kv_n; i++) kv[i] = ((int)(i % 31) - 15) * 0.03125f;
+    for (size_t i = 0; i < out_n; i++) low[i] = ((int)(i % 23) - 11) * 0.015625f;
+    for (uint32_t t = 0; t < tokens; t++) {
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t v;
+            if (i < topk) {
+                /* 512 pools of four CONSECUTIVE rows, all inside the cache */
+                const uint32_t pool = (i / 4u + t) % (cap / 4u);
+                v = (int32_t)(pool * 4u + i % 4u);
+            } else {
+                const uint32_t tail_slot = i - topk;
+                v = tail_slot < tail_valid ? (int32_t)(cap - 1u - tail_slot) : -1;
+            }
+            ids[(size_t)t * count + i] = v;
+        }
+    }
+    attention_reference(ref, low, kv, ids, tokens, heads, dim, 0, cap, count,
+                        nope, true);
+    ds4_gpu_tensor *qg = upload(q, (size_t)tokens * heads * nope * sizeof(float));
+    ds4_gpu_tensor *lg = upload(low, out_n * sizeof(float));
+    ds4_gpu_tensor *kg = upload_cache(kv, kv_n, true);
+    ds4_gpu_tensor *rg = upload_cache(kv, 1, true);
+    ds4_gpu_tensor *ig = upload(ids, (size_t)tokens * count * sizeof(int32_t));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    check(out != NULL, "pooled output allocation");
+    check(ds4_gpu_glm_attention_indexed_batch_lora_pooled_tensor(
+              out, qg, lg, kg, rg, ig, tokens, count, topk, cap, true,
+              heads, dim, nope, 0, 4096, 10000, 1, 0, 1, 32, 1) &&
+          ds4_gpu_synchronize(), "pooled attention launch");
+    check(ds4_gpu_tensor_read(out, 0, pooled, out_n * sizeof(float)), "pooled read");
+    check(ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+              out, qg, lg, kg, rg, ig, tokens, count, cap, true,
+              heads, dim, nope, 0, 4096, 10000, 1, 0, 1, 32, 1) &&
+          ds4_gpu_synchronize(), "row-checked attention launch");
+    check(ds4_gpu_tensor_read(out, 0, checked, out_n * sizeof(float)),
+          "row-checked read");
+    for (size_t i = 0; i < out_n; i++) {
+        if (!isfinite(pooled[i]) || fabsf(pooled[i] - ref[i]) > 0.002f ||
+            fabsf(pooled[i] - checked[i]) > 0.002f) {
+            fprintf(stderr, "pooled tail_valid=%u wide=%d index=%zu: "
+                    "%.9g vs ref %.9g vs row-checked %.9g\n",
+                    tail_valid, (int)full_end_over_prefix, i, pooled[i], ref[i],
+                    checked[i]);
+            exit(1);
+        }
+    }
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ig); ds4_gpu_tensor_free(kg);
+    ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(lg); ds4_gpu_tensor_free(qg);
+    free(checked); free(pooled); free(ref); free(ids); free(kv); free(low); free(q);
+}
+
 static void attention_case(uint32_t tokens, uint32_t heads, uint32_t dim,
                            uint32_t pos, uint32_t cap, bool selected,
                            bool zero_rope, bool bench, bool f16) {
@@ -196,6 +270,142 @@ static void attention_case(uint32_t tokens, uint32_t heads, uint32_t dim,
     free(kr); free(kv); free(low); free(q);
 }
 
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+/* The GLM-5.3 serial-decode selection contract, at the geometry the graph
+ * dispatches: 64 heads, kv_lora 512, no RoPE, f16 cache, n_selected 2051,
+ * block_rows 128 (so 17 blocks: 0..15 cover the 2,048 guaranteed slots and 16
+ * holds the <= 3 causal-tail slots), guaranteed_prefix 2048.
+ *
+ *   POOLED     pooled ids, pad confined to the final block, prefix declared.
+ *   CHECKED    the same ids with no prefix claim -- the fully row-checked
+ *              masked reference arm.
+ *   ARBITRARY  invalid ids scattered through the FULL blocks with no prefix
+ *              claim, which is the only honest way to present such a selection;
+ *              it must take the fully checked level and still mask correctly.
+ *   NOPAD      every slot live: the prefix level and the all-rows-valid level
+ *              must agree (control -- the prefix test must cost nothing when
+ *              there is no pad).
+ *
+ * tail_valid 0 makes the final block entirely pad.  The value weights are Q8_0
+ * ones, so each head output element is the sum of the attention-weighted lora
+ * vector; comparing them exercises the partial max/sum/accumulator reduction
+ * across all 17 blocks, not just one block's arithmetic. */
+static void pooled_decode_case(uint32_t tail_valid, int mode) {
+    enum { H = 64, D = 512, V = 4, CAP = 4096, NSEL = 2051, PREFIX = 2048,
+           BLOCK_ROWS = 128, NBLOCKS = 17, QNOPE = 256,
+           VALUE_OFF = 4096, MODEL_BYTES = 147456 };
+    const bool nopad = mode == 3;
+    unsigned char *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, -1, 0);
+    check(model != MAP_FAILED, "pooled decode model allocation");
+    for (int i = 0; i < H * V * (D / 32); i++) {
+        unsigned char *block = model + VALUE_OFF + i * 34;
+        _Float16 scale = 1;
+        memcpy(block, &scale, sizeof(scale));
+        memset(block + 2, 1, 32);
+    }
+    check(ds4_gpu_set_model_map(model, MODEL_BYTES), "pooled decode model map");
+
+    float *kv = malloc((size_t)CAP * D * sizeof(float));
+    float *low = malloc((size_t)H * D * sizeof(float));
+    float *q = calloc((size_t)H * QNOPE, sizeof(float));
+    int32_t *ids = malloc(NSEL * sizeof(int32_t));
+    double *ref = malloc((size_t)H * V * sizeof(double));
+    float *got = malloc((size_t)H * V * sizeof(float));
+    float *alt = malloc((size_t)H * V * sizeof(float));
+    check(kv && low && q && ids && ref && got && alt, "pooled decode allocation");
+    for (size_t i = 0; i < (size_t)CAP * D; i++)
+        kv[i] = ((int)(i % 31) - 15) * 0.03125f;   /* exact in f16 */
+    for (size_t i = 0; i < (size_t)H * D; i++)
+        low[i] = ((int)(i % 23) - 11) * 0.015625f;
+
+    for (uint32_t i = 0; i < NSEL; i++) {
+        int32_t v;
+        if (mode == 2) {
+            /* arbitrary: pad and out-of-range rows anywhere, including inside
+             * what would be the guaranteed prefix */
+            v = i % 7 == 0 ? -1 : (i % 11 == 0 ? (int32_t)CAP : (int32_t)(i % CAP));
+        } else if (i < PREFIX) {
+            const uint32_t pool = (i / 4u) % (CAP / 4u);
+            v = (int32_t)(pool * 4u + i % 4u);
+        } else {
+            const uint32_t tail_slot = i - PREFIX;
+            v = (nopad || tail_slot < tail_valid) ?
+                    (int32_t)(CAP - 1u - tail_slot) : -1;
+        }
+        ids[i] = v;
+    }
+
+    /* masked host reference: an out-of-range row carries no probability mass */
+    const double scale = 1.0 / sqrt((double)QNOPE);
+    for (uint32_t h = 0; h < H; h++) {
+        double m = -1e30, sum = 0;
+        double *acc = calloc(D, sizeof(double));
+        check(acc != NULL, "pooled decode reference allocation");
+        for (uint32_t i = 0; i < NSEL; i++) {
+            const uint32_t row = (uint32_t)ids[i];
+            if (row >= (uint32_t)CAP) continue;
+            double dot = 0;
+            for (uint32_t d = 0; d < D; d++)
+                dot += (double)low[(size_t)h * D + d] * kv[(size_t)row * D + d];
+            const double score = dot * scale;
+            const double nm = m > score ? m : score;
+            const double os = exp(m - nm), rs = exp(score - nm);
+            for (uint32_t d = 0; d < D; d++)
+                acc[d] = acc[d] * os + rs * kv[(size_t)row * D + d];
+            sum = sum * os + rs;
+            m = nm;
+        }
+        double total = 0;
+        for (uint32_t d = 0; d < D; d++) total += sum > 0 ? acc[d] / sum : 0;
+        for (uint32_t d = 0; d < V; d++) ref[(size_t)h * V + d] = total;
+        free(acc);
+    }
+
+    ds4_gpu_tensor *kg = upload_cache(kv, (size_t)CAP * D, true);
+    ds4_gpu_tensor *rg = upload_cache(kv, 1, true);
+    ds4_gpu_tensor *qg = upload(q, (size_t)H * QNOPE * sizeof(float));
+    ds4_gpu_tensor *lg = upload(low, (size_t)H * D * sizeof(float));
+    ds4_gpu_tensor *ig = upload(ids, NSEL * sizeof(int32_t));
+    ds4_gpu_tensor *pl = ds4_gpu_tensor_alloc((size_t)NBLOCKS * H * D * sizeof(float));
+    ds4_gpu_tensor *pm = ds4_gpu_tensor_alloc((size_t)NBLOCKS * H * 2 * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((size_t)H * V * sizeof(float));
+    check(pl && pm && out, "pooled decode output allocation");
+
+    /* mode 0 and 3 declare the prefix; 1 and 2 make no claim; 3 also runs the
+     * all-rows-valid level and requires the two to agree. */
+    const bool claim = mode == 0 || mode == 3;
+    for (int arm = 0; arm < (nopad ? 2 : 1); arm++) {
+        const bool rows_valid = arm == 1;
+        const uint32_t prefix = (arm == 0 && claim) ? PREFIX : 0u;
+        check(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+                  out, pl, pm, qg, lg, kg, rg, model, MODEL_BYTES, VALUE_OFF,
+                  ig, NSEL, rows_valid, prefix, CAP, true, H, D, QNOPE, 0, V,
+                  4096, BLOCK_ROWS, NBLOCKS, 10000, 1, 0, 1, 32, 1) &&
+              ds4_gpu_synchronize(), "pooled decode launch");
+        check(ds4_gpu_tensor_read(out, 0, arm == 0 ? got : alt,
+                                  (size_t)H * V * sizeof(float)),
+              "pooled decode read");
+    }
+    for (size_t i = 0; i < (size_t)H * V; i++) {
+        const double tol = 1e-3 * (1.0 + fabs(ref[i]));
+        if (!isfinite(got[i]) || fabs(got[i] - ref[i]) > tol ||
+            (nopad && fabs(got[i] - alt[i]) > tol)) {
+            fprintf(stderr, "pooled decode mode=%d tail_valid=%u index=%zu: "
+                    "%.9g vs ref %.9g%s\n", mode, tail_valid, i, got[i], ref[i],
+                    nopad ? " (or vs all-valid arm)" : "");
+            exit(1);
+        }
+    }
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(pm); ds4_gpu_tensor_free(pl);
+    ds4_gpu_tensor_free(ig); ds4_gpu_tensor_free(lg); ds4_gpu_tensor_free(qg);
+    ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(kg);
+    free(alt); free(got); free(ref); free(ids); free(q); free(low); free(kv);
+    munmap(model, MODEL_BYTES);
+    printf("pooled decode mode=%d tail_valid=%u: PASS\n", mode, tail_valid);
+}
+#endif
+
 static void reduction_cases(void) {
     enum { D = 512, N = 128, T = 3, C = 521, H = 8, V = 4, R = 64, MODEL_BYTES = 65536 };
     unsigned char *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
@@ -299,7 +509,7 @@ static void reduction_cases(void) {
         for (int run = 0; run < 20; run++) {
             check(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
                   out, pl, pm, qg, lg, kg, rg, model, MODEL_BYTES, 4096,
-                  ig, C, mode == 0, C, true, H, D, 32, R, V, 4096,
+                  ig, C, mode == 0, 0, C, true, H, D, 32, R, V, 4096,
                   192, 4, 10000, 1, 0, 1, 32, 1), "split attention");
             check(ds4_gpu_tensor_read(out, 0, split, sizeof(split)), "split read");
             for (int i = 0; i < H * V; i++)
@@ -351,6 +561,16 @@ int main(int argc, char **argv) {
         attention_case(67, 17, 512, 0, 32, true, true, false, true);
         attention_case(64, 17, 512, 0, 2052, true, true, false, true);
         attention_case(257, 17, 512, 127, 384, false, true, false, true);
+        for (uint32_t tail = 0; tail <= 3; tail++) pooled_tail_case(tail, false);
+        pooled_tail_case(3, true);   /* refusal shape: full blocks past prefix */
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+        for (uint32_t tail = 0; tail <= 3; tail++) {
+            pooled_decode_case(tail, 0);   /* pooled prefix level */
+            pooled_decode_case(tail, 1);   /* fully row-checked reference */
+        }
+        pooled_decode_case(0, 2);          /* arbitrary invalid ids, no claim */
+        pooled_decode_case(3, 3);          /* no-pad control */
+#endif
         reduction_cases();
     }
     return 0;
