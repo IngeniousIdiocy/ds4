@@ -67,8 +67,8 @@ substituted:
 
 ```sh
 export MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf
-export PROMPT62=/path/to/needle-64k.txt
-export PROMPT300=/path/to/prompt-300k.txt
+export PROMPT62=bench/prompts/needle-64k.txt
+export PROMPT300=bench/prompts/prompt-300k.txt
 export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1
 
 ./ds4 -m "$MODEL" --metal --nothink --temp 0 \
@@ -117,7 +117,7 @@ rows are in `RELEASE-EVIDENCE.md`; compact final receipts are under
 | 62,174-token native prefill | **550.27 t/s** | bare guarded bank/fused/pipeline8/untracked policy; `final-native62.json` |
 | same-prompt native serial decode | **37.868944385 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; same receipt |
 | 33,148-token bank boundary | **556.73 AUTO / 540.64 OFF t/s** | same 77 output bytes; `final-bank-boundary33.json` |
-| affected server runtime | **16/16 plus 4/4 pipeline/SIGTERM passed** | `final-runtime.json` |
+| affected server runtime | **16/16 startup/server, 5/5 routed disconnect and 4/4 connected-client SIGTERM passed** | `final-runtime.json` |
 | routed failure/re-prime | **comparator v3 passed** | 128 native tokens in both arms, identical 183-byte response, zero cache |
 | 300,000-token native prefill | **473.64 t/s** | five bank groups, 210 routed layers, no refusal; `final-native300.json` |
 | 300,000-token native serial decode | **37.187023218 t/s** | complete 2,048-token native block; same receipt |

@@ -4,15 +4,14 @@
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the validated 185299232064-byte target GGUF}"
-: "${PROMPT:?set PROMPT to the pinned 62k or 300k prompt}"
 
 BIN=${BIN:-./ds4}
 CASE=${CASE:-62k}
 OUT=${OUT:-native-${CASE}-$(date -u +%Y%m%dT%H%M%SZ)}
 
 case "$CASE" in
-  62k)  CTX=70000;  EXPECTED_PROMPT_SHA=e15ce96e009e4684d7006be75e6c24d2f8bfabf0a1ebacf9bc06a850034a6b9b ;;
-  300k) CTX=320000; EXPECTED_PROMPT_SHA=7a66f69f497d09e7c5c8dbe4295b8956b46e7874d03b7209c48b555bfc7efc9c ;;
+  62k)  CTX=70000;  PROMPT=${PROMPT:-bench/prompts/needle-64k.txt}; EXPECTED_PROMPT_SHA=e15ce96e009e4684d7006be75e6c24d2f8bfabf0a1ebacf9bc06a850034a6b9b ;;
+  300k) CTX=320000; PROMPT=${PROMPT:-bench/prompts/prompt-300k.txt}; EXPECTED_PROMPT_SHA=7a66f69f497d09e7c5c8dbe4295b8956b46e7874d03b7209c48b555bfc7efc9c ;;
   *) echo "CASE must be 62k or 300k" >&2; exit 2 ;;
 esac
 

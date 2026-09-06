@@ -9,6 +9,7 @@
     "ds4_sha256": "79dd8f58f1d74d6f43a6ce3dbd52c60d5eda0119ab821d37d72f52b6a17d027b"
   },
   "environment_overrides": {"DS4_GLM_GEN_COUNTERS": "1"},
+  "prompt": "Output a JSON array of 30 user records. Each record has: id (integer), name, email, phone, address (object with street, city, state, zip), roles (array of 3 strings), active (boolean), created_at (ISO 8601 timestamp). Output only the JSON, pretty-printed with 2-space indentation.",
   "resolved_policy": "profile=m3ultra-public-q4-v1 mode=auto bank=1 superchunk=1 fused=1 pipelined=1 model_untracked=1 min_tokens=32768",
   "measured": {
     "prompt_tokens": 84,

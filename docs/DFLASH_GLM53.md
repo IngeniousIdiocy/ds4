@@ -67,7 +67,8 @@ digest in that run:
 | conservative | 8,192 | 173.536 s | 47.2064 |
 | speculative | 8,192 | 134.764 s | 60.7875 |
 
-Receipt: `ASTRAL-THREE-MODES-20260906T192241Z`, build `b723dfa`. The prompt asks
+Receipt: [`dflash-three-mode.json`](../bench/receipts/glm53-m3ultra/dflash-three-mode.json),
+build `b723dfa`. The compact receipt contains the exact prompt. It asks
 for 2,000 SQL tuples, but every arm stops at the fixed token limit during tuple
 483. This is a favorable fixed-horizon capability result, not a completed-task
 measurement or a representative average. Matching bytes on this fixture do not

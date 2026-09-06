@@ -1,0 +1,23 @@
+{
+  "schema": "ds4.glm53.dflash-three-mode.v1",
+  "build": {
+    "source_commit": "b723dfa7594dbadc6480cf2872751ae22e551754",
+    "ds4_sha256": "31139ed7f231856d4ba5414dbd375c2dfcea3965dc1b7378a5e8e77e98fe74e1"
+  },
+  "prompt": "Generate PostgreSQL test data for a users table. Output one INSERT statement with exactly 2000 value tuples, one tuple per line, for columns (id, name, department, active, country). IDs run from 1 through 2000 in order. The name for ID n is User n. Every department is Engineering, every active value is true, and every country is US. Output SQL only, include every tuple, and do not use generate_series, loops, markdown, explanations, or abbreviated rows.",
+  "prompt_bytes": 457,
+  "prompt_sha256": "6fde91a5a71998ea43ee71abbf09794aae9a43e8bd01e31b955370dcc0d96fed",
+  "prompt_tokens": 114,
+  "context_capacity": 16384,
+  "requested_tokens": 8192,
+  "temperature": 0,
+  "natural_eos": true,
+  "arms": {
+    "serial": {"decode_seconds": 212.310357, "tokens_per_second": 38.58502296239839, "n_generated": 8192, "n_decode_eval": 8191},
+    "conservative": {"decode_seconds": 173.535768, "tokens_per_second": 47.20640646255705, "n_generated": 8192, "n_decode_eval": 8191, "cycles": 530, "drafted": 3710, "accepted": 3581},
+    "speculative": {"decode_seconds": 134.764438, "tokens_per_second": 60.78754990244533, "n_generated": 8192, "n_decode_eval": 8192, "cycles": 1025, "drafted": 7170, "accepted": 7166}
+  },
+  "output": {"bytes_each": 22036, "sha256_each": "8809108cf961f4bdbc5e0f58714b691636312ab1f3a25042a8efe69bc7eabb30", "byte_identical_in_this_fixture": true},
+  "scope": "The fixed 8192-token horizon stopped during tuple 483 of 2000. This is a favorable repetitive workload, not a completed task, representative average, or universal identity contract. Speculative performs one additional target evaluation in this accounting.",
+  "preserved_staging_receipt": {"directory_label": "ASTRAL-THREE-MODES-20260906T192241Z", "root_analysis_sha256": "fcfcfe0707630483fcc79857f0e29d9fd4673f3644fe8aa3bf504a8ca1c3b8cf"}
+}

@@ -7,7 +7,7 @@
 #   BUCKETS         comma list of prompts: 62k,30k,512,128,111 (default 62k,30k,111)
 #   OUTDIR          results dir (default bench/results/gate-<ts>)
 #   PROMPT_DIR      directory holding the bucket prompts needle-64k.txt, prefill-30k.txt,
-#                   prefill-512.txt, prefill-128.txt, prefill-111.txt (default bench/prompts; none are tracked)
+#                   prefill-512.txt, prefill-128.txt, prefill-111.txt (default bench/prompts; only needle-64k.txt is tracked)
 #   GATE_LOCK_DIR   optional GPU-lock directory; when set the script refuses to run unless it exists
 #   GATE_LOCK_OWNER substring that must appear in $GATE_LOCK_DIR/owner (refuse otherwise)
 # Runs base, variant, base, variant … per bucket; reports prefill t/s, seconds to

@@ -1,0 +1,41 @@
+{
+  "schema": "ds4.glm53.task-outcome.v1",
+  "candidate": {
+    "source_commit": "40d72b9a395c8dceaed5babe3d27f11443a4d07e",
+    "configuration": "v3 plus DS4_GLM_ENABLE_SCORER_XREDUCE=1",
+    "ds4_sha256": "c88430b9116907473e620bcee4f0135492c4707373c5f7ab603c68c5d64523b1",
+    "metal_sha256": "42f0ffd0d9d0049c386b92a6b10ed15ff8d9b0f79ef95568e684c1dd4d9a82bf"
+  },
+  "upstream": {
+    "source_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "ds4_sha256": "b5a4777a4489f938f40cb4ef159911aedf5e40180c19b0d74a874da7c2dcff84",
+    "metal_sha256": "6e833f4a8ced10073c8ecf391078057b05917d6eb6433dd663b01584092cbae3"
+  },
+  "inputs": {
+    "model_bytes": 185299232064,
+    "model_known_sha256": "828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0",
+    "short_items": 20,
+    "long_recall_subitems": 48,
+    "long_derived_subitems": 9,
+    "total_subitems": 77,
+    "long_depths": [62000, 300000]
+  },
+  "result": {
+    "admitted": true,
+    "verdict": "NO REGRESSION DETECTED ON THIS SCREEN",
+    "candidate_correct": 77,
+    "upstream_correct": 77,
+    "losses": 0,
+    "gains": 0,
+    "byte_identical_output_pairs": 22,
+    "output_pairs": 23,
+    "wording_difference_item": "S13"
+  },
+  "subitems_tsv": "taskcheck-subitems.tsv",
+  "subitems_tsv_sha256": "f6325af09d5bca1d1e23e4f2ee82941ea72c4556ad95ff80d77d058339fdedf1",
+  "scope": "This is an observation of 77 predeclared exact-answer subitems, not a quality certificate or proof of model equivalence. It does not make the E6 NLL margin pass.",
+  "preserved_staging_receipt": {
+    "directory_label": "TASKCHECK-20260906T154355Z",
+    "receipt_json_sha256": "09a9b5da179f7df93c17c340bfdf008b1992b6cd061447889d8ee11856d28281"
+  }
+}

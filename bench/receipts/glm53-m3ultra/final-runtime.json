@@ -28,16 +28,30 @@
     "preserved_receipt_label": "ASTRAL-RUNTIME-20260906T203554Z",
     "checks_tsv_sha256": "7df7a9e780be5b3313f8ac9fbfb7d090ad98c566023f240de6f8cefd44eb5c7a"
   },
-  "pipelined_cancel_and_sigterm": {
-    "passed": true,
+  "pipelined_disconnect_cancel": {
+    "checks_passed": 5,
     "pipelined_layer_flushes": 7,
     "routed_batches": 8,
     "routed_layers": 8,
     "expanded_banks": 8,
     "status": "cancelled, state restored",
-    "connected_client_sigterm_observed": true,
+    "disconnect_after_queued_routed_work": true,
+    "healthy_reuse": true,
+    "fresh_control_byte_identical": true,
+    "preserved_receipt_label": "ASTRAL-BANK-PIPELINE-DRAIN-20260906T203706Z",
+    "coverage_json_sha256": "e4f8fdab71b79a1080e7283b70e6e762a944e29a29710a0f7892a525bb47f108",
+    "checks_tsv_sha256": "0fc00f58b3f5131afb4d34d182d5c9a110dc38760434648ae42d4f3c23d735a3"
+  },
+  "connected_client_sigterm": {
+    "checks_passed": 4,
+    "pipelined_layer_flushes": 7,
+    "routed_batches": 8,
+    "status": "cancelled, state restored",
+    "client_remained_connected_until_restore": true,
+    "owned_server_exited": true,
     "preserved_receipt_label": "ASTRAL-BANK-PIPELINE-DRAIN-20260906T203938Z",
-    "coverage_json_sha256": "e4f8fdab71b79a1080e7283b70e6e762a944e29a29710a0f7892a525bb47f108"
+    "coverage_json_sha256": "e4f8fdab71b79a1080e7283b70e6e762a944e29a29710a0f7892a525bb47f108",
+    "checks_tsv_sha256": "85566e4a464614d9c57842b5ef212c20ca36721c9b34b4a0b4fc382c23d1fb34"
   },
   "metal_model_view_teardown": {
     "passed": true,

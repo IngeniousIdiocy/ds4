@@ -1,0 +1,30 @@
+{
+  "schema": "ds4.comment-preprocess-proof.v1",
+  "compiled_source_commit": "538c37c0455a58df5024bec58be99a4ecfef58a7",
+  "curated_compiled_tree_checkpoint": "26e454fbd93ee545eec1a928ab8f2a0d47dc23cd",
+  "comment_cleanup_commit": "779b2dce7ed42c7c23f470994dc16024e2caefed",
+  "file": "ds4_metal.m",
+  "change_scope": "Two comment lines replaced with a link to the shipped expert-bank guide; line count preserved.",
+  "source_sha256": {
+    "compiled_original": "5c0eb039990014fece2306a5293c744b0ce76a1d3c20348e246ac345250481a6",
+    "comment_cleaned": "ace8422b59af094a178a510840a4425945ab759cad3f41e612eb24498a90c990"
+  },
+  "preprocess": {
+    "production_flags": ["-O3", "-ffast-math", "-g", "-mcpu=native", "-Wall", "-Wextra", "-fobjc-arc", "-E"],
+    "same_temporary_input_path": true,
+    "same_includes": true,
+    "original_stderr_bytes": 0,
+    "cleaned_stderr_bytes": 0,
+    "original_bytes": 8243840,
+    "cleaned_bytes": 8243840,
+    "original_sha256": "1f27694dd0d4a95a001b44b3476cabe13e9712873e661f29b95d65905b0be0a5",
+    "cleaned_sha256": "1f27694dd0d4a95a001b44b3476cabe13e9712873e661f29b95d65905b0be0a5",
+    "byte_identical": true
+  },
+  "portability_note": "The preprocessed digest includes #line path text and is therefore not a portable cross-checkout constant. Equality within this controlled run proves the comment replacement did not alter preprocessed program text; the two source-file digests are portable.",
+  "build_scope": "No compile, link, executable replacement, GPU work or inference followed the comment-only edit. Runtime receipts remain bound to the compiled 538c37c source and 79dd8f58... executable.",
+  "preserved_staging_receipt": {
+    "directory_label": "ASTRAL-COMMENT-PREPROCESS-PROOF",
+    "receipt_json_sha256": "648f8c3bc1904fc6af3daba9e064e5faf88c3f7ee2056efc990cece96313ec1d"
+  }
+}

@@ -1,0 +1,78 @@
+item	class	depth	kind	field	depth_position	truth	U	Cstar	U_ok	Cstar_ok	class	U_flag	Cstar_flag	U_truncated	Cstar_truncated
+S00	short	short	short	Answer	None	108	108	108	True	True	concordant_right			False	False
+S01	short	short	short	Answer	None	466	466	466	True	True	concordant_right			False	False
+S02	short	short	short	Answer	None	351	351	351	True	True	concordant_right			False	False
+S03	short	short	short	Answer	None	29	29	29	True	True	concordant_right			False	False
+S04	short	short	short	Answer	None	10	10	10	True	True	concordant_right			False	False
+S05	short	short	short	Answer	None	288	288	288	True	True	concordant_right			False	False
+S06	short	short	short	Answer	None	292	292	292	True	True	concordant_right			False	False
+S07	short	short	short	Answer	None	87	87	87	True	True	concordant_right			False	False
+S08	short	short	short	Answer	None	52	52	52	True	True	concordant_right			False	False
+S09	short	short	short	Answer	None	355	355	355	True	True	concordant_right			False	False
+S10	short	short	short	Answer	None	25	25	25	True	True	concordant_right			False	False
+S11	short	short	short	Answer	None	20	20	20	True	True	concordant_right			False	False
+S12	short	short	short	Answer	None	[130, 215, 273, 296, 361, 367, 617]	[130, 215, 273, 296, 361, 367, 617]	[130, 215, 273, 296, 361, 367, 617]	True	True	concordant_right			False	False
+S13	short	short	short	Answer	None	[186, 330, 452, 491, 573, 770, 875]	[186, 330, 452, 491, 573, 770, 875]	[186, 330, 452, 491, 573, 770, 875]	True	True	concordant_right			False	False
+S14	short	short	short	Answer	None	elddup	elddup	elddup	True	True	concordant_right			False	False
+S15	short	short	short	Answer	None	licnep	licnep	licnep	True	True	concordant_right			False	False
+S16	short	short	short	Answer	None	15	15	15	True	True	concordant_right			False	False
+S17	short	short	short	Answer	None	3	3	3	True	True	concordant_right			False	False
+S18	short	short	short	Answer	None	288	288	288	True	True	concordant_right			False	False
+S19	short	short	short	Answer	None	297	297	297	True	True	concordant_right			False	False
+L62A	long	62k	recall	Bob	0.031	42	42	42	True	True	concordant_right			False	False
+L62A	long	62k	recall	Alice	0.094	18	18	18	True	True	concordant_right			False	False
+L62A	long	62k	recall	Clara	0.156	85	85	85	True	True	concordant_right			False	False
+L62A	long	62k	recall	Diego	0.219	89	89	89	True	True	concordant_right			False	False
+L62A	long	62k	recall	Elena	0.281	67	67	67	True	True	concordant_right			False	False
+L62A	long	62k	recall	Felix	0.344	79	79	79	True	True	concordant_right			False	False
+L62A	long	62k	recall	Greta	0.406	82	82	82	True	True	concordant_right			False	False
+L62A	long	62k	recall	Hugo	0.469	65	65	65	True	True	concordant_right			False	False
+L62A	long	62k	recall	Iris	0.531	16	16	16	True	True	concordant_right			False	False
+L62A	long	62k	recall	Jonas	0.594	57	57	57	True	True	concordant_right			False	False
+L62A	long	62k	recall	Kira	0.656	51	51	51	True	True	concordant_right			False	False
+L62A	long	62k	recall	Leo	0.719	95	95	95	True	True	concordant_right			False	False
+L62A	long	62k	recall	Marta	0.781	20	20	20	True	True	concordant_right			False	False
+L62A	long	62k	recall	Nadia	0.844	40	40	40	True	True	concordant_right			False	False
+L62A	long	62k	recall	Owen	0.906	76	76	76	True	True	concordant_right			False	False
+L62A	long	62k	recall	Priya	0.969	59	59	59	True	True	concordant_right			False	False
+L62A	long	62k	derived	Sum	[0.0306, 0.9694]	101	101	101	True	True	concordant_right			False	False
+L62A	long	62k	derived	Larger	[0.2806, 0.7194]	Leo	Leo	Leo	True	True	concordant_right			False	False
+L62A	long	62k	derived	Diff	[0.4056, 0.5944]	25	25	25	True	True	concordant_right			False	False
+L62B	long	62k	recall	Bob	0.031	12	12	12	True	True	concordant_right			False	False
+L62B	long	62k	recall	Alice	0.094	47	47	47	True	True	concordant_right			False	False
+L62B	long	62k	recall	Clara	0.156	70	70	70	True	True	concordant_right			False	False
+L62B	long	62k	recall	Diego	0.219	56	56	56	True	True	concordant_right			False	False
+L62B	long	62k	recall	Elena	0.281	82	82	82	True	True	concordant_right			False	False
+L62B	long	62k	recall	Felix	0.344	50	50	50	True	True	concordant_right			False	False
+L62B	long	62k	recall	Greta	0.406	77	77	77	True	True	concordant_right			False	False
+L62B	long	62k	recall	Hugo	0.469	99	99	99	True	True	concordant_right			False	False
+L62B	long	62k	recall	Iris	0.531	23	23	23	True	True	concordant_right			False	False
+L62B	long	62k	recall	Jonas	0.594	90	90	90	True	True	concordant_right			False	False
+L62B	long	62k	recall	Kira	0.656	68	68	68	True	True	concordant_right			False	False
+L62B	long	62k	recall	Leo	0.719	49	49	49	True	True	concordant_right			False	False
+L62B	long	62k	recall	Marta	0.781	48	48	48	True	True	concordant_right			False	False
+L62B	long	62k	recall	Nadia	0.844	98	98	98	True	True	concordant_right			False	False
+L62B	long	62k	recall	Owen	0.906	46	46	46	True	True	concordant_right			False	False
+L62B	long	62k	recall	Priya	0.969	18	18	18	True	True	concordant_right			False	False
+L62B	long	62k	derived	Sum	[0.0306, 0.9694]	30	30	30	True	True	concordant_right			False	False
+L62B	long	62k	derived	Larger	[0.2806, 0.7194]	Elena	Elena	Elena	True	True	concordant_right			False	False
+L62B	long	62k	derived	Diff	[0.4056, 0.5944]	13	13	13	True	True	concordant_right			False	False
+L300	long	300k	recall	Bob	0.031	32	32	32	True	True	concordant_right			False	False
+L300	long	300k	recall	Alice	0.094	37	37	37	True	True	concordant_right			False	False
+L300	long	300k	recall	Clara	0.156	49	49	49	True	True	concordant_right			False	False
+L300	long	300k	recall	Diego	0.219	25	25	25	True	True	concordant_right			False	False
+L300	long	300k	recall	Elena	0.281	93	93	93	True	True	concordant_right			False	False
+L300	long	300k	recall	Felix	0.344	72	72	72	True	True	concordant_right			False	False
+L300	long	300k	recall	Greta	0.406	40	40	40	True	True	concordant_right			False	False
+L300	long	300k	recall	Hugo	0.469	50	50	50	True	True	concordant_right			False	False
+L300	long	300k	recall	Iris	0.531	31	31	31	True	True	concordant_right			False	False
+L300	long	300k	recall	Jonas	0.594	78	78	78	True	True	concordant_right			False	False
+L300	long	300k	recall	Kira	0.656	30	30	30	True	True	concordant_right			False	False
+L300	long	300k	recall	Leo	0.719	41	41	41	True	True	concordant_right			False	False
+L300	long	300k	recall	Marta	0.781	86	86	86	True	True	concordant_right			False	False
+L300	long	300k	recall	Nadia	0.844	77	77	77	True	True	concordant_right			False	False
+L300	long	300k	recall	Owen	0.906	61	61	61	True	True	concordant_right			False	False
+L300	long	300k	recall	Priya	0.969	19	19	19	True	True	concordant_right			False	False
+L300	long	300k	derived	Sum	[0.0312, 0.9688]	51	51	51	True	True	concordant_right			False	False
+L300	long	300k	derived	Larger	[0.281, 0.719]	Elena	Elena	Elena	True	True	concordant_right			False	False
+L300	long	300k	derived	Diff	[0.4062, 0.5938]	38	38	38	True	True	concordant_right			False	False

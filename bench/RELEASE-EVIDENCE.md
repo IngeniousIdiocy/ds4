@@ -19,9 +19,12 @@ source-receipt hashes preserve the link to the full logs without machine-local p
 | 300k prompt | 300,000 tokens; sha256 `7a66f69f497d09e7c5c8dbe4295b8956b46e7874d03b7209c48b555bfc7efc9c` |
 
 The runtime checkout included `d1838d7`, a Python comparator and documentation change
-made after the final build. It did not change compiled inputs. The curated checkpoint
-above preserves the exact compiled tree; subsequent release commits change only tests,
-documentation, scripts and receipts.
+made after the final build. It did not change compiled inputs. The curated `26e454f`
+checkpoint preserves the exact compiled tree. A later two-line comment cleanup changed
+the `ds4_metal.m` source-file digest while preserving line count and producing
+byte-identical preprocessor output under the production Objective-C flags; see
+[comment-preprocess-proof.json](receipts/glm53-m3ultra/comment-preprocess-proof.json).
+All other later changes are tests, documentation, scripts and receipts.
 
 ## Final artifact ledger
 
@@ -33,7 +36,8 @@ documentation, scripts and receipts.
 | native 300,000-token prefill | **473.64 t/s**; five bank groups, 210 routed layers, no refusal | same receipt; bare guarded policy |
 | guarded boundary | **556.73 AUTO vs 540.64 bank-off t/s** at 33,148 native tokens; same 77 bytes | [final-bank-boundary33.json](receipts/glm53-m3ultra/final-bank-boundary33.json); fixed AUTO-then-OFF pair supports 32768 but does not locate a crossover |
 | startup/server affected runtime | **16/16 passed** | [final-runtime.json](receipts/glm53-m3ultra/final-runtime.json); mode precedence/bypass, model aliases, cancellation/reuse, conservative credit, speculative stop and natural EOS |
-| pipelined routed cancellation + SIGTERM | **4/4 passed**; 7 pipeline flushes, 8 routed batches, state restored | same runtime receipt; disconnect occurred after queued routed work |
+| pipelined routed disconnect cancellation | **5/5 passed**; 7 pipeline flushes, 8 routed batches, state restored, healthy reuse byte-identical to fresh control | same runtime receipt; disconnect occurred after queued routed work |
+| connected-client SIGTERM | **4/4 passed**; prefill restored before the client socket closed | same runtime receipt; the client remained connected through restoration |
 | Metal model-view teardown | **passed** with four maps, pending/open batches and 256 results | same runtime receipt |
 | routed failure/re-prime | comparator v3 **passed**: fault after 8 routed layers/banks, statuses 200/500/200, baseline/recovery 128 native tokens and 183 identical bytes | same runtime receipt; zero cached prompt tokens; same-session re-prime; server exit 0 |
 | JSON512 observation | **40.632779352 t/s**; `n_generated=512`, `n_decode_eval=511`, natural EOS enabled | [final-json512.json](receipts/glm53-m3ultra/final-json512.json); output matched prior JSON512 bytes, but the task was truncated at the prediction limit |
@@ -57,9 +61,9 @@ scrubs inherited tuning variables and does not rehash the 185 GB model.
 | native prefill at 62,174 tokens | **550.72 t/s**, forced bank + fused command buffer + eight-layer pipeline; `ASTRAL-BANK-PIPELINED62-20260906T194550Z` |
 | native serial decode at 300,000 tokens | **37.2993996 t/s**, 2,048 generated / 2,047 evaluated, prediction-limit stop; `BASE300-astral-b723-pipeline-20260906T195448Z` |
 | prefill at 300,000 tokens | **473.75 t/s**, five admitted bank groups and no refusal; same receipt |
-| DFlash three-mode fixed horizon | serial **38.5850**, conservative **47.2064**, speculative **60.7875 t/s**; 8,192 generated and 22,036 equal output bytes per arm; `ASTRAL-THREE-MODES-20260906T192241Z` |
-| task outcome screen | **77/77** in both arms; 22/23 byte-identical, one wording difference; `TASKCHECK-20260906T154355Z` |
-| E6 quality margin | **unmet**: token-weighted NLL 1.270792 vs upstream 1.268859, delta +0.001933; provisional +0.0005 criterion not met |
+| DFlash three-mode fixed horizon | serial **38.5850**, conservative **47.2064**, speculative **60.7875 t/s**; 8,192 generated and 22,036 equal output bytes per arm; [dflash-three-mode.json](receipts/glm53-m3ultra/dflash-three-mode.json) contains the exact prompt |
+| task outcome screen | **77/77** in both arms; 22/23 byte-identical, one wording difference; [taskcheck-quality.json](receipts/glm53-m3ultra/taskcheck-quality.json) and [subitems TSV](receipts/glm53-m3ultra/taskcheck-subitems.tsv) |
+| E6 quality margin | **unmet**: token-weighted NLL 1.270792 vs upstream 1.268859, delta +0.001933; provisional +0.0005 criterion not met; [e6-quality.json](receipts/glm53-m3ultra/e6-quality.json), [candidate TSV](receipts/glm53-m3ultra/e6-candidate.tsv), [upstream TSV](receipts/glm53-m3ultra/e6-upstream.tsv) |
 
 The DFlash result is one favorable repetitive SQL fixture. Every arm stopped at the
 8,192-token horizon during tuple 483 of a requested 2,000, so it is neither a

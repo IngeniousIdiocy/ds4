@@ -7,4 +7,7 @@ fidelity/manifest-long/tok/
 fidelity/manifest-long/prompts/
 fidelity/manifest-long/continuations/
 fidelity/manifest-long/manifest*.tsv
-prompts/
+prompts/*
+!prompts/README.md
+!prompts/needle-64k.txt
+!prompts/prompt-300k.txt

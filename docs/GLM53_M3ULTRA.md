@@ -471,8 +471,8 @@ local files with those digests before running:
 
 ```sh
 export MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf
-export PROMPT62=/path/to/needle-64k.txt
-export PROMPT300=/path/to/prompt-300k.txt
+export PROMPT62=bench/prompts/needle-64k.txt
+export PROMPT300=bench/prompts/prompt-300k.txt
 export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1
 
 # Serial native generation gate. The final guarded-profile build resolves model
@@ -534,7 +534,7 @@ Repository-contained receipts are linked from `bench/RELEASE-EVIDENCE.md`.
 | native prefill, 62,174 prompt tokens | **550.27 t/s** | bare guarded policy selected bank + fused command buffer + fixed pipeline8; 42/42 routed layers banked |
 | native serial decode, same prompt | **37.868944385 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 54.081254 s |
 | guarded bank boundary, 33,148 native tokens | **556.73 AUTO / 540.64 OFF t/s** | fixed-order same-binary pair, same 77 output bytes; retain 32768 threshold |
-| affected server runtime | **16/16 plus 4/4 pipeline/SIGTERM checks passed** | comparator v3 also passed with 128 native tokens in both recovery arms |
+| affected server runtime | **16/16 startup/server, 5/5 routed disconnect and 4/4 connected-client SIGTERM checks passed** | comparator v3 also passed with 128 native tokens in both recovery arms |
 | native 300,000-token prefill | **473.64 t/s** | five groups, 210 routed layers, zero refusals |
 | native serial decode, 300,000-token prompt | **37.187023218 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 55.072975 s |
 

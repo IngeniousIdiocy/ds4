@@ -1,0 +1,40 @@
+{
+  "schema": "ds4.glm53.quality-e6.v1",
+  "candidate": {
+    "source_commit": "40d72b9a395c8dceaed5babe3d27f11443a4d07e",
+    "score_binary_sha256": "1a02259f9507ade6026e95d3495dc72198fb991501af1137ea12a95f2b5095c5",
+    "metal_sha256": "42f0ffd0d9d0049c386b92a6b10ed15ff8d9b0f79ef95568e684c1dd4d9a82bf",
+    "tsv": "e6-candidate.tsv",
+    "tsv_sha256": "3ba8ca7d4a5f2b4054b81f7e15f89e048dbdf32750ae24e6c3cddbd66418ca29"
+  },
+  "upstream": {
+    "source_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "score_binary_sha256": "67dfd51cf391fc2485f02b4e95bd2ca64172c04c390364021b66fafdd935df7d",
+    "metal_sha256": "6e833f4a8ced10073c8ecf391078057b05917d6eb6433dd663b01584092cbae3",
+    "tsv": "e6-upstream.tsv",
+    "tsv_sha256": "7a19c335cadfbd40d216d6e77ff60cb7d68bae5962762dbd95800627e799a8ba"
+  },
+  "inputs": {
+    "model_bytes": 185299232064,
+    "model_known_sha256": "828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0",
+    "manifest_sha256": "b8264c8627a628c6d7999681dd7578a88223b07855cc293126508d1b0325eef5",
+    "cases": 12,
+    "context_limit": 70000,
+    "depths": [6000, 12000, 30000, 62000]
+  },
+  "result": {
+    "admitted": true,
+    "candidate_token_weighted_nll": 1.2707918430747562,
+    "upstream_token_weighted_nll": 1.268858895877573,
+    "candidate_minus_upstream": 0.001932947197183114,
+    "casewise_standard_error": 0.0017571105229307966,
+    "one_sided_upper_95": 0.004823394007404275,
+    "provisional_margin": 0.0005,
+    "within_provisional_margin": false
+  },
+  "scope": "The provisional E6 margin is unmet. This 12-case selected long-context screen is neither an industry standard nor a 300k quality measurement. Its point estimate is about 1.1 casewise standard errors above zero.",
+  "preserved_staging_receipt": {
+    "directory_label": "E6-v3-20260906",
+    "receipt_json_sha256": "53e5ee00ba49419f6bdf1899f31f0eb221ef2d1d4f7cb553d138e8b4baf7d44b"
+  }
+}
