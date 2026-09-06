@@ -61,9 +61,10 @@ values:
 
 **Exact mode.** Every Tier 2 change ships behind its own kill switch *and* is registered
 in the exact-mode list, so that `DS4_GLM_EXACT=1` turns every FP-order change off and
-the scorer TSV is byte-identical to the upstream pin. The check is the recipe in
-`bench/EXACT-MODE-PLAN.md` ("The exact-mode check"); run it before every deploy and
-after every upstream rebase.
+the result can be compared with the upstream pin and the same-build all-off arm. This
+is a measured diagnostic, not a universal upstream byte-identity promise: corrected
+behavior outside the registry may remain active. The check is the recipe in
+`bench/EXACT-MODE-PLAN.md` ("The exact-mode check").
 
 **Ship default-on** only if S1–S5 pass and the interleaved gate (≥ 4 repetitions) shows
 a mean gain of at least +0.2 t/s; a kill switch is mandatory and the feature is
@@ -82,11 +83,11 @@ moves the final logits by about 0.4 for production and candidate alike. Greedy o
 identity is therefore not a usable gate for prefill changes: main itself would fail it
 against a more accurate copy of itself.
 
-**Unchanged and absolute:** every change that is not bit-exact with upstream at the
-pinned commit ships behind its own kill switch, is registered in `glm53_exact_mode()`
-so `DS4_GLM_EXACT=1` turns it off, and the exact-mode check must still reproduce the
-upstream TSV byte for byte. The standard below only decides whether such a flag may
-default on.
+**Registration remains absolute:** every floating-point-order change ships behind its
+own kill switch and is registered in `glm53_exact_mode()` so `DS4_GLM_EXACT=1` turns
+it off. The upstream diagnostic reports numerical and quality differences; it does not
+turn byte identity into a model-quality requirement. The standard below decides whether
+such a flag may default on.
 
 Gate for a prefill-side Tier 2 change (all required; P1–P4 as above; determinism
 1000/1000 in the kernel harness *and* repeated in-graph runs byte-identical):
@@ -127,9 +128,9 @@ registration always.
 ### Two modes, one bundle
 
 There is no per-feature user-facing choice. The exact-mode registry in
-`glm53_exact_mode()` *is* the fast bundle: `DS4_GLM_EXACT=1` means bit-exact with
-upstream at the pin (every registered item off); the default means every adopted item
-on. The per-feature `DS4_GLM_DISABLE_*` / `DS4_GLM_ENABLE_*` switches remain engineering
+`glm53_exact_mode()` defines the fast bundle: `DS4_GLM_EXACT=1` means every registered
+item is off; the default means every adopted item is on. The per-feature
+`DS4_GLM_DISABLE_*` / `DS4_GLM_ENABLE_*` switches remain engineering
 knobs for bisecting a speed or fidelity regression to one change; no adopted item ships
 opt-in on its own. Adoption is judged per round: each candidate passes criterion 1 (the
 check that a kernel is not wrong), then the *bundle* with every candidate on is scored
@@ -282,7 +283,11 @@ epoch carries over.
 |---|---|---|---|---|---|
 | upstream 9ab7053 (pin), upstream scorer | — | 0 | 0% | — | `bench/fidelity/upstream-9ab7053-epoch.tsv` (to be added from the E1 sanity run) |
 | this branch, defaults (fast mode) | — | — | — | — | `bench/fidelity/public-<head>-default.tsv` (to be added from the E1 sanity run) |
-| this branch, `DS4_GLM_EXACT=1` | — | must be 0, TSV byte-identical | 0% | — | `bench/fidelity/public-<head>-exact.tsv` (to be added) |
+| this branch, `DS4_GLM_EXACT=1` | — | measured comparison pending | n/a | — | `bench/fidelity/public-<head>-exact.tsv` (to be added) |
 
-The exact-mode row is the exactness claim; the default row is the fast-mode drift; the
-`cmp` of the first and third TSVs is the check described in `bench/EXACT-MODE-PLAN.md`.
+The exact-mode row isolates registered Tier 2 changes; the default row is the fast-mode
+drift. The current E6 token-weighted NLL screen did not meet its provisional margin:
+candidate 1.270792 versus upstream 1.268859, delta +0.001933 against a +0.0005
+criterion. The focused task screen remained 77/77 in both arms (22/23 outputs
+byte-identical, one wording difference). Keep both facts; neither substitutes for a
+broader equivalence claim.

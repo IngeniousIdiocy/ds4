@@ -3,9 +3,9 @@
 An engineering account of what this branch changes relative to upstream ds4 at
 `9ab7053`, written for a reviewer of the code. User-facing details (configuration,
 switches, status, known issues) are in `docs/GLM53_M3ULTRA.md`; the fidelity rules in
-`bench/FIDELITY.md`; the exact-mode contract in `bench/EXACT-MODE-PLAN.md`. Speed and
-quality numbers are not repeated here — the branch's claims are bound to receipts on
-the public artifact (see `docs/GLM53_M3ULTRA.md`, "Results"), and the historical
+`bench/FIDELITY.md`; the exact-mode diagnostic in `bench/EXACT-MODE-PLAN.md`. Current
+capability numbers are kept in `bench/RELEASE-EVIDENCE.md`, where `b723dfa` is separated
+from the still-pending final rebuilt artifact. The historical
 per-round numbers, measured on a retired custom quantization, are kept only in
 `bench/README.md` under a historical heading.
 
@@ -145,18 +145,37 @@ The blocked softmax and the split-K were adopted together as one "bundle" agains
 1,000-case manifest; that procedure, and why greedy-output identity cannot gate prefill
 changes, is in `bench/FIDELITY.md`.
 
+**Long-prompt expert bank.** The integration line can expand the routed Q4_K expert
+weights once per layer-major prompt group, reuse that bank across the group's token
+tiles, encode the layer in one fused command buffer and pipeline up to eight layers.
+On `b723dfa`, the forced configuration reached 550.72 prefill tokens/s at 62,174
+prompt tokens and 473.75 at 300,000. Guarded C defaults are being merged separately:
+automatic admission is restricted to exactly M3 Ultra with at least 500 GiB RAM and
+the full unsliced, non-SSD, non-TP 185,299,232,064-byte public Q4_K profile. A planned
+32768-token prompt threshold is provisional until the final 32k screen. The ordinary
+path remains the refusal/failure fallback, and explicit enable/disable, schedule and
+model-mapping controls are documented in `docs/GLM53_M3ULTRA.md`.
+
+The guarded profile also defaults the mmap-backed Metal model view to untracked mode
+when `DS4_METAL_MODEL_UNTRACKED` is unset. This decision happens after weight binding,
+is independent of the bank kill switch, and does not widen CPU inspection, SSD,
+multi-tier or tensor-parallel paths. Explicit `=0` disables it and `=1` enables it on
+other compatible Metal profiles. The implementation and final startup receipt remain
+pending at this documentation commit.
+
 ## 3. DFlash2 speculative decoding
 
 `ds4_dflash2.inc`, `ds4_dflash_glm.inc`, `ds4_dflash_seed.inc`, `ds4_dflash_selector.inc`,
 `ds4_dflash_golden.inc`, `metal/dflash2.metal`, `gguf-tools/dflash2_to_gguf.py`, and the
 `--dflash` flag in `ds4_cli.c:2130` / `ds4_server.c:14488`. A GLM-5.3 port of the
-DFlash/DFlash2 block-diffusion draft engine from antirez/ds4 PR #844 (attribution in
+DFlash/DFlash2 block-diffusion draft engine from antirez/ds4 PR #844 (MIT source and
+attribution details in
 `THIRD_PARTY.md`): a simdgroup SDPA drafter kernel, BF16 drafter weights, a persistent
 sliding-window context-KV cache, the z-lab candidate selector, exact rejection sampling
-for the sampled path, and an adaptive throttle that prices the draft cycle against
-serial decode from live wall-clock measurements and parks speculation when acceptance
-cannot pay (this is what kept it break-even rather than negative on agentic content at
-depth, where the embedded MTP-2 draft loses 10–20%).
+for the sampled path, and two greedy scheduling policies. Bare startup is serial and
+does not load draft weights; `--dflash FILE` defaults to conservative request-credit
+admission; `--dflash-mode speculative` selects the uncapped policy. Explicit modes win
+over the legacy environment switches regardless of argument order.
 
 **Rollback.** Upstream includes the DSA indexer tail ring in the speculative state it
 restores after a rejected draft, while the per-step snapshot taken inside a DFlash verify
@@ -192,11 +211,16 @@ layers are screened once at load — an unsupported target is refused there with
 not aborted mid-generation. `tests/test_dflash2_embed_q8.c` and
 `tests/test_dflash_rollback.c`, `tests/test_dflash_lifecycle.c` and
 `tests/test_dflash_sampling.c` cover the row decode, the rollback bookkeeping, the failure
-exits and lifecycle identity, and the sampler contract on CPU. Model-level certification
-is outstanding: `tests/dflash_rejection_harness.sh` supplies deterministic drafts from a
+exits and lifecycle identity, and the sampler contract on CPU.
+`tests/dflash_rejection_harness.sh` supplies deterministic drafts from a
 retained serial continuation so a rejection can be placed after 0, 1, 2 or 3 accepted
 drafts on either side of the 4-token pool boundary, and `tests/dflash_cached_depth.c`
-measures a restored 62k/300k prefix through the product speculative entry point. The personal-use recreation recipe for the drafter — pinned
+measures a restored prefix through the product speculative entry point. The `b723dfa`
+affected runtime driver passed 16/16 startup, model-id, cancellation, stop, natural-EOS
+and healthy-reuse checks. Its favorable fixed 8,192-token SQL horizon measured
+38.5850 / 47.2064 / 60.7875 t/s for serial / conservative / speculative, with all arms
+reaching the fixed limit during tuple 483 of a requested 2,000 rather than completing
+the task. The personal-use recreation recipe for the drafter — pinned
 revision, checksums, converter command, launch flags and smoke tests — is
 `docs/DFLASH_GLM53.md`; no drafter weights are redistributed.
 
@@ -238,6 +262,11 @@ revision, checksums, converter command, launch flags and smoke tests — is
   error shape instead of a 200 with an empty completion (`json_max_tokens()`).
 - The merge adopted upstream's newer multimodal session handling (a validity predicate
   instead of the fork's unconditional invalidation); see `docs/GLM53_M3ULTRA.md`.
+- **Shutdown cancellation across long prefill.** Commit `be75a99` makes the
+  non-streaming long-prefill callback observe the process-wide stop state. Shutdown can
+  therefore cancel work before generation begins, while teardown still joins worker
+  threads before the engine and Metal model views are closed. The focused cancellation
+  test is part of the final affected runtime set.
 
 ## 5. Exact mode and the fidelity harness
 
@@ -248,8 +277,9 @@ change (Tier 2) that ships behind its own kill switch, is registered in
 `glm53_exact_mode_c()` in `ds4.c:42329`), and may default on only after the
 teacher-forced scorer shows it indistinguishable from the same-build control within a
 cumulative 3e-4 avg_nll budget against clean upstream. `DS4_GLM_EXACT=1` clamps all
-eleven registered entries at once, so the branch can be scored byte-identical to
-upstream at the pin (`bench/EXACT-MODE-PLAN.md`).
+eleven registered entries at once. Its role is to isolate registered FP-order changes;
+it does not undo the corrected DSA pad-row semantics and does not promise universal
+byte identity with upstream (`bench/EXACT-MODE-PLAN.md`).
 
 The harness itself: `bench/prefill-gate.sh` (interleaved A/B prefill gate with byte
 identity), `bench/tier2-gate.sh` + `bench/compare_1k.py` (the 1,000-case scorer gate

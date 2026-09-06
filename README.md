@@ -160,9 +160,13 @@ With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
 Speculative decoding is opt-in. GLM uses `--mtp`; Flash DSpark needs a matching
-support GGUF. It can improve generation, but not every workload benefits.
-Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
-difference between default opportunistic sampling and `--mtp-exact-sampling`.
+support GGUF. GLM-5.3 also supports an optional, separately obtained DFlash2
+drafter. A bare startup is serial; supplying `--dflash FILE` selects the
+conservative scheduler unless `--dflash-mode` says otherwise. It can improve
+generation, but not every workload benefits. Read
+[speculative decoding](docs/SPECULATIVE_DECODING.md) for MTP/DSpark and the
+[GLM-5.3 DFlash2 guide](docs/DFLASH_GLM53.md) for the drafter recipe and startup
+policies.
 
 ### Output and power
 
@@ -229,9 +233,14 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 This branch carries a Metal-side decode/prefill kernel set, server changes and a
 fidelity harness for GLM-5.3-Flash on a 512 GB Mac Studio. Start with
 [the GLM-5.3 M3 Ultra guide](docs/GLM53_M3ULTRA.md) — tested configuration, the
-exactness contract (`DS4_GLM_EXACT=1` reproduces upstream's numerics), feature status,
-switch reference and known issues — and read
+measured scope of `DS4_GLM_EXACT=1`, feature status, switch reference and known
+issues — and read
 [CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relative to upstream and why.
+The current `b723dfa` capability receipts record 550.72 prefill tokens/s at 62,174
+prompt tokens and 37.2994 decode tokens/s for a complete 2,048-token block at a
+300,000-token prompt. These are pinned configuration records; the final rebuilt
+release artifact still needs its own receipts. See the
+[release evidence index](bench/RELEASE-EVIDENCE.md) for scope and open gates.
 `./ds4 --help glm53` lists the supported controls and kill switches.
 
 ## Logo

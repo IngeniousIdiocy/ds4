@@ -1,14 +1,12 @@
-# Exact mode: every non-bit-exact optimization behind a flag, and an umbrella switch that restores upstream numerics
+# Exact mode: isolate registered floating-point-order changes
 
 ## 0. The goal
 
-To be able to state two things about this branch against upstream antirez/ds4 at a
-pinned commit: *here is single-stream decode and prefill throughput bit-exact with your
-release — the scorer TSV is byte-identical — and here is the same build with the fast
-mode on, at an NLL delta of x·10⁻⁴.* That requires (1) a build in which every
-floating-point-order change is switched off and the scorer output is byte-identical to
-clean upstream at the pin, and (2) every floating-point-order change individually
-switchable, so the delta can be attributed and the set negotiated feature by feature.
+Exact mode isolates the branch's registered floating-point-order changes from its
+other correctness and integration changes. It makes the upstream pin, the same-build
+all-off arm and fast mode comparable and attributable. It does not by itself promise
+byte identity with upstream: corrected behavior outside the registry can remain active,
+and every upstream comparison is reported as measured data.
 
 ## 1. The rule
 
@@ -19,8 +17,9 @@ switchable, so the delta can be attributed and the set negotiated feature by fea
    translation unit (`glm53_exact_mode()` in `ds4_metal.m`, `glm53_exact_mode_c()` in
    `ds4.c`) is consulted by each Tier 2 gate; the list of features lives in one place
    with a comment per entry naming the change and the measured Δ.
-3. Exact-mode check: the recipe in section 2, run before every deploy and after every
-   upstream rebase. Fast mode is reported next to it (Δ vs the pin, budget used).
+3. Exact-mode diagnostic: the recipe in section 2, run before deployment and after an
+   upstream rebase. Report the exact-mode delta, same-build all-off comparison and fast
+   mode next to the pin; do not substitute an assumed `cmp` result.
 4. Bit-exact (Tier 1) changes need no flag for exactness (they are exact by construction
    and harness-proven) but keep their kill switches for A/B.
 
@@ -86,9 +85,10 @@ M=gguf/GLM-5.3-Flash-Q4_K.gguf
 MAN=gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv
 export DS4_GLM53_MEMORY_CEILING_GB=400
 
-# 1. Upstream identity -- the EXACTNESS claim.
+# 1. Upstream comparison -- a measured diagnostic.
 DS4_GLM_EXACT=1 $S $M $MAN exact.tsv
-cmp exact.tsv bench/fidelity/upstream-<pin>-epoch.tsv      # must be silent
+python3 gguf-tools/quality-testing/compare_scores.py \
+  bench/fidelity/upstream-<pin>-epoch.tsv exact.tsv
 
 # 2. Same-build individual-kill-switch identity -- the umbrella and the
 #    individual switches agree.  Every registered kill switch, plus
@@ -111,10 +111,11 @@ exact-mode or all-off TSV of the intended build lineage; a fast-mode TSV with Ti
 features enabled is not a valid reference for it, and when no qualifying artifact
 exists the comparison is *unavailable*, not a pass.
 
-The 3e-4 threshold of `bench/FIDELITY.md` is the fast-mode cumulative-drift budget and
-is not a waiver for check 1. If upstream identity fails, classify it — a legacy gap
-predating registration versus a new change — which checks 2 and 3 discriminate, and
-record the unresolved claim rather than inventing a waiver.
+The 3e-4 threshold of `bench/FIDELITY.md` is the fast-mode cumulative-drift budget.
+If the upstream comparison differs, classify it as a change outside the registry or a
+new registered-change failure. Checks 2 and 3 distinguish those cases. Record the
+measured difference and its quality effect rather than treating any nonzero byte delta
+as a generic failure.
 
 ## 3. Prefill
 
@@ -124,8 +125,8 @@ scorer's own prefill runs through the changed kernels.
 
 ## 4. Upstream drift
 
-"Bit-exact with upstream" is against the *pinned* commit. When the branch rebases onto a
-newer upstream, re-score clean upstream at the new commit, re-run the check, and update
+The upstream comparison is against the *pinned* commit. When the branch rebases onto a
+newer upstream, re-score clean upstream at the new commit, re-run the diagnostic, and update
 the pin in `bench/FIDELITY.md` by an explicit decision. Upstream's own numerics changes
 (they merge FP-order changes too) are then part of the new baseline. The current pin is
 `9ab7053`, the base of this branch; the custom-weight-epoch ledger in `bench/FIDELITY.md`

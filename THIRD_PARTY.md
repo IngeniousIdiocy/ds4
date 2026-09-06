@@ -16,19 +16,35 @@ candidate selector (`ds4_dflash_selector.inc`) implements the z-lab `CandidateSe
 contract; the draft-model contracts follow z-lab's `DFlashDraftModel` /
 `DFlash2DraftModel`.
 
-The pull request carries no licence statement of its own (checked 2026-09-06: PR
-still open, author @audreyt, no licence or origin terms in the description); it was
-submitted for inclusion in antirez/ds4, which is MIT-licensed, and this branch treats the
-ported code under that licence on the inbound=outbound basis of a contribution to an
-MIT repository. If the contribution's licence status is settled differently upstream,
-this section is to be updated before publication.
+The imported source is distributed under MIT. Audrey Tang (`@audreyt`) submitted the
+implementation from `audreyt/ds4`'s `ornith15` branch in
+[antirez/ds4 PR #844](https://github.com/antirez/ds4/pull/844); the DFlash2
+implementation begins at commit
+[`b02d5ecb243fff092a00ed8981b1ad16d525183d`](https://github.com/audreyt/ds4/commit/b02d5ecb243fff092a00ed8981b1ad16d525183d).
+The upstream base named by the PR (`84cc882`) and the inspected contributor head
+(`bde007a5757e2701761ce30c869fa7f82771857e`) contain the same MIT `LICENSE` blob
+(`5973a4c99a8b7c0f2e0a58fbcd7f93b230da6b78`). GitHub's
+[contribution terms](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#6-contributions-under-repository-license)
+also apply the repository license to contributions unless a separate agreement says
+otherwise. No contrary license or separate agreement was found in the inspected
+sources.
 
-**Drafter weights are not redistributed.** The DFlash2 drafter for GLM-5.3-Flash
-(`incoai/GLM-5.3-Flash-DFlash2` on Hugging Face) is published under **CC BY-NC-ND 4.0**
-(`license: cc-by-nc-nd-4.0` in its model card, checked via the Hub API 2026-09-06). `gguf-tools/dflash2_to_gguf.py` converts it
-for local research use only; the converted GGUF must not be redistributed, and nothing
-of it is tracked in this repository — no weights, no derivative tensors, no golden weight
-data. Historical DFlash2 results in `bench/README.md` depended on that file.
+Source and method credit are distinct: the C/Metal implementation ported here comes
+from Audrey Tang's PR; the DFlash algorithm and the `DFlashDraftModel`,
+`DFlash2DraftModel` and `CandidateSelector` reference contracts come from
+[Z Lab's MIT-licensed DFlash project](https://github.com/z-lab/dflash/tree/07ebd93db9f472af339b644bb70221ad8428328a).
+Source distributions retain this repository's MIT `LICENSE` and the
+[Z Lab MIT notice](licenses/Z-LAB-DFLASH-MIT.txt).
+
+**Drafter weights are not redistributed.** The pinned
+[`incoai/GLM-5.3-Flash-DFlash2@dc77ff1c99eeb2df044ee3d4f0094eb033fee410`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/blob/dc77ff1c99eeb2df044ee3d4f0094eb033fee410/README.md)
+model card declares **CC BY-NC-ND 4.0** and describes the checkpoint as released for
+research and evaluation, with separate contact information for commercial licensing.
+`gguf-tools/dflash2_to_gguf.py` supports a local, non-commercial copy. This repository
+distributes neither the original checkpoint nor the converted output; keep the converted
+GGUF local and do not share it. Nothing from the checkpoint is tracked here: no weights,
+derivative tensors or golden weight data. Historical DFlash2 results in
+`bench/README.md` depended on a local copy.
 `docs/DFLASH_GLM53.md` documents how to obtain and convert the drafter yourself, pinned
 to revision `dc77ff1c99eeb2df044ee3d4f0094eb033fee410` (`model.safetensors` sha256
 `b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b`), with the model-card

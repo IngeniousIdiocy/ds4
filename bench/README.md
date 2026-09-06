@@ -5,7 +5,7 @@ fixtures they score against, and the ledgers that bind the branch's numerics and
 to upstream. What the branch changes and why is in `CHANGES-GLM53.md` at the repository
 root; how to build, run and reproduce the headline configuration is in
 `docs/GLM53_M3ULTRA.md`; the fidelity rules are in `FIDELITY.md` and the exact-mode
-contract in `EXACT-MODE-PLAN.md`.
+diagnostic in `EXACT-MODE-PLAN.md`; the current release ledger is in `RELEASE-EVIDENCE.md`.
 
 ## Why the operating points are deep
 
@@ -60,44 +60,69 @@ outputs (see the ledger in `FIDELITY.md` for which epoch each belongs to).
 
 ### The native reference recipe (throughput)
 
-The number quoted for this branch is single-stream decode at depth on the CLI, cold
-prefill, greedy, with prefill reported separately:
+The quoted native records use the ordinary single-session CLI generation loop, cold
+prefill and greedy decoding. Verify the public model and prompt digests against
+`RELEASE-EVIDENCE.md`; long prompt files are release inputs and are not silently
+substituted:
 
 ```sh
-# 62k: the needle prompt, ctx 70000, 2048 generated tokens
-DS4_METAL_MODEL_UNTRACKED=1 DS4_GLM53_MEMORY_CEILING_GB=280 \
-  ./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --metal --nothink --temp 0 \
-        -c 70000 -n 2048 --prompt-file needle-64k.txt
-# 300k: a 300k-token prompt, ctx 320000
-DS4_METAL_MODEL_UNTRACKED=1 DS4_GLM53_MEMORY_CEILING_GB=280 \
-  ./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --metal --nothink --temp 0 \
-        -c 320000 -n 2048 --prompt-file prompt-300k.txt
+export MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf
+export PROMPT62=/path/to/needle-64k.txt
+export PROMPT300=/path/to/prompt-300k.txt
+export DS4_GLM53_MEMORY_CEILING_GB=280
+export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1
+
+./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+      -c 70000 -n 2048 --prompt-file "$PROMPT62"
+./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+      -c 320000 -n 2048 --prompt-file "$PROMPT300"
 ```
 
-A block is valid only if it generated the full `-n` (stop reason "predict limit");
-`DS4_GLM_IGNORE_EOS=1` keeps decoding past EOS so that both arms of a comparison get the
-same decode window per prefill, and `DS4_GLM_GEN_COUNTERS=1` prints the loop's own
-counters and stop reason so validity can be checked from the log. Arms are run as
-interleaved pairs (candidate / reference / reference / candidate …), at least three
-pairs; the report carries the best valid block and the mean of the valid blocks per
-arm, and the output bytes of every block.
+`DS4_GLM53_MEMORY_CEILING_GB=280` is an optional conservative admission cap for the
+512 GB machine. The prefill chunk already defaults to 8192. The final guarded-profile
+build is intended to resolve its model mapping and expert-bank schedule without force
+environment variables; the `b723dfa` receipts used explicit bank, fused, pipeline,
+`xr8` and untracked-view controls and are labeled accordingly.
+
+To reproduce the named `b723dfa` capability configuration before running either command
+above, add:
+
+```sh
+export DS4_METAL_MODEL_UNTRACKED=1 DS4_GLM_ENABLE_EXPERT_BANK=1
+export DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB=1
+export DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS=1
+export DS4_GLM_ENABLE_SCORER_XREDUCE=1
+export DS4_GLM_DISABLE_ROUTER_SPLITK_B4=1
+```
+
+A block is valid only when the CLI session counters report `generated=2048`,
+`requested=2048`, `stop=limit`, and 2,047 committed forward positions after the
+initial sampled token. One complete block records achieved capability. Interleaved
+matched runs are required to assign a speed difference or quantify repeatability.
+`DS4_GLM_IGNORE_EOS=1` is a benchmark-only fixed-horizon control and changes the text.
 
 ## Results
 
-### Public-artifact epoch
+### Public-artifact release epoch
 
-Weights and build identity: see `docs/GLM53_M3ULTRA.md` ("Tested configuration"). No
-number from the custom-weight epoch below is carried over; every cell here is filled
-from a receipt produced on the public artifact with the reference recipe above.
+The current measured rows come from the public 185,299,232,064-byte GGUF at sha256
+`828f413c…` and integration commit `b723dfa`. They establish capability for the named
+forced configuration; the final rebuilt release artifact column remains open in
+`RELEASE-EVIDENCE.md`.
 
-| measurement | reference (upstream 9ab7053) | this branch (defaults) | receipt |
-|---|---|---|---|
-| 62k decode t/s (best valid / mean of 3) | — | — | E3 `BASELINE-RECEIPT.json` (pending) |
-| 62k prefill t/s | — | — | same run, `*.err` |
-| 300k decode t/s | — | — | E4 (pending) |
-| 100-prompt scorer avg_nll, fast mode | — | — | `fidelity/` TSVs (pending) |
-| 100-prompt scorer, `DS4_GLM_EXACT=1` | — | must be byte-identical | same |
-| serving lifecycle suite (14 required tests) | — | public build `a0bf48d`: 13/14 (the false cache hit on a repeated prompt, fixed by `8d7e091`); v2 candidate with that fix: 14/14 (details and receipts in `docs/GLM53_M3ULTRA.md`, "Known issues") | E2 |
+| measurement | `b723dfa` capability | scope / receipt |
+|---|---:|---|
+| 62,174-token native prefill | **550.72 t/s** | forced bank + fused layer command buffer + pipeline; `ASTRAL-BANK-PIPELINED62-20260906T194550Z` |
+| 300,000-token native serial decode | **37.2993996 t/s** | 2,048 generated / 2,047 evaluated, limit stop; `BASE300-astral-b723-pipeline-20260906T195448Z` |
+| 300,000-token native prefill | **473.75 t/s** | same receipt; five bank groups admitted |
+| SQL 8,192-token fixed horizon, serial / conservative / speculative | **38.5850 / 47.2064 / 60.7875 t/s** | favorable repetitive fixture, all arms 22,036 bytes, truncated during tuple 483; `ASTRAL-THREE-MODES-20260906T192241Z` |
+| focused task screen | **77/77 in both arms** | 22/23 byte-identical, one wording difference; `TASKCHECK-20260906T154355Z` |
+| E6 token-weighted NLL criterion | **unmet** | delta +0.001933 against upstream; provisional +0.0005 criterion not met |
+
+The 300k generated block matched the retained v3+`xr8` reference block. This is
+lineage evidence rather than a universal upstream-identity claim. Exact mode disables
+registered Tier 2 changes but leaves the corrected DSA pad-row semantics active; compare
+its measured scores instead of requiring an upstream TSV `cmp` pass.
 
 ### Custom-weight epoch (historical)
 

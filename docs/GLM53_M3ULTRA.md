@@ -6,8 +6,9 @@ This branch is a set of Metal decode and prefill kernels, server changes and a
 fidelity harness for **single-stream GLM-5.3-Flash on one M3 Ultra**, built on top of
 upstream ds4 at commit `9ab7053`. It targets the regime where a coding agent actually
 spends its tokens — 40k to 300k+ tokens of context, one request at a time — and it
-keeps every non-bit-exact change behind a switch so the build can be put back into
-upstream's exact floating-point order with one environment variable. The engineering
+keeps every registered floating-point-order change behind a switch so those changes
+can all be disabled with one environment variable. The measured scope of that
+diagnostic is stated below. The engineering
 account of what changed and why is in [`CHANGES-GLM53.md`](../CHANGES-GLM53.md); the
 fidelity rules are in [`bench/FIDELITY.md`](../bench/FIDELITY.md).
 
@@ -75,9 +76,11 @@ so run the binaries from the repository root (or the tree they were built in).
 clamps the model's memory guard so other work on a 512 GB machine stays safe (280 GB
 leaves room for a 400k context; 400 GB is used for scorer runs).
 
-Defaults are the "fast mode" of `bench/FIDELITY.md`: every adopted kernel change on,
-including the eleven registered floating-point-order changes. Nothing needs to be set to
-get the shipped configuration.
+Kernel defaults are the "fast mode" of `bench/FIDELITY.md`: every adopted kernel
+change on, including the eleven registered floating-point-order changes. The final
+release also plans a guarded M3 Ultra/public-Q4 mapping and expert-bank profile described
+below. That policy is still pending its final merge and screen, so `b723dfa` required
+explicit bank and mapping controls for its capability receipts.
 
 ### Model ids
 
@@ -98,11 +101,14 @@ is assigned. The listing is, in order:
 `GET /v1/models/<id>` but are not listed. The `name` field of every entry is the loaded
 shape's name (`GLM 5.3 Flash`).
 
-## The exactness contract
+## Exact-mode diagnostic
 
-`DS4_GLM_EXACT=1` turns every registered floating-point-order change off, so the build
-reproduces upstream's numerics at the pinned commit — the same floating-point order,
-hence the same scorer output byte for byte. It clamps the eleven registry entries listed
+`DS4_GLM_EXACT=1` turns every registered floating-point-order change off. It is a
+diagnostic with a measured scope, not a promise of byte identity with upstream. On
+three diagnostic long-context cases, exact-mode total NLL differed from upstream by
+0.000238, 0.004171 and 0.000048. The corrected DSA pad-row semantics stay active under
+exact mode and are not expected to reproduce upstream's legacy pad-row behavior. The
+switch clamps the eleven registry entries listed
 in [`bench/EXACT-MODE-PLAN.md`](../bench/EXACT-MODE-PLAN.md) §1a (hc_pre slice count,
 BF16 low-rank split-K, blocked DSA softmax, the checked DSA tail, the `xr8` scorer, the
 hc_pre algebra halves, split8 block rows, the Q8_0 and BF16 matvec simdgroup counts, and
@@ -122,8 +128,9 @@ In plain words, the two tiers of `bench/FIDELITY.md`:
   teacher-forced scorer shows it statistically indistinguishable from the same-build
   control and the whole set stays within 3e-4 avg_nll of clean upstream.
 
-The check itself — exact-mode scorer TSV `cmp`-identical to upstream's at the pin — is
-the three-step recipe in `bench/EXACT-MODE-PLAN.md` §2.
+The three-way diagnostic against an upstream pin, the same-build all-off arm and fast
+mode is in `bench/EXACT-MODE-PLAN.md` §2. It records numerical differences rather than
+assuming the upstream TSV must be byte-identical.
 
 ## Feature status
 
@@ -133,16 +140,17 @@ are deliberately separate.
 
 | feature | implemented / default | validated on the merged branch with the public artifact |
 |---|---|---|
-| Decode kernel set (HC-pre single dispatch and wide tail, hc-mix split-K, KDA low-rank pack/fold and glue, DSA indexer fold and pair, routed-down split, router shared fold and tail fold, top-k radix fast path, epilogue fusions) | implemented, default on, each with a kill switch | E1 sanity only: 8k greedy generation byte-identical to untouched upstream `9ab7053` on the same file (receipt: E1 `SANITY-public-…/driver.log`, `gen8k` vs `ugen8k`); throughput and scorer receipts pending (see Results) |
-| Prefill kernel set (KDA prefill fast path, BF16 low-rank split-K, blocked DSA softmax, checked DSA tail, token-tiled router and qk low-rank, dense half copy/ring, indexer causal grid, prefill folds) | implemented, default on, each with a kill switch | same |
+| Decode kernel set (HC-pre single dispatch and wide tail, hc-mix split-K, KDA low-rank pack/fold and glue, DSA indexer fold and pair, routed-down split, router shared fold and tail fold, top-k radix fast path, epilogue fusions) | implemented, default on, each with a kill switch | `b723dfa`: complete native 300k serial block at 37.2994 t/s; final rebuilt release receipt pending |
+| Prefill kernel set (KDA prefill fast path, BF16 low-rank split-K, blocked DSA softmax, checked DSA tail, token-tiled router and qk low-rank, dense half copy/ring, indexer causal grid, prefill folds) | implemented, default on, each with a kill switch | `b723dfa`: 550.72 t/s at 62,174 prompt tokens and 473.75 t/s at 300,000; final rebuilt release receipt pending |
+| Long-prompt expert bank | implemented on the integration line; guarded defaults are being merged after `b723dfa` | intended auto profile is exactly M3 Ultra with at least 500 GiB RAM and the full unsliced, non-SSD, non-TP 185,299,232,064-byte Q4_K artifact; `b723dfa` capability receipts used forced bank controls, so the final default build and 32k boundary still need screening |
 | `ptail` HC-expand epilogue (kernel in `metal/t2screen.metal`) | implemented, default on (`DS4_GLM_DISABLE_HCX_PTAIL=1` off) | Tier 1 receipt on the pre-merge tree; dispatch confirmed in the E1 log (`T2SCREEN first-dispatch HCXTAIL`) |
-| `DS4_GLM_EXACT` umbrella, 11 registry entries | implemented | exact-vs-upstream TSV `cmp` pending on the public artifact |
+| `DS4_GLM_EXACT` umbrella, 11 registry entries | implemented | three long-context diagnostics within 0.0042 total NLL per case; full public-artifact diagnostic remains pending |
 | MoE block dataflow kernel, hc_pre algebra half B, one-dispatch hc_pre, `xr8` scorer, split8 opt-ins | implemented, **opt-in** (measured slower, or unexplained divergence in the case of `xr8`) | not part of the validated defaults |
 | All-Q8 KDA projection fusion (`DS4_GLM_ENABLE_KDA_PROJ_FUSE`) | implemented, opt-in; the first path written for this file's all-Q8 KDA layout | **not validated**; needs an identity check against the default before it can be recommended |
-| Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | public build `a0bf48d`: 13/14 required lifecycle tests (`RUN-20260906T121302Z`; the failure is the false cache hit under "Known issues"); v2 candidate with the cache fix `8d7e091`: 14/14 required, 4/5 observational (`RUN-20260906T123859Z`; the observational miss is negative `max_tokens`) |
+| Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | affected runtime driver on `b723dfa`: 16/16 checks passed, including model aliases, explicit DFlash mode precedence, bank cancellation and healthy reuse, speculative stop and natural EOS; final rebuilt receipt pending |
 | Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge | **re-validation pending** on a vision prompt |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
-| DFlash2 speculative decoding (`--dflash`) | implemented, opt-in and greedy-only; complete per-position KDA/DSA snapshots restore the accepted prefix, with full restore/replay retained as fallback and diagnostic reference. Positive temperature decodes serially. | Focused GPU prefix tests and a JSON speed comparison passed on the isolated DFlash build; final merged-branch validation and the new <2% negative-impact requirement remain pending. |
+| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to conservative request-credit scheduling; `--dflash-mode speculative` selects the uncapped policy. Positive temperature decodes serially. | `b723dfa` passed the affected runtime suite. On one favorable fixed 8,192-token SQL horizon: serial 38.5850, conservative 47.2064, speculative 60.7875 t/s; final rebuilt receipt pending. |
 | CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
 
 **How DFlash2's rollback was completed.** Verification snapshots both the KDA
@@ -164,11 +172,13 @@ checks; the adaptive admission policy remains under development.
 
 Stated once, so a reader does not have to infer them from the table:
 
-- **DFlash2 speculative decoding is opt-in and greedy-only.** Accepted-prefix
-  snapshots eliminate replay when complete capture is available. Performance is
-  workload-dependent; the less-than-2% negative-impact requirement is not yet met
-  by the current admission policy. Personal-use draft recreation instructions are
-  in `docs/DFLASH_GLM53.md`; draft weights are not distributed here.
+- **DFlash2 speculative decoding is optional and greedy-only.** A bare startup is
+  serial and allocates no drafter state. Supplying `--dflash FILE` defaults to the
+  conservative request-credit policy; speculative selects the uncapped policy and can
+  regress. Both retain the target model as verifier and are intended to preserve model
+  quality. The conservative policy has an empirical less-than-2% added-work target on
+  its calibrated M3 Ultra profile, not a universal physical guarantee. Personal-use
+  draft recreation instructions are in `docs/DFLASH_GLM53.md`; no draft weights ship.
 - **Unsupported or untested configurations.** The CUDA and ROCm paths carry small
   GLM-5.3 additions (`ds4_cuda.cu`, `rocm/ds4_rocm_glm.cuh`) that are compile-only as far
   as this branch goes: no CUDA or ROCm machine built or ran them here; tensor
@@ -181,6 +191,33 @@ Stated once, so a reader does not have to infer them from the table:
   disconnects, invalid requests, over-context prompts). It does not exercise a server
   restart against a warm disk cache, a session reset, or eviction under disk-space
   pressure; those paths are upstream's and remain **not validated here**.
+
+### Guarded expert-bank defaults pending final integration
+
+The planned C defaults enable the expert bank only when all of these checks pass:
+Metal reports exactly Apple M3 Ultra, physical memory is at least 500 GiB, and the
+model is the full unsliced, non-SSD, non-TP public GLM-5.3 Q4_K profile with the
+185,299,232,064-byte artifact shape and all 42 routed-expert tensors in Q4_K. The
+automatic schedule uses the bank, fused layer command buffer and an eight-layer
+pipeline only for prompts at or above `DS4_GLM_EXPERT_BANK_MIN_TOKENS` (planned
+default 32768). That threshold is a conservative engineering boundary pending the
+final 32k screen, not a measured crossover.
+
+`DS4_GLM_ENABLE_EXPERT_BANK=1` force-enables another compatible profile; `=0` forces
+it off. `DS4_GLM_DISABLE_EXPERT_BANK=1` is the strong kill switch. The fused and
+pipelined controls accept `1` or `0`, with unset taking the guarded profile default;
+the pipeline requires the fused layer command buffer. `DS4_GLM_DISABLE_SUPERCHUNK=1`
+is the strong schedule kill. Dynamic memory admission and ordinary fallback still
+apply. These defaults are not present at the `b723dfa` capability commit: release
+documentation must not call them shipped until their implementation, final build and
+boundary screen are complete.
+
+For the same validated profile, the planned Metal mapping default also enables
+untracked model views when `DS4_METAL_MODEL_UNTRACKED` is unset. `=0` disables that
+mapping explicitly and `=1` enables it elsewhere. The mapping decision is independent
+of the bank kill switch, so an auto-vs-disabled bank comparison keeps the model view
+constant. CPU inspection, SSD streaming, tensor parallelism and other profiles do not
+inherit this automatic mapping. Startup prints the resolved `model_untracked=0|1`.
 
 ## Environment switches introduced by this branch
 
@@ -208,9 +245,14 @@ opt-in, so they matter only when a drafter is loaded.
 |---|---|---|---|
 | `DS4_ANTHROPIC_DEFAULT_EFFORT` | supported control | Default reasoning effort for Anthropic-protocol requests that carry none (e.g. Claude Code); explicit request fields still win. | `ds4_server.c:3859` |
 | `DS4_DFLASH_CTX_CAP` | supported control | Caps the drafter's context rows (default about 256; more rows cost draft latency). | `ds4_dflash_glm.inc:174`, `ds4_dflash_seed.inc:31` |
-| `DS4_DFLASH_DISABLE` | supported control | Ignores a loaded DFlash2 drafter and decodes serially. | `ds4.c:59216` |
+| `DS4_DFLASH_DISABLE` | supported control | With no explicit `--dflash-mode`, selects serial startup and avoids loading the drafter. An explicit mode wins. | `ds4.c`, DFlash mode resolver |
 | `DS4_GLM53_MEMORY_CEILING_GB` | supported control | Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe). | `ds4.c:42037` |
 | `DS4_GLM53_PREFILL_CHUNK` | supported control | Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks). | `ds4.c:37902` |
+| `DS4_GLM_ENABLE_EXPERT_BANK` | supported control (pending guarded default) | Unset selects the exact M3 Ultra/public-Q4 profile automatically; `1` forces another compatible profile; `0` forces off. Final implementation and screen pending. | expert-bank admission |
+| `DS4_GLM_EXPERT_BANK_MIN_TOKENS` | supported control (pending guarded default) | Minimum prompt tokens for the automatic bank schedule; planned default 32768, a provisional engineering boundary pending the final 32k screen. | expert-bank admission |
+| `DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB` | supported control (pending guarded default) | Unset takes the guarded profile default; `1` enables and `0` disables the fused layer command buffer. | expert-bank scheduler |
+| `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS` | supported control (pending guarded default) | Unset takes the guarded profile default (eight-layer bound); `1` enables and `0` disables the layer pipeline. Requires the fused layer command buffer. | expert-bank scheduler |
+| `DS4_METAL_MODEL_UNTRACKED` | supported control (pending guarded default) | Unset enables untracked model views only on the validated Metal M3 Ultra/public-Q4 profile; `1` enables elsewhere and `0` disables explicitly. Independent of bank admission. | Metal model mapping |
 | `DS4_GLM_DSA_TAIL_CHECKED` | supported control | =0 restores the legacy unchecked ragged tail in DSA attention (default 1: bounds-checked; registry entry 4). | `ds4_metal.m:41060` |
 | `DS4_GLM_ENABLE_BF16_LOWRANK_SPLITK` | supported control | =0 turns the BF16 low-rank split-K off (default on since bundle round 1). | `ds4_metal.m:52171` |
 | `DS4_GLM_ENABLE_DSA_BLOCKED_SOFTMAX` | supported control | =1 forces the blocked softmax on (default on). | `ds4_metal.m:41029` |
@@ -218,7 +260,7 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_GLM_ENABLE_ROUTED_DOWN_SPLIT` | supported control | =1 forces the expert-parallel routed down split on (default on). | `ds4_metal.m:42895` |
 | `DS4_GLM_ENABLE_ROUTER_SHARED_FOLD` | supported control | =1 forces the router/shared-expert fold on (it is the default; the kill switch wins). | `ds4_metal.m:42127` |
 | `DS4_GLM_ENABLE_TOPK_FAST` | supported control | No-op kept for scripts that set it (the fast path is on by default). | `ds4_metal.m:20439` |
-| `DS4_GLM_EXACT` | supported control | =1 exact mode: every registered floating-point-order change off, numerics equal to upstream at the pin (see EXACT-MODE-PLAN.md). | `ds4.c:42332` |
+| `DS4_GLM_EXACT` | supported control | =1 diagnostic: every registered floating-point-order change off. It does not undo the corrected DSA pad-row semantics and is not a universal upstream-byte-identity promise (see EXACT-MODE-PLAN.md). | `ds4.c:42332` |
 | `DS4_GLM_HC_PRE_ALGEBRA_A` | supported control | =0 turns off hc_pre algebra half A (unscaled split-K dot, scale in the tail; default on, registry entry 6). | `ds4_metal.m:53058` |
 | `DS4_GLM_HC_PRE_SLICES` | supported control | =8|16|32 hc_pre split-K slice count (default 16; 32 is faster but out of the fidelity budget). | `ds4_metal.m:52827` |
 | `DS4_GLM_SCORER_XREDUCE_MIN_ROWS` | supported control | Candidate-row threshold below which the production scorer is kept even when xr8 is enabled (default 37500; 0 disables the gate). | `ds4_metal.m:20333` |
@@ -241,6 +283,8 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_DFLASH_FAIL` | developer instrumentation (bench-only) | Inject a cycle failure at `state_save`, `after_arm` or `after_verify` to exercise the cleanup on those exits. | `ds4_dflash2.inc` |
 | `DS4_DFLASH_NO_SELECTOR` | kill switch | Disables the DFlash2 candidate selector (coherent-chain tracing). | `ds4_dflash_selector.inc:29` |
 | `DS4_DFLASH_SDPA_SCALAR` | kill switch | Forces the scalar SDPA drafter kernel instead of the simdgroup one. | `ds4_metal.m:56113` |
+| `DS4_GLM_DISABLE_EXPERT_BANK` | kill switch (pending guarded default) | `=1` strongly disables expert-bank admission; `=0` is a no-op. | expert-bank admission |
+| `DS4_GLM_DISABLE_SUPERCHUNK` | kill switch (pending guarded default) | `=1` strongly disables the bank superchunk schedule; `=0` is a no-op. | expert-bank scheduler |
 | `DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK` | kill switch | Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2). | `ds4_metal.m:52173` |
 | `DS4_GLM_DISABLE_DENSE_HALF_COPY` | kill switch | Disables the dense-layer half-copy path and its ring (prefill lever 24). | `ds4_metal.m:21155` |
 | `DS4_GLM_DISABLE_DENSE_HALF_RING` | kill switch | Disables the half-copy ring alone. | `ds4_metal.m:21299` |
@@ -407,62 +451,91 @@ Upstream's own switches (`DS4_METAL_Q8_MV_NSG`, `DS4_TP_*`, `DS4_DSPARK_*`,
 
 ## Benchmark recipes
 
-The instruments and their environment are described in [`bench/README.md`](../bench/README.md).
-The two numbers this branch is measured by:
-
-**Native reference recipe (decode at depth, CLI, cold prefill, greedy; prefill reported
-separately):**
+The instruments and their environment are described in
+[`bench/README.md`](../bench/README.md). The public-model capability commands use the
+model digest in "Tested configuration" and the exact prompt digests listed in
+[`bench/RELEASE-EVIDENCE.md`](../bench/RELEASE-EVIDENCE.md). Set the prompt variables to
+local files with those digests before running:
 
 ```sh
-export DS4_METAL_MODEL_UNTRACKED=1 DS4_GLM53_MEMORY_CEILING_GB=280
-export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1     # validity counters, equal decode windows
-./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --metal --nothink --temp 0 \
-      -c 70000  -n 2048 --prompt-file needle-64k.txt    # 62k bucket
-./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --metal --nothink --temp 0 \
-      -c 320000 -n 2048 --prompt-file prompt-300k.txt   # 300k bucket
+export MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf
+export PROMPT62=/path/to/needle-64k.txt
+export PROMPT300=/path/to/prompt-300k.txt
+export DS4_GLM53_MEMORY_CEILING_GB=280
+export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1
+
+# Serial native generation gate. The final guarded-profile build resolves model
+# mapping and expert-bank defaults itself; force flags below reproduce b723dfa only.
+./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+      -c 70000 -n 2048 --prompt-file "$PROMPT62"
+./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+      -c 320000 -n 2048 --prompt-file "$PROMPT300"
 ```
 
-A block counts only if `n_generated == 2048` and the stop reason is the predict limit;
-arms are run as at least three interleaved pairs against the reference build on the same
-file, and the report carries the best valid block, the mean of the valid blocks and the
-output bytes of every block.
+A native decode block counts only when the normal CLI session loop reports
+`generated=2048`, `requested=2048`, `stop=limit`, and 2,047 committed forward
+positions after the initial sampled token. One valid complete block records achieved
+capability. Interleaved matched runs are still required to attribute a speed difference
+or characterize repeatability. `DS4_GLM_IGNORE_EOS=1` is a benchmark-only fixed-horizon
+control and changes the generated text.
 
-**100-case scorer (quality; exact mode and fast mode):**
+The `b723dfa` capability receipts forced the bank, fused layer command buffer,
+eight-layer pipeline, `xr8` at its depth gate, untracked model view, and serial DFlash.
+They are evidence for that named configuration. The final release recipe should use the
+guarded defaults after their implementation and record the resolved startup policy.
+
+For an exact `b723dfa` configuration reproduction, export
+`DS4_METAL_MODEL_UNTRACKED=1`, `DS4_GLM_ENABLE_EXPERT_BANK=1`,
+`DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB=1`,
+`DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS=1`,
+`DS4_GLM_ENABLE_SCORER_XREDUCE=1`, and
+`DS4_GLM_DISABLE_ROUTER_SPLITK_B4=1` before the native commands.
+
+**Quality screen:**
 
 ```sh
 make -C gguf-tools quality-score
-DS4_GLM53_MEMORY_CEILING_GB=400 gguf-tools/quality-testing/score_official \
-    gguf/GLM-5.3-Flash-Q4_K.gguf \
-    gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv fast.tsv
-DS4_GLM_EXACT=1 DS4_GLM53_MEMORY_CEILING_GB=400 gguf-tools/quality-testing/score_official \
-    gguf/GLM-5.3-Flash-Q4_K.gguf \
-    gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv exact.tsv
-cmp exact.tsv upstream-9ab7053.tsv          # the exactness claim
+DS4_GLM53_MEMORY_CEILING_GB=400 \
+  gguf-tools/quality-testing/score_official "$MODEL" \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv \
+  fast.tsv
+DS4_GLM_EXACT=1 DS4_GLM53_MEMORY_CEILING_GB=400 \
+  gguf-tools/quality-testing/score_official "$MODEL" \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv \
+  exact.tsv
+python3 gguf-tools/quality-testing/compare_scores.py upstream-9ab7053.tsv exact.tsv
 python3 gguf-tools/quality-testing/compare_scores.py upstream-9ab7053.tsv fast.tsv
 ```
 
+Compare scores and outputs as measured data. Exact mode disables the registered Tier 2
+changes, but the corrected DSA pad-row semantics remain active, so upstream TSV byte
+identity is not assumed.
+
 ## Results
 
-Every cell below is bound to a receipt produced on the merged branch with the public
-artifact; none is filled from the earlier custom-weight measurements. Until a receipt
-exists the cell is a placeholder, not a number.
+These are capability receipts from `b723dfa7594dbadc6480cf2872751ae22e551754`
+(`ds4` sha256 `31139ed7…`) on the public 185,299,232,064-byte GGUF. They are not yet
+receipts for the final rebuilt artifact.
 
-| measurement | upstream 9ab7053 | this branch, defaults | this branch, `DS4_GLM_EXACT=1` | receipt |
-|---|---|---|---|---|
-| 62k decode, t/s (best valid / mean of 3 pairs) | `<E3 receipt: ~/megakernel-refs/public-artifact/BASE62-public-…/BASELINE-RECEIPT.json>` | same receipt | — | E3 |
-| 62k prefill, t/s | `<E3 receipt, *.err "GLM prefill:">` | same | — | E3 |
-| 300k decode, t/s | `<E4 receipt: …/BASE300-public-…/BASELINE-RECEIPT.json>` | same | — | E4 |
-| 300k prefill, t/s | `<E4 receipt>` | same | — | E4 |
-| 100-case scorer avg_nll / first_match / avg_lcp | `<E1 receipt: ~/megakernel-refs/public-artifact/SANITY-public-…/uf1.tsv>` | `<E1 receipt: …/SANITY-public-…/f1.tsv>` | `<exact-mode TSV, pending>` | E1 |
-| exact-mode TSV vs upstream TSV | — | — | `<cmp result, pending>` | E1 |
-| 8k greedy generation, 64 tokens, bytes | `<E1 receipt: …/SANITY-public-20260906T115921Z/ugen8k.out>` | `<same receipt, gen8k.out>` | — | E1 (identical in the run logged) |
-| serving lifecycle suite (14 required) | — | `a0bf48d`: 13/14 (`~/megakernel-refs/public-artifact/server-lifecycle/RUN-20260906T121302Z/results.json`); v2 candidate with `8d7e091`: 14/14 (`…/RUN-20260906T123859Z/results.json`) | — | E2 |
+| measurement | `b723dfa` result | scope | staging receipt |
+|---|---:|---|---|
+| native prefill, 62,174 prompt tokens | **550.72 t/s** | forced shared bank + fused layer command buffer + eight-layer pipeline; all 42 layers banked | `ASTRAL-BANK-PIPELINED62-20260906T194550Z` |
+| native serial decode, 300,000-token prompt | **37.2993996 t/s** | 2,048 generated / 2,047 evaluated, stop at prediction limit | `BASE300-astral-b723-pipeline-20260906T195448Z` |
+| native prefill, 300,000 prompt tokens | **473.75 t/s** | five admitted bank groups, no refusal | same |
+| DFlash SQL fixed horizon, serial / conservative / speculative | **38.5850 / 47.2064 / 60.7875 t/s** | 8,192 generated in every arm; favorable repetitive prompt, truncated during tuple 483 of 2,000 | `ASTRAL-THREE-MODES-20260906T192241Z` |
+| task outcome screen | **77/77 in both arms** | 22/23 outputs byte-identical; one wording difference; focused screen, not broad equivalence | `TASKCHECK-20260906T154355Z` |
+| E6 token-weighted NLL margin | **unmet** | candidate 1.270792 vs upstream 1.268859, delta +0.001933; provisional +0.0005 criterion not met | E6 retained comparison |
 
-Binary identities of the runs (sha256 of `ds4`, `ds4-server`, the Metal source aggregate
-and the model file) are recorded in each receipt directory's `identity.txt`. Different
-hashes across builds do not by themselves prove changed numerical code — the `-g` build
-is not byte-reproducible — but they identify exactly which executables produced a
-receipt.
+The 300k output matched the retained v3+`xr8` reference block. That is lineage evidence,
+not a claim of universal or upstream byte identity. The DFlash arms happened to emit the
+same 22,036 bytes on the SQL fixture. They reached the fixed token horizon rather than
+completing the requested task, so the result must not be presented as average workload
+speed.
+
+The concise evidence ledger and final-release placeholders are in
+[`bench/RELEASE-EVIDENCE.md`](../bench/RELEASE-EVIDENCE.md). Binary, source, model and
+prompt identities belong in each retained receipt; the final release rows stay pending
+until the rebuilt artifact is screened.
 
 ## Known issues
 
@@ -478,7 +551,11 @@ receipt.
   integer","type":"invalid_request_error"}}`. Zero is still accepted and yields an empty
   completion with `finish_reason: length`. Lifecycle test T14 checks it; T7b's
   observational miss in the earlier receipts is this.
-- **DFlash2 remains experimental.** The complete prefix-snapshot path is implemented, but speculative admission does not yet meet the project's less-than-2% negative-impact requirement on low-acceptance workloads. Omit `--dflash` for serial decoding. Positive-temperature requests already use the serial path.
+- **DFlash2 is optional.** Bare startup is serial. With local draft weights,
+  conservative request-credit scheduling is the default; the uncapped speculative mode
+  is explicit and can regress. The less-than-2% figure is the conservative scheduler's
+  empirical added-work target on its calibrated profile, not a promise for every
+  workload or machine. Positive-temperature requests use the serial path.
 - **Repeat of a long prompt accounted as a cache hit while the whole prompt was
   rebuilt — fixed on two paths.** Two mechanisms are involved. First, upstream's
   validity check on the memory-rewind path (`ds4_server.c`, the `rewind_valid` test after
@@ -518,17 +595,21 @@ receipt.
   `metal/t2screen.metal`; relocating the supported kernels into a production-named
   Metal file with a build/runtime check is future work, listed below.
 
-## Checklist for publication (future work, not done here)
+## Checklist for publication
 
-- [ ] Run E1–E4 on the merged branch and replace every placeholder in "Results" with
-      the receipt's numbers and a repository-relative pointer to the retained TSV/JSON.
-- [ ] Exact-mode `cmp` against the upstream `9ab7053` scorer TSV on the public artifact.
+- [ ] Build the final merged artifact and replace the pending column in
+      `bench/RELEASE-EVIDENCE.md` with its binary/source identities and retained
+      repository-relative receipts.
+- [ ] Confirm the guarded M3 Ultra/public-Q4 startup policy, including the untracked
+      model view, expert bank, fused layer command buffer and eight-layer pipeline.
+- [ ] Run the focused 32k auto-vs-disabled screen before freezing the provisional
+      32768-token expert-bank boundary.
+- [ ] Record the exact-mode upstream diagnostic on the final artifact; report measured
+      deltas and do not assume byte identity because the DSA pad-row fix remains active.
 - [ ] Re-validate a vision prompt after the multimodal session-reuse change.
-- [ ] Certify DFlash2 at the model level: `tests/dflash_rejection_harness.sh`
-      (deterministic rejection after 0/1/2/3 accepted drafts, on both sides of the
-      4-token pool boundary, plus a full-accept block; token identity, restored state and
-      frontier logits compared against the serial arm), then `tests/dflash_cached_depth.c`
-      at 62k and 300k from a restored payload, then a server smoke.
+- [ ] Re-run only the affected DFlash startup/lifecycle checks on the final artifact;
+      keep the `b723dfa` 16/16 result as capability evidence rather than repeating
+      unchanged broad matrices.
 - [ ] Decide DFlash2 sampled operation: compute the rejection residual against the
       target's original filtered support instead of masking a logit, or leave the mode
       greedy-only.

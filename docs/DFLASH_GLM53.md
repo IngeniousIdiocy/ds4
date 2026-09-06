@@ -22,10 +22,13 @@ result.
 
 **Status of this page.** The conversion and provenance steps below are
 verified: the pinned source hash was computed here, and re-running the pinned
-converter command reproduced the tested artifact byte for byte. The runtime
-steps — launching, serving, and the behaviour at depth — are **pending**: the
-model-level certification described in §8 has not passed yet. Treat `--dflash`
-as an optional mode you may build and try, not as a validated configuration.
+converter command reproduced the tested artifact byte for byte. The `b723dfa`
+capability build also passed the affected startup, server reuse, cancellation,
+stop and natural-EOS runtime checks. The fixed-horizon measurement in §1 shows
+that this drafter can pay on one favorable structured workload. It does not
+establish a general speedup. DFlash2 remains optional, greedy-only and dependent
+on a locally obtained drafter. The final rebuilt release artifact still needs
+its own retained runtime receipt.
 
 ---
 
@@ -43,6 +46,25 @@ as an optional mode you may build and try, not as a validated configuration.
 | Target GGUF sha256 | `828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0` |
 | Converter | `gguf-tools/dflash2_to_gguf.py` (this repository) |
 | Python | 3.12, numpy 2.5.1 (numpy is the only third-party import) |
+
+### Capability receipt on `b723dfa`
+
+One deliberately repetitive SQL prompt was run for a fixed 8,192-token horizon
+through all three startup policies. Each arm emitted 22,036 bytes with the same
+digest in that run:
+
+| startup policy | generated tokens | generation time | tokens/s |
+| --- | ---: | ---: | ---: |
+| serial | 8,192 | 212.310 s | 38.5850 |
+| conservative | 8,192 | 173.536 s | 47.2064 |
+| speculative | 8,192 | 134.764 s | 60.7875 |
+
+Receipt: `ASTRAL-THREE-MODES-20260906T192241Z`, build `b723dfa`. The prompt asks
+for 2,000 SQL tuples, but every arm stops at the fixed token limit during tuple
+483. This is a favorable fixed-horizon capability result, not a completed-task
+measurement or a representative average. Matching bytes on this fixture do not
+create a universal byte-identity requirement; meaningful quality comparisons
+remain about the target distribution, argmax margins and causal output effects.
 
 The drafter's `main` branch has moved on since that revision and its current
 model card differs from the one tested here. **Pin the revision.** A different
@@ -154,6 +176,8 @@ Server: the same `--dflash FILE` flag.
 
 `--dflash-mode` is a startup policy shared by the CLI and server:
 
+- With neither `--dflash` nor an explicit mode, startup is serial and allocates
+  no drafter state.
 - `conservative` uses request-credit admission. This is also the default when
   `--dflash FILE` is supplied without an explicit mode.
 - `speculative` runs the existing uncapped path. It can improve or regress
@@ -272,7 +296,8 @@ Confirm the mode is really running rather than quietly falling back:
 
 ```sh
 DS4_DFLASH_STATS=1 ./ds4 --model TARGET.gguf --dflash "$DFLASH_DIR/GLM-5.3-Flash-DFlash2.gguf" \
-    --ctx 8192 -n 64 -p "Write a short paragraph about the sea."
+    --dflash-mode speculative --ctx 8192 -n 64 \
+    -p "Write a short paragraph about the sea."
 ```
 
 Expect per-cycle lines with **nonzero** `drafted=` and `accepted=`, and a
@@ -307,7 +332,8 @@ that can reject. It compares the token streams, the per-block accept and
 rollback outcome, the frontier logits, and a per-tensor digest of the complete
 speculative state at equal frontiers.
 
-Expect: output identical to serial; `accepted` equal to each block's K;
+For this deterministic rejection harness, expect output identical to serial;
+`accepted` equal to each block's K;
 `rollback=replay` on every partial block and `rollback=none` on the
 full-accept one; and the restored speculative state bit-identical to the
 serial arm's at the same frontier (both arms reach those positions through
