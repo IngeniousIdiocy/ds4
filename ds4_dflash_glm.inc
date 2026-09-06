@@ -353,7 +353,7 @@ static int ds4_session_glm_dflash_cycle_impl(
         s->dflash_serial_ms > 0.1f && s->dflash_cycle_ms > 0.1f ?
             s->dflash_cycle_ms / s->dflash_serial_ms : 4.1f;
     if (!sblk && !s->dflash_budget.active &&
-        !getenv("DS4_DFLASH_NO_ADAPTIVE") && s->dflash_warm) {
+        e->dflash_mode != DS4_DFLASH_MODE_SPECULATIVE && s->dflash_warm) {
         if (s->dflash_ema == 0.0f) s->dflash_ema = breakeven + 1.5f;
         if (s->dflash_ema < breakeven) {
             s->dflash_lowrun++;
@@ -550,8 +550,8 @@ static int ds4_session_glm_dflash_cycle_impl(
         return -1;
     }
 
-    /* Per-row head through the exact single-row path (bit-identical to
-     * serial decode's head), logits read to the host per row. */
+    /* Per-row reference arithmetic, with NT4 sharing weights across rows.
+     * HC collapse and normalization are common to both head paths. */
     static float *row_logits = NULL;
     if (!row_logits) {
         row_logits = xmalloc((size_t)(DS4_DFLASH2_MAX_DRAFT + 1u) *
@@ -570,13 +570,19 @@ static int ds4_session_glm_dflash_cycle_impl(
         snprintf(err, errlen, "dflash: hc upload failed");
         return -1;
     }
-    /* NT4 is opt-in and head-local. Compare/bench modes always retain scalar
-     * logits for acceptance; unsupported shapes use the existing scalar path. */
+    /* NT4 defaults on only for the measured device/model profile. A force
+     * broadens that profile, never the kernel shape; the kill dominates both
+     * dispatch and diagnostics. Compare/bench retain scalar acceptance. */
     const bool head_shape = H == 4096u && DS4_N_VOCAB == 154880u && L == 8u &&
         e->weights.output->type == DS4_TENSOR_Q8_0;
-    const bool head_compare = head_shape &&
+    const bool head_killed = getenv("DS4_DFLASH_DISABLE_HEAD_NT4") != NULL;
+    const bool head_compare = head_shape && !head_killed &&
         (getenv("DS4_DFLASH_HEAD_COMPARE") || getenv("DS4_DFLASH_HEAD_BENCH"));
-    const bool head_use = head_shape && getenv("DS4_DFLASH_HEAD_NT4") && !head_compare;
+    const bool head_use = !head_compare && dflash_fast_path_enabled(head_shape,
+        dflash2_fast_default(&e->dflash_model, &e->dflash_weights,
+                            &e->model, &e->weights),
+        getenv("DS4_DFLASH_HEAD_NT4"),
+        getenv("DS4_DFLASH_DISABLE_HEAD_NT4"), NULL);
     bool head_nt4_ran = false;
     if (head_compare && !g->dflash_head_compare) {
         g->dflash_head_compare = ds4_gpu_tensor_alloc(
@@ -662,8 +668,7 @@ static int ds4_session_glm_dflash_cycle_impl(
             return -1;
         }
     }
-    if ((getenv("DS4_DFLASH_HEAD_NT4") || getenv("DS4_DFLASH_HEAD_COMPARE") ||
-         getenv("DS4_DFLASH_HEAD_BENCH")) && getenv("DS4_DFLASH_STATS")) {
+    if (getenv("DS4_DFLASH_STATS")) {
         fprintf(stderr, "ds4: dflash head pos=%u rows=%u nt4=%d scalar_logits_retained=%d\n",
                 pos, L, head_nt4_ran, !head_use || !head_nt4_ran);
     }
@@ -870,7 +875,7 @@ static int ds4_session_glm_dflash_cycle_argmax(
         ds4_session *s, int first_token,
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
-    if (getenv("DS4_DFLASH_NO_ADAPTIVE")) {
+    if (s->engine->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE) {
         return ds4_session_glm_dflash_cycle_impl(s, first_token,
             0.0f, 0, 0.0f, 0.0f, NULL, accepted, accepted_cap, err, errlen);
     }

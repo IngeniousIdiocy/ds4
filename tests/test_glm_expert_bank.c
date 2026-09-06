@@ -9,7 +9,7 @@
  * and reports
  *   1. bank identity  -- every half of the three bank sections re-derived from
  *      the packed rows through the inverse index mapping (--verify),
- *   2. output identity -- every output word of the whole 62,174-row prompt,
+ *   2. output identity -- every output word of the captured prompt prefix,
  *      the nine production chunks of the packed arm against the one
  *      whole-prompt batch of the bank arm, with planted single-row controls so
  *      the comparator is proven live,
@@ -97,7 +97,9 @@ static uint32_t g_total_tokens;
 static uint32_t g_prod_chunks[512];
 static int      g_nprod;
 
-static void load_ids(const char *path, uint32_t want_layer) {
+static void load_ids(const char *path,
+                     uint32_t    want_layer,
+                     uint32_t    token_limit) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open ids dump %s\n", path); exit(2); }
     size_t cap = 1u << 20, used = 0;
@@ -109,16 +111,34 @@ static void load_ids(const char *path, uint32_t want_layer) {
         int32_t *buf = malloc(n * sizeof(int32_t));
         if (!buf || fread(buf, sizeof(int32_t), n, f) != n) { free(buf); break; }
         if (ne != TOPK || layer != want_layer) { free(buf); continue; }
-        while (used + n > cap) { cap *= 2; g_ids = realloc(g_ids, cap * sizeof(int32_t)); }
+        const uint32_t have_tokens = (uint32_t)(used / TOPK);
+        uint32_t take = nt;
+        if (token_limit != 0) {
+            if (have_tokens >= token_limit) take = 0;
+            else if (take > token_limit - have_tokens) {
+                take = token_limit - have_tokens;
+            }
+        }
+        const size_t take_ids = (size_t)take * ne;
+        while (used + take_ids > cap) {
+            cap *= 2;
+            g_ids = realloc(g_ids, cap * sizeof(int32_t));
+        }
         if (!g_ids) { free(buf); break; }
-        memcpy(g_ids + used, buf, n * sizeof(int32_t));
-        used += n;
+        memcpy(g_ids + used, buf, take_ids * sizeof(int32_t));
+        used += take_ids;
         free(buf);
-        if (g_nprod < 512) g_prod_chunks[g_nprod++] = nt;
+        if (take != 0 && g_nprod < 512) g_prod_chunks[g_nprod++] = take;
     }
     fclose(f);
     if (!g_ids) { fprintf(stderr, "out of memory loading routing\n"); exit(2); }
     g_total_tokens = (uint32_t)(used / TOPK);
+    if (token_limit != 0 && g_total_tokens != token_limit) {
+        fprintf(stderr,
+                "requested %u routing tokens for layer %u, capture has %u\n",
+                token_limit, want_layer, g_total_tokens);
+        exit(2);
+    }
     printf("routing: layer %u, %u tokens, %d production chunks (",
            want_layer, g_total_tokens, g_nprod);
     for (int i = 0; i < g_nprod; i++) printf("%s%u", i ? ", " : "", g_prod_chunks[i]);
@@ -325,15 +345,17 @@ static int observe_expansion_pair(const void *map,
 int main(int argc, char **argv) {
     const char *gguf = NULL, *ids = NULL;
     uint32_t layer = 24;
+    uint32_t token_limit = 0;
     uint64_t gate_off = 0, up_off = 0, down_off = 0;
     int passes = 8, do_verify = 0, do_compare = 1, prod = 1, whole = 1;
-    int self_test_only = 0, expansion_only = 0;
+    int self_test_only = 0, expansion_only = 0, cross_screen = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (!strcmp(a, "--gguf") && v) { gguf = v; i++; }
         else if (!strcmp(a, "--ids") && v) { ids = v; i++; }
         else if (!strcmp(a, "--layer") && v) { layer = (uint32_t)strtoul(v, NULL, 10); i++; }
+        else if (!strcmp(a, "--tokens") && v) { token_limit = (uint32_t)strtoul(v, NULL, 10); i++; }
         else if (!strcmp(a, "--off-gate") && v) { gate_off = strtoull(v, NULL, 10); i++; }
         else if (!strcmp(a, "--off-up") && v) { up_off = strtoull(v, NULL, 10); i++; }
         else if (!strcmp(a, "--off-down") && v) { down_off = strtoull(v, NULL, 10); i++; }
@@ -341,6 +363,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--verify")) do_verify = 1;
         else if (!strcmp(a, "--self-test")) self_test_only = 1;
         else if (!strcmp(a, "--expansion-only")) expansion_only = 1;
+        else if (!strcmp(a, "--cross-screen")) cross_screen = 1;
         else if (!strcmp(a, "--no-compare")) do_compare = 0;
         else if (!strcmp(a, "--chunks") && v) {
             prod = strstr(v, "prod") != NULL;
@@ -349,8 +372,9 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr,
                     "usage: %s --gguf F --ids F --layer N --off-gate N --off-up N "
-                    "--off-down N [--chunks prod,whole] [--passes N] [--verify] "
-                    "[--no-compare] [--self-test] [--expansion-only]\n", argv[0]);
+                    "--off-down N [--tokens N] [--chunks prod,whole] [--passes N] "
+                    "[--verify] [--no-compare] [--self-test] [--expansion-only] "
+                    "[--cross-screen]\n", argv[0]);
             return 2;
         }
     }
@@ -364,7 +388,7 @@ int main(int argc, char **argv) {
     setenv("DS4_GLM_ENABLE_EXPERT_BANK", "1", 1);
     unsetenv("DS4_GLM_DISABLE_EXPERT_BANK");
 
-    load_ids(ids, layer);
+    load_ids(ids, layer, token_limit);
 
     int fd = open(gguf, O_RDONLY);
     struct stat st;
@@ -574,7 +598,60 @@ int main(int argc, char **argv) {
     double *pk = malloc((size_t)passes * sizeof(double));
     double *bk = malloc((size_t)passes * sizeof(double));
     if (!pk || !bk) return 2;
-    for (int sched = 0; sched < 2; sched++) {
+    if (cross_screen) {
+        ds4_gpu_glm_expert_bank_disarm();
+        if (!pass(&c, 0)) {
+            fprintf(stderr, "FAIL: packed production-boundary warm-up failed\n");
+            return 1;
+        }
+        for (int p = 0; p < passes; p++) {
+            const double t0 = now_ms();
+            if (!pass(&c, 0)) {
+                fprintf(stderr, "FAIL: packed production-boundary timing failed\n");
+                return 1;
+            }
+            pk[p] = now_ms() - t0;
+        }
+        if (!ds4_gpu_glm_expert_bank_expand_layer(
+                    map, (uint64_t)st.st_size, gate_off, up_off, down_off,
+                    Q4_K, Q4_K, Q4_K,
+                    (uint64_t)DMID * gate_row, gate_row,
+                    (uint64_t)DMID * gate_row, gate_row,
+                    (uint64_t)DIN * down_row, down_row,
+                    DIN, DMID, DIN, NEXP, layer) ||
+            !pass(&c, 1)) {
+            fprintf(stderr, "FAIL: bank whole-batch warm-up failed\n");
+            return 1;
+        }
+        for (int p = 0; p < passes; p++) {
+            const double t0 = now_ms();
+            if (!pass(&c, 1)) {
+                fprintf(stderr, "FAIL: bank whole-batch timing failed\n");
+                return 1;
+            }
+            bk[p] = now_ms() - t0;
+        }
+        double pm, plo, phi, bm, blo, bhi;
+        stats(pk, passes, &pm, &plo, &phi);
+        stats(bk, passes, &bm, &blo, &bhi);
+        const double us_tok =
+            (double)TRUNK_MOE_LAYERS * 1000.0 / (double)T;
+        printf("\n16k cross-schedule routed screen (%d production chunks -> "
+               "one whole batch, layer %u)\n", g_nprod, layer);
+        printf("  packed production boundaries: mean %.3f ms "
+               "(min %.3f max %.3f spread %.3f) = %.2f us/token x%d\n",
+               pm, plo, phi, phi - plo, pm * us_tok, TRUNK_MOE_LAYERS);
+        printf("  bank whole batch           : mean %.3f ms "
+               "(min %.3f max %.3f spread %.3f) = %.2f us/token x%d\n",
+               bm, blo, bhi, bhi - blo, bm * us_tok, TRUNK_MOE_LAYERS);
+        printf("  routed saving before expansion: %+.2f us/token x%d\n",
+               (pm - bm) * us_tok, TRUNK_MOE_LAYERS);
+        printf("  net, first-observed expansion repeated x42: %+.2f us/token\n",
+               (pm - bm - cold_expand_ms) * us_tok);
+        printf("  net, same-layer-warm expansion repeated x42: %+.2f us/token "
+               "(resident lower bound)\n",
+               (pm - bm - warm_expand_ms) * us_tok);
+    } else for (int sched = 0; sched < 2; sched++) {
         const int is_whole = (sched == 1);
         if ((is_whole && !whole) || (!is_whole && !prod)) continue;
         for (int arm = 0; arm < 2; arm++) {

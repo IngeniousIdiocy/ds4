@@ -4,6 +4,9 @@
 # one instrumented 16k native prefill.  MODE=packed16 keeps the super-chunk
 # schedule but deliberately skips bank expansion and uses packed operands.
 # MODE=async16 enables deferred completion for resident-HC pass-1 slices.
+# MODE=fused16 also holds the final slice and appends expansion + pass23.
+# MODE=stage0-16 runs only the retained-routing L24 routed-segment cross screen.
+# MODE=ledgeroff16/ledgerbank16/ledgerfused16 collect mode-1 GPU spans.
 set -o pipefail
 
 W=${W:-/Users/mark/src/ds4-wt-astral-expertbank}
@@ -32,7 +35,18 @@ expansion)
     grep -E "model pages|expansion |bank allocation reuse|expansion-only" \
         "$O/expansion.out"
     ;;
-native16|packed16|async16)
+stage0-16)
+    "$W/tests/test_glm_expert_bank" \
+        --gguf "$M" --ids "$IDS" --layer 24 --tokens 16224 \
+        --off-gate 91109299648 --off-up 92468254144 --off-down 93827208640 \
+        --passes 5 --cross-screen --no-compare >"$O/stage0-16.out" \
+        2>"$O/stage0-16.err"
+    rc=$?
+    echo "rc=$rc" >"$O/stage0-16.rc"
+    grep -E "routing:|expansion |allocation reuse|cross-schedule|packed production|bank whole|routed saving|net," \
+        "$O/stage0-16.out"
+    ;;
+native16|packed16|async16|fused16)
     head -c 69254 "$P62" >"$O/p16k.txt"
     packed_env=
     if [ "$MODE" = packed16 ]; then
@@ -42,6 +56,10 @@ native16|packed16|async16)
     if [ "$MODE" = async16 ]; then
         async_env=DS4_GLM_EXPERT_BANK_ASYNC_SLICES=1
     fi
+    fused_env=
+    if [ "$MODE" = fused16 ]; then
+        fused_env=DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB=1
+    fi
     env DS4_METAL_MODEL_UNTRACKED=1 \
         DS4_GLM53_MEMORY_CEILING_GB=280 \
         DS4_GLM_ENABLE_EXPERT_BANK=1 \
@@ -50,6 +68,7 @@ native16|packed16|async16)
         DS4_GLM_IGNORE_EOS=1 \
         $packed_env \
         $async_env \
+        $fused_env \
         "$W/ds4" -m "$M" --metal --nothink --temp 0 -c 70000 -n 16 \
         --prompt-file "$O/p16k.txt" >"$O/native16.out" 2>"$O/native16.err"
     rc=$?
@@ -57,8 +76,34 @@ native16|packed16|async16)
     grep -E "GLM SUPER-CHUNK (prefill ENGAGED|expert-bank expansion timing|wall timing|layer completion timing|pass23 timing|pass1 sliced timing|done)|GLM prefill:" \
         "$O/native16.err"
     ;;
+ledgeroff16|ledgerbank16|ledgerfused16)
+    head -c 69254 "$P62" >"$O/p16k.txt"
+    bank_env=DS4_GLM_ENABLE_EXPERT_BANK=1
+    if [ "$MODE" = ledgeroff16 ]; then
+        bank_env=DS4_GLM_DISABLE_EXPERT_BANK=1
+    fi
+    fused_env=
+    if [ "$MODE" = ledgerfused16 ]; then
+        fused_env=DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB=1
+    fi
+    env DS4_METAL_MODEL_UNTRACKED=1 \
+        DS4_GLM53_MEMORY_CEILING_GB=280 \
+        DS4_GLM_GEN_COUNTERS=1 \
+        DS4_GLM_IGNORE_EOS=1 \
+        DS4_KERNEL_LEDGER=1 \
+        DS4_KERNEL_LEDGER_DUMP="$O/ledger.tsv" \
+        $bank_env \
+        $fused_env \
+        "$W/ds4" -m "$M" --metal --nothink --temp 0 -c 70000 -n 16 \
+        --prompt-file "$O/p16k.txt" >"$O/native16.out" 2>"$O/native16.err"
+    rc=$?
+    echo "rc=$rc" >"$O/native16.rc"
+    grep -E "GLM SUPER-CHUNK (prefill ENGAGED|done)|GLM prefill:" \
+        "$O/native16.err"
+    grep -E '^#LEDGER|expert_bank|mul_mm_id' "$O/ledger.tsv"
+    ;;
 *)
-    echo "MODE must be expansion, native16, packed16, or async16" >&2
+    echo "MODE must be expansion, stage0-16, native16, packed16, async16, fused16, ledgeroff16, ledgerbank16, or ledgerfused16" >&2
     exit 2
     ;;
 esac

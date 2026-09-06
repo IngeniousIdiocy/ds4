@@ -66,3 +66,6 @@ __pycache__/
 /tests/test_glm_superchunk_state
 /speed-bench/metal_router_b4_fixture
 /tests/test_dflash_budget
+/tests/test_dflash_fastpath
+
+/tests/test_dflash_mode

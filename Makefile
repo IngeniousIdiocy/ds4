@@ -330,7 +330,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_dflash2.inc ds4_dflash_glm.inc ds4_dflash_script.inc ds4_dflash_rollback.h ds4_dflash_budget.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_dflash2.inc ds4_dflash_glm.inc ds4_dflash_script.inc ds4_dflash_rollback.h ds4_dflash_budget.h ds4_dflash_fastpath.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -606,7 +606,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_dflash2.inc ds4_dflash_rollback.h ds4_dflash_budget.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_dflash2.inc ds4_dflash_rollback.h ds4_dflash_budget.h ds4_dflash_fastpath.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -797,7 +797,7 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/test_glm_superchunk_state $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_dflash_mode tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/test_glm_superchunk_state $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -807,6 +807,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	./tests/test_dflash_mode
 	./tests/test_sampling
 	./tests/test_dflash2_embed_q8
 	./tests/test_dflash_rollback
@@ -857,7 +858,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
-	rm -f tests/test_dflash_prefix tests/test_dflash_budget tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state
+	rm -f tests/test_dflash_prefix tests/test_dflash_budget tests/test_dflash_mode tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state tests/test_dflash_fastpath
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
@@ -872,3 +873,17 @@ dflash-budget-test: tests/test_dflash_budget
 
 tests/test_dflash_budget: tests/test_dflash_budget.c ds4_dflash_budget.h
 	$(CC) $(CFLAGS) -o $@ tests/test_dflash_budget.c
+
+.PHONY: dflash-mode-test
+dflash-mode-test: tests/test_dflash_mode
+	./tests/test_dflash_mode
+
+tests/test_dflash_mode: tests/test_dflash_mode.c ds4.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_mode.c
+
+.PHONY: dflash-fastpath-test
+dflash-fastpath-test: tests/test_dflash_fastpath
+	./tests/test_dflash_fastpath
+
+tests/test_dflash_fastpath: tests/test_dflash_fastpath.c ds4_dflash_fastpath.h
+	$(CC) -std=c11 -Wall -Wextra -O0 -o $@ $<

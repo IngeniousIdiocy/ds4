@@ -44587,9 +44587,9 @@ static int ds4_gpu_glm_expert_bank_encode_expand(
 }
 
 /* Expand one layer's three expert tensors into the bank and arm it for that
- * layer.  Runs in its own command buffer: the caller must not hold one open
- * across this call if it expects the bank to be readable by the next dispatch
- * -- ds4_gpu_finish_command_buffer commits and waits. */
+ * layer.  Without an active batch this owns, commits and waits its command
+ * buffer.  With an active serial batch it appends the expansion; a later bank
+ * consumer in that same batch is ordered after the write by the encoder. */
 int ds4_gpu_glm_expert_bank_expand_layer(
         const void *model_map,
         uint64_t    model_size,

@@ -39058,6 +39058,7 @@ struct ds4_engine {
     ds4_model dflash_model;
     ds4_dflash2_weights dflash_weights;
     bool dflash_ready;
+    ds4_dflash_mode dflash_mode;
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
@@ -41655,6 +41656,7 @@ typedef struct ds4_glm_gpu_graph {
     bool            sc_hc_resident;
     bool            sc_defer_routed;
     bool            sc_defer_completion;
+    bool            sc_hold_commands;
     bool            sc_hc_scale_valid;
     double          sc_timing_token_upload_ms;
     double          sc_timing_begin_ms;
@@ -43551,6 +43553,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     g->sc_hc_resident = false;
     g->sc_defer_routed = false;
     g->sc_defer_completion = false;
+    g->sc_hold_commands = false;
     g->sc_hc_scale_valid = false;
     g->sc_timing_token_upload_ms = 0.0;
     g->sc_timing_begin_ms = 0.0;
@@ -53925,6 +53928,7 @@ glm53_indexed_attention_done:
         }
         if (ok &&
             !g->ssd_streaming &&
+            !g->sc_hold_commands &&
             progress_flush_interval != 0 &&
             (il < g->layer_end || progress_requested) &&
             (slice_layer_done % progress_flush_interval) == 0) {
@@ -54579,6 +54583,14 @@ static int glm_graph_forward_indexed_superchunk(
         getenv("DS4_GLM_EXPERT_BANK_DIAGNOSTIC_PACKED") != NULL;
     const bool async_slices =
         getenv("DS4_GLM_EXPERT_BANK_ASYNC_SLICES") != NULL;
+    /* Diagnostic scheduling arm: the final pass-1 slice stays in its active
+     * batch, then the bank expansion, whole-superchunk routed dispatch and HC
+     * tail are appended in queue order.  This removes the two extra nonempty
+     * command-buffer boundaries per routed layer while retaining the normal
+     * path and the earlier async arm as independent controls. */
+    const bool fused_layer_cb = !bank_diagnostic_packed &&
+        getenv("DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB") != NULL;
+    const bool defer_slices = async_slices || fused_layer_cb;
     const double bank_timing_total_t0 = bank_timing ? now_sec() : 0.0;
     double bank_timing_prepare_ms = 0.0;
     double bank_timing_admission_ms = 0.0;
@@ -54718,13 +54730,14 @@ static int glm_graph_forward_indexed_superchunk(
         fprintf(stderr,
                 "ds4: GLM SUPER-CHUNK prefill ENGAGED: tokens=%u chunks=%u [%s] "
                 "pos=%u..%u layers=%u..%u routed_from=%u passes=3 "
-                "bank_mode=%s async_slices=%u bank=%.2f GiB staging=%.2f GiB\n",
+                "bank_mode=%s async_slices=%u fused_layer_cb=%u "
+                "bank=%.2f GiB staging=%.2f GiB\n",
                 total_tokens, n_chunks, sizes,
                 chunks[0].pos0,
                 chunks[n_chunks - 1].pos0 + chunks[n_chunks - 1].n_tokens - 1u,
                 g->layer_start, g->layer_end, (uint32_t)DS4_N_LEADING_DENSE,
                 bank_diagnostic_packed ? "packed-diagnostic" : "expanded",
-                async_slices ? 1u : 0u,
+                defer_slices ? 1u : 0u, fused_layer_cb ? 1u : 0u,
                 bank_diagnostic_packed ? 0.0 : bank_bytes / 1073741824.0,
                 stage_bytes / 1073741824.0);
     }
@@ -54760,6 +54773,7 @@ static int glm_graph_forward_indexed_superchunk(
     g->sc_timing_slice_calls = 0;
     g->sc_timing_deferred_slices = 0;
     g->sc_timing_skipped_token_uploads = 0;
+    g->sc_hold_commands = false;
 
     for (uint32_t il = g->layer_start; rc == 1 && il <= g->layer_end; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -54792,7 +54806,7 @@ static int glm_graph_forward_indexed_superchunk(
             if (bank_diagnostic_packed) {
                 ds4_gpu_glm_expert_bank_disarm();
                 n_bank_packed++;
-            } else {
+            } else if (!fused_layer_cb) {
                 bank_layer = ds4_gpu_glm_expert_bank_expand_layer(
                         model->map, model->size,
                         l->ffn_gate_exps->abs_offset,
@@ -54807,8 +54821,12 @@ static int glm_graph_forward_indexed_superchunk(
                         (uint32_t)gate_in, (uint32_t)gate_out,
                         (uint32_t)down_out,
                         (uint32_t)l->ffn_gate_exps->dim[2], il) != 0;
+            } else {
+                /* The fused arm expands only after pass 1 has encoded its
+                 * final slice into the live batch. */
+                ds4_gpu_glm_expert_bank_disarm();
             }
-            if (bank_timing) {
+            if (!fused_layer_cb && bank_timing) {
                 ds4_gpu_glm_expert_bank_stats current;
                 ds4_gpu_glm_expert_bank_get_stats(&current);
                 if (current.expansion_count > bank_stats_prev.expansion_count) {
@@ -54831,7 +54849,9 @@ static int glm_graph_forward_indexed_superchunk(
                 bank_stats_prev = current;
             }
             n_routed_layers++;
-            if (bank_diagnostic_packed) {
+            if (fused_layer_cb) {
+                /* Accounted after the deferred expansion below. */
+            } else if (bank_diagnostic_packed) {
                 /* Counted separately from an allocation or kernel refusal. */
             } else if (bank_layer) {
                 n_bank_ok++;
@@ -54854,10 +54874,12 @@ static int glm_graph_forward_indexed_superchunk(
         g->sc_defer_routed = routed_layer;
         /* Layer 0 still uploads each chunk's token IDs through one shared
          * buffer, so it keeps the original synchronous completion. */
-        g->sc_defer_completion = async_slices && il != g->layer_start;
+        g->sc_defer_completion = defer_slices && il != g->layer_start;
         const double bank_timing_pass1_t0 = bank_timing ? now_sec() : 0.0;
         for (uint32_t ci = 0; rc == 1 && ci < n_chunks; ci++) {
             const glm_sc_chunk *c = &chunks[ci];
+            g->sc_hold_commands = fused_layer_cb && routed_layer &&
+                                  ci + 1u == n_chunks;
             glm_sc_binding views;
             if (!glm_sc_make_views(g, hc_parity, c, &views)) { rc = -1; break; }
             glm_sc_binding_restore(g, &views);   /* bind this chunk's rows */
@@ -54876,6 +54898,7 @@ static int glm_graph_forward_indexed_superchunk(
             if (rc != 1) { glm_sc_binding_free_views(&views); break; }
             glm_sc_binding_free_views(&views);
         }
+        g->sc_hold_commands = false;
         g->sc_defer_routed = false;
         if (rc != 1) break;
 
@@ -54912,6 +54935,64 @@ static int glm_graph_forward_indexed_superchunk(
         if (bank_timing) {
             bank_timing_pass1_ms +=
                 (now_sec() - bank_timing_pass1_t0) * 1000.0;
+        }
+
+        if (fused_layer_cb) {
+            if (!g->sc_defer_completion || !ds4_gpu_commands_active()) {
+                fprintf(stderr,
+                        "ds4: GLM super-chunk fused layer %u lost its active "
+                        "final-slice command batch\n", il);
+                rc = -1;
+                break;
+            }
+            bank_layer = ds4_gpu_glm_expert_bank_expand_layer(
+                    model->map, model->size,
+                    l->ffn_gate_exps->abs_offset,
+                    l->ffn_up_exps->abs_offset,
+                    l->ffn_down_exps->abs_offset,
+                    l->ffn_gate_exps->type,
+                    l->ffn_up_exps->type,
+                    l->ffn_down_exps->type,
+                    gate_out * gate_row_bytes, gate_row_bytes,
+                    up_out * up_row_bytes, up_row_bytes,
+                    down_out * down_row_bytes, down_row_bytes,
+                    (uint32_t)gate_in, (uint32_t)gate_out,
+                    (uint32_t)down_out,
+                    (uint32_t)l->ffn_gate_exps->dim[2], il) != 0;
+            if (bank_timing) {
+                ds4_gpu_glm_expert_bank_stats current;
+                ds4_gpu_glm_expert_bank_get_stats(&current);
+                if (current.expansion_count > bank_stats_prev.expansion_count) {
+                    const double elapsed = current.last_ensure_ms +
+                        current.last_model_view_ms + current.last_command_ms;
+                    if (bank_expand_timed == 0) {
+                        bank_expand_first_ms = elapsed;
+                        bank_expand_min_ms = elapsed;
+                        bank_expand_max_ms = elapsed;
+                    } else {
+                        if (elapsed < bank_expand_min_ms) bank_expand_min_ms = elapsed;
+                        if (elapsed > bank_expand_max_ms) bank_expand_max_ms = elapsed;
+                    }
+                    bank_expand_total_ms += elapsed;
+                    bank_expand_ensure_ms += current.last_ensure_ms;
+                    bank_expand_model_view_ms += current.last_model_view_ms;
+                    bank_expand_command_ms += current.last_command_ms;
+                    bank_expand_timed++;
+                }
+                bank_stats_prev = current;
+            }
+            if (bank_layer) {
+                n_bank_ok++;
+            } else {
+                n_bank_refused++;
+                if (n_bank_refused == 1) {
+                    fprintf(stderr,
+                            "ds4: GLM SUPER-CHUNK deferred bank expansion "
+                            "refused at layer %u; that layer runs packed "
+                            "operands in the fused command batch\n", il);
+                }
+                ds4_gpu_glm_expert_bank_disarm();
+            }
         }
 
         /* Passes 2 and 3 of this layer share ONE command buffer, exactly as
@@ -54993,6 +55074,7 @@ static int glm_graph_forward_indexed_superchunk(
     g->sc_hc_resident = false;
     g->sc_defer_routed = false;
     g->sc_defer_completion = false;
+    g->sc_hold_commands = false;
 
     if (rc == 1 && logits_out) {
         const double bank_timing_head_t0 = bank_timing ? now_sec() : 0.0;
@@ -55066,7 +55148,8 @@ static int glm_graph_forward_indexed_superchunk(
                 "phases ensure=%.3f model_view=%.3f command=%.3f ms; "
                 "allocations=%llu capacity=%.2f GiB "
                 "Metal_allocated=%.2f->%.2f GiB\n",
-                bank_diagnostic_packed ? "packed-diagnostic" : "expanded",
+                bank_diagnostic_packed ? "packed-diagnostic" :
+                    (fused_layer_cb ? "expanded-fused-enqueue" : "expanded"),
                 bank_expand_timed, bank_expand_first_ms, subsequent_mean,
                 bank_expand_min_ms, bank_expand_max_ms, bank_expand_total_ms,
                 bank_expand_ensure_ms, bank_expand_model_view_ms,
@@ -55105,7 +55188,7 @@ static int glm_graph_forward_indexed_superchunk(
                 "by an extra synchronization\n",
                 bank_timing_pass2_encode_ms, bank_timing_pass3_encode_ms,
                 bank_timing_pass23_wait_ms, bank_timing_pass23_total_ms,
-                async_slices ? 1u : 0u);
+                defer_slices ? 1u : 0u);
         fprintf(stderr,
                 "ds4: GLM SUPER-CHUNK pass1 sliced timing: calls=%u "
                 "total=%.3f token_upload=%.3f begin=%.3f end_wait=%.3f "
@@ -58581,6 +58664,7 @@ struct ds4_session {
     ds4_dflash_budget dflash_budget;
     uint64_t dflash_budget_gen;
     uint64_t dflash_budget_estimate_ns;
+    uint64_t dflash_budget_clock_ns;
     bool dflash_budget_attempted;
     int glm_mtp_draft;
     int glm_mtp_parent;
@@ -60487,7 +60571,7 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        if (e->dflash_ready && !getenv("DS4_DFLASH_DISABLE"))
+        if (e->dflash_ready && e->dflash_mode != DS4_DFLASH_MODE_SERIAL)
             return (int)e->dflash_weights.block_size;
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
@@ -60503,6 +60587,10 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     }
 #endif
     return 0;
+}
+
+ds4_dflash_mode ds4_engine_get_dflash_mode(ds4_engine *e) {
+    return e && e->dflash_ready ? e->dflash_mode : DS4_DFLASH_MODE_SERIAL;
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -60852,12 +60940,24 @@ void ds4_session_decode_begin(ds4_session *s) {
     if (!s || !s->engine || !s->engine->dflash_ready) return;
     const double account_start = now_sec();
     dflash_budget_begin(&s->dflash_budget);
+    /* Cache the reported quantum once per request, never on each ACK. The
+     * M3 Ultra CLOCK_MONOTONIC quantum is 1000ns; zero bookkeeping is common. */
+    struct timespec clock_resolution = {0};
+    s->dflash_budget_clock_ns = 0;
+    if (clock_getres(CLOCK_MONOTONIC, &clock_resolution) == 0 &&
+        clock_resolution.tv_sec >= 0 && clock_resolution.tv_nsec >= 0 &&
+        clock_resolution.tv_nsec < 1000000000L &&
+        (uint64_t)clock_resolution.tv_sec < DS4_DFLASH_BUDGET_LIMIT / 1000000000u) {
+        s->dflash_budget_clock_ns = (uint64_t)clock_resolution.tv_sec * 1000000000u +
+            (uint64_t)clock_resolution.tv_nsec;
+    }
     s->dflash_budget_gen = s->dflash_gen;
     s->dflash_budget_estimate_ns = dflash_budget_profile(s);
     ds4_session_dflash_reset_conditioning(s);
     s->dflash_bound_gen = s->dflash_gen;
     s->dflash_last_pos = (uint32_t)s->checkpoint.len;
-    if (getenv("DS4_DFLASH_NO_ADAPTIVE")) s->dflash_budget.active = false;
+    if (s->engine->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE)
+        s->dflash_budget.active = false;
     if (getenv("DS4_DFLASH_STATS")) {
         fprintf(stderr, "ds4: dflash admission policy=%s profile=%s estimate_ms=%.3f ctx=%d\n",
             s->dflash_budget.active ? "request-credit" : "uncapped-experiment",
@@ -60866,7 +60966,7 @@ void ds4_session_decode_begin(ds4_session *s) {
     }
     if (s->dflash_budget.active) {
         uint64_t ns = 0;
-        (void)dflash_budget_ns(now_sec() - account_start, true, &ns);
+        (void)dflash_budget_account_ns(now_sec() - account_start, s->dflash_budget_clock_ns, &ns);
         dflash_budget_account(&s->dflash_budget, ns);
     }
 #else
@@ -60894,7 +60994,7 @@ void ds4_session_decode_ack(ds4_session *s, int consumed, bool done) {
                 b->probes, b->overruns, b->parked);
     }
     uint64_t ns = 0;
-    (void)dflash_budget_ns(now_sec() - account_start, true, &ns);
+    (void)dflash_budget_account_ns(now_sec() - account_start, s->dflash_budget_clock_ns, &ns);
     const uint32_t previous_overruns = b->overruns;
     dflash_budget_account(b, ns);
     if (b->overruns != previous_overruns)
@@ -67487,6 +67587,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->dflash_model.fd = -1;
     e->vision_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
@@ -67495,6 +67596,33 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->dspark = opt->dspark;
     e->dspark_strict = opt->dspark_strict;
     e->dspark_exact_sampling = opt->dspark_exact_sampling;
+    const bool has_drafter = opt->dflash_path && opt->dflash_path[0];
+    if (opt->dflash_mode < DS4_DFLASH_MODE_AUTO ||
+        opt->dflash_mode > DS4_DFLASH_MODE_SERIAL) {
+        fprintf(stderr, "ds4: invalid DFlash mode in engine options\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+    if ((opt->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE ||
+         opt->dflash_mode == DS4_DFLASH_MODE_CONSERVATIVE) && !has_drafter) {
+        fprintf(stderr,
+                "ds4: DFlash mode %s requires draft weights (--dflash FILE)\n",
+                opt->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE ?
+                    "speculative" : "conservative");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+    e->dflash_mode = ds4_dflash_mode_resolve(
+        opt->dflash_mode, has_drafter,
+        getenv("DS4_DFLASH_DISABLE") != NULL,
+        getenv("DS4_DFLASH_NO_ADAPTIVE") != NULL);
+    if (has_drafter && e->dflash_mode == DS4_DFLASH_MODE_SERIAL) {
+        fprintf(stderr,
+                "ds4: DFlash mode=serial; draft model will not be loaded: %s\n",
+                opt->dflash_path);
+    }
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
@@ -67985,7 +68113,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
      * into it has to be guarded to match, or a DS4_NO_GPU or non-Apple build
      * does not compile. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (opt->dflash_path && opt->dflash_path[0] &&
+    if (e->dflash_mode != DS4_DFLASH_MODE_SERIAL &&
+        opt->dflash_path && opt->dflash_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE &&
         e->backend != DS4_BACKEND_CPU) {
         model_open(&e->dflash_model, opt->dflash_path, graph_backend, true);
@@ -68005,15 +68134,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                         0) &&
             dflash_pool_init(e->dflash_weights.n_embd)) {
             e->dflash_ready = true;
-            glm_dflash_seed_configure(&e->dflash_weights);
+            glm_dflash_seed_configure(
+                &e->dflash_weights,
+                e->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE);
             dflash2_golden_selftest(&e->dflash_model, &e->dflash_weights,
                                     &e->model, &e->weights);
             fprintf(stderr,
-                    "ds4: DFlash%s draft model loaded: %s "
+                    "ds4: DFlash%s draft model loaded: %s mode=%s "
                     "(layers=%u block=%u targets=%u window=%u "
                     "target_embd_type=%u target_head_type=%u vocab=%llu)\n",
                     e->dflash_weights.classic ? "" : "2",
                     opt->dflash_path,
+                    ds4_dflash_mode_name(e->dflash_mode),
                     e->dflash_weights.n_layer,
                     e->dflash_weights.block_size,
                     e->dflash_weights.n_target,
@@ -68030,7 +68162,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
 #else
-    if (opt->dflash_path && opt->dflash_path[0]) {
+    if (e->dflash_mode != DS4_DFLASH_MODE_SERIAL &&
+        opt->dflash_path && opt->dflash_path[0]) {
         fprintf(stderr,
                 "ds4: --dflash needs the Metal DFlash2 runtime; ignoring %s\n",
                 opt->dflash_path);

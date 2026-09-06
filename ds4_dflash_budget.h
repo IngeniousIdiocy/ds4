@@ -29,6 +29,20 @@ static inline bool dflash_budget_ns(double seconds, bool round_up, uint64_t *out
     *out = n;
     return true;
 }
+/* Bookkeeping can complete inside one clock tick. Charge that reported
+ * quantum for a valid zero interval; evaluator samples and reserves still use
+ * the strictly-positive conversion above. Invalid clock metadata fails closed. */
+static inline bool dflash_budget_account_ns(double seconds, uint64_t quantum_ns,
+                                            uint64_t *out) {
+    if (!quantum_ns || quantum_ns > DS4_DFLASH_BUDGET_LIMIT) return false;
+    uint64_t bits;
+    memcpy(&bits, &seconds, sizeof(bits));
+    if ((bits & UINT64_C(0x7fffffffffffffff)) == 0) {
+        *out = quantum_ns;
+        return true;
+    }
+    return dflash_budget_ns(seconds, true, out);
+}
 static inline void dflash_budget_begin(ds4_dflash_budget *b) {
     memset(b, 0, sizeof(*b));
     b->active = true;

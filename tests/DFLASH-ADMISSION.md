@@ -34,7 +34,9 @@ minimum observed plain serial cost; a later cheaper sample reprices all such
 credit downward. This reference is conservative empirically, not a proven
 lower bound on an unobservable counterfactual serial run. Invalid clocks,
 NaN/infinite/zero estimates, arithmetic overflow, bad acknowledgments and
-missing acknowledgments fail closed.
+missing acknowledgments fail closed. A valid zero-duration bookkeeping interval
+is charged one CLOCK_MONOTONIC tick, whose resolution is cached per request;
+zero serial samples and zero reserve estimates remain invalid.
 
 A funded feature refresh retains the unspent reservation in escrow for its
 first proposal. Its acknowledgment does not release that escrow unless the

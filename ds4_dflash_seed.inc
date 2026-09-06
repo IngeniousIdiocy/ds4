@@ -20,7 +20,8 @@ typedef struct {
 } ds4_glm_dflash_seed;
 static ds4_glm_dflash_seed g_glm_dflash_seed;
 
-static void glm_dflash_seed_configure(const ds4_dflash2_weights *dw) {
+static void glm_dflash_seed_configure(const ds4_dflash2_weights *dw,
+                                      bool speculative) {
     if (!dw || !dw->ready) return;
     g_glm_dflash_seed.n_taps = dw->n_target;
     for (uint32_t j = 0; j < dw->n_target; j++) {
@@ -38,7 +39,7 @@ static void glm_dflash_seed_configure(const ds4_dflash2_weights *dw) {
     g_glm_dflash_seed.chunk_cap = glm53_prefill_chunk_tokens();
     /* Capped requests cannot pay optional prefill capture from future decode
      * credit. They obtain fresh features only after funding a decode bundle. */
-    g_glm_dflash_seed.enabled = getenv("DS4_DFLASH_NO_ADAPTIVE") != NULL;
+    g_glm_dflash_seed.enabled = speculative;
 }
 
 /* Stamp the prefill about to run with its session's conditioning generation,

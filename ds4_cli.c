@@ -665,8 +665,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     }
     const double t_decode0 = cli_now_sec();
     ds4_session_decode_begin(session);
-    const bool dflash_capped = cfg->engine.dflash_path &&
-        getenv("DS4_DFLASH_NO_ADAPTIVE") == NULL;
+    const bool dflash_capped =
+        ds4_engine_get_dflash_mode(engine) == DS4_DFLASH_MODE_CONSERVATIVE;
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
         if (greedy_argmax && have_greedy_next) {
@@ -2144,6 +2144,15 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--dflash")) {
             c.engine.dflash_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash-mode")) {
+            const char *value = need_arg(&i, argc, argv, arg);
+            if (!ds4_dflash_mode_parse(value, &c.engine.dflash_mode)) {
+                fprintf(stderr,
+                        "ds4: invalid --dflash-mode value: %s "
+                        "(expected speculative, conservative, or serial)\n",
+                        value);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -2357,6 +2366,15 @@ static cli_config parse_options(int argc, char **argv) {
     if (c.gen.prefix.count != 0 && is_rendered_chat_prompt(c.gen.prompt)) {
         fprintf(stderr,
                 "ds4: --prefix-file cannot be combined with an already-rendered prompt\n");
+        exit(2);
+    }
+    if ((c.engine.dflash_mode == DS4_DFLASH_MODE_SPECULATIVE ||
+         c.engine.dflash_mode == DS4_DFLASH_MODE_CONSERVATIVE) &&
+        (!c.engine.dflash_path || !c.engine.dflash_path[0])) {
+        fprintf(stderr,
+                "ds4: --dflash-mode %s requires --dflash FILE\n",
+                c.engine.dflash_mode == DS4_DFLASH_MODE_SPECULATIVE ?
+                    "speculative" : "conservative");
         exit(2);
     }
     char tp_err[256];

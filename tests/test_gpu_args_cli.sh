@@ -62,6 +62,10 @@ for i in "${!BINS[@]}"; do
             "mtp-exact-sampling" "$LOG"
         assert_not_grep "$name --help runtime omits --glm-mtp" \
             "--glm-mtp" "$LOG"
+        if [ "$name" = "ds4" ] || [ "$name" = "ds4-server" ]; then
+            assert_grep "$name --help runtime mentions --dflash-mode" \
+                "--dflash-mode" "$LOG"
+        fi
     else
         "$bin" --help runtime > "$LOG" 2>&1 || true
         assert_grep "$name --help runtime mentions --mtp-model" \
@@ -76,6 +80,44 @@ for i in "${!BINS[@]}"; do
             "tensor-parallel-token-prefill" "$LOG"
         assert_not_grep "$name --help distributed omits old --tp spellings" "--tp-" "$LOG"
     fi
+done
+
+# DFlash startup mode is accepted by the two DFlash frontends, validated
+# before model loading, and checked against the final argv state rather than
+# the relative order of --dflash and --dflash-mode.
+for i in 0 1; do
+    name=${NAMES[$i]}; bin=${BINS[$i]}
+    [ -x "$bin" ] || continue
+    "$bin" --dflash-mode invalid -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q "invalid --dflash-mode value" "$LOG"; then
+        ok "$name rejects invalid --dflash-mode"
+    else
+        fail "$name returned the wrong invalid --dflash-mode error"
+    fi
+    for mode in speculative conservative; do
+        "$bin" --dflash-mode "$mode" -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -eq 2 ] && grep -q -- "--dflash-mode $mode requires --dflash FILE" "$LOG"; then
+            ok "$name requires weights for --dflash-mode $mode"
+        else
+            fail "$name did not require weights for --dflash-mode $mode"
+        fi
+        for order in before after; do
+            if [ "$order" = before ]; then
+                "$bin" --dflash-mode "$mode" --dflash /dev/null -m /dev/null > "$LOG" 2>&1
+            else
+                "$bin" --dflash /dev/null --dflash-mode "$mode" -m /dev/null > "$LOG" 2>&1
+            fi
+            rc=$?
+            if [ $rc -ne 0 ] &&
+               ! grep -qE "unknown option|requires --dflash FILE|invalid --dflash-mode" "$LOG"; then
+                ok "$name parses $mode mode with --dflash $order"
+            else
+                fail "$name made --dflash-mode order-dependent ($mode/$order)"
+            fi
+        done
+    done
 done
 
 if [ -x ./ds4-eval ]; then

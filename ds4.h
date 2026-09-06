@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "ds4_ssd.h"
 
@@ -21,6 +22,52 @@ typedef enum {
     DS4_BACKEND_CUDA,
     DS4_BACKEND_CPU,
 } ds4_backend;
+
+/* DFlash startup policy. AUTO is the zero/default API value and preserves
+ * the legacy environment controls; frontends set one of the other values
+ * only for an explicit --dflash-mode argument. */
+typedef enum {
+    DS4_DFLASH_MODE_AUTO = 0,
+    DS4_DFLASH_MODE_SPECULATIVE,
+    DS4_DFLASH_MODE_CONSERVATIVE,
+    DS4_DFLASH_MODE_SERIAL,
+} ds4_dflash_mode;
+
+static inline bool ds4_dflash_mode_parse(const char *value,
+                                         ds4_dflash_mode *mode) {
+    if (!value || !mode) return false;
+    if (!strcmp(value, "speculative")) {
+        *mode = DS4_DFLASH_MODE_SPECULATIVE;
+    } else if (!strcmp(value, "conservative")) {
+        *mode = DS4_DFLASH_MODE_CONSERVATIVE;
+    } else if (!strcmp(value, "serial")) {
+        *mode = DS4_DFLASH_MODE_SERIAL;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static inline ds4_dflash_mode ds4_dflash_mode_resolve(
+        ds4_dflash_mode requested,
+        bool             has_drafter,
+        bool             legacy_disable,
+        bool             legacy_no_adaptive) {
+    if (requested != DS4_DFLASH_MODE_AUTO) return requested;
+    if (!has_drafter || legacy_disable) return DS4_DFLASH_MODE_SERIAL;
+    return legacy_no_adaptive ? DS4_DFLASH_MODE_SPECULATIVE
+                              : DS4_DFLASH_MODE_CONSERVATIVE;
+}
+
+static inline const char *ds4_dflash_mode_name(ds4_dflash_mode mode) {
+    switch (mode) {
+    case DS4_DFLASH_MODE_SPECULATIVE:  return "speculative";
+    case DS4_DFLASH_MODE_CONSERVATIVE: return "conservative";
+    case DS4_DFLASH_MODE_SERIAL:       return "serial";
+    case DS4_DFLASH_MODE_AUTO:         return "auto";
+    }
+    return "invalid";
+}
 
 typedef enum {
     DS4_THINK_NONE,
@@ -128,6 +175,7 @@ typedef struct {
     const char *model_path;
     const char *mtp_path;
     const char *dflash_path;
+    ds4_dflash_mode dflash_mode;
     const char *vision_path;
     ds4_backend backend;
     int n_threads;
@@ -550,6 +598,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+ds4_dflash_mode ds4_engine_get_dflash_mode(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

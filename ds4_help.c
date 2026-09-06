@@ -193,6 +193,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
             if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER) {
                 opt(fp, c, "--dflash FILE", "GLM-5.3: load a DFlash2 draft GGUF and speculate (optional; drafter weights are not bundled). See docs/DFLASH_GLM53.md.");
+                opt(fp, c, "--dflash-mode MODE", "DFlash scheduling: conservative (default with --dflash), speculative (uncapped), or serial (do not load the drafter).");
             }
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
@@ -453,7 +454,7 @@ static void print_glm53(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     title(fp, c, "Kill Switches");
     para(fp, c, "Each turns one default-on change off, for A/B measurement and bisection. Unless the meaning says otherwise a switch is read as set to any non-empty value.");
-    opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Uncapped DFlash experiment: bypasses request-credit admission and restores prefill seeding; no 2% slowdown claim.");
+    opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Legacy fallback when --dflash-mode is omitted: uncapped DFlash experiment with prefill seeding; no 2% slowdown claim.");
     opt(fp, c, "DS4_DFLASH_BUDGET_MS", "Diagnostic positive full refresh/proposal budget estimate; default 500ms on the calibrated M3 Ultra public-model profile. Invalid values stay serial.");
     opt(fp, c, "DS4_DFLASH_NO_SELECTOR", "Disables the DFlash2 candidate selector (coherent-chain tracing).");
     opt(fp, c, "DS4_DFLASH_SDPA_SCALAR", "Forces the scalar SDPA drafter kernel instead of the simdgroup one.");

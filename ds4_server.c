@@ -14548,6 +14548,15 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--dflash")) {
             c.engine.dflash_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash-mode")) {
+            const char *value = need_arg(&i, argc, argv, arg);
+            if (!ds4_dflash_mode_parse(value, &c.engine.dflash_mode)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: invalid --dflash-mode value: %s "
+                           "(expected speculative, conservative, or serial)",
+                           value);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -14704,6 +14713,15 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if ((c.engine.dflash_mode == DS4_DFLASH_MODE_SPECULATIVE ||
+         c.engine.dflash_mode == DS4_DFLASH_MODE_CONSERVATIVE) &&
+        (!c.engine.dflash_path || !c.engine.dflash_path[0])) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --dflash-mode %s requires --dflash FILE",
+                   c.engine.dflash_mode == DS4_DFLASH_MODE_SPECULATIVE ?
+                       "speculative" : "conservative");
+        exit(2);
     }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp,

@@ -139,6 +139,7 @@ CLI:
 ```sh
 ./ds4 --model /path/to/GLM-5.3-Flash-Q4_K-9ab7053.gguf \
       --dflash "$DFLASH_DIR/GLM-5.3-Flash-DFlash2.gguf" \
+      --dflash-mode conservative \
       --ctx 65536 -p "your prompt"
 ```
 
@@ -147,8 +148,30 @@ Server: the same `--dflash FILE` flag.
 ```sh
 ./ds4-server --model /path/to/GLM-5.3-Flash-Q4_K-9ab7053.gguf \
              --dflash "$DFLASH_DIR/GLM-5.3-Flash-DFlash2.gguf" \
+             --dflash-mode conservative \
              --ctx 65536
 ```
+
+`--dflash-mode` is a startup policy shared by the CLI and server:
+
+- `conservative` uses request-credit admission. This is also the default when
+  `--dflash FILE` is supplied without an explicit mode.
+- `speculative` runs the existing uncapped path. It can improve or regress
+  throughput depending on the prompt, context, and acceptance rate.
+- `serial` does not load the draft model or allocate DFlash scratch, even when
+  a `--dflash FILE` path is present.
+
+Speculative and conservative modes require `--dflash FILE`; without draft
+weights they fail at startup. All three modes retain the target model as the
+verifier and are intended to produce the same quality. They differ in whether
+and when speculative work is scheduled. The conservative policy targets less
+than 2% added generated-work time on its calibrated M3 Ultra profile; that is
+an empirical admission target, not a universal hardware guarantee.
+
+An explicit `--dflash-mode` takes precedence over the legacy
+`DS4_DFLASH_DISABLE` and `DS4_DFLASH_NO_ADAPTIVE` presence switches regardless
+of argument order. When the flag is omitted, those switches retain their
+legacy meanings.
 
 A successful load prints one line naming the drafter's geometry and the
 target's borrowed tensor types, for example:
@@ -165,10 +188,10 @@ here means the drafter did not bind its metadata.
 
 | Variable | Effect |
 | --- | --- |
-| `DS4_DFLASH_DISABLE=1` | Ignore a loaded drafter entirely and decode serially. The identity control. |
+| `DS4_DFLASH_DISABLE=1` | With no explicit `--dflash-mode`, select serial startup and do not load the drafter. |
 | `DS4_DFLASH_NO_WIDE_ROLLBACK=1` | Kill switch. Refuse the speculative cycle on any graph whose speculative state includes the DSA indexer tail — that is, every real GLM-5.3 graph — before any target state is mutated, and decode serially. This is the behaviour of the branch before the rollback was completed. |
 | `DS4_DFLASH_FORCE_REPLAY=1` | Take the restore-and-replay rollback even where the cheaper per-step snapshot would be sound. An A/B oracle, not a normal setting. |
-| `DS4_DFLASH_NO_ADAPTIVE=1` | Disable the throttle: always run a cycle, never park. |
+| `DS4_DFLASH_NO_ADAPTIVE=1` | With no explicit `--dflash-mode`, select the uncapped speculative policy. |
 | `DS4_DFLASH_STATS=1` | Per-cycle drafted/accepted counts, rollback kind and stage timings on stderr, plus a totals summary when the engine closes. |
 | `DS4_DFLASH_ZERO_FEATURES=1` | Zero the drafter's input features. It makes a mismatch *likely*, not certain: the drafter still emits a deterministic token per row, and a common one occasionally coincides with the target's own prediction. |
 | `DS4_DFLASH_FORCE_DRAFTS=N` | Cap every block at N drafted tokens, so the verify block is N+1 rows including the anchor. It caps the block length; it does **not** choose where a rejection lands. |

@@ -1,6 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 #include "../ds4_dflash_budget.h"
 #include <assert.h>
 #include <stdio.h>
+#include <time.h>
 #define MS UINT64_C(1000000)
 static const uint64_t U = UINT64_C(500000000);
 static void serial(ds4_dflash_budget *b, uint64_t ms) {
@@ -116,6 +118,43 @@ int main(void) {
         double x; memcpy(&x, &bad[i], sizeof(x));
         assert(!dflash_budget_ns(x, true, &ns));
     }
+    assert(dflash_budget_account_ns(0.0, 1000u, &ns) && ns == 1000u);
+    dflash_budget_begin(&b);
+    dflash_budget_account(&b, ns);
+    assert(!b.parked && b.actual_ns == 1000u);
+    assert(!dflash_budget_ns(0.0, false, &ns)); /* serial samples remain invalid */
+    assert(!dflash_budget_reserve(&b, 0));
+    assert(!dflash_budget_account_ns(0.0, 0, &ns));
+    assert(!dflash_budget_account_ns(0.0, UINT64_MAX, &ns));
+    assert(!dflash_budget_account_ns(-1.0, 1000u, &ns));
+    for (unsigned i = 0; i < 3; i++) {
+        double x; memcpy(&x, &bad[i], sizeof(x));
+        assert(!dflash_budget_account_ns(x, 1000u, &ns));
+    }
+
+    /* Real host-clock regression: use the production ACK and accounting
+     * conversion, including equal endpoints. Do not demand any fixed speed. */
+    struct timespec resolution;
+    assert(clock_getres(CLOCK_MONOTONIC, &resolution) == 0);
+    const uint64_t quantum = (uint64_t)resolution.tv_sec * 1000000000u +
+        (uint64_t)resolution.tv_nsec;
+    unsigned zero_intervals = 0;
+    for (unsigned i = 0; i < 20000; i++) {
+        dflash_budget_begin(&b);
+        b.pending_rows = 1; b.pending_serial_ns = 25 * MS; b.actual_ns = 25 * MS;
+        struct timespec start, end;
+        assert(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+        dflash_budget_ack(&b, 1, false);
+        assert(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
+        const double seconds = ((double)end.tv_sec + (double)end.tv_nsec / 1e9) -
+            ((double)start.tv_sec + (double)start.tv_nsec / 1e9);
+        assert(dflash_budget_account_ns(seconds, quantum, &ns));
+        if (seconds == 0) { zero_intervals++; assert(ns == quantum); }
+        dflash_budget_account(&b, ns);
+        assert(b.actual_ns == 25 * MS + ns && b.actual_ns != DS4_DFLASH_BUDGET_LIMIT);
+    }
+    printf("dflash accounting clock: quantum=%llu ns, zero intervals=%u/20000\n",
+        (unsigned long long)quantum, zero_intervals);
     puts("dflash request credit/escrow/EOS/cancel/overflow: OK");
     return 0;
 }

@@ -11,6 +11,8 @@
 #define DS4_DFLASH2_MAX_HEAD_DIM 128
 #define DS4_DFLASH2_MAX_DRAFT 7
 
+#include "ds4_dflash_fastpath.h"
+
 typedef struct {
 #ifndef DS4_NO_GPU
     ds4_gpu_tensor *k;
@@ -72,6 +74,29 @@ typedef struct {
     bool classic;
     bool ready;
 } ds4_dflash2_weights;
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Applicability of the measured public-model/M3 Ultra fast paths, independent
+ * of request admission. Sizes narrow the profile; they are not content hashes.
+ * This reads initialized device metadata and never initializes Metal. */
+static bool dflash2_fast_default(const ds4_model *dm,
+                                const ds4_dflash2_weights *dw,
+                                const ds4_model *tm, const ds4_weights *tw) {
+    return dm && dw && tm && tw && ds4_model_is_glm53() &&
+        DS4_N_LAYER - DS4_N_NEXTN_PREDICT == 45u &&
+        DS4_N_EMBD == 4096u && DS4_N_VOCAB == 154880u &&
+        tm->size == UINT64_C(185299232064) &&
+        dm->size == UINT64_C(2342595168) &&
+        tw->output && tw->output->type == DS4_TENSOR_Q8_0 &&
+        dw->fc && dw->fc->type == DS4_TENSOR_BF16 && dw->fc->ndim == 2u &&
+        dw->fc->dim[0] == 20480u && dw->fc->dim[1] == 4096u &&
+        dw->fc->elements == UINT64_C(20480) * 4096u &&
+        dw->n_layer == 5u && dw->n_embd == 4096u && dw->n_target == 5u &&
+        dw->block_size == 8u && dw->sliding_window == 2048u && !dw->classic &&
+        dw->n_ff == 12288u && dw->n_head == 32u && dw->n_head_kv == 8u &&
+        dw->head_dim == 128u && ds4_gpu_dflash_budget_profile_device();
+}
+#endif
 
 /* Scratch pool for the draft head (logits + argmax over the target vocab). */
 typedef struct {
@@ -1665,8 +1690,14 @@ static int dflash2_propose(
     /* The FC precedes the existing layer MM scope. Share its BF16 weights
      * across 2..8 rows, then restore dispatch policy before CPU normalization
      * or any fallback. The target verifier still checks the resulting drafts. */
-    if (getenv("DS4_DFLASH_FC_MM") && dw->fc->type == DS4_TENSOR_BF16 &&
-        target_rows >= 2u && target_rows <= 8u) {
+    const bool fc_shape = dw->fc && dw->fc->type == DS4_TENSOR_BF16 &&
+        dw->fc->ndim == 2u && dw->fc->dim[0] == 20480u &&
+        dw->fc->dim[1] == 4096u &&
+        dw->fc->elements == UINT64_C(20480) * 4096u && H == 4096u &&
+        target_rows >= 2u && target_rows <= 8u;
+    if (dflash_fast_path_enabled(fc_shape, dflash2_fast_default(dm, dw, tm, tw),
+            getenv("DS4_DFLASH_FC_MM"), getenv("DS4_DFLASH_DISABLE_FC_MM"),
+            getenv("DS4_GLM_EXACT"))) {
         const uint32_t fc_mv_max = ds4_gpu_glm53_bf16_mv_max_get();
         ds4_gpu_glm53_bf16_mv_max_set(1);
         fc_mm_ran = dflash2_matvecs_gpu(
@@ -1675,7 +1706,7 @@ static int dflash2_propose(
     }
 #endif
     if (!fc_mm_ran) dflash2_matvecs(fc_out, dm, dw->fc, target_concat, target_rows);
-    if (getenv("DS4_DFLASH_FC_MM") && getenv("DS4_DFLASH_STATS")) {
+    if (getenv("DS4_DFLASH_STATS")) {
         fprintf(stderr, "ds4: dflash fc rows=%u mm=%d\n", target_rows, fc_mm_ran);
     }
     for (uint32_t t = 0; t < target_rows; t++) {
