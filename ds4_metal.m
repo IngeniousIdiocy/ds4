@@ -27,6 +27,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_glm53_prefix.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -5561,6 +5562,9 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_GLM53_KDA_SOURCE",  @"metal/glm53_kda.metal"],
         @[@"DS4_METAL_DFLASH2_SOURCE",    @"metal/dflash2.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
+        /* Expanded-expert bank kernels; must follow moe.metal, whose
+         * kernel_mul_mm_id template and dequantize_q4_K they are generated from. */
+        @[@"DS4_METAL_GLM53_EXPERT_BANK_SOURCE", @"metal/glm53_expert_bank.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
         @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
@@ -12529,6 +12533,7 @@ int ds4_gpu_synchronize(void) {
 }
 
 void ds4_gpu_cleanup(void) {
+    ds4_gpu_glm_expert_bank_free();
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
@@ -37847,6 +37852,47 @@ int ds4_gpu_glm_store_indexer_k_tensor(
     return 1;
 }
 
+/* DFlash owns this instrumentation only for the duration of one verify.
+ * Each step is KDA state followed by the DSA tails in forward layer order.
+ * A short/incompatible capture is never used: the cycle checks both cursors
+ * and falls back to the pre-block backup + replay. */
+static ds4_gpu_tensor *g_glm53_tail_snap_base;
+static uint64_t g_glm53_tail_snap_cursor, g_glm53_tail_snap_stride;
+static uint32_t g_glm53_tail_snap_steps, g_glm53_tail_snap_pos;
+static bool g_glm53_tail_snap_valid;
+
+void ds4_gpu_glm53_tail_stepsnap_begin(ds4_gpu_tensor *base,
+                                      uint64_t stride_bytes,
+                                      uint64_t tail_offset,
+                                      uint32_t n_steps, uint32_t pos0) {
+    g_glm53_tail_snap_base = base;
+    g_glm53_tail_snap_cursor = tail_offset;
+    g_glm53_tail_snap_stride = stride_bytes;
+    g_glm53_tail_snap_steps = n_steps;
+    g_glm53_tail_snap_pos = pos0;
+    g_glm53_tail_snap_valid = base && n_steps > 0u && n_steps <= 8u &&
+        tail_offset <= stride_bytes && stride_bytes != 0u &&
+        ds4_gpu_tensor_bytes(base) / stride_bytes >= n_steps;
+}
+
+int ds4_gpu_glm53_tail_stepsnap_complete(void) {
+    return g_glm53_tail_snap_valid &&
+        g_glm53_tail_snap_cursor == g_glm53_tail_snap_stride;
+}
+
+void ds4_gpu_glm53_tail_stepsnap_end(void) {
+    g_glm53_tail_snap_base = NULL;
+    g_glm53_tail_snap_cursor = g_glm53_tail_snap_stride = 0;
+    g_glm53_tail_snap_steps = g_glm53_tail_snap_pos = 0;
+    g_glm53_tail_snap_valid = false;
+}
+
+typedef struct {
+    uint32_t head_dim, n_steps;
+    uint64_t stride_floats;
+    int32_t source_rows[8 * 4];
+} ds4_gpu_glm53_tail_stepsnap_args;
+
 int ds4_gpu_glm53_indexer_pool_update_tensor(
         ds4_gpu_tensor       *pool_cache,
         ds4_gpu_tensor       *tail_k,
@@ -37926,6 +37972,45 @@ int ds4_gpu_glm53_indexer_pool_update_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (g_glm53_tail_snap_base && g_glm53_tail_snap_valid) {
+            const uint64_t bytes = 2u * tail_bytes;
+            if (pos0 != g_glm53_tail_snap_pos ||
+                n_tokens != g_glm53_tail_snap_steps ||
+                bytes > g_glm53_tail_snap_stride - g_glm53_tail_snap_cursor) {
+                g_glm53_tail_snap_valid = false;
+            } else {
+                id<MTLComputePipelineState> snap_pipeline =
+                    ds4_gpu_get_pipeline("kernel_glm53_indexer_tail_stepsnap");
+                if (!snap_pipeline) return 0;
+                ds4_gpu_glm53_tail_stepsnap_args snap_args = {
+                    .head_dim = head_dim, .n_steps = n_tokens,
+                    .stride_floats = g_glm53_tail_snap_stride / sizeof(float),
+                };
+                for (uint32_t t = 0; t < n_tokens; t++) {
+                    for (uint32_t r = 0; r < 4u; r++) {
+                        snap_args.source_rows[t * 4u + r] =
+                            ds4_glm53_tail_prefix_source(pos0, t + 1u, r);
+                    }
+                }
+                [enc setComputePipelineState:snap_pipeline];
+                [enc setBytes:&snap_args length:sizeof(snap_args) atIndex:0];
+                [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_k) atIndex:1];
+                [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:2];
+                [enc setBuffer:tailkbuf offset:ds4_gpu_tensor_offset(tail_k) atIndex:3];
+                [enc setBuffer:tailgatebuf offset:ds4_gpu_tensor_offset(tail_gate) atIndex:4];
+                [enc setBuffer:ds4_gpu_tensor_buffer(g_glm53_tail_snap_base)
+                        offset:ds4_gpu_tensor_offset(g_glm53_tail_snap_base) +
+                               (NSUInteger)g_glm53_tail_snap_cursor atIndex:5];
+                [enc dispatchThreads:MTLSizeMake(head_dim * 4u, n_tokens, 1)
+                     threadsPerThreadgroup:MTLSizeMake(MIN(head_dim * 4u, 256u), 1, 1)];
+                /* The following update mutates the old tail that snapshot
+                 * threads read. Keep this read/write pair ordered even if
+                 * the caller supplied a concurrent encoder. */
+                if (enc.dispatchType == MTLDispatchTypeConcurrent)
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                g_glm53_tail_snap_cursor += bytes;
+            }
+        }
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:norm_weightbuf offset:(NSUInteger)norm_weight_inner atIndex:3];
         [enc setBuffer:norm_biasbuf offset:(NSUInteger)norm_bias_inner atIndex:4];
@@ -44126,6 +44211,391 @@ static ds4_routed_tile_choice ds4_gpu_glm_routed_tile_choice(uint32_t gate_type,
     return c;
 }
 
+
+/* ===========================================================================
+ * GLM-5.3 expanded-expert one-layer bank (audit addendum 28 section 3;
+ * design ~/megakernel-refs/public-artifact/EXPERT-BANK-DESIGN.md rev 3).
+ *
+ * One routed layer's three expert tensors are dequantized ONCE into a
+ * 13.50 GiB half image laid out in exactly the order kernel_mul_mm_id stages
+ * its A operand (the "T" layout, metal/glm53_expert_bank.metal), and the
+ * routed GEMMs of that layer read the image instead of re-dequantizing the
+ * packed Q4_K rows on every tile.  The halves are by construction the values
+ * dequantize_q4_K produces for the packed kernel's A stage -- same file, same
+ * decoded values -- and every other stage of the routed block (map, SwiGLU,
+ * down, sum8) is the shipped dispatch, so the arithmetic sequence and the
+ * output words are unchanged.
+ *
+ * The bank pays for itself only when it is amortized over many chunks of one
+ * layer, which needs the layer-major super-chunk driver in ds4.c.  It is OFF
+ * by default: DS4_GLM_ENABLE_EXPERT_BANK=1 arms it, DS4_GLM_DISABLE_EXPERT_BANK=1
+ * is an absolute kill switch that wins over the opt-in.
+ * ======================================================================== */
+
+static id<MTLBuffer> g_glm_expert_bank_buffer = nil;
+static NSUInteger    g_glm_expert_bank_capacity = 0;
+static int64_t       g_glm_expert_bank_layer = -1;
+static uint32_t      g_glm_expert_bank_in_dim = 0;
+static uint32_t      g_glm_expert_bank_mid_dim = 0;
+static uint32_t      g_glm_expert_bank_out_dim = 0;
+static uint32_t      g_glm_expert_bank_n_expert = 0;
+static uint64_t      g_glm_expert_bank_gate_section = 0;
+static uint64_t      g_glm_expert_bank_up_section = 0;
+static uint64_t      g_glm_expert_bank_down_section = 0;
+static uint64_t      g_glm_expert_bank_allocation_count = 0;
+static uint64_t      g_glm_expert_bank_expansion_count = 0;
+static double        g_glm_expert_bank_last_ensure_ms = 0.0;
+static double        g_glm_expert_bank_last_model_view_ms = 0.0;
+static double        g_glm_expert_bank_last_command_ms = 0.0;
+
+#ifndef DS4_GLM_EXPERT_BANK_DEFAULT_ON
+#define DS4_GLM_EXPERT_BANK_DEFAULT_ON 0
+#endif
+
+int ds4_gpu_glm_expert_bank_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int on = DS4_GLM_EXPERT_BANK_DEFAULT_ON ? 1 : 0;
+        const char *e = getenv("DS4_GLM_ENABLE_EXPERT_BANK");
+        if (e && e[0] && e[0] != '0') on = 1;
+        if (getenv("DS4_GLM_DISABLE_EXPERT_BANK") != NULL) on = 0;
+        cached = on;
+        if (on) {
+            fprintf(stderr,
+                    "ds4: GLM expanded-expert bank enabled "
+                    "(DS4_GLM_DISABLE_EXPERT_BANK=1 to kill)\n");
+        }
+    }
+    return cached;
+}
+
+/* Bytes one layer's bank needs: three expanded half images, no padding.
+ * 4096 x 2048 x 288 x 2 B x 3 = 14,495,514,624 B = 13.50 GiB for GLM-5.3-Flash. */
+uint64_t ds4_gpu_glm_expert_bank_bytes(uint32_t expert_in_dim,
+                                       uint32_t expert_mid_dim,
+                                       uint32_t out_dim,
+                                       uint32_t n_total_expert) {
+    if (expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
+        n_total_expert == 0) {
+        return 0;
+    }
+    const uint64_t gate = (uint64_t)expert_in_dim * expert_mid_dim * 2ull;
+    const uint64_t down = (uint64_t)expert_mid_dim * out_dim * 2ull;
+    if (gate > UINT64_MAX / n_total_expert || down > UINT64_MAX / n_total_expert) {
+        return 0;
+    }
+    return (2ull * gate + down) * n_total_expert;
+}
+
+/* The bank geometry the T layout is defined for: whole 64-output x
+ * 32-reduction blocks, no padding, and the shipped top-8 routing. */
+static bool ds4_gpu_glm_expert_bank_geometry_ok(uint32_t expert_in_dim,
+                                                uint32_t expert_mid_dim,
+                                                uint32_t out_dim,
+                                                uint32_t n_expert) {
+    return n_expert == 8u &&
+           expert_in_dim != 0 && expert_mid_dim != 0 && out_dim != 0 &&
+           (expert_mid_dim % 64u) == 0u && (expert_in_dim % 32u) == 0u &&
+           (out_dim % 64u) == 0u && (expert_mid_dim % 32u) == 0u;
+}
+
+void ds4_gpu_glm_expert_bank_disarm(void) {
+    g_glm_expert_bank_layer = -1;
+}
+
+void ds4_gpu_glm_expert_bank_free(void) {
+    g_glm_expert_bank_layer = -1;
+    g_glm_expert_bank_buffer = nil;
+    g_glm_expert_bank_capacity = 0;
+    g_glm_expert_bank_in_dim = 0;
+    g_glm_expert_bank_mid_dim = 0;
+    g_glm_expert_bank_out_dim = 0;
+    g_glm_expert_bank_n_expert = 0;
+}
+
+int ds4_gpu_glm_expert_bank_armed_layer(void) {
+    return (int)g_glm_expert_bank_layer;
+}
+
+void ds4_gpu_glm_expert_bank_get_stats(ds4_gpu_glm_expert_bank_stats *stats) {
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    stats->allocation_count = g_glm_expert_bank_allocation_count;
+    stats->expansion_count = g_glm_expert_bank_expansion_count;
+    stats->capacity_bytes = (uint64_t)g_glm_expert_bank_capacity;
+    stats->current_allocated_bytes = g_device ?
+        (uint64_t)[g_device currentAllocatedSize] : 0ull;
+    stats->last_ensure_ms = g_glm_expert_bank_last_ensure_ms;
+    stats->last_model_view_ms = g_glm_expert_bank_last_model_view_ms;
+    stats->last_command_ms = g_glm_expert_bank_last_command_ms;
+}
+
+/* Allocate the bank, refusing (never crashing) when the machine cannot carry
+ * it.  The caller in ds4.c has already put the same byte count through the GLM
+ * memory guard against DS4_GLM53_MEMORY_CEILING_GB; this is the second,
+ * device-level assertion so a direct caller (the test vehicle) is safe too. */
+int ds4_gpu_glm_expert_bank_ensure(uint32_t expert_in_dim,
+                                   uint32_t expert_mid_dim,
+                                   uint32_t out_dim,
+                                   uint32_t n_total_expert) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t bytes = ds4_gpu_glm_expert_bank_bytes(expert_in_dim,
+                                                         expert_mid_dim,
+                                                         out_dim,
+                                                         n_total_expert);
+    if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return 0;
+    if (g_glm_expert_bank_buffer && g_glm_expert_bank_capacity >= bytes) {
+        return 1;
+    }
+
+    const uint64_t working_set = ds4_gpu_recommended_working_set_size();
+    const uint64_t already = g_glm_expert_bank_buffer ?
+        (uint64_t)g_glm_expert_bank_capacity : 0ull;
+    const uint64_t in_use = (uint64_t)[g_device currentAllocatedSize];
+    const uint64_t after = in_use - (already < in_use ? already : in_use) + bytes;
+    if (working_set != 0 && after > working_set) {
+        fprintf(stderr,
+                "ds4: GLM expert bank refused: %.2f GiB would take Metal "
+                "allocations to %.2f GiB against a %.2f GiB working set; "
+                "running the shipped routed path\n",
+                bytes / 1073741824.0,
+                after / 1073741824.0,
+                working_set / 1073741824.0);
+        return 0;
+    }
+
+    /* Reallocating means dropping the old image first: two 13.50 GiB banks
+     * must never be live at once (the design's memory ledger assumes one). */
+    ds4_gpu_glm_expert_bank_free();
+    if (!ds4_gpu_ensure_scratch_buffer(&g_glm_expert_bank_buffer,
+                                       &g_glm_expert_bank_capacity,
+                                       (NSUInteger)bytes,
+                                       "ds4_glm_expert_bank")) {
+        g_glm_expert_bank_capacity = 0;
+        return 0;
+    }
+    g_glm_expert_bank_allocation_count++;
+    g_glm_expert_bank_in_dim = expert_in_dim;
+    g_glm_expert_bank_mid_dim = expert_mid_dim;
+    g_glm_expert_bank_out_dim = out_dim;
+    g_glm_expert_bank_n_expert = n_total_expert;
+    const uint64_t gate_section =
+        (uint64_t)expert_in_dim * expert_mid_dim * 2ull * n_total_expert;
+    g_glm_expert_bank_gate_section = 0;
+    g_glm_expert_bank_up_section = gate_section;
+    g_glm_expert_bank_down_section = 2ull * gate_section;
+    fprintf(stderr,
+            "ds4: GLM expert bank allocated %.2f GiB (%u experts, %ux%u/%ux%u)\n",
+            bytes / 1073741824.0,
+            n_total_expert, expert_in_dim, expert_mid_dim,
+            expert_mid_dim, out_dim);
+    return 1;
+}
+
+/* Mirrors glm53_expert_bank_args in metal/glm53_expert_bank.metal. */
+typedef struct {
+    uint32_t rows;
+    uint32_t ne00;
+    uint64_t row_bytes;
+    uint32_t kblocks;
+    uint32_t n_expert;
+} ds4_gpu_glm_expert_bank_args;
+
+static int ds4_gpu_glm_expert_bank_encode_expand(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        id<MTLBuffer>               src,
+        NSUInteger                  src_off,
+        NSUInteger                  dst_off,
+        uint32_t                    rows,
+        uint32_t                    ne00,
+        uint64_t                    row_bytes,
+        uint32_t                    n_total_expert) {
+    ds4_gpu_glm_expert_bank_args a = {0};
+    a.rows = rows;
+    a.ne00 = ne00;
+    a.row_bytes = row_bytes;
+    a.kblocks = ne00 / 32u;
+    a.n_expert = n_total_expert;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:src offset:src_off atIndex:0];
+    [enc setBuffer:g_glm_expert_bank_buffer offset:dst_off atIndex:1];
+    [enc setBytes:&a length:sizeof(a) atIndex:2];
+    [enc setThreadgroupMemoryLength:4096 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(a.kblocks, rows / 64u, n_total_expert)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Expand one layer's three expert tensors into the bank and arm it for that
+ * layer.  Runs in its own command buffer: the caller must not hold one open
+ * across this call if it expects the bank to be readable by the next dispatch
+ * -- ds4_gpu_finish_command_buffer commits and waits. */
+int ds4_gpu_glm_expert_bank_expand_layer(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint32_t    gate_type,
+        uint32_t    up_type,
+        uint32_t    down_type,
+        uint64_t    gate_expert_bytes,
+        uint64_t    gate_row_bytes,
+        uint64_t    up_expert_bytes,
+        uint64_t    up_row_bytes,
+        uint64_t    down_expert_bytes,
+        uint64_t    down_row_bytes,
+        uint32_t    expert_in_dim,
+        uint32_t    expert_mid_dim,
+        uint32_t    out_dim,
+        uint32_t    n_total_expert,
+        uint32_t    layer_index) {
+    if (!model_map || model_size == 0 ||
+        gate_type != DS4_METAL_TENSOR_Q4_K ||
+        up_type != DS4_METAL_TENSOR_Q4_K ||
+        down_type != DS4_METAL_TENSOR_Q4_K ||
+        !ds4_gpu_glm_expert_bank_geometry_ok(expert_in_dim, expert_mid_dim,
+                                             out_dim, 8u)) {
+        return 0;
+    }
+    if (g_tp_split_world > 1) return 0;
+    const double ensure_t0 = ds4_gpu_now_ms();
+    if (!ds4_gpu_glm_expert_bank_ensure(expert_in_dim, expert_mid_dim,
+                                        out_dim, n_total_expert)) {
+        return 0;
+    }
+    const double ensure_t1 = ds4_gpu_now_ms();
+    g_glm_expert_bank_last_ensure_ms = ensure_t1 - ensure_t0;
+    g_glm_expert_bank_last_model_view_ms = 0.0;
+    g_glm_expert_bank_last_command_ms = 0.0;
+    ds4_gpu_glm_expert_bank_disarm();
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_expert_bank_expand");
+        if (!pipeline) return 0;
+
+        uint64_t gate_inner = 0, up_inner = 0, down_inner = 0;
+        id<MTLBuffer> gatebuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, gate_offset,
+                (uint64_t)n_total_expert * gate_expert_bytes, &gate_inner);
+        id<MTLBuffer> upbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, up_offset,
+                (uint64_t)n_total_expert * up_expert_bytes, &up_inner);
+        id<MTLBuffer> downbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, down_offset,
+                (uint64_t)n_total_expert * down_expert_bytes, &down_inner);
+        if (!gatebuf || !upbuf || !downbuf) return 0;
+        if (gate_expert_bytes != (uint64_t)expert_mid_dim * gate_row_bytes ||
+            up_expert_bytes != (uint64_t)expert_mid_dim * up_row_bytes ||
+            down_expert_bytes != (uint64_t)out_dim * down_row_bytes) {
+            return 0;
+        }
+        const double model_view_t1 = ds4_gpu_now_ms();
+        g_glm_expert_bank_last_model_view_ms = model_view_t1 - ensure_t1;
+
+        const double command_t0 = ds4_gpu_now_ms();
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        int ok = ds4_gpu_glm_expert_bank_encode_expand(
+                cb, pipeline, gatebuf, (NSUInteger)gate_inner,
+                (NSUInteger)g_glm_expert_bank_gate_section,
+                expert_mid_dim, expert_in_dim, gate_row_bytes, n_total_expert);
+        if (ok) {
+            ok = ds4_gpu_glm_expert_bank_encode_expand(
+                    cb, pipeline, upbuf, (NSUInteger)up_inner,
+                    (NSUInteger)g_glm_expert_bank_up_section,
+                    expert_mid_dim, expert_in_dim, up_row_bytes, n_total_expert);
+        }
+        if (ok) {
+            ok = ds4_gpu_glm_expert_bank_encode_expand(
+                    cb, pipeline, downbuf, (NSUInteger)down_inner,
+                    (NSUInteger)g_glm_expert_bank_down_section,
+                    out_dim, expert_mid_dim, down_row_bytes, n_total_expert);
+        }
+        if (!ok) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM expert bank expand")) {
+            return 0;
+        }
+        g_glm_expert_bank_last_command_ms = ds4_gpu_now_ms() - command_t0;
+    }
+    g_glm_expert_bank_layer = (int64_t)layer_index;
+    g_glm_expert_bank_expansion_count++;
+    return 1;
+}
+
+/* Independent inverse-mapping check of one bank section against a fresh
+ * dequantization of the packed rows.  Test-only; counters are
+ * {mismatching, compared, one mismatching index, finite}. */
+int ds4_gpu_glm_expert_bank_verify_section(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    tensor_offset,
+        uint64_t    expert_bytes,
+        uint64_t    row_bytes,
+        uint32_t    rows,
+        uint32_t    ne00,
+        uint32_t    n_total_expert,
+        int         section,
+        uint64_t    counters_out[4]) {
+    if (!counters_out || !g_glm_expert_bank_buffer || !model_map) return 0;
+    const uint64_t dst_off = section == 0 ? g_glm_expert_bank_gate_section :
+                             section == 1 ? g_glm_expert_bank_up_section :
+                                            g_glm_expert_bank_down_section;
+    int rc = 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_expert_bank_verify");
+        if (!pipeline) return 0;
+        uint64_t inner = 0;
+        id<MTLBuffer> src = ds4_gpu_wrap_model_range(
+                model_map, model_size, tensor_offset,
+                (uint64_t)n_total_expert * expert_bytes, &inner);
+        if (!src) return 0;
+        id<MTLBuffer> ctr = [g_device newBufferWithLength:4 * sizeof(uint32_t)
+                                                  options:MTLResourceStorageModeShared];
+        if (!ctr) return 0;
+        memset([ctr contents], 0, 4 * sizeof(uint32_t));
+
+        const uint64_t groups = (uint64_t)ne00 / 16ull;
+        const uint64_t threads = (uint64_t)n_total_expert * rows * groups;
+        ds4_gpu_glm_expert_bank_args a = {0};
+        a.rows = rows;
+        a.ne00 = ne00;
+        a.row_bytes = row_bytes;
+        a.kblocks = ne00 / 32u;
+        a.n_expert = n_total_expert;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256) nth = 256;
+        const NSUInteger tgs = (NSUInteger)((threads + nth - 1) / nth);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:(NSUInteger)inner atIndex:0];
+        [enc setBuffer:g_glm_expert_bank_buffer
+                offset:(NSUInteger)dst_off atIndex:1];
+        [enc setBuffer:ctr offset:0 atIndex:2];
+        [enc setBytes:&a length:sizeof(a) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM expert bank verify")) {
+            return 0;
+        }
+        const uint32_t *c = (const uint32_t *)[ctr contents];
+        for (int i = 0; i < 4; i++) counters_out[i] = c[i];
+        rc = 1;
+    }
+    return rc;
+}
+
 #ifndef DS4_GLM_ROUTED_GROUPED_MIN_TOKENS_DEFAULT
 #define DS4_GLM_ROUTED_GROUPED_MIN_TOKENS_DEFAULT 96u
 #endif
@@ -44230,6 +44700,41 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         ds4_gpu_glm_routed_tile_choice(gate_type, down_type, n_expert,
                                          n_total_expert, n_tokens);
     const uint32_t tile_rows = tile_choice.tile_rows;
+    /* Expanded-expert bank: when this layer's bank is armed the map, SwiGLU,
+     * down and sum8 dispatches are unchanged and only the three GEMMs' A
+     * operand moves from the packed Q4_K rows to the bank's half image, which
+     * holds exactly the halves dequantize_q4_K would have produced.  The bank
+     * kernel is the shipped 32-row cull4 template, so any narrower tile or a
+     * tensor-parallel expert split falls back to the packed path. */
+    const bool use_bank =
+        ds4_gpu_glm_expert_bank_enabled() &&
+        g_glm_expert_bank_buffer != nil &&
+        g_glm_expert_bank_layer == (int64_t)layer_index &&
+        g_glm_expert_bank_in_dim == expert_in_dim &&
+        g_glm_expert_bank_mid_dim == expert_mid_dim &&
+        g_glm_expert_bank_out_dim == out_dim &&
+        g_glm_expert_bank_n_expert == n_total_expert &&
+        gate_type == DS4_METAL_TENSOR_Q4_K &&
+        up_type == DS4_METAL_TENSOR_Q4_K &&
+        down_type == DS4_METAL_TENSOR_Q4_K &&
+        g_tp_split_world <= 1 &&
+        tile_rows == 32u && tile_choice.cull_gran == 8u &&
+        ds4_gpu_glm_expert_bank_geometry_ok(expert_in_dim, expert_mid_dim,
+                                            out_dim, n_expert);
+    /* Half-image strides for the bank operands; the packed strides stay in
+     * scope for the fallback and for the model-range checks above. */
+    const uint64_t mm_gate_row_bytes =
+        use_bank ? (uint64_t)expert_in_dim * 2ull : gate_row_bytes;
+    const uint64_t mm_gate_expert_bytes =
+        use_bank ? (uint64_t)expert_mid_dim * mm_gate_row_bytes : gate_expert_bytes;
+    const uint64_t mm_up_row_bytes =
+        use_bank ? (uint64_t)expert_in_dim * 2ull : up_row_bytes;
+    const uint64_t mm_up_expert_bytes =
+        use_bank ? (uint64_t)expert_mid_dim * mm_up_row_bytes : up_expert_bytes;
+    const uint64_t mm_down_row_bytes =
+        use_bank ? (uint64_t)expert_mid_dim * 2ull : down_row_bytes;
+    const uint64_t mm_down_expert_bytes =
+        use_bank ? (uint64_t)out_dim * mm_down_row_bytes : down_expert_bytes;
     const uint64_t compact_mid_values = (uint64_t)pair_rows * expert_mid_dim;
     const uint64_t down_values = (uint64_t)pair_rows * out_dim;
     const uint64_t x_values = (uint64_t)n_tokens * expert_in_dim;
@@ -44299,22 +44804,37 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
-        id<MTLBuffer> gatebuf = ds4_gpu_wrap_model_range(model_map, model_size,
-                                                         gate_offset, gate_tensor_bytes,
-                                                         &gate_inner);
-        id<MTLBuffer> upbuf = ds4_gpu_wrap_model_range(model_map, model_size,
-                                                       up_offset, up_tensor_bytes,
-                                                       &up_inner);
-        id<MTLBuffer> downbuf = ds4_gpu_wrap_model_range(model_map, model_size,
-                                                         down_offset, down_tensor_bytes,
-                                                         &down_inner);
+        id<MTLBuffer> gatebuf = nil;
+        id<MTLBuffer> upbuf = nil;
+        id<MTLBuffer> downbuf = nil;
+        if (use_bank) {
+            gatebuf = upbuf = downbuf = g_glm_expert_bank_buffer;
+            gate_inner = g_glm_expert_bank_gate_section;
+            up_inner = g_glm_expert_bank_up_section;
+            down_inner = g_glm_expert_bank_down_section;
+        } else {
+            gatebuf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                               gate_offset, gate_tensor_bytes,
+                                               &gate_inner);
+            upbuf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                             up_offset, up_tensor_bytes,
+                                             &up_inner);
+            downbuf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                               down_offset, down_tensor_bytes,
+                                               &down_inner);
+        }
         if (!gatebuf || !upbuf || !downbuf) return 0;
 
         /* Lever 6(c): the widened A-stage dequant reads 16 quant bytes at once,
          * so the three weight bases must be 16 B aligned.  Q4_K row and expert
          * strides are multiples of 144, but the wrapped model offsets are not
          * guaranteed, so check them and fall back to the scalar dequant. */
-        if (tile_choice.deq_wide &&
+        if (use_bank) {
+            /* The bank kernel reads 16 B tiles, not Q4_K blocks, and is
+             * instantiated single-buffered: neither lever-6 option applies. */
+            tile_choice.deq_wide = 0u;
+            tile_choice.astage_db = 0u;
+        } else if (tile_choice.deq_wide &&
             !((gate_inner % 16u) == 0u && (up_inner % 16u) == 0u &&
               (down_inner % 16u) == 0u &&
               (gate_row_bytes % 16u) == 0u && (up_row_bytes % 16u) == 0u &&
@@ -44335,10 +44855,12 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                 announced = 1;
                 fprintf(stderr,
                         "ds4: GLM routed lever-6: astage_db=%u "
-                        "deq_wide=%u tile_rows=%u cull_gran=%u tg_bytes=%lu\n",
+                        "deq_wide=%u tile_rows=%u cull_gran=%u tg_bytes=%lu "
+                        "expert_bank=%d\n",
                         tile_choice.astage_db, tile_choice.deq_wide,
                         tile_choice.tile_rows, tile_choice.cull_gran,
-                        (unsigned long)mm_id_threadgroup_bytes);
+                        (unsigned long)mm_id_threadgroup_bytes,
+                        use_bank ? 1 : 0);
             }
         }
 
@@ -44349,15 +44871,45 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                       ds4_gpu_mul_mm_id_map0_narrow_name(n_expert, tile_rows));
         const bool tile_plain =
             (tile_choice.tile_rows == 32u && tile_choice.cull_gran == 0u);
-        id<MTLComputePipelineState> gate_pipeline =
-            tile_plain ? ds4_gpu_routed_mm_pipeline(gate_type)
-                       : ds4_gpu_routed_mm_narrow_pipeline(gate_type, tile_choice, false);
-        id<MTLComputePipelineState> up_pipeline =
-            tile_plain ? ds4_gpu_routed_mm_pipeline(up_type)
-                       : ds4_gpu_routed_mm_narrow_pipeline(up_type, tile_choice, false);
-        id<MTLComputePipelineState> down_pipeline =
-            tile_plain ? ds4_gpu_routed_mm_f16_rhs_pipeline(down_type)
-                       : ds4_gpu_routed_mm_narrow_pipeline(down_type, tile_choice, true);
+        /* The shipped kernel_mul_mm_id keeps two routed-row indices in a
+         * short, so a batch above 32,767 tokens needs the widened copy.  The
+         * bank kernel is already widened; the packed path takes the generated
+         * kernel_glm53_wide_mul_mm_id_* twins, which are the shipped template
+         * with only those two indices widened (bit-identical below 32,768).
+         * If neither is reachable the call refuses and the caller falls back
+         * rather than silently wrapping a row index. */
+        const bool need_wide_index = (uint64_t)n_tokens > 32767ull;
+        id<MTLComputePipelineState> gate_pipeline = nil;
+        id<MTLComputePipelineState> up_pipeline = nil;
+        id<MTLComputePipelineState> down_pipeline = nil;
+        if (use_bank) {
+            gate_pipeline = up_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_glm53_expert_bank_mm_id_f32_cull4", false);
+            down_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_glm53_expert_bank_mm_id_f16_cull4", false);
+        } else if (need_wide_index) {
+            if (tile_rows != 32u || tile_choice.cull_gran != 8u ||
+                tile_choice.deq_wide != 16u || tile_choice.astage_db != 0u ||
+                gate_type != DS4_METAL_TENSOR_Q4_K ||
+                up_type != DS4_METAL_TENSOR_Q4_K ||
+                down_type != DS4_METAL_TENSOR_Q4_K) {
+                return 0;
+            }
+            gate_pipeline = up_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_glm53_wide_mul_mm_id_q4_K_f32_cull4_w16", false);
+            down_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
+                    "kernel_glm53_wide_mul_mm_id_q4_K_f16_cull4_w16", false);
+        } else {
+            gate_pipeline =
+                tile_plain ? ds4_gpu_routed_mm_pipeline(gate_type)
+                           : ds4_gpu_routed_mm_narrow_pipeline(gate_type, tile_choice, false);
+            up_pipeline =
+                tile_plain ? ds4_gpu_routed_mm_pipeline(up_type)
+                           : ds4_gpu_routed_mm_narrow_pipeline(up_type, tile_choice, false);
+            down_pipeline =
+                tile_plain ? ds4_gpu_routed_mm_f16_rhs_pipeline(down_type)
+                           : ds4_gpu_routed_mm_narrow_pipeline(down_type, tile_choice, true);
+        }
         if (!map_pipeline || !gate_pipeline || !up_pipeline || !down_pipeline) {
             return 0;
         }
@@ -44366,15 +44918,15 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
             ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
         ds4_gpu_mul_mm_id_args gate_args =
             ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
-                                          gate_row_bytes, gate_expert_bytes,
+                                          mm_gate_row_bytes, mm_gate_expert_bytes,
                                           1, n_expert, n_tokens);
         ds4_gpu_mul_mm_id_args up_args =
             ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
-                                          up_row_bytes, up_expert_bytes,
+                                          mm_up_row_bytes, mm_up_expert_bytes,
                                           1, n_expert, n_tokens);
         ds4_gpu_mul_mm_id_args down_args =
             ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, n_total_expert,
-                                                    down_row_bytes, down_expert_bytes,
+                                                    mm_down_row_bytes, mm_down_expert_bytes,
                                                     n_expert, n_expert, n_tokens,
                                                     mid_f16 ? sizeof(uint16_t) : sizeof(float));
         gate_args.tp_rank = g_tp_split_rank;
@@ -54921,6 +55473,12 @@ void ds4_gpu_glm53_kda_rowsnap_end(void) {
     g_glm53_kda_snap_cursor = 0;
     g_glm53_kda_snap_capacity = 0;
     g_glm53_kda_snap_row = -1;
+    g_glm53_kda_snap_stride = 0;
+}
+
+int ds4_gpu_glm53_kda_stepsnap_complete(uint64_t expected_bytes) {
+    return g_glm53_kda_snap_base && g_glm53_kda_snap_row == -2 &&
+        g_glm53_kda_snap_cursor == expected_bytes;
 }
 
 int ds4_gpu_glm53_kda_decode(

@@ -1,19 +1,22 @@
 /* GLM-5.3 DFlash speculative cycle: draft (block-diffusion drafter) ->
- * one batched target verify with per-step KDA snapshots and tap-layer
- * feature capture -> longest-prefix accept. Greedy only (v1). Lossless:
- * every committed draft equals the target argmax on the true prefix, and
+ * one batched target verify with per-step state snapshots and tap-layer
+ * feature capture -> longest-prefix accept. Every committed draft is
+ * verified against the target distribution on its causal prefix, and
  * s->logits is left at the new frontier (the bonus distribution), mirroring
  * the MTP spec-cycle contract. */
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-static bool glm53_graph_restore_kda_stepsnap(
+#include "ds4_dflash_script.inc"
+
+static bool glm53_graph_restore_dflash_stepsnap(
         ds4_glm_gpu_graph *g,
         ds4_gpu_tensor *snap,
         uint32_t step,
         uint64_t step_bytes) {
     if (!g || !g->glm53 || !snap) return false;
-    const uint64_t expected = glm53_graph_kda_state_bytes(g);
-    if (expected == 0 || step_bytes < expected) return false;
+    const uint64_t expected = glm53_graph_spec_state_bytes(g);
+    if (expected == 0 || step_bytes != expected ||
+        step >= ds4_gpu_tensor_bytes(snap) / step_bytes) return false;
     bool ok = glm_graph_begin_commands_if_needed();
     const uint64_t offset = (uint64_t)step * step_bytes;
     uint64_t walked = 0;
@@ -30,17 +33,54 @@ static bool glm53_graph_restore_kda_stepsnap(
             walked += bytes;
         }
     }
+    /* Capture layout puts tails after all KDA layers, each K allocation
+     * includes its gate view. It is deliberately distinct from the
+     * interleaved pre-block backup layout. */
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (ds4_glm53_layer_is_kda(il)) continue;
+        ds4_gpu_tensor *tail = g->layer_indexer_tail_k[il];
+        const uint64_t bytes = tail ? ds4_gpu_tensor_bytes(tail) : 0;
+        if (bytes) ok = ds4_gpu_tensor_copy(tail, 0, snap, offset + walked,
+                                           bytes) != 0;
+        walked += bytes;
+    }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     return ok && walked == expected;
 }
 
-/* temperature <= 0 or rng == NULL: greedy longest-prefix accept (byte-exact
- * vs serial argmax). temperature > 0: lossless rejection sampling — the
+/* temperature <= 0 or rng == NULL: greedy longest-prefix accept against
+ * batched target logits. Batched arithmetic can differ from serial.
+ * temperature > 0: lossless rejection sampling against that distribution — the
  * drafter is deterministic (point-mass q), so each draft d is accepted with
  * probability p(d) under the temp/top-k/top-p-filtered target distribution;
  * on rejection the frontier logits get d masked to -inf so the caller's own
  * sampling draws from the exact residual distribution. */
+/* Failure exit after the verify forward has advanced per-token state: put the
+ * complete speculative state back if we saved it, and keep the checkpoint only
+ * when that restore actually happened (dflash_exit_keeps_checkpoint). */
+static void dflash_cycle_fail_after_verify(ds4_session *s,
+                                           ds4_glm_gpu_graph *g,
+                                           bool state_saved) {
+    bool restore_ok = false;
+    if (state_saved) {
+        restore_ok = glm53_graph_copy_spec_state_to(g, g->dflash_state_backup,
+                                                    false);
+    }
+    s->checkpoint_valid =
+        dflash_exit_keeps_checkpoint(true, state_saved, restore_ok);
+}
+
+/* Undo the process-global instrumentation this cycle arms: the tap capture
+ * and the per-step KDA snapshot. Safe to call when neither is armed. */
+static void dflash_cycle_disarm(void) {
+    g_glm_dflash_cap.enabled = 0;
+    g_glm_dflash_cap.buf = NULL;
+    g_glm_dflash_cap.n_rows = 0;
+    ds4_gpu_glm53_kda_rowsnap_end();
+    ds4_gpu_glm53_tail_stepsnap_end();
+}
+
 static int ds4_session_glm_dflash_cycle_impl(
         ds4_session *s, int first_token,
         float temperature, int top_k, float top_p, float min_p,
@@ -54,71 +94,51 @@ static int ds4_session_glm_dflash_cycle_impl(
     const uint32_t H = DS4_N_EMBD;
     const uint32_t n_taps = dw->n_target;
 
-    /* UNSUPPORTED ON THIS BRANCH: incomplete speculative rollback.
-     *
-     * The cycle below snapshots and restores the KDA conv/recurrent state
-     * only (glm53_graph_restore_kda_stepsnap, sized by
-     * glm53_graph_kda_state_bytes).  The speculative state of a GLM-5.3 graph
-     * is wider than that: every verify route this cycle can take --
-     * glm53_graph_verify_rows, glm_graph_forward_tokens and
-     * glm_graph_forward_indexed_tokens -- also drives
-     * ds4_gpu_glm53_indexer_pool_update_tensor over
-     * layer_indexer_tail_k[il] / layer_indexer_tail_gate[il] for all L
-     * drafted rows, and glm53_graph_spec_state_tensors counts that tail
-     * (the K object owns the contiguous K+gate allocation; the gate is a
-     * view into it) as part of the state a rejected draft must undo.  After a
-     * partial acceptance the tail therefore still carries the rejected rows,
-     * while the checkpoint is marked valid and the frontier advances.
-     *
-     * Rather than leave a selectable mode whose rollback is known to be
-     * incomplete, refuse the whole cycle -- before any target state is
-     * mutated -- whenever the graph has indexer tail state, and let the
-     * caller's ordinary serial path evaluate the token.  The predicate is the
-     * same one that guards the MTP row-snapshot fast path: the snapshot is
-     * usable only when it covers the entire speculative state.
-     *
-     * To lift this: capture and restore the indexer tail alongside the KDA
-     * state per draft step (a Metal-side change in
-     * ds4_gpu_glm53_kda_stepsnap_begin and its consumers), or restore the
-     * full speculative state and replay the committed prefix before
-     * returning.  Either fix must be certified by a forced-rejection run
-     * across a pool/tail boundary against a serial continuation. */
-    {
+    /* Each verify captures KDA post-row state and DSA tails reconstructed
+     * from the pre-block tail plus only that prefix's raw K/gates. Restore
+     * committed-1 on partial acceptance. The complete pre-block backup is
+     * retained for failure recovery or missing capture coverage.
+     * DS4_DFLASH_FORCE_REPLAY forces restore+serial replay on EVERY cycle,
+     * including full acceptance: an oracle for state on accepted token IDs,
+     * not a claim that batched argmax always equals serial argmax.
+     * DS4_DFLASH_NO_WIDE_ROLLBACK still declines wide graphs before verify. */
+    const uint64_t spec_bytes = glm53_graph_spec_state_bytes(g);
+    const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
+    const bool wide_state = dflash_state_is_wide(spec_bytes, kda_bytes);
+    const bool allow_wide = getenv("DS4_DFLASH_NO_WIDE_ROLLBACK") == NULL;
+    const bool force_replay = getenv("DS4_DFLASH_FORCE_REPLAY") != NULL;
+    if (wide_state && !allow_wide) {
         static int refuse_reported;
-        if (glm53_graph_spec_state_bytes(g) != glm53_graph_kda_state_bytes(g)) {
-            if (!refuse_reported) {
-                refuse_reported = 1;
-                fprintf(stderr,
-                        "ds4: dflash disabled on this graph: speculative "
-                        "rollback does not restore the DSA indexer tail "
-                        "(unsupported on this branch); decoding serially\n");
-            }
-            const int rc = ds4_session_eval_internal(s, first_token, false,
-                                                     err, errlen);
-            if (rc != 0) return -1;
-            accepted[0] = first_token;
-            return 1;
+        if (!refuse_reported) {
+            refuse_reported = 1;
+            fprintf(stderr,
+                    "ds4: dflash disabled on this graph: "
+                    "DS4_DFLASH_NO_WIDE_ROLLBACK is set and the speculative "
+                    "state includes the DSA indexer tail; decoding "
+                    "serially\n");
         }
+        const int rc = ds4_session_eval_internal(s, first_token, false,
+                                                 err, errlen);
+        if (rc != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
     }
 
     s->glm_mtp_rollback_valid = false;
     s->glm_mtp_have = 0;
-    if (s->dflash_last_pos != 0 && pos < s->dflash_last_pos) {
-        /* The session rewound (server slot reuse across requests, or a
-         * thinking-trim checkpoint rewind): the drafter's context rows are
-         * positioned for the old generation and the throttle state — EMA,
-         * probe backoff — belongs to the old content. Start fresh. */
-        s->dflash_ema = 0.0f;
-        s->dflash_lowrun = 0;
-        s->dflash_probe_fails = 0;
-        s->dflash_cycles = 0;
-        s->dflash_pending_rows = 0;
-        s->dflash_warm = 0;
-        /* keep dflash_cycle_ms/serial_ms: cost tracking survives requests
-         * (position barely moves across a rewound slot) */
-        for (uint32_t i = 0; i < s->dflash_cache.n_layer; i++) {
-            s->dflash_cache.layer[i].len = 0;
-        }
+    if (dflash_conditioning_stale(s->dflash_bound_gen, s->dflash_gen,
+                                  pos, s->dflash_last_pos)) {
+        /* Either the prefix is no longer an extension of the one the drafter
+         * was warmed on (a different request on a reused slot, a restored
+         * payload, an invalidation), or the frontier moved backwards inside
+         * this generation (a thinking-trim rewind). The drafter's context
+         * rows and the throttle state — EMA, probe backoff — belong to the
+         * old content either way. Start fresh.
+         *
+         * Costs are reseeded as well: a restored/new request can be at a
+         * completely different depth. */
+        ds4_session_dflash_reset_conditioning(s);
+        s->dflash_bound_gen = s->dflash_gen;
     }
     s->dflash_last_pos = pos;
 
@@ -140,20 +160,25 @@ static int ds4_session_glm_dflash_cycle_impl(
         return 1;
     }
 
-    /* Lazy scratch: per-step KDA snapshots (8 x state), feature capture
+    /* Lazy scratch: complete per-step snapshots (8 x state), feature capture
      * (8 x taps x embd), the drafter's sliding context-KV cache, and the
      * pending-feature staging rows. */
-    const uint64_t state_bytes = glm53_graph_kda_state_bytes(g);
+    const uint64_t state_bytes = spec_bytes;
     if (!g->dflash_stepsnap && state_bytes != 0) {
         g->dflash_stepsnap = ds4_gpu_tensor_alloc(
                 (uint64_t)(DS4_DFLASH2_MAX_DRAFT + 1u) * state_bytes);
+    }
+    const bool want_backup = wide_state || force_replay;
+    if (want_backup && !g->dflash_state_backup && spec_bytes != 0) {
+        g->dflash_state_backup = ds4_gpu_tensor_alloc(spec_bytes);
     }
     if (!g->dflash_capture) {
         g->dflash_capture = ds4_gpu_tensor_alloc(
                 (uint64_t)(DS4_DFLASH2_MAX_DRAFT + 1u) * n_taps * H *
                 sizeof(float));
     }
-    if (!g->dflash_stepsnap || !g->dflash_capture) {
+    if ((state_bytes != 0 && !g->dflash_stepsnap) || !g->dflash_capture ||
+        (want_backup && !g->dflash_state_backup)) {
         snprintf(err, errlen, "dflash: scratch alloc failed");
         return -1;
     }
@@ -177,6 +202,45 @@ static int ds4_session_glm_dflash_cycle_impl(
         s->dflash_pending_rows = 0;
     }
 
+    /* Deterministic draft supply (test-only, see ds4_dflash_script.inc). A
+     * script names the positions that get a speculative block and how many of
+     * its drafts are the true continuation; every other position -- and every
+     * position in the control arm -- decodes serially, so the frontier lands
+     * exactly where the next block asked for it. */
+    dflash_script_init();
+    const ds4_dflash_script_block *sblk = NULL;
+    if (g_dflash_script.active) {
+        sblk = g_dflash_script.serial ? NULL : dflash_script_at(pos);
+        if (sblk && (uint32_t)sblk->n + 1u > L_max) sblk = NULL;
+        if (!sblk) {
+            g_glm_dflash_cap.enabled = 1;
+            g_glm_dflash_cap.buf = g->dflash_capture;
+            g_glm_dflash_cap.n_rows = 1;
+            g_glm_dflash_cap.n_taps = n_taps;
+            for (uint32_t j = 0; j < n_taps; j++) {
+                g_glm_dflash_cap.taps[j] = dw->target_layers[j];
+            }
+            const int rc = ds4_session_eval_internal(s, first_token, false,
+                                                     err, errlen);
+            dflash_cycle_disarm();
+            if (rc != 0) return -1;
+            if (ds4_gpu_tensor_read(g->dflash_capture, 0, s->dflash_pending,
+                                    (uint64_t)n_taps * H * sizeof(float))) {
+                s->dflash_pending_rows = 1;
+            } else {
+                s->dflash_pending_rows = 0;
+            }
+            s->dflash_warm = 1;
+            dflash_script_record_id(pos, first_token);
+            if (dflash_script_dump_frontier(pos + 1u)) {
+                dflash_script_dump_logits(pos + 1u, s->logits);
+                dflash_script_dump_state(pos + 1u, g, "serial");
+            }
+            accepted[0] = first_token;
+            return 1;
+        }
+    }
+
     /* First cycle: ingest the prefill feature ring (last <=2047 prompt
      * positions) into the drafter's context cache so drafting starts with
      * the prompt in view. The throwaway draft block costs one drafter pass. */
@@ -184,8 +248,11 @@ static int ds4_session_glm_dflash_cycle_impl(
     int drafts[DS4_DFLASH2_MAX_DRAFT];
     int n_draft = 0;
     if (!s->dflash_warm) {
-        if (g_glm_dflash_seed.ring_len != 0 &&
-            g_glm_dflash_seed.ring_end_pos == pos) {
+        const double ingest_t0 = now_sec();
+        if (dflash_seed_ring_usable(g_glm_dflash_seed.owner_gen,
+                                    s->dflash_gen,
+                                    g_glm_dflash_seed.ring_len,
+                                    g_glm_dflash_seed.ring_end_pos, pos)) {
             int seed_drafts[DS4_DFLASH2_MAX_DRAFT];
             (void)dflash2_propose(seed_drafts, 1,
                                   &e->dflash_model, dw,
@@ -194,11 +261,14 @@ static int ds4_session_glm_dflash_cycle_impl(
                                   g_glm_dflash_seed.ring_len,
                                   &s->dflash_cache,
                                   first_token, pos);
-            g_glm_dflash_seed.ring_len = 0;
         }
         s->dflash_warm = 1;
-        /* consumed (or unusable) — an empty ring is never re-ingested */
-        g_glm_dflash_seed.ring_len = 0;
+        /* consumed (or unusable) — a ring is never ingested twice, and one
+         * left by another session's prefill is dropped rather than reused */
+        glm_dflash_seed_invalidate();
+        /* paid before cyc_t0 below, so the throttle never sees it */
+        g_dflash_overhead.ingest_ms += (now_sec() - ingest_t0) * 1000.0;
+        g_dflash_overhead.ingests++;
     }
     /* Adaptive throttle with live-measured break-even: cycle and serial
      * token costs are tracked per session (EMA of wall time), so the park
@@ -209,7 +279,7 @@ static int ds4_session_glm_dflash_cycle_impl(
     const float breakeven =
         s->dflash_serial_ms > 0.1f && s->dflash_cycle_ms > 0.1f ?
             s->dflash_cycle_ms / s->dflash_serial_ms : 4.1f;
-    if (!getenv("DS4_DFLASH_NO_ADAPTIVE") && s->dflash_warm) {
+    if (!sblk && !getenv("DS4_DFLASH_NO_ADAPTIVE") && s->dflash_warm) {
         if (s->dflash_ema == 0.0f) s->dflash_ema = breakeven + 1.5f;
         if (s->dflash_ema < breakeven) {
             s->dflash_lowrun++;
@@ -225,8 +295,10 @@ static int ds4_session_glm_dflash_cycle_impl(
                                                          false, err, errlen);
                 if (rc != 0) return -1;
                 const float fb_ms = (float)((now_sec() - fb_t0) * 1000.0);
-                s->dflash_serial_ms = s->dflash_serial_ms <= 0.0f ? fb_ms :
-                    0.9f * s->dflash_serial_ms + 0.1f * fb_ms;
+                s->dflash_serial_ms = dflash_timing_ema(s->dflash_serial_ms,
+                                                       fb_ms);
+                g_dflash_overhead.park_ms += (double)fb_ms;
+                g_dflash_overhead.parks++;
                 if (getenv("DS4_DFLASH_STATS")) {
                     static uint32_t fbn;
                     if (++fbn % 128u == 0u) {
@@ -257,7 +329,12 @@ static int ds4_session_glm_dflash_cycle_impl(
         memset(s->dflash_pending, 0,
                (size_t)s->dflash_pending_rows * n_taps * H * sizeof(float));
     }
-    if (s->dflash_warm && s->dflash_pending_rows != 0 && l_clamp > 1u) {
+    if (sblk) {
+        /* The verifier is untouched: these are proposals, and the target's
+         * own argmax decides which of them survive. */
+        n_draft = dflash_script_drafts(sblk, pos, drafts, DS4_N_VOCAB);
+        s->dflash_pending_rows = 0;
+    } else if (s->dflash_warm && s->dflash_pending_rows != 0 && l_clamp > 1u) {
         n_draft = dflash2_propose(drafts, (int)(l_clamp - 1u),
                                   &e->dflash_model, dw,
                                   &e->model, &e->weights,
@@ -280,10 +357,17 @@ static int ds4_session_glm_dflash_cycle_impl(
         for (uint32_t j = 0; j < n_taps; j++) {
             g_glm_dflash_cap.taps[j] = dw->target_layers[j];
         }
+        const double refresh_t0 = now_sec();
         const int rc = ds4_session_eval_internal(s, first_token, false,
                                                  err, errlen);
-        g_glm_dflash_cap.enabled = 0;
+        dflash_cycle_disarm();
+        const float refresh_ms = (float)((now_sec() - refresh_t0) * 1000.0);
+        g_dflash_overhead.refresh_ms += refresh_ms;
+        g_dflash_overhead.refreshes++;
         if (rc != 0) return -1;
+        /* This is a measured serial target step even when no park has yet
+         * occurred. Capture overhead stays charged conservatively. */
+        s->dflash_serial_ms = dflash_timing_ema(s->dflash_serial_ms, refresh_ms);
         if (ds4_gpu_tensor_read(g->dflash_capture, 0, s->dflash_pending,
                                 (uint64_t)n_taps * H * sizeof(float))) {
             s->dflash_pending_rows = 1;
@@ -298,6 +382,11 @@ static int ds4_session_glm_dflash_cycle_impl(
     toks[0] = first_token;
     for (int i = 0; i < n_draft; i++) toks[i + 1] = drafts[i];
 
+    /* Arm the tap capture and the per-step snapshot. Everything from here to
+     * dflash_cycle_disarm() below is instrumentation state that is global to
+     * the process, so every exit in between has to go through the disarm --
+     * an armed capture left behind would write the next serial decode's tap
+     * rows into this cycle's buffer with this cycle's row count. */
     g_glm_dflash_cap.enabled = 1;
     g_glm_dflash_cap.buf = g->dflash_capture;
     g_glm_dflash_cap.n_rows = L;
@@ -305,10 +394,39 @@ static int ds4_session_glm_dflash_cycle_impl(
     for (uint32_t j = 0; j < n_taps; j++) {
         g_glm_dflash_cap.taps[j] = dw->target_layers[j];
     }
+    /* Last point before any target state is mutated: take the complete
+     * speculative-state backup the rejection path will restore from.  Both
+     * exits below happen before that mutation, so the session's checkpoint is
+     * still exactly what it was and stays valid; only the instrumentation
+     * needs undoing. */
+    bool state_saved = false;
+    if (dflash_rollback_needs_save(wide_state, allow_wide) || force_replay) {
+        state_saved = glm53_graph_copy_spec_state_to(
+                g, g->dflash_state_backup, true) &&
+                !dflash_fail_injected(DS4_DFLASH_FAIL_STATE_SAVE);
+        if (!state_saved) {
+            dflash_cycle_disarm();
+            snprintf(err, errlen, "dflash: speculative state save failed");
+            return -1;
+        }
+    }
+    if (!dflash_rollback_can_run(wide_state, allow_wide, state_saved,
+                                 g->dflash_stepsnap != NULL)) {
+        dflash_cycle_disarm();
+        snprintf(err, errlen, "dflash: no sound speculative rollback");
+        return -1;
+    }
+    if (dflash_fail_injected(DS4_DFLASH_FAIL_AFTER_ARM)) {
+        dflash_cycle_disarm();
+        snprintf(err, errlen, "dflash: injected failure after arm");
+        return -1;
+    }
     const double t_draft = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
     ds4_gpu_glm53_kda_stepsnap_begin(g->dflash_stepsnap,
                                      (uint32_t)(state_bytes / sizeof(float)),
                                      DS4_DFLASH2_MAX_DRAFT + 1u);
+    ds4_gpu_glm53_tail_stepsnap_begin(g->dflash_stepsnap, state_bytes,
+                                      kda_bytes, L, pos);
     static float *hc_rows_host = NULL;
     if (!hc_rows_host) {
         hc_rows_host = xmalloc((size_t)(DS4_DFLASH2_MAX_DRAFT + 1u) *
@@ -342,12 +460,17 @@ static int ds4_session_glm_dflash_cycle_impl(
                                                     pos, L, hc_rows_host, NULL,
                                                     NULL, NULL, pos, 0, L);
     }
-    ds4_gpu_glm53_kda_rowsnap_end();
-    g_glm_dflash_cap.enabled = 0;
+    const bool stepsnap_complete =
+        ds4_gpu_glm53_kda_stepsnap_complete(kda_bytes) &&
+        ds4_gpu_glm53_tail_stepsnap_complete();
+    dflash_cycle_disarm();
+    if (verified && !stepsnap_complete && getenv("DS4_DFLASH_STATS")) {
+        fprintf(stderr, "ds4: dflash incomplete prefix capture; using replay\n");
+    }
     const double t_verify = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
-    if (!verified) {
+    if (!verified || dflash_fail_injected(DS4_DFLASH_FAIL_AFTER_VERIFY)) {
+        dflash_cycle_fail_after_verify(s, g, state_saved);
         snprintf(err, errlen, "dflash: verify forward failed");
-        s->checkpoint_valid = false;
         return -1;
     }
 
@@ -367,8 +490,8 @@ static int ds4_session_glm_dflash_cycle_impl(
     if (!g->dflash_hcrows ||
         !ds4_gpu_tensor_write(g->dflash_hcrows, 0, hc_rows_host,
                               (uint64_t)L * hc_row * sizeof(float))) {
+        dflash_cycle_fail_after_verify(s, g, state_saved);
         snprintf(err, errlen, "dflash: hc upload failed");
-        s->checkpoint_valid = false;
         return -1;
     }
     /* All L heads in one command stream: collapse each hc row, then the
@@ -424,8 +547,8 @@ static int ds4_session_glm_dflash_cycle_impl(
                     (uint64_t)L * DS4_N_VOCAB * sizeof(float)) != 0;
         }
         if (!ok) {
+            dflash_cycle_fail_after_verify(s, g, state_saved);
             snprintf(err, errlen, "dflash: verify head failed");
-            s->checkpoint_valid = false;
             return -1;
         }
     }
@@ -460,25 +583,103 @@ static int ds4_session_glm_dflash_cycle_impl(
         }
     }
     const uint32_t n_committed = (uint32_t)n_accept + 1u;
-    memcpy(s->logits, row_logits + (size_t)n_accept * DS4_N_VOCAB,
-           (size_t)DS4_N_VOCAB * sizeof(float));
-    if (rejected_tok >= 0) s->logits[rejected_tok] = -1e30f;
-
-    if (n_committed < L) {
-        if (!glm53_graph_restore_kda_stepsnap(g, g->dflash_stepsnap,
-                                              n_committed - 1u,
+    const ds4_dflash_rollback_plan plan =
+        dflash_rollback_plan(L, n_committed, pos, wide_state, allow_wide,
+                             state_saved, force_replay || !stepsnap_complete);
+    bool replayed = false;
+    switch (plan.kind) {
+    case DS4_DFLASH_ROLLBACK_NONE:
+        break;
+    case DS4_DFLASH_ROLLBACK_STEPSNAP:
+        if (!glm53_graph_restore_dflash_stepsnap(g, g->dflash_stepsnap,
+                                              plan.stepsnap_index,
                                               state_bytes)) {
-            snprintf(err, errlen, "dflash: KDA step restore failed");
+            snprintf(err, errlen, "dflash: prefix state restore failed");
             s->checkpoint_valid = false;
             return -1;
         }
+        break;
+    case DS4_DFLASH_ROLLBACK_REPLAY: {
+        /* Undo the whole block, then walk the committed prefix forward
+         * one token at a time exactly as serial decode would.  Every
+         * per-step producer -- KDA conv/recurrent state, the indexer tail
+         * ring, the positional caches -- is rebuilt by the replay, so the
+         * frontier is the serial frontier and its logits (the last
+         * forward's output) are the serial logits. */
+        bool ok = glm53_graph_copy_spec_state_to(g, g->dflash_state_backup,
+                                                 false);
+        for (uint32_t i = 0; ok && i < plan.replay_tokens; i++) {
+            ok = glm_graph_forward_token(g, &e->model, &e->weights, toks[i],
+                                         NULL, pos + i, NULL, s->logits,
+                                         false);
+        }
+        if (!ok) {
+            snprintf(err, errlen, "dflash: speculative state replay failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        replayed = true;
+        break;
     }
+    case DS4_DFLASH_ROLLBACK_REFUSE:
+    default:
+        /* Unreachable: dflash_rollback_can_run() screened this before the
+         * verify. Keep the state consistent rather than commit anything. */
+        dflash_cycle_fail_after_verify(s, g, state_saved);
+        snprintf(err, errlen, "dflash: no sound speculative rollback");
+        return -1;
+    }
+    if (!replayed) {
+        memcpy(s->logits, row_logits + (size_t)n_accept * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    if (rejected_tok >= 0) s->logits[rejected_tok] = -1e30f;
     for (uint32_t i = 0; i < n_committed; i++) {
         token_vec_push(&s->checkpoint, toks[i]);
         accepted[i] = toks[i];
     }
     s->checkpoint_valid = true;
+    if ((uint32_t)s->checkpoint.len != plan.frontier_pos) {
+        /* The committed frontier must be exactly what the rollback plan
+         * priced; anything else means the two disagree about how much of
+         * the block survived. */
+        snprintf(err, errlen,
+                 "dflash: frontier %d does not match plan %u",
+                 s->checkpoint.len, plan.frontier_pos);
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    /* Compact KV is append-only at absolute positions. Compressed indexer
+     * keys are visible only up to floor(frontier/4); scalar score_rows uses
+     * visible/4 and batch scores mask per query. Entries produced solely by
+     * rejected rows stay outside that range and are overwritten before use.
+     * No independent GLM compact-cache live count is advanced by verify.
+     * Dense-cache validity likewise advances only over committed rows. */
     ds4_session_glm_note_dense_cache(s, pos, n_committed);
+
+    if (g_dflash_script.active) {
+        /* Both arms record every committed token, so the comparison is over
+         * token ids rather than rendered text. */
+        for (uint32_t i = 0; i < n_committed; i++) {
+            dflash_script_record_id(pos + i, toks[i]);
+        }
+    }
+    if (sblk) {
+        /* The certification line: what was asked for, and what the verifier
+         * and the rollback actually did. */
+        fprintf(stderr,
+                "ds4: dflash script pos=%u k=%d n=%d drafted=%d accepted=%d "
+                "committed=%u rollback=%s frontier=%u\n",
+                pos, sblk->k, sblk->n, n_draft, n_accept, n_committed,
+                plan.kind == DS4_DFLASH_ROLLBACK_NONE ? "none" :
+                plan.kind == DS4_DFLASH_ROLLBACK_STEPSNAP ? "stepsnap" :
+                plan.kind == DS4_DFLASH_ROLLBACK_REPLAY ? "replay" : "refuse",
+                plan.frontier_pos);
+        if (dflash_script_dump_frontier(plan.frontier_pos)) {
+            dflash_script_dump_logits(plan.frontier_pos, s->logits);
+            dflash_script_dump_state(plan.frontier_pos, g, "speculative");
+        }
+    }
 
     /* Stage committed rows' features for the next cycle's draft context. */
     if (ds4_gpu_tensor_read(g->dflash_capture, 0, s->dflash_pending,
@@ -518,10 +719,13 @@ static int ds4_session_glm_dflash_cycle_impl(
     }
     if (getenv("DS4_DFLASH_STATS")) {
         fprintf(stderr,
-                "ds4: dflash cycle drafted=%d accepted=%d ctx=%u "
-                "draft=%.1fms verify=%.1fms heads=%.1fms tail=%.1fms "
+                "ds4: dflash cycle drafted=%d accepted=%d rollback=%s "
+                "ctx=%u draft=%.1fms verify=%.1fms heads=%.1fms tail=%.1fms "
                 "serial=%.1fms cyc=%.1fms be=%.2f\n",
                 n_draft, n_accept,
+                plan.kind == DS4_DFLASH_ROLLBACK_NONE ? "none" :
+                plan.kind == DS4_DFLASH_ROLLBACK_STEPSNAP ? "stepsnap" :
+                plan.kind == DS4_DFLASH_ROLLBACK_REPLAY ? "replay" : "refuse",
                 s->dflash_cache.n_layer ? s->dflash_cache.layer[0].len : 0u,
                 (t_draft - t_cycle0) * 1000.0,
                 (t_verify - t_draft) * 1000.0,
@@ -531,8 +735,18 @@ static int ds4_session_glm_dflash_cycle_impl(
     }
     {
         const float cyc_ms = (float)((now_sec() - cyc_t0) * 1000.0);
-        s->dflash_cycle_ms = s->dflash_cycle_ms <= 0.0f ? cyc_ms :
-            0.9f * s->dflash_cycle_ms + 0.1f * cyc_ms;
+        s->dflash_cycle_ms = dflash_timing_ema(s->dflash_cycle_ms, cyc_ms);
+        g_dflash_overhead.cycle_ms += (double)cyc_ms;
+        g_dflash_overhead.cycles++;
+        g_dflash_overhead.drafted += (uint64_t)n_draft;
+        g_dflash_overhead.accepted += (uint64_t)n_accept;
+        g_dflash_overhead.committed += n_committed;
+        if (plan.kind == DS4_DFLASH_ROLLBACK_REPLAY) {
+            g_dflash_overhead.replays++;
+            g_dflash_overhead.replay_tokens += plan.replay_tokens;
+        } else if (plan.kind == DS4_DFLASH_ROLLBACK_STEPSNAP) {
+            g_dflash_overhead.stepsnaps++;
+        }
     }
     return (int)n_committed;
 }

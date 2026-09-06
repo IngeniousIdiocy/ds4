@@ -72,7 +72,7 @@ endif
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-small-fuse-bench check-mxfp4-half-lut
-.PHONY: test-metal-moe-prefill test-metal-dense-mpp
+.PHONY: test-metal-moe-prefill test-metal-dense-mpp check-expert-bank-kernels superchunk-state-test
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -174,6 +174,24 @@ tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
 
 test-metal-moe-prefill: tests/test_metal_moe_prefill
 	./tests/test_metal_moe_prefill
+
+tests/test_glm_superchunk_state.o: tests/test_glm_superchunk_state.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm_superchunk_state: tests/test_glm_superchunk_state.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+superchunk-state-test: tests/test_glm_superchunk_state
+	./tests/test_glm_superchunk_state
+
+check-expert-bank-kernels:
+	python3 metal/gen_expert_bank_kernels.py --check
+
+tests/test_glm_expert_bank.o: tests/test_glm_expert_bank.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_glm_expert_bank: check-expert-bank-kernels tests/test_glm_expert_bank.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_glm_expert_bank.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 tests/test_metal_dense_mpp.o: tests/test_metal_dense_mpp.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
@@ -304,7 +322,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_dflash2.inc ds4_dflash_glm.inc
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_dflash2.inc ds4_dflash_glm.inc ds4_dflash_script.inc ds4_dflash_rollback.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -388,7 +406,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4_eval_cases.h ds4.h ds4_ssd.h ds4_distributed.h ds
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_glm53_prefix.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
@@ -580,7 +598,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_dflash2.inc ds4_dflash_rollback.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -594,6 +612,74 @@ tests/test_sampling.o: tests/test_sampling.c ds4.h
 
 tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_dflash2_embed_q8.o: tests/test_dflash2_embed_q8.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dflash2_embed_q8: tests/test_dflash2_embed_q8.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: dflash2-embed-q8-test
+dflash2-embed-q8-test: tests/test_dflash2_embed_q8
+	./tests/test_dflash2_embed_q8
+
+tests/test_dflash_rollback.o: tests/test_dflash_rollback.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dflash_rollback: tests/test_dflash_rollback.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: dflash-rollback-test
+dflash-rollback-test: tests/test_dflash_rollback
+	./tests/test_dflash_rollback
+
+# Tiny CPU-only check; does not build or initialize the model backend.
+.PHONY: dflash-prefix-test
+dflash-prefix-test: tests/test_dflash_prefix
+	./tests/test_dflash_prefix
+
+tests/test_dflash_prefix: tests/test_dflash_prefix.c ds4_glm53_prefix.h ds4_dflash_rollback.h
+	$(CC) -std=c11 -Wall -Wextra -O0 -o $@ $< -lm
+
+tests/test_dflash_lifecycle.o: tests/test_dflash_lifecycle.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dflash_lifecycle: tests/test_dflash_lifecycle.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: dflash-lifecycle-test
+dflash-lifecycle-test: tests/test_dflash_lifecycle
+	./tests/test_dflash_lifecycle
+
+tests/test_dflash_sampling.o: tests/test_dflash_sampling.c
+	$(CC) $(CFLAGS) -fno-finite-math-only -I. -c -o $@ $<
+
+tests/test_dflash_sampling: tests/test_dflash_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: dflash-sampling-test
+dflash-sampling-test: tests/test_dflash_sampling
+	./tests/test_dflash_sampling
+
+# The rejection comparator is the instrument that decides whether a DFlash
+# rejection run certifies the rollback, so it has its own planted fixtures.
+# No model, no GPU.
+.PHONY: dflash-compare-fixtures
+dflash-compare-fixtures: tests/dflash_rejection_fixtures.py tests/dflash_rejection_compare.py
+	python3 tests/dflash_rejection_fixtures.py
+
+tests/dflash_cached_depth.o: tests/dflash_cached_depth.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/dflash_cached_depth: tests/dflash_cached_depth.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ tests/dflash_cached_depth.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ tests/dflash_cached_depth.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+endif
+
+.PHONY: dflash-cached-depth
+dflash-cached-depth: tests/dflash_cached_depth
 
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
@@ -703,7 +789,7 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/test_glm_superchunk_state $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -714,7 +800,14 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
 	./tests/test_sampling
+	./tests/test_dflash2_embed_q8
+	./tests/test_dflash_rollback
+	./tests/test_dflash_lifecycle
+	./tests/test_dflash_sampling
+	$(MAKE) dflash-compare-fixtures
+	./tests/test_glm_superchunk_state
 	./tests/test_deepseek4_vision_image
+	python3 metal/gen_expert_bank_kernels.py --check
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
@@ -756,6 +849,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory

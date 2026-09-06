@@ -2763,6 +2763,69 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_gpu_tensor       *routed_partials,
         int                    *used_split);
 
+/* --- GLM-5.3 expanded-expert one-layer bank (EXPERT-BANK-DESIGN.md rev 3) ---
+ * One routed layer's three expert tensors dequantized once into a half image
+ * in the routed GEMM's own A-stage order.  Bit-exact with the packed path by
+ * construction; OFF unless DS4_GLM_ENABLE_EXPERT_BANK=1, and
+ * DS4_GLM_DISABLE_EXPERT_BANK=1 kills it outright. */
+int ds4_gpu_glm_expert_bank_enabled(void);
+uint64_t ds4_gpu_glm_expert_bank_bytes(uint32_t expert_in_dim,
+                                       uint32_t expert_mid_dim,
+                                       uint32_t out_dim,
+                                       uint32_t n_total_expert);
+int ds4_gpu_glm_expert_bank_ensure(uint32_t expert_in_dim,
+                                   uint32_t expert_mid_dim,
+                                   uint32_t out_dim,
+                                   uint32_t n_total_expert);
+/* End-to-end expansion accounting.  The command time includes any VM page-in
+ * or first destination touch paid while Metal executes the expansion. */
+typedef struct {
+    uint64_t allocation_count;
+    uint64_t expansion_count;
+    uint64_t capacity_bytes;
+    uint64_t current_allocated_bytes;
+    double   last_ensure_ms;
+    double   last_model_view_ms;
+    double   last_command_ms;
+} ds4_gpu_glm_expert_bank_stats;
+void ds4_gpu_glm_expert_bank_get_stats(ds4_gpu_glm_expert_bank_stats *stats);
+/* Expands one layer into the bank and arms it.  Opens and finishes its own
+ * command buffer, so it must not be called with one open. */
+int ds4_gpu_glm_expert_bank_expand_layer(const void *model_map,
+                                         uint64_t    model_size,
+                                         uint64_t    gate_offset,
+                                         uint64_t    up_offset,
+                                         uint64_t    down_offset,
+                                         uint32_t    gate_type,
+                                         uint32_t    up_type,
+                                         uint32_t    down_type,
+                                         uint64_t    gate_expert_bytes,
+                                         uint64_t    gate_row_bytes,
+                                         uint64_t    up_expert_bytes,
+                                         uint64_t    up_row_bytes,
+                                         uint64_t    down_expert_bytes,
+                                         uint64_t    down_row_bytes,
+                                         uint32_t    expert_in_dim,
+                                         uint32_t    expert_mid_dim,
+                                         uint32_t    out_dim,
+                                         uint32_t    n_total_expert,
+                                         uint32_t    layer_index);
+void ds4_gpu_glm_expert_bank_disarm(void);
+void ds4_gpu_glm_expert_bank_free(void);
+int ds4_gpu_glm_expert_bank_armed_layer(void);
+/* Test-only: independent inverse-mapping check of one bank section
+ * (0 gate, 1 up, 2 down) against a fresh dequantization of the packed rows. */
+int ds4_gpu_glm_expert_bank_verify_section(const void *model_map,
+                                           uint64_t    model_size,
+                                           uint64_t    tensor_offset,
+                                           uint64_t    expert_bytes,
+                                           uint64_t    row_bytes,
+                                           uint32_t    rows,
+                                           uint32_t    ne00,
+                                           uint32_t    n_total_expert,
+                                           int         section,
+                                           uint64_t    counters_out[4]);
+
 int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,

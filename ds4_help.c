@@ -192,7 +192,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
             if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER) {
-                opt(fp, c, "--dflash FILE", "GLM-5.3: load a DFlash2 draft GGUF. On this branch the drafter loads but decoding stays serial; see docs/GLM53_M3ULTRA.md.");
+                opt(fp, c, "--dflash FILE", "GLM-5.3: load a DFlash2 draft GGUF and speculate (optional; drafter weights are not bundled). See docs/DFLASH_GLM53.md.");
             }
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");

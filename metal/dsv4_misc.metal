@@ -1010,6 +1010,33 @@ static inline float glm53_pool_bf16_to_f32(ushort value) {
     return as_type<float>((uint)value << 16);
 }
 
+struct ds4_metal_args_glm53_tail_stepsnap {
+    uint head_dim, n_steps;
+    uint64_t stride_floats;
+    int source_rows[8 * 4];
+};
+
+/* Called before pool_update touches the live tail. Every output depends on
+ * the pre-block tail or a row at/before this prefix, never its draft suffix.
+ * The host computes the ring indices using ds4_glm53_tail_prefix_source. */
+kernel void kernel_glm53_indexer_tail_stepsnap(
+        constant ds4_metal_args_glm53_tail_stepsnap &args [[buffer(0)]],
+        device const float *raw_k [[buffer(1)]],
+        device const float *gate [[buffer(2)]],
+        device const float *tail_k [[buffer(3)]],
+        device const float *tail_gate [[buffer(4)]],
+        device float *snapshot [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 4u * args.head_dim || gid.y >= args.n_steps) return;
+    const uint slot = gid.x / args.head_dim;
+    const uint d = gid.x % args.head_dim;
+    const int row = args.source_rows[gid.y * 4u + slot];
+    const uint64_t src = row < 0 ? gid.x : (uint64_t)row * args.head_dim + d;
+    const uint64_t dst = (uint64_t)gid.y * args.stride_floats + gid.x;
+    snapshot[dst] = row < 0 ? tail_k[src] : raw_k[src];
+    snapshot[dst + 4u * args.head_dim] = row < 0 ? tail_gate[src] : gate[src];
+}
+
 kernel void kernel_glm53_indexer_pool_update(
         constant ds4_metal_args_glm53_indexer_pool_update &args,
         device const char   *raw_k,

@@ -13,6 +13,8 @@ typedef struct {
     uint32_t ring_len;
     uint32_t ring_cap;
     uint32_t ring_end_pos;      /* absolute position AFTER the last ring row */
+    uint64_t bound_gen;         /* generation the current prefill belongs to */
+    uint64_t owner_gen;         /* generation whose rows the ring holds (0 = none) */
     uint32_t n_taps;
     uint32_t taps[DS4_DFLASH2_MAX_TARGET];
 } ds4_glm_dflash_seed;
@@ -35,6 +37,20 @@ static void glm_dflash_seed_configure(const ds4_dflash2_weights *dw) {
     }
     g_glm_dflash_seed.chunk_cap = glm53_prefill_chunk_tokens();
     g_glm_dflash_seed.enabled = 1;
+}
+
+/* Stamp the prefill about to run with its session's conditioning generation,
+ * so a ring filled for one request cannot be ingested by another. */
+static void glm_dflash_seed_bind_owner(uint64_t gen) {
+    g_glm_dflash_seed.bound_gen = gen;
+}
+
+/* Drop whatever the ring holds: a cancelled or failed prefill leaves a
+ * partial capture that belongs to no completed prefix. */
+static void glm_dflash_seed_invalidate(void) {
+    g_glm_dflash_seed.ring_len = 0;
+    g_glm_dflash_seed.ring_end_pos = 0;
+    g_glm_dflash_seed.owner_gen = 0;
 }
 
 static bool glm_dflash_seed_chunk_begin(uint32_t chunk) {
@@ -69,7 +85,13 @@ static void glm_dflash_seed_chunk_end(uint32_t chunk, uint32_t pos_end,
                                       bool ok) {
     ds4_glm_dflash_seed *sd = &g_glm_dflash_seed;
     g_glm_dflash_cap.enabled = 0;
-    if (!ok || !sd->enabled) return;
+    if (!ok) {
+        /* a failed or cancelled chunk leaves a partial capture that belongs
+         * to no completed prefix */
+        glm_dflash_seed_invalidate();
+        return;
+    }
+    if (!sd->enabled) return;
     const uint64_t row = (uint64_t)sd->n_taps * DS4_N_EMBD;
     uint32_t take = chunk;
     uint32_t skip = 0;
@@ -83,11 +105,18 @@ static void glm_dflash_seed_chunk_end(uint32_t chunk, uint32_t pos_end,
                 (size_t)(sd->ring_len - drop) * row * sizeof(float));
         sd->ring_len -= drop;
     }
+    /* readback + ring upkeep: prefill-time cost, outside the adaptive
+     * cycle timer, so account for it explicitly. */
+    const double t0 = now_sec();
     if (ds4_gpu_tensor_read(sd->buf, (uint64_t)skip * row * sizeof(float),
                             sd->ring + (size_t)sd->ring_len * row,
                             (uint64_t)take * row * sizeof(float))) {
         sd->ring_len += take;
         sd->ring_end_pos = pos_end;
+        sd->owner_gen = sd->bound_gen;
+        g_dflash_overhead.seed_rows += take;
     }
+    g_dflash_overhead.seed_readback_ms += (now_sec() - t0) * 1000.0;
+    g_dflash_overhead.seed_chunks++;
 }
 #endif

@@ -158,16 +158,47 @@ serial decode from live wall-clock measurements and parks speculation when accep
 cannot pay (this is what kept it break-even rather than negative on agentic content at
 depth, where the embedded MTP-2 draft loses 10–20%).
 
-**On this branch it is refused at run time** (`ds4_dflash_glm.inc:57-101`). Upstream
-now includes the DSA indexer tail ring in the speculative state it restores after a
-rejected draft; the DFlash rollback restores KDA state only, and all three verify routes
-write the ring for every drafted row, so a partial acceptance would leave rejected rows
-in it. Rather than ship a selectable mode with a known-incomplete rollback, the cycle is
-refused before any target state is mutated and the token is evaluated serially, with
-one stderr notice. The two completions and the certification they need are described in
-`docs/GLM53_M3ULTRA.md`. The same incompleteness in upstream's MTP row-snapshot fast
-path is handled by a guard (`ds4.c:68578`) that makes the fast path fall through to
-upstream's full restore+replay on every real GLM-5.3 graph.
+**Rollback.** Upstream includes the DSA indexer tail ring in the speculative state it
+restores after a rejected draft, while the per-step snapshot taken inside a DFlash verify
+covers the KDA conv/recurrent state only — and all three verify routes write the ring for
+every drafted row. A partial acceptance therefore used to leave rejected rows in the
+ring, which is why this branch refused the cycle outright. The cycle now saves the
+complete speculative state before the verify and, on a partial acceptance, restores it
+and replays the committed prefix one token at a time through the ordinary serial forward:
+upstream's own MTP rejection contract, applied to a block of rows, so every per-token
+producer is re-derived rather than patched. `DS4_DFLASH_NO_WIDE_ROLLBACK=1` restores the
+previous refusal; `DS4_DFLASH_FORCE_REPLAY=1` selects the replay unconditionally as an
+A/B oracle. The same incompleteness in upstream's MTP row-snapshot fast path is handled
+by a guard (`ds4.c:68578`) that makes the fast path fall through to upstream's full
+restore+replay on every real GLM-5.3 graph.
+
+**Greedy only, and request-state ownership.** Positive temperature does not enter the
+speculative cycle: its rejection masks the rejected token's logit and every caller then
+re-applies top-k/top-p/min-p to that modified vector, so the residual is filtered against
+a different support than the target's own distribution and can admit a token the original
+filter excluded (`tests/test_dflash_sampling.c` shows it on the real sampler). Separately,
+the drafter's context cache, staged features and the process-global prefill seed ring are
+now bound to a per-session prefix generation that changes on any non-extending sync, a
+restored payload, a rewind or an invalidation — a frontier comparison alone cannot see a
+different request of the same length, or a restored prefix longer than the last one. Every
+exit after the cycle arms its instrumentation routes through one disarm, and the session's
+checkpoint survives such an exit only when the speculative state was actually restored.
+
+**Target compatibility.** The drafter borrows the target's `token_embd` (anchor and mask
+rows, read per proposal) and its `output` head. The public target GGUF stores both as
+Q8_0, so `dflash2_embed_row` gained a Q8_0 row decode that shares the engine's canonical
+Q8_0 decoder, and the target's embedding/head shapes, embedding type, mask token and tap
+layers are screened once at load — an unsupported target is refused there with a reason,
+not aborted mid-generation. `tests/test_dflash2_embed_q8.c` and
+`tests/test_dflash_rollback.c`, `tests/test_dflash_lifecycle.c` and
+`tests/test_dflash_sampling.c` cover the row decode, the rollback bookkeeping, the failure
+exits and lifecycle identity, and the sampler contract on CPU. Model-level certification
+is outstanding: `tests/dflash_rejection_harness.sh` supplies deterministic drafts from a
+retained serial continuation so a rejection can be placed after 0, 1, 2 or 3 accepted
+drafts on either side of the 4-token pool boundary, and `tests/dflash_cached_depth.c`
+measures a restored 62k/300k prefix through the product speculative entry point. The personal-use recreation recipe for the drafter — pinned
+revision, checksums, converter command, launch flags and smoke tests — is
+`docs/DFLASH_GLM53.md`; no drafter weights are redistributed.
 
 ## 4. Server
 

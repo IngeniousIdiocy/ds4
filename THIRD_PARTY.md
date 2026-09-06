@@ -27,9 +27,13 @@ this section is to be updated before publication.
 (`incoai/GLM-5.3-Flash-DFlash2` on Hugging Face) is published under **CC BY-NC-ND 4.0**
 (`license: cc-by-nc-nd-4.0` in its model card, checked via the Hub API 2026-09-06). `gguf-tools/dflash2_to_gguf.py` converts it
 for local research use only; the converted GGUF must not be redistributed, and nothing
-of it is tracked in this repository. Historical DFlash2 results in `bench/README.md`
-depended on that file. On this branch DFlash2 is loaded but refused at run time (see
-`docs/GLM53_M3ULTRA.md`, "Feature status").
+of it is tracked in this repository — no weights, no derivative tensors, no golden weight
+data. Historical DFlash2 results in `bench/README.md` depended on that file.
+`docs/DFLASH_GLM53.md` documents how to obtain and convert the drafter yourself, pinned
+to revision `dc77ff1c99eeb2df044ee3d4f0094eb033fee410` (`model.safetensors` sha256
+`b33c03475ba7322cf398828f2d8d1be376df30dc05c6b40c28c8ea8da23e410b`), with the model-card
+and licence links; on this branch `--dflash` is an opt-in mode whose status is recorded
+in `docs/GLM53_M3ULTRA.md`, "Feature status".
 
 ## KDA kernels (`metal/glm53_kda.metal`)
 

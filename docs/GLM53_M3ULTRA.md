@@ -142,32 +142,33 @@ are deliberately separate.
 | Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | public build `a0bf48d`: 13/14 required lifecycle tests (`RUN-20260906T121302Z`; the failure is the false cache hit under "Known issues"); v2 candidate with the cache fix `8d7e091`: 14/14 required, 4/5 observational (`RUN-20260906T123859Z`; the observational miss is negative `max_tokens`) |
 | Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge | **re-validation pending** on a vision prompt |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
-| DFlash2 speculative decoding (`--dflash`) | **refused and documented**: the drafter loads, then the engine decodes serially with one stderr notice on any graph that has DSA indexer tail state, i.e. every real GLM-5.3 graph (`ds4_dflash_glm.inc:57-101`) | serial-fallback identity (`DS4_DFLASH_DISABLE=1` vs `--dflash`) is step 0 of the certification recipe; not yet run |
+| DFlash2 speculative decoding (`--dflash`) | implemented, opt-in and greedy-only; complete per-position KDA/DSA snapshots restore the accepted prefix, with full restore/replay retained as fallback and diagnostic reference. Positive temperature decodes serially. | Focused GPU prefix tests and a JSON speed comparison passed on the isolated DFlash build; final merged-branch validation and the new <2% negative-impact requirement remain pending. |
 | CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
 
-**Why DFlash2 is refused.** Upstream now counts the DSA indexer tail ring
-(`layer_indexer_tail_k`, K+gate) as speculative state, and restores it with the KDA
-state when a draft is rejected. All three DFlash verify routes write that ring for every
-drafted row before any acceptance test, but the DFlash rollback restores KDA state only,
-so after a partial acceptance the ring keeps the rejected rows while the frontier
-advances. The two ways to complete the rollback (snapshot the tail per step on the Metal
-side; or full restore plus replay of the committed prefix, a second forward per cycle)
-both need a GPU certification run — a forced-rejection stream across a pool boundary,
-byte-identical tokens *and* byte-identical saved indexer tail — before the refusal may be
-lifted. Refusing costs nothing the serial path was not already paying and leaves no
-unsafe selectable mode.
+**How DFlash2's rollback was completed.** Verification snapshots both the KDA
+state and the DSA indexer's incomplete key/gate tails at each block position.
+On partial acceptance, it restores the accepted prefix instead of replaying all
+accepted tokens through the model. The complete pre-block backup remains the
+fallback when capture coverage is incomplete; `DS4_DFLASH_FORCE_REPLAY=1`
+selects the serial replay reference, including fully accepted blocks.
+
+Focused tests compare complete recurrent state, live caches and continued logits
+while changing rejected tokens, including the first rejected row and a pooled-key
+boundary. These tests establish causality for the tested frontiers. They do not
+promise byte equality between all batched and serial arithmetic. See
+`tests/DFLASH-PREFIX.md` for the test scope and reproduction commands. The final
+combined branch still needs its affected correctness, serving and performance
+checks; the adaptive admission policy remains under development.
 
 ### Dispositions
 
 Stated once, so a reader does not have to infer them from the table:
 
-- **DFlash2 speculative decoding is ported but refuses at run time on GLM-5.3.** After
-  upstream widened the speculative state to include the DSA indexer tail, the state the
-  DFlash rollback restores (KDA state only) is narrower than the state a rejected draft
-  has to undo, so the cycle is refused before any target state is mutated and every token
-  is decoded serially. Completing it is Metal-side work (a per-step snapshot of the
-  indexer tail, or full restore plus replay) followed by the certification run above;
-  neither is done here.
+- **DFlash2 speculative decoding is opt-in and greedy-only.** Accepted-prefix
+  snapshots eliminate replay when complete capture is available. Performance is
+  workload-dependent; the less-than-2% negative-impact requirement is not yet met
+  by the current admission policy. Personal-use draft recreation instructions are
+  in `docs/DFLASH_GLM53.md`; draft weights are not distributed here.
 - **Unsupported or untested configurations.** The CUDA and ROCm paths carry small
   GLM-5.3 additions (`ds4_cuda.cu`, `rocm/ds4_rocm_glm.cuh`) that are compile-only as far
   as this branch goes: no CUDA or ROCm machine built or ran them here; tensor
@@ -200,13 +201,14 @@ in `ds4.c`, `ds4_metal.m`, `ds4_cli.c`, `ds4_server.c`, `ds4_gpu.h` and the
 
 Unless a meaning says otherwise, a switch is read as "set to any non-empty value" and
 `=0` is not special; the `DS4_GLM_ENABLE_*` controls that accept `=0` say so. The
-`DS4_DFLASH_*` switches are moot on this branch while DFlash2 is refused.
+`DS4_DFLASH_*` switches take effect on this branch now that DFlash2 runs; `--dflash` is
+opt-in, so they matter only when a drafter is loaded.
 
 | switch | class | meaning | site |
 |---|---|---|---|
 | `DS4_ANTHROPIC_DEFAULT_EFFORT` | supported control | Default reasoning effort for Anthropic-protocol requests that carry none (e.g. Claude Code); explicit request fields still win. | `ds4_server.c:3859` |
-| `DS4_DFLASH_CTX_CAP` | supported control | Caps the drafter's context rows (default about 256; more rows cost draft latency). | `ds4_dflash_glm.inc:166` |
-| `DS4_DFLASH_DISABLE` | supported control | Ignores a loaded DFlash2 drafter and decodes serially. | `ds4.c:58981` |
+| `DS4_DFLASH_CTX_CAP` | supported control | Caps the drafter's context rows (default about 256; more rows cost draft latency). | `ds4_dflash_glm.inc:174`, `ds4_dflash_seed.inc:31` |
+| `DS4_DFLASH_DISABLE` | supported control | Ignores a loaded DFlash2 drafter and decodes serially. | `ds4.c:59216` |
 | `DS4_GLM53_MEMORY_CEILING_GB` | supported control | Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe). | `ds4.c:42037` |
 | `DS4_GLM53_PREFILL_CHUNK` | supported control | Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks). | `ds4.c:37902` |
 | `DS4_GLM_DSA_TAIL_CHECKED` | supported control | =0 restores the legacy unchecked ragged tail in DSA attention (default 1: bounds-checked; registry entry 4). | `ds4_metal.m:41060` |
@@ -228,7 +230,15 @@ Unless a meaning says otherwise, a switch is read as "set to any non-empty value
 | `DS4_SERVER_CHECKPOINT_ON_LENGTH` | supported control | =0 stops recording the thinking checkpoint for turns truncated by max_tokens (default: recorded, so the next turn continues from live KV). | `ds4_server.c:11713` |
 | `DS4_SERVER_CHECKPOINT_WITH_TOOLS` | supported control | =0 stops recording the thinking checkpoint for tool-context turns (default: recorded). | `ds4_server.c:11710` |
 | `DS4_TRACE_MAX_MB` | supported control | Caps the live --trace segment at N MB; the previous segment is kept at <path>.1. | `ds4_server.c:11060` |
-| `DS4_DFLASH_NO_ADAPTIVE` | kill switch | Disables the adaptive break-even throttle that parks speculation when it cannot pay. | `ds4_dflash_glm.inc:212` |
+| `DS4_DFLASH_NO_ADAPTIVE` | kill switch | Disables the adaptive break-even throttle that parks speculation when it cannot pay. | `ds4_dflash_glm.inc:224` |
+| `DS4_DFLASH_NO_WIDE_ROLLBACK` | kill switch | Refuses the speculative cycle on any graph whose speculative state includes the DSA indexer tail (every real GLM-5.3 graph), before any target state is mutated, and decodes serially. Restores this branch's previous behaviour. | `ds4_dflash_glm.inc:88` |
+| `DS4_DFLASH_FORCE_REPLAY` | developer instrumentation (bench-only) | Takes the restore-and-replay rollback even where the per-step snapshot is complete; the correctness oracle for A/B. | `ds4_dflash_glm.inc:89` |
+| `DS4_DFLASH_SCRIPT` | developer instrumentation (bench-only) | Deterministic draft supply `P:K:N,...`: at position P propose N drafts of which the first K are the retained serial continuation and row K is a known-wrong token; unnamed positions decode serially. The verifier is untouched. | `ds4_dflash_script.inc` |
+| `DS4_DFLASH_SCRIPT_IDS` | developer instrumentation (bench-only) | The retained serial continuation the script proposes from. | `ds4_dflash_script.inc` |
+| `DS4_DFLASH_SCRIPT_IDS_OUT` | developer instrumentation (bench-only) | Control arm: record the continuation as "position token" lines. | `ds4_dflash_script.inc` |
+| `DS4_DFLASH_SCRIPT_SERIAL` | developer instrumentation (bench-only) | Control arm: decode every position serially through the same binary and dumps. | `ds4_dflash_script.inc` |
+| `DS4_DFLASH_SCRIPT_DUMP` | developer instrumentation (bench-only) | Directory for frontier logits and per-tensor digests of the complete speculative state. | `ds4_dflash_script.inc` |
+| `DS4_DFLASH_FAIL` | developer instrumentation (bench-only) | Inject a cycle failure at `state_save`, `after_arm` or `after_verify` to exercise the cleanup on those exits. | `ds4_dflash2.inc` |
 | `DS4_DFLASH_NO_SELECTOR` | kill switch | Disables the DFlash2 candidate selector (coherent-chain tracing). | `ds4_dflash_selector.inc:29` |
 | `DS4_DFLASH_SDPA_SCALAR` | kill switch | Forces the scalar SDPA drafter kernel instead of the simdgroup one. | `ds4_metal.m:56113` |
 | `DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK` | kill switch | Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2). | `ds4_metal.m:52173` |
@@ -303,7 +313,7 @@ Unless a meaning says otherwise, a switch is read as "set to any non-empty value
 | `DS4_METAL_DISABLE_GLM53_Q8_QKV` | kill switch | Disables the fused Q8_0 KDA q/k/v decode matvec (separate projections instead). | `ds4.c:45373` |
 | `DS4_SLOT_SCORE_LEGACY` | kill switch | Restores the legacy slot placement instead of eviction-cost scoring (only matters with --batched-session >= 2). | `ds4_server.c:13682` |
 | `DS4_STREAM_GUARD_LEGACY` | kill switch | Restores the old streaming guard that held all answer text until a second </think> when thinking and tools were both enabled. | `ds4_server.c:6553` |
-| `DS4_DFLASH_MIN_MARGIN` | experimental opt-in | Opt-in draft-confidence floor: drops trailing drafts whose top1-top2 logit margin is below N. | `ds4_dflash2.inc:1342` |
+| `DS4_DFLASH_MIN_MARGIN` | experimental opt-in | Opt-in draft-confidence floor: drops trailing drafts whose top1-top2 logit margin is below N. | `ds4_dflash2.inc:1605` |
 | `DS4_GLM_ENABLE_HCX_NR` | experimental opt-in | Selects an HC-expand row-count screening variant (nr2w/nr4/nr4w); mutually exclusive with ptail; not retained as a default. | `ds4_metal.m:51823` |
 | `DS4_GLM_ENABLE_HCX_VECHC` | experimental opt-in | Selects the float4 HC post/comb epilogue on M3 (gated to M5 by upstream policy) for screening. | `ds4_metal.m:51798` |
 | `DS4_GLM_ENABLE_KDA_PROJ_FUSE` | experimental opt-in | All-Q8_0 fusion of the whole KDA projection stage (8 dispatches to 2 per layer); reachable only on an all-Q8 KDA layout such as the public artifact and not yet validated there. | `ds4.c:45302` |
@@ -320,12 +330,12 @@ Unless a meaning says otherwise, a switch is read as "set to any non-empty value
 | `DS4_GLM_ROUTER_NR0` | experimental opt-in | =1 one-row-per-threadgroup router logits kernel (measured indistinguishable; default 2). | `ds4_metal.m:41929` |
 | `DS4_GLM_SHARED_MID_NR0` | experimental opt-in | =1 one-row-per-threadgroup shared-expert mid kernel (within noise; default 2). | `ds4_metal.m:23202` |
 | `DS4_MV_EXT_R1_8` | experimental opt-in | Selects the r1_8 extended matvec variant (measured slower on M3 Ultra; kept for experiments). | `ds4_metal.m:6404` |
-| `DS4_DFLASH_FORCE_DRAFTS` | developer instrumentation (bench-only) | Clamps every block to N+1 drafted rows (certification aid). | `ds4_dflash_glm.inc:250` |
+| `DS4_DFLASH_FORCE_DRAFTS` | developer instrumentation (bench-only) | Caps a block at N drafts, so the verify block is N+1 rows including the anchor. It caps the length only; it does not choose the rejection position. | `ds4_dflash_glm.inc:264` |
 | `DS4_DFLASH_GOLDEN_DIR` | developer instrumentation (bench-only) | Loads drafter goldens from a directory at engine load and exits the process afterwards. | `ds4_dflash_golden.inc:50` |
-| `DS4_DFLASH_STATS` | developer instrumentation (bench-only) | Per-cycle acceptance and timing statistics. | `ds4_dflash2.inc:1375` |
-| `DS4_DFLASH_STEP_PROFILE` | developer instrumentation (bench-only) | Per-stage timing inside a draft step. | `ds4_dflash2.inc:1066` |
-| `DS4_DFLASH_VERIFY_ROWS` | developer instrumentation (bench-only) | Selects the alternate row-verify route (byte-identical to the batch route, not faster). | `ds4_dflash_glm.inc:324` |
-| `DS4_DFLASH_ZERO_FEATURES` | developer instrumentation (bench-only) | Zeroes the drafter's input features so every draft mismatches (certification aid). | `ds4_dflash_glm.inc:256` |
+| `DS4_DFLASH_STATS` | developer instrumentation (bench-only) | Per-cycle acceptance and timing statistics, plus a totals summary at engine close. | `ds4_dflash2.inc:1638` |
+| `DS4_DFLASH_STEP_PROFILE` | developer instrumentation (bench-only) | Per-stage timing inside a draft step. | `ds4_dflash2.inc:1329` |
+| `DS4_DFLASH_VERIFY_ROWS` | developer instrumentation (bench-only) | Selects the alternate row-verify route (byte-identical to the batch route, not faster). | `ds4_dflash_glm.inc:357` |
+| `DS4_DFLASH_ZERO_FEATURES` | developer instrumentation (bench-only) | Zeroes the drafter's input features. It makes a mismatch likely, not certain, and does not choose the rejection position: use `DS4_DFLASH_SCRIPT` for that. | `ds4_dflash_glm.inc:270` |
 | `DS4_GLM_BF16_LOWRANK_SPLITK_SLICES` | developer instrumentation (bench-only) | Forces the split-K slice count. | `ds4_metal.m:52188` |
 | `DS4_GLM_BF16_LOWRANK_SPLITK_TGS` | developer instrumentation (bench-only) | Threadgroups per tile for the split-K (default 16; the gated shape). | `ds4_metal.m:52129` |
 | `DS4_GLM_DENSE_HALF_COPY_MIN_ROWS` | developer instrumentation (bench-only) | Row threshold for the half copy. | `ds4_metal.m:21166` |
@@ -468,8 +478,7 @@ receipt.
   integer","type":"invalid_request_error"}}`. Zero is still accepted and yields an empty
   completion with `finish_reason: length`. Lifecycle test T14 checks it; T7b's
   observational miss in the earlier receipts is this.
-- **DFlash2 is unavailable on this branch** (refused as described above); `--dflash` is
-  accepted, the drafter loads, and decoding is serial with one stderr notice.
+- **DFlash2 remains experimental.** The complete prefix-snapshot path is implemented, but speculative admission does not yet meet the project's less-than-2% negative-impact requirement on low-acceptance workloads. Omit `--dflash` for serial decoding. Positive-temperature requests already use the serial path.
 - **Repeat of a long prompt accounted as a cache hit while the whole prompt was
   rebuilt — fixed on two paths.** Two mechanisms are involved. First, upstream's
   validity check on the memory-rewind path (`ds4_server.c`, the `rewind_valid` test after
@@ -515,8 +524,14 @@ receipt.
       the receipt's numbers and a repository-relative pointer to the retained TSV/JSON.
 - [ ] Exact-mode `cmp` against the upstream `9ab7053` scorer TSV on the public artifact.
 - [ ] Re-validate a vision prompt after the multimodal session-reuse change.
-- [ ] Decide DFlash2: certify a completed rollback with the forced-rejection recipe, or
-      keep the refusal and say so in the README feature list.
+- [ ] Certify DFlash2 at the model level: `tests/dflash_rejection_harness.sh`
+      (deterministic rejection after 0/1/2/3 accepted drafts, on both sides of the
+      4-token pool boundary, plus a full-accept block; token identity, restored state and
+      frontier logits compared against the serial arm), then `tests/dflash_cached_depth.c`
+      at 62k and 300k from a restored payload, then a server smoke.
+- [ ] Decide DFlash2 sampled operation: compute the rejection residual against the
+      target's original filtered support instead of masking a logit, or leave the mode
+      greedy-only.
 - [ ] Decide the MTP row-snapshot path: extend the snapshot to the indexer tail, or
       remove the path and `DS4_GLM_MTP_NO_ROWSNAP`.
 - [ ] Relocate the supported kernels out of `metal/t2screen.metal` into a

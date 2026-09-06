@@ -450,6 +450,14 @@ static void dflash2_embed_row(float *out, const ds4_model *m, const ds4_tensor *
         }
         return;
     }
+    if (w->type == DS4_TENSOR_Q8_0) {
+        /* Same decode the target's own embedding reader uses. */
+        embed_row_q8_0(out,
+                       (const uint8_t *)tensor_data(m, w) +
+                           (uint64_t)token * embed_row_bytes_q8_0(dim),
+                       dim);
+        return;
+    }
     if (w->type == DS4_TENSOR_Q4_K) {
         if (dim % QK_K != 0) ds4_die("Q4_K embed row is not aligned");
         const uint64_t row_bytes = (dim / QK_K) * sizeof(block_q4_K);
@@ -709,14 +717,16 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     w->sliding_window = swa;
     w->rope_freq_base = rope_base;
     w->rms_eps = rms_eps;
-    fprintf(stderr, "ds4: dflash bind rope_base=%.1f rms_eps=%g window=%u mask=%d\n",
-            rope_base, rms_eps, swa, w->mask_token_id);
     w->full_attention_layer = full_layer;
     w->classic = classic;
     if (!model_get_token_id(m, "tokenizer.ggml.mask_token_id", &w->mask_token_id) ||
         w->mask_token_id < 0 || (uint32_t)w->mask_token_id >= DS4_N_VOCAB) {
         return 0;
     }
+    /* after the getter: printing before it reported the previous (zero)
+     * field value, not the mask this drafter actually uses. */
+    fprintf(stderr, "ds4: dflash bind rope_base=%.1f rms_eps=%g window=%u mask=%d\n",
+            rope_base, rms_eps, swa, w->mask_token_id);
 
     w->enc_output_norm = model_find_tensor(m, "enc.output_norm.weight");
     w->fc = model_find_tensor(m, "fc.weight");
@@ -792,6 +802,279 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     w->ready = true;
     return 1;
 }
+
+/* Row types dflash2_embed_row() can decode. Anything else reaches its
+ * ds4_die() -- which is why the target is screened here, before any draft
+ * setup, rather than at the first proposal. */
+static bool dflash2_embed_type_supported(uint32_t type) {
+    return type == DS4_TENSOR_F32 || type == DS4_TENSOR_BF16 ||
+           type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K;
+}
+
+/* Target-side compatibility gate for a bound drafter.
+ *
+ * The drafter is a separate checkpoint but it borrows two target tensors:
+ * token_embd (anchor + mask rows, read per proposal by dflash2_embed_row on
+ * the CPU) and output (its own block head, run through the GPU quantized
+ * matmul at n_tok = n_draft).  Requantizing the target changes both types,
+ * so check them once at load and reject clearly.  The output tensor's type
+ * is not enumerated here: the target's own decode head drives the same
+ * ds4_gpu_matmul_quant_tensor() entry point every token, so a type the
+ * engine can decode with is a type this head can use; only its shape is
+ * asserted.  Returns false with a message in err. */
+static bool dflash2_target_compatible(const ds4_dflash2_weights *dw,
+                                      const ds4_weights *tw,
+                                      char *err, size_t errlen) {
+    const ds4_tensor *te = tw ? tw->token_embd : NULL;
+    const ds4_tensor *outw = tw ? tw->output : NULL;
+    if (!te || te->ndim != 2) {
+        snprintf(err, errlen, "target token_embd is missing or not 2D");
+        return false;
+    }
+    if (!outw || outw->ndim != 2) {
+        snprintf(err, errlen, "target output head is missing or not 2D");
+        return false;
+    }
+    if (te->dim[0] != dw->n_embd || outw->dim[0] != dw->n_embd) {
+        snprintf(err, errlen,
+                 "target embedding width %llu / head width %llu != drafter %u",
+                 (unsigned long long)te->dim[0],
+                 (unsigned long long)outw->dim[0], dw->n_embd);
+        return false;
+    }
+    if (te->dim[1] != outw->dim[1]) {
+        snprintf(err, errlen,
+                 "target embedding rows %llu != head rows %llu",
+                 (unsigned long long)te->dim[1],
+                 (unsigned long long)outw->dim[1]);
+        return false;
+    }
+    if (!dflash2_embed_type_supported(te->type)) {
+        snprintf(err, errlen,
+                 "target token_embd type %u has no DFlash2 row decoder",
+                 te->type);
+        return false;
+    }
+    if ((te->type == DS4_TENSOR_Q4_K || te->type == DS4_TENSOR_Q5_K ||
+         te->type == DS4_TENSOR_Q6_K) && (te->dim[0] % QK_K) != 0) {
+        snprintf(err, errlen,
+                 "target token_embd width %llu is not a K-quant multiple",
+                 (unsigned long long)te->dim[0]);
+        return false;
+    }
+    /* The anchor row is any target token; the mask row is fixed and comes
+     * from the drafter's own metadata, so it has to exist in this table. */
+    if (dw->mask_token_id < 0 ||
+        (uint64_t)dw->mask_token_id >= te->dim[1]) {
+        snprintf(err, errlen,
+                 "drafter mask token %d is outside the target's %llu rows",
+                 dw->mask_token_id, (unsigned long long)te->dim[1]);
+        return false;
+    }
+    for (uint32_t i = 0; i < dw->n_target; i++) {
+        if (dw->target_layers[i] >= DS4_N_LAYER) {
+            snprintf(err, errlen,
+                     "drafter tap layer %u is outside the target's %u layers",
+                     dw->target_layers[i], (unsigned)DS4_N_LAYER);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* ---------------------------------------------------------------------
+ * Cycle failure exits.
+ *
+ * A speculative cycle arms two pieces of process-global instrumentation --
+ * the tap capture and the per-step KDA snapshot -- and then mutates target
+ * state.  Every exit after the arm must disarm; whether the session's
+ * checkpoint survives depends on whether target state was mutated and, if it
+ * was, whether the saved speculative state was actually restored.  The
+ * predicate is here, outside the Metal-only cycle, so it can be tested.
+ * ------------------------------------------------------------------- */
+
+/* mutated: the verify forward ran, so per-token state advanced past the
+ * frontier.  state_saved: a complete speculative-state backup exists.
+ * restore_ok: that backup was restored on this exit. */
+static bool dflash_exit_keeps_checkpoint(bool mutated, bool state_saved,
+                                         bool restore_ok) {
+    if (!mutated) return true;              /* nothing advanced */
+    return state_saved && restore_ok;       /* put back exactly as found */
+}
+
+/* Injected failure points, for exercising those exits without a fault.
+ * DS4_DFLASH_FAIL holds a comma-separated list of point names; matching is
+ * on whole names, so "state_save" does not select "state_save_late".
+ * Test-only: unset, dflash_fail_injected() is a single getenv-cached read. */
+typedef enum {
+    DS4_DFLASH_FAIL_NONE = 0,
+    DS4_DFLASH_FAIL_STATE_SAVE,
+    DS4_DFLASH_FAIL_AFTER_ARM,
+    DS4_DFLASH_FAIL_AFTER_VERIFY,
+} ds4_dflash_fail_point;
+
+static const char *dflash_fail_point_name(ds4_dflash_fail_point p) {
+    switch (p) {
+    case DS4_DFLASH_FAIL_STATE_SAVE:   return "state_save";
+    case DS4_DFLASH_FAIL_AFTER_ARM:    return "after_arm";
+    case DS4_DFLASH_FAIL_AFTER_VERIFY: return "after_verify";
+    default:                           return "";
+    }
+}
+
+static bool dflash_fail_point_selected(const char *spec, const char *name) {
+    if (!spec || !name || !name[0]) return false;
+    const size_t n = strlen(name);
+    for (const char *p = spec; *p; ) {
+        while (*p == ',' || *p == ' ') p++;
+        const char *start = p;
+        while (*p && *p != ',' && *p != ' ') p++;
+        if ((size_t)(p - start) == n && memcmp(start, name, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dflash_fail_injected(ds4_dflash_fail_point point) {
+    static const char *spec;
+    static int cached;
+    if (!cached) { spec = getenv("DS4_DFLASH_FAIL"); cached = 1; }
+    if (!spec) return false;
+    return dflash_fail_point_selected(spec, dflash_fail_point_name(point));
+}
+
+/* ---------------------------------------------------------------------
+ * Overhead accounting.
+ *
+ * The adaptive throttle prices one thing: the wall time of a speculative
+ * cycle against the wall time of a serial token, both measured live.  Some
+ * DFlash cost sits outside that timer and so outside the throttle's view:
+ *
+ *   - the prefill-time tap capture and its readback into the seed ring
+ *     (ds4_dflash_seed.inc), paid per prefill chunk before any cycle runs;
+ *   - the first cycle's ingest of that ring into the drafter's context-KV
+ *     cache, paid before the cycle timer starts;
+ *   - the serial fallbacks the throttle takes while parked, and the
+ *     feature-refresh decodes that carry a tap capture.
+ *
+ * These counters exist so a matched run can report that cost honestly
+ * rather than infer it.  They are measurement only -- nothing reads them to
+ * make a decision.  What they cannot measure is the tap capture inside the
+ * prefill kernels themselves, which has no separable timer: that needs an
+ * A/B prefill with and without --dflash.
+ * ------------------------------------------------------------------- */
+
+typedef struct {
+    uint64_t cycles;            /* full speculative cycles run */
+    uint64_t drafted;           /* draft tokens proposed */
+    uint64_t accepted;          /* draft tokens the target confirmed */
+    uint64_t committed;         /* tokens committed by cycles (incl. anchor) */
+    uint64_t replays;           /* rollbacks that restored + replayed */
+    uint64_t replay_tokens;     /* tokens re-run by those replays */
+    uint64_t stepsnaps;         /* rollbacks served by the per-step snapshot */
+    uint64_t parks;             /* serial tokens taken while parked */
+    uint64_t refreshes;         /* serial tokens taken to refresh features */
+    uint64_t seed_chunks;       /* prefill chunks whose taps were captured */
+    uint64_t seed_rows;         /* prompt rows added to the seed ring */
+    uint64_t ingests;           /* seed-ring ingests into the drafter cache */
+    double   cycle_ms;          /* wall time inside the priced cycle */
+    double   park_ms;           /* wall time of parked serial tokens */
+    double   refresh_ms;        /* wall time of feature-refresh decodes */
+    double   seed_readback_ms;  /* prefill capture readback + ring upkeep */
+    double   ingest_ms;         /* seed-ring ingest (before the cycle timer) */
+} ds4_dflash_overhead;
+
+static ds4_dflash_overhead g_dflash_overhead;
+
+static void dflash_overhead_report(FILE *fp) {
+    const ds4_dflash_overhead *o = &g_dflash_overhead;
+    if (!fp) return;
+    if (o->cycles == 0 && o->parks == 0 && o->refreshes == 0 &&
+        o->seed_chunks == 0) {
+        return;
+    }
+    const double outside = o->seed_readback_ms + o->ingest_ms;
+    fprintf(fp,
+            "ds4: dflash totals: cycles=%llu drafted=%llu accepted=%llu "
+            "committed=%llu (accept_rate=%.3f) rollback stepsnap=%llu "
+            "replay=%llu replay_tokens=%llu\n",
+            (unsigned long long)o->cycles,
+            (unsigned long long)o->drafted,
+            (unsigned long long)o->accepted,
+            (unsigned long long)o->committed,
+            o->drafted ? (double)o->accepted / (double)o->drafted : 0.0,
+            (unsigned long long)o->stepsnaps,
+            (unsigned long long)o->replays,
+            (unsigned long long)o->replay_tokens);
+    fprintf(fp,
+            "ds4: dflash time: cycle=%.1fms park=%.1fms(%llu) "
+            "refresh=%.1fms(%llu) | outside the cycle timer: "
+            "seed_readback=%.1fms(%llu chunks, %llu rows) ingest=%.1fms(%llu) "
+            "= %.1fms\n",
+            o->cycle_ms, o->park_ms, (unsigned long long)o->parks,
+            o->refresh_ms, (unsigned long long)o->refreshes,
+            o->seed_readback_ms, (unsigned long long)o->seed_chunks,
+            (unsigned long long)o->seed_rows,
+            o->ingest_ms, (unsigned long long)o->ingests, outside);
+}
+
+/* ---------------------------------------------------------------------
+ * Speculative-rollback bookkeeping.
+ *
+ * A GLM-5.3 verify forward advances two kinds of per-step state: the KDA
+ * conv/recurrent state, and -- on graphs with full DSA layers -- the indexer
+ * tail K+gate ring. The per-step snapshot covers both. If capture coverage
+ * is incomplete, the cycle instead forces restore+replay. The
+ * decision and the counts that follow from it are pure arithmetic, kept here
+ * (outside the Metal-only cycle) so they can be tested directly.
+ * ------------------------------------------------------------------- */
+
+#include "ds4_dflash_rollback.h"
+
+/* The drafter's context rows and throttle state belong to the position they
+ * were built at; a server slot reused for a new request, or a checkpoint
+ * rewind, moves the frontier backwards and invalidates both. */
+static bool dflash_session_rewound(uint32_t pos, uint32_t last_pos) {
+    return last_pos != 0 && pos < last_pos;
+}
+
+/* ---------------------------------------------------------------------
+ * Drafter conditioning identity.
+ *
+ * The drafter's context-KV cache, its pending tap features and the prefill
+ * seed ring are conditioned on the exact token prefix that produced them.
+ * A moving frontier is not enough to detect when that prefix changes: a
+ * server slot reused for a DIFFERENT request of the same length, or a
+ * restored payload whose prefix is longer than the last one, both leave the
+ * frontier at or ahead of where it was.  Each session therefore carries a
+ * generation that changes whenever its prefix stops being an extension of
+ * what it was -- a non-extending sync, a restored payload, a rewind, an
+ * invalidation -- and conditioning is bound to the generation it was built
+ * for.  Legitimate same-prefix extension keeps the generation, and with it
+ * the drafter's warm context.
+ * ------------------------------------------------------------------- */
+static bool dflash_conditioning_stale(uint64_t bound_gen, uint64_t gen,
+                                      uint32_t pos, uint32_t last_pos) {
+    if (bound_gen != gen) return true;
+    return dflash_session_rewound(pos, last_pos);
+}
+
+/* The prefill seed ring is process-global -- one buffer shared by every
+ * session -- so matching its end position to the frontier is not enough
+ * either. It is usable only by the session and generation that filled it,
+ * and only when it ends exactly at the position about to be decoded.
+ * Generation 0 means "unowned": a cleared or never-filled ring. */
+static bool dflash_seed_ring_usable(uint64_t ring_gen, uint64_t session_gen,
+                                    uint32_t ring_len, uint32_t ring_end_pos,
+                                    uint32_t pos) {
+    if (ring_len == 0) return false;
+    if (ring_gen == 0 || session_gen == 0) return false;
+    if (ring_gen != session_gen) return false;
+    return ring_end_pos == pos;
+}
+
 static int dflash_cache_init(
         ds4_dflash_cache *cache,
         const ds4_dflash2_weights *cfg,
@@ -1574,4 +1857,3 @@ static int dflash2_propose(
     free(normed); free(h); free(fc_out); free(h_ctx);
     return n_out;
 }
-
