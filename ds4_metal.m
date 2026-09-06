@@ -44428,8 +44428,8 @@ static ds4_routed_tile_choice ds4_gpu_glm_routed_tile_choice(uint32_t gate_type,
 
 
 /* ===========================================================================
- * GLM-5.3 expanded-expert one-layer bank (audit addendum 28 section 3;
- * design ~/megakernel-refs/public-artifact/EXPERT-BANK-DESIGN.md rev 3).
+ * GLM-5.3 expanded-expert one-layer bank. See docs/GLM53_M3ULTRA.md
+ * for the guarded profile, scheduling contract and measured scope.
  *
  * One routed layer's three expert tensors are dequantized ONCE into a
  * 13.50 GiB half image laid out in exactly the order kernel_mul_mm_id stages
