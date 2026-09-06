@@ -1,0 +1,87 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+   - Checks if a file exists
+
+108. **picolFileIsDirectory**:
+   - Checks if a path is a directory
+
+109. **picolFileIsFile**:
+   - Checks if a path is a regular file
+
+110. **picolFileList**:
+   - Lists files in a directory
+
+111. **picolFileMkdir**:
+   - Creates a directory
+
+112. **picolFileRead**:
+   - Reads a file
+
+113. **picolFileReadWrite**:
+   - Reads and writes files
+
+114. **picolFileTell**:
+   - Returns the current file position
+
+115. **picolFileSeek**:
+   - Sets the file position
+
+116. **picolFileClose**:
+   - Closes a file handle
+
+117. **picolFileFlush**:
+   - Flushes file buffers
+
+118. **picolFileEof**:
+   - Checks if end of file has been reached
+
+119. **picolFileError**:
+   - Checks if an error occurred on the stream
+
+120. **picolFileSize**:
+   - Gets the file size
+
+121. **picolFileTell**:
+   - Returns the current position in a file
+
+122. **picolFileWrite**:
+   - Writes to a file
+
+123. **picolFileRead**:
+   - Reads from a file
+
+124. **picolFileOpen**:
+   - Opens a file
+
+125. **picolFileClose**:
+   - Closes a file
+
+126. **picolFileFlush**:
+   - Flushes file buffer
+
+127. **picolFileGets**:
+   - Reads a line from a file
+
+128. **picolFilePuts**:
+   - Writes a string to a file
+
+129. **picolFileSeek**:
+   - Seeks to a position in a file
+
+130. **picolFileTell**:
+   - Returns the current position in a file
+
+131. **picolFileRead**:
+   - Reads raw data from a file
+
+132. **picolFileWrite**:
+   - Writes raw data to a file
+
+133. **picolFileClose**:
+   - Closes an open file
+
+134. **picolFileFlush**:
+   - Flushes the file buffer
+
+135. **picolFileSize**:
+   - Returns the size of

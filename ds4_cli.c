@@ -577,7 +577,46 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    /* BENCH-ONLY: DS4_GLM_LOAD_PAYLOAD=<file>
+     * restores a prepared prefix instead of prefilling the prompt, so the
+     * SHIPPED generation loop below (sampler, detokenizer, counters) runs from a
+     * cached state.  It is not a numerics change and is deliberately NOT clamped
+     * by DS4_GLM_EXACT; it only replaces prefill with a restore. */
+    const char *bench_payload = getenv("DS4_GLM_LOAD_PAYLOAD");
+    int sync_rc;
+    double bench_restore_s = 0.0;
+    int bench_pos0 = -1;
+    if (bench_payload && bench_payload[0]) {
+        const double br0 = cli_now_sec();
+        FILE *pf = fopen(bench_payload, "rb");
+        if (!pf) {
+            snprintf(err, sizeof(err), "DS4_GLM_LOAD_PAYLOAD open failed: %s", bench_payload);
+            fprintf(stderr, "ds4: %s\n", err);
+            sync_rc = 1;
+        } else {
+            fseek(pf, 0, SEEK_END);
+            long pb = ftell(pf);
+            fseek(pf, 0, SEEK_SET);
+            sync_rc = ds4_session_load_payload(session, pf, (uint64_t)pb, err, sizeof(err));
+            fclose(pf);
+            bench_restore_s = cli_now_sec() - br0;
+            if (sync_rc == 0) {
+                bench_pos0 = ds4_session_pos(session);
+                fprintf(stderr, "ds4: BENCH payload restored: %s (%ld bytes), session pos=%d, restore_s=%.6f\n",
+                        bench_payload, pb, bench_pos0, bench_restore_s);
+            } else {
+                fprintf(stderr, "ds4: BENCH payload load FAILED (fail closed, no cold fallback): %s\n", err);
+            }
+        }
+    } else {
+        sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    }
+    /* BENCH-ONLY fixed-length policy: under the payload hook, honour
+     * DS4_GLM_IGNORE_EOS exactly as the engine argmax loop does (ds4.c:54733),
+     * so a fixed-length block cannot end early.  Normal serving semantics are
+     * untouched: without DS4_GLM_LOAD_PAYLOAD this is always 0. */
+    const int bench_ignore_eos =
+        (bench_payload && bench_payload[0] && getenv("DS4_GLM_IGNORE_EOS") != NULL) ? 1 : 0;
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
         ds4_session_set_progress(session, NULL, NULL);
@@ -606,6 +645,24 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
+    /* BENCH-ONLY (mirrors the argmax path's RUNFX_IDS; ordered 2026-09-06):
+     * under the SAME condition as the payload adapter -- DS4_GLM_LOAD_PAYLOAD
+     * set -- record the generated token ids so a byte divergence between two
+     * blocks names the first differing EVALUATION instead of needing another
+     * campaign to find it.  The ids are printed AFTER the timed region.
+     * Without the flag `bench_ids` stays NULL, every record site below is one
+     * predictable NULL test, and nothing about the generation changes: no
+     * numerics, no sampling, no stop policy, no output bytes. */
+    int *bench_ids = NULL;
+    int *bench_lens = NULL;   /* bytes this token contributed to stdout */
+    int bench_nids = 0;
+    if (bench_payload && bench_payload[0] && max_tokens > 0) {
+        bench_ids = (int *)calloc((size_t)max_tokens, sizeof(int));
+        bench_lens = (int *)calloc((size_t)max_tokens, sizeof(int));
+        if (!bench_ids || !bench_lens)
+            fprintf(stderr, "ds4: BENCH id recording disabled (allocation of %d ids failed)\n",
+                    max_tokens);
+    }
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
@@ -616,7 +673,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
-        if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
+        if (!bench_ignore_eos && ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
         int toks[17];
         int ntok = 0;
@@ -641,6 +698,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
+            if (bench_ids && bench_lens && bench_nids < max_tokens) {
+                bench_lens[bench_nids] = (int)piece_len; bench_ids[bench_nids++] = token;
+            }
             generated++;
             if (generated >= max_tokens || cli_interrupt_requested()) {
                 continue;
@@ -659,7 +719,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
+            if (!bench_ignore_eos && ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
                 stop = true;
                 break;
             }
@@ -668,6 +728,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
+            if (bench_ids && bench_lens && bench_nids < max_tokens) {
+                bench_lens[bench_nids] = (int)piece_len; bench_ids[bench_nids++] = toks[j];
+            }
             generated++;
             if (generated >= max_tokens) break;
         }
@@ -679,12 +742,53 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    if (bench_payload && bench_payload[0]) {
+        /* BENCH-ONLY: under the payload hook NO prompt was
+         * prefilled -- the [t_prefill0,t_prefill1] interval is the payload
+         * restore.  prompt->len / prefill_s would therefore be a meaningless
+         * "prefill rate" over a prompt that was never evaluated, so the generic
+         * print is suppressed and the interval is relabelled as the restore. */
+        ds4_log(stderr,
+                DS4_LOG_TIMING,
+                "ds4: prefill: n/a (payload restore, no prompt prefill; setup %.6f s), "
+                "generation: %.2f t/s\n",
+                prefill_s,
+                decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    } else {
+        ds4_log(stderr,
+                DS4_LOG_TIMING,
+                "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+                prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+                decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    }
 
+    if (bench_payload && bench_payload[0]) {
+        fprintf(stderr,
+            "ds4: BENCH RECORD route=CLI-session-loop-forced payload=%s pos_initial=%d pos_final=%d "
+            "requested=%d generated=%d evaluated=%d decode_s=%.9f restore_s=%.9f rate_gen_per_s=%.9f stop=%s\n",
+            bench_payload, bench_pos0, ds4_session_pos(session),
+            cfg->gen.n_predict, generated, generated > 0 ? generated - 1 : 0,
+            decode_s, bench_restore_s,
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0,
+            generated >= cfg->gen.n_predict ? "predict_limit" : "early_stop");
+    }
+    if (bench_ids && bench_lens) {
+        /* Printed AFTER the timed region, in the argmax path's RUNFX_IDS format
+         * (campaign-t2-screen/snapfix.c), so the two routes' id lines can be
+         * compared by the same parser. */
+        fprintf(stderr, "ds4: RUNFX_IDS tag=cli-session-loop-forced count=%d", bench_nids);
+        for (int i = 0; i < bench_nids; i++) fprintf(stderr, " %d", bench_ids[i]);
+        fprintf(stderr, "\n");
+        /* Byte lengths, so a byte offset in the .out file maps to an exact
+         * evaluation index without a detokenizer.  Their sum is compared
+         * against the file size by the analysis, which is the check that the
+         * printer wrote each piece verbatim. */
+        fprintf(stderr, "ds4: RUNFX_LENS tag=cli-session-loop-forced count=%d", bench_nids);
+        for (int i = 0; i < bench_nids; i++) fprintf(stderr, " %d", bench_lens[i]);
+        fprintf(stderr, "\n");
+        free(bench_ids); free(bench_lens);
+        bench_ids = NULL; bench_lens = NULL;
+    }
     ds4_session_free(session);
     return 0;
 }

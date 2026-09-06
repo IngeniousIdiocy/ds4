@@ -1,0 +1,23 @@
+ char *dir = (argc == 3) ? argv[2] : "/tmp";
++    char template[1024];
++    int n = snprintf(template, sizeof(template), "%s/picolXXXXXX", dir);
++    if (n < 0 || (size_t)n >= sizeof(template)) {
++        picolSetResult(i,"Temp file path too long");
++        return PICOL_ERR;
++    }
++    int fd = mkstemp(template);
++    if (fd == -1) {
++        char buf[1024];
++        snprintf(buf,sizeof(buf),"Cannot create temp file in '%s': %s",dir,strerror(errno));
++        picolSetResult(i,buf);
++        return PICOL_ERR;
++    }
++    close(fd);
++    picolSetResult(i,template);
++    return PICOL_OK;
++}
++
++/* file subcommand dispatch */
++int picolCommandFile(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
++    if (argc < 2) return picolArityErr(i, argv[0]);
++    static const char

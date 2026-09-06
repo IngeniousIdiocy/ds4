@@ -1,0 +1,26 @@
+ picolSetResult(i,data);
++    free(data);
++    return PICOL_OK;
++}
++
++/* file write filename data */
++static int picolFileWrite(struct picolInterp *i, int argc, char **argv) {
++    if (argc != 4) return picolArityErr(i, argv[0]);
++    FILE *fp = fopen(argv[2],"wb");
++    if (!fp) {
++        char buf[1024];
++        snprintf(buf,sizeof(buf),"Cannot write file '%s': %s",argv[2],strerror(errno));
++        picolSetResult(i,buf);
++        return PICOL_ERR;
++    }
++    size_t len = strlen(argv[3]);
++    size_t written = fwrite(argv[3], 1, len, fp);
++    if (written != len) {
++        char buf[1024];
++        snprintf(buf,sizeof(buf),"Cannot write file '%s': %s",argv[2],strerror(errno));
++        picolSetResult(i,buf);
++        fclose(fp);
++        return PICOL_ERR;
++    }
++    fclose(fp);
++   

@@ -1,0 +1,55 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
++        /* Return everything before the last / */
++        while (p > s && *(p-1) == '/') p--;
++        if (p == s) {
++            picolSetResult(i,"/");
++        } else {
++            size_t len = p - s;
++            char *res = xmalloc(len+1);
++            memcpy(res, s, len);
++            res[len] = '\0';
++            picolSetResult(i,res);
++            free(res);
++        }
++    }
++    return PICOL_OK;
++}
++
++/* file tail path */
++static int picolFileTail(struct picolInterp *i, int argc, char **argv) {
++    if (argc != 3) return picolArityErr(i, argv[0]);
++    char *s = argv[2];
++    char *p = s + strlen(s);
++    /* Skip trailing slashes */
++    while (p > s && *(p-1) == '/') p--;
++    /* Find last / */
++    char *last = p;
++    while (p > s && *--p != '/') ;
++    if (*p == '/') p++;
++    size_t len = last - p;
++    char *res = xmalloc(len+1);
++    memcpy(res, p, len);
++    res[len] = '\0';
++    picolSetResult(i,res);
++    free(res);
++    return PICOL_OK;
++}
++
++/* file mkdir dirname */
++static int picolFileMkdir(struct picolInterp *i, int argc, char **argv) {
++    if (argc != 3) return picolArityErr(i, argv[0]);
++    if (mkdir(argv[2], 0755) == -1) {
++        char buf[1024];
++        snprintf(buf,sizeof(buf),"Cannot create directory '%s': %s",argv[2],strerror(errno));
++        picolSetResult(i,buf);
++        return PICOL_ERR;
++    }
++    picolSetResult(i,"");
++    return PICOL_OK;
++}
++
++/* file tempfile ?dir? */
++static int picolFileTempfile(struct picolInterp *i, int argc, char **argv) {
++    if (argc != 2 && argc != 3) return picolArityErr(i, argv[0]);
++    const

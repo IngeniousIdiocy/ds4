@@ -56291,6 +56291,17 @@ static int generate_glm_metal_argmax(
 
     int n_generated = 0;
     int n_decode_eval = 0;
+    /* TOPK-LEVER: gate reporting.  Output bytes are not tokens, so a speed
+     * gate has to print the loop's own counters and why it stopped.
+     * DS4_GLM_GEN_COUNTERS=1. */
+    const char *stop_reason = "predict_limit_loop";
+    /* TOPK-LEVER gate aid: at 300k a prefill costs 11 minutes and an
+     * EOS-terminated decode only ~3.4 s, so an A/B pair spends 99.5% of the
+     * GPU on prefill.  DS4_GLM_IGNORE_EOS=1 keeps decoding to -n so the paired
+     * measurement gets a usable decode window per prefill.  Default off; it
+     * changes the generated text (it continues past EOS) but identically in
+     * both arms, so the byte comparison between arms is unaffected. */
+    const int ignore_eos = getenv("DS4_GLM_IGNORE_EOS") != NULL;
     uint32_t pos = (uint32_t)prompt->len;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
     const double t_decode0 = now_sec();
@@ -56301,11 +56312,14 @@ static int generate_glm_metal_argmax(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
         const int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (vocab_token_is_generation_stop(vocab, token)) break;
+        if (!ignore_eos && vocab_token_is_generation_stop(vocab, token)) {
+            stop_reason = "eos"; break;
+        }
         if (emit) emit(emit_ud, token);
         n_generated++;
 
         if (i == n_predict - 1 || pos + 1u >= g.ctx_size) {
+            stop_reason = (i == n_predict - 1) ? "predict_limit" : "ctx_limit";
             pos++;
             break;
         }
@@ -56339,6 +56353,16 @@ static int generate_glm_metal_argmax(
             "ds4: GLM prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+    if (getenv("DS4_GLM_GEN_COUNTERS") != NULL) {
+        fprintf(stderr,
+                "ds4: GLM gen counters: n_generated=%d n_decode_eval=%d "
+                "prompt_len=%u final_pos=%u ctx=%u n_predict=%d "
+                "decode_s=%.6f ms_per_eval=%.4f stop=%s\n",
+                n_generated, n_decode_eval, (uint32_t)prompt->len, pos,
+                g.ctx_size, n_predict, decode_s,
+                n_decode_eval > 0 ? decode_s * 1000.0 / (double)n_decode_eval : 0.0,
+                stop_reason);
+    }
 
     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
     free(logits);

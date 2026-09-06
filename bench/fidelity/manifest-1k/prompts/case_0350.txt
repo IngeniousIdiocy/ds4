@@ -1,0 +1,130 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+it would come to immediate trial if your lordship would vouchsafe the
+answer.
+
+HAMLET.
+How if I answer no?
+
+OSRIC.
+I mean, my lord, the opposition of your person in trial.
+
+HAMLET.
+Sir, I will walk here in the hall. If it please his Majesty, it is the
+breathing time of day with me. Let the foils be brought, the gentleman
+willing, and the King hold his purpose, I will win for him if I can; if
+not, I will gain nothing but my shame and the odd hits.
+
+OSRIC.
+Shall I re-deliver you e’en so?
+
+HAMLET.
+To this effect, sir; after what flourish your nature will.
+
+OSRIC.
+I commend my duty to your lordship.
+
+HAMLET.
+Yours, yours.
+
+[_Exit Osric._]
+
+He does well to commend it himself, there are no tongues else for’s
+turn.
+
+HORATIO.
+This lapwing runs away with the shell on his head.
+
+HAMLET.
+He did comply with his dug before he suck’d it. Thus has he,—and many
+more of the same bevy that I know the drossy age dotes on,— only got
+the tune of the time and outward habit of encounter; a kind of yeasty
+collection, which carries them through and through the most fanned and
+winnowed opinions; and do but blow them to their trial, the bubbles are
+out.
+
+Enter a Lord.
+
+LORD.
+My lord, his Majesty commended him to you by young Osric, who brings
+back to him that you attend him in the hall. He sends to know if your
+pleasure hold to play with Laertes or that you will take longer time.
+
+HAMLET.
+I am constant to my purposes, they follow the King’s pleasure. If his
+fitness speaks, mine is ready. Now or whensoever, provided I be so able
+as now.
+
+LORD.
+The King and Queen and all are coming down.
+
+HAMLET.
+In happy time.
+
+LORD.
+The Queen desires you to use some gentle entertainment to Laertes
+before you fall to play.
+
+HAMLET.
+She well instructs me.
+
+[_Exit Lord._]
+
+HORATIO.
+You will lose this wager, my lord.
+
+HAMLET.
+I do not think so. Since he went into France, I have been in continual
+practice. I shall win at the odds. But thou wouldst not think how ill
+all’s here about my heart: but it is no matter.
+
+HORATIO.
+Nay, good my lord.
+
+HAMLET.
+It is but foolery; but it is such a kind of gain-giving as would
+perhaps trouble a woman.
+
+HORATIO.
+If your mind dislike anything, obey it. I will forestall their repair
+hither, and say you are not fit.
+
+HAMLET.
+Not a whit, we defy augury. There’s a special providence in the fall of
+a sparrow. If it be now, ’tis not to come; if it be not to come, it
+will be now; if it be not now, yet it will come. The readiness is all.
+Since no man has aught of what he leaves, what is’t to leave betimes?
+
+Enter King, Queen, Laertes, Lords, Osric and Attendants with foils &c.
+
+KING.
+Come, Hamlet, come, and take this hand from me.
+
+[_The King puts Laertes’s hand into Hamlet’s._]
+
+HAMLET.
+Give me your pardon, sir. I have done you wrong;
+But pardon’t as you are a gentleman.
+This presence knows, and you must needs have heard,
+How I am punish’d with sore distraction.
+What I have done
+That might your nature, honour, and exception
+Roughly awake, I here proclaim was madness.
+Was’t Hamlet wrong’d Laertes? Never Hamlet.
+If Hamlet from himself be ta’en away,
+And when he’s not himself does wrong Laertes,
+Then Hamlet does it not, Hamlet denies it.
+Who does it, then? His madness. If’t be so,
+Hamlet is of the faction that is wrong’d;
+His madness is poor Hamlet’s enemy.
+Sir, in this audience,
+Let my disclaiming from a purpos’d evil
+Free me so far in your most generous thoughts
+That I have shot my arrow o’er the house
+And hurt my brother.
+
+LAERTES.
+I am satisfied in nature,
+Whose motive in this case should stir me most
+To my revenge. But in my terms of honour
+I stand

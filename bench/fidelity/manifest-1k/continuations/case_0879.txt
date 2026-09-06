@@ -1,0 +1,22 @@
+ `file delete`, `file exists`, `file join`) to the Picol interpreter, plus a safety fix for division by zero in expressions.
+
+## Issues & Recommendations
+
+### 1. Missing error handling for `fopen` failure in `picolFileWrite`
+**File:** `picol.c`, around line 777
+
+The helper function `picolReadFile` checks if `fopen` fails and returns NULL, but the error message in `picolFileWrite` is missing:
+
+```c
+    FILE *fp = fopen(argv[2],"wb");
+    if (!fp) {
+        char buf[1024];
+        snprintf(buf,sizeof(buf),"Cannot write file '%s': %s",argv[2],strerror(errno));
+        picolSetResult(i,buf);
+        return PICOL_ERR;
+    }
+```
+
+This is correct, but let me verify the code is actually present.
+
+Looking at the diff, I see `picolFileWrite` is a new function that was added. The code shown includes

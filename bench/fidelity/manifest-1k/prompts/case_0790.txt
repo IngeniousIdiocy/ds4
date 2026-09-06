@@ -1,0 +1,27 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+<｜begin▁of▁sentence｜>You are a careful assistant. Read the story, remember the assignments, and answer the final task exactly.<｜User｜>You are reading a long story from the harbor town of Bellwether. The story is
+ordinary on purpose: people speak, walk, remember, repair things, argue about
+weather, and sometimes receive a private assignment number written out in
+words. Your job at the end is to recover the assignment numbers.
+
+Important rule while reading: only assignments stated as "was assigned the
+number ..." count. Other ages, prices, dates, distances, room numbers, rumors,
+or guesses do not count. The assignment numbers in the story are written in
+words, not numerals.
+
+At first light the harbor smelled of rope, rain, and cedar smoke. Elena crossed
+the quay with a folded map tucked under one arm, stopping whenever gulls made a
+mess of the chalk marks near the fish stalls. Nadia had promised to fix the
+south gate before supper, but the hinges complained so loudly that everyone
+pretended not to hear them. In the bakery window, loaves cooled beneath linen
+while a child counted shells in a wooden bowl. No one was in a hurry, because
+Bellwether moved by tide and habit, not by the bells on the council tower.
+
+The archivist Mara wrote notes in brown ink, never black, because black ink made
+old ledgers look like court summonses. She watched Elena and Nadia pass the
+fountain, then added a line about the morning fog. Her notes often wandered into
+small details: the color of a scarf, the chipped rim of a cup, the way a door
+kept opening after it had been firmly shut.
+
+By noon the

@@ -1,0 +1,62 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+
+22. **picolFileOpen**:
+   - Opens a file for reading or writing
+
+23. **picolFileRead**:
+   - Reads from a file
+
+24. **picolFileWrite**:
+   - Writes to a file
+
+25. **picolFileClose**:
+   - Closes a file
+
+26. **picolFileReadInteger**:
+   - Reads an integer from a file
+
+27. **picolFileWriteInteger**:
+   - Writes an integer to a file
+
+28. **picolFileReadDoubles**:
+   - Reads doubles from a file
+
+29. **picolFileWriteDouble**:
+   - Writes a double to a file
+
+30. **picolFileReadString**:
+   - Reads a string from a file
+
+31. **picolFileWriteString**:
+   - Writes a string to a file
+
+32. **picolFileSeek**:
+   - Seeks to a position in a file
+
+33. **picolFileTell**:
+   - Returns the current position in a file
+
+34. **picolFileEof**:
+   - Tests for end of file
+
+35. **picolFileClose**:
+   - Closes a file handle
+
+36. **picolFileFlush**:
+   - Flushes the file buffer
+
+37. **picolFileSize**:
+   - Returns the size of the file
+
+38. **picolFileTell**:
+   - Returns the current position in the file
+
+39. **picolFileGetc**:
+   - Reads the next character from the file stream
+
+40. **picolFileUngetc**:
+   - Puts a character back into the file stream
+
+41. **picolFileGetMore**:
+   - Reads more data from the

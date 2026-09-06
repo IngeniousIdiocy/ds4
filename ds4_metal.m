@@ -2038,17 +2038,56 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+static _Atomic double g_allcb_busy_s;
+static _Atomic uint64_t g_allcb_count;
+
+/* DS4_METAL_GPU_BUSY_PROFILE: accumulate the GPU span of EVERY command
+ * buffer (including commit-without-wait flushes, which the wait-side hook
+ * never sees). On a serial queue spans don't overlap, so wall - sum(span)
+ * = GPU idle (encode stalls + launch gaps between buffers). */
+static void ds4_gpu_busy_track(id<MTLCommandBuffer> cb) {
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        const double span = done.GPUEndTime - done.GPUStartTime;
+        if (span > 0) {
+            double cur = atomic_load(&g_allcb_busy_s);
+            while (!atomic_compare_exchange_weak(&g_allcb_busy_s, &cur,
+                                                 cur + span)) { }
+        }
+        const uint64_t n = atomic_fetch_add(&g_allcb_count, 1) + 1;
+        if ((n % 256u) == 0u) {
+            fprintf(stderr, "ds4: allcb busy %.1f ms over %llu cbs\n",
+                    atomic_load(&g_allcb_busy_s) * 1000.0,
+                    (unsigned long long)n);
+        }
+    }];
+}
+
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     static int initialized;
     static int use_unretained;
+    static int busy_profile;
     if (!initialized) {
         use_unretained = getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") != NULL;
+        busy_profile = getenv("DS4_METAL_GPU_BUSY_PROFILE") != NULL;
         initialized = 1;
     }
-    if (use_unretained) {
-        return [g_queue commandBufferWithUnretainedReferences];
+    id<MTLCommandBuffer> cb = use_unretained ?
+        [g_queue commandBufferWithUnretainedReferences] :
+        [g_queue commandBuffer];
+    if (busy_profile && cb) ds4_gpu_busy_track(cb);
+    if (g_ledger_mode && cb) {
+        g_ledger_cbs++;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            const double s = done.GPUStartTime, e = done.GPUEndTime;
+            if (e > s) {
+                g_ledger_cb_gpu_s += e - s;
+                if (g_ledger_wall_first == 0.0 || s < g_ledger_wall_first)
+                    g_ledger_wall_first = s;
+                if (e > g_ledger_wall_last) g_ledger_wall_last = e;
+            }
+        }];
     }
-    return [g_queue commandBuffer];
+    return cb;
 }
 
 static uint64_t ds4_gpu_exact_view_cache_limit_bytes(void) {
@@ -4617,6 +4656,21 @@ static int ds4_gpu_trace_allocs(void) {
     static int enabled;
     if (!initialized) {
         enabled = getenv("DS4_METAL_TRACE_ALLOCS") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+/* Prefill-campaign instrumentation (default off).  DS4_METAL_PRETOUCH_TENSORS=1
+ * faults every owned tensor's pages in on the CPU at allocation time, so that a
+ * measurement can separate "the buffer is bigger" from "the first GPU touch of
+ * the buffer pays the page-in". */
+static int ds4_gpu_pretouch_tensors(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *e = getenv("DS4_METAL_PRETOUCH_TENSORS");
+        enabled = e && e[0] && e[0] != '0';
         initialized = 1;
     }
     return enabled;
@@ -10111,6 +10165,9 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
+        if (ds4_gpu_pretouch_tensors()) {
+            memset([tensor.buffer contents], 0, (size_t)bytes);
+        }
         uint64_t live_snap = 0;
         uint64_t peak_snap = 0;
         pthread_mutex_lock(&g_tensor_mu);

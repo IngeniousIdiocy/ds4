@@ -1,0 +1,28 @@
+ {
++        size_t partlen = strlen(argv[j]);
++        if (j > 2) *p++ = '/';
++        memcpy(p, argv[j], partlen);
++        p += partlen;
++    }
++    *p = '\0';
++    picolSetResult(i, result);
++    free(result);
++    return PICOL_OK;
++}
++
++/* file dirname path */
++static int picolFileDirname(struct picolInterp *i, int argc, char **argv) {
++    if (argc != 3) return picolArityErr(i, argv[0]);
++    char *s = argv[2];
++    char *p = s + strlen(s);
++    /* Skip trailing slashes */
++    while (p > s && *(p-1) == '/') p--;
++    /* Find last / */
++    while (p > s && *--p != '/') ;
++    if (p == s && *p == '/') {
++        /* Root directory: dirname of / is / */
++        picolSetResult(i,"/");
++    } else if (p == s) {
++        /* No / found, return "." */
++        picolSetResult(i,".");
++    }

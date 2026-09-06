@@ -1,0 +1,18 @@
+ /tmp/picol_test.txt") == PICOL_OK);
++    test(++t, "file exists after delete",
++        eval_ok(interp, "file exists /tmp/picol_test.txt", "0"));
++    test(++t, "file join two",
++        eval_ok(interp, "file join /tmp foo", "/tmp/foo"));
++    test(++t, "file join three",
++        eval_ok(interp, "file join /tmp a b", "/tmp/a/b"));
++    test(++t, "file dirname",
++        eval_ok(interp, "file dirname /tmp/foo/bar", "/tmp/foo"));
++    test(++t, "file dirname root",
++        eval_ok(interp, "file dirname /", "/"));
++    test(++t, "file dirname no slash",
++        eval_ok(interp, "file dirname foo", "."));
++    test(++t, "file tail",
++        eval_ok(interp, "file tail /tmp/foo/bar", "bar"));
++    test(++t, "file tail no dir",
++        eval_ok(interp, "file tail bar", "bar"));
++   

@@ -1,0 +1,9 @@
+ lighthouse blinked with patient regularity (note 01303).
+She sharpened a pencil, rejected it, and returned to brown ink (note 01304).
+The festival ledger had grown heavy with the week: weather notes, repairs, errands, apologies, and a few facts she underlined only once so they would not look too important (note 01305).
+Final task:  Compile the assignment ledger from the story (note 01306).
+Convert the spelled-out numbers to ordinary decimal numerals (note 01307).
+The first example line is Bob=34; include that line and all remaining people (note 01308).
+People to list: Bob, Alice, Clara, Diego, Elena, Felix, Greta, Hugo, Iris, Jonas, Kira, Leo, Marta, Nadia, Owen, Priya (note 01309).
+<｜begin▁of▁sentence｜>You are a careful assistant (note 01310).
+Read the story, remember the assignments,

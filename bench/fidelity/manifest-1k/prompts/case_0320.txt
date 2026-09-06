@@ -1,0 +1,65 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+A scullion! Fie upon’t! Foh!
+About, my brain! I have heard
+That guilty creatures sitting at a play,
+Have by the very cunning of the scene,
+Been struck so to the soul that presently
+They have proclaim’d their malefactions.
+For murder, though it have no tongue, will speak
+With most miraculous organ. I’ll have these players
+Play something like the murder of my father
+Before mine uncle. I’ll observe his looks;
+I’ll tent him to the quick. If he but blench,
+I know my course. The spirit that I have seen
+May be the devil, and the devil hath power
+T’assume a pleasing shape, yea, and perhaps
+Out of my weakness and my melancholy,
+As he is very potent with such spirits,
+Abuses me to damn me. I’ll have grounds
+More relative than this. The play’s the thing
+Wherein I’ll catch the conscience of the King.
+
+[_Exit._]
+
+
+
+
+ACT III
+
+SCENE I. A room in the Castle.
+
+
+Enter King, Queen, Polonius, Ophelia, Rosencrantz and Guildenstern.
+
+KING.
+And can you by no drift of circumstance
+Get from him why he puts on this confusion,
+Grating so harshly all his days of quiet
+With turbulent and dangerous lunacy?
+
+ROSENCRANTZ.
+He does confess he feels himself distracted,
+But from what cause he will by no means speak.
+
+GUILDENSTERN.
+Nor do we find him forward to be sounded,
+But with a crafty madness keeps aloof
+When we would bring him on to some confession
+Of his true state.
+
+QUEEN.
+Did he receive you well?
+
+ROSENCRANTZ.
+Most like a gentleman.
+
+GUILDENSTERN.
+But with much forcing of his disposition.
+
+ROSENCRANTZ.
+Niggard of question, but of our demands,
+Most free in his reply.
+
+QUEEN.
+Did you assay him to any

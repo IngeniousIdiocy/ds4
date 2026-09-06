@@ -1,0 +1,36 @@
+ **picolOpenEvent**:
+   - Opens a file for both reading and writing with event-driven I/O
+
+183. **picolOpenEventBinary**:
+   - Opens a binary file for reading and writing with event-driven I/O
+
+184. **picolFlush**:
+   - Flushes the file handle
+
+185. **picolPuts**:
+    - Writes a string to a file handle
+
+186. **picolGets**:
+    - Reads a line from a file handle
+
+187. **picolClose**:
+    - Closes a file handle
+
+188. **picolFlushChannel**:
+    - Flushes the output buffer of the given FILE
+
+189. **picolGetsChannel**:
+    - Reads a line from a channel
+
+190. **picolPutsChannel**:
+    - Writes a string to a channel
+
+191. **picolOpenChannel**:
+    - Opens a channel for I/O
+
+192. **picolCloseChannel**:
+    - Closes a channel
+
+193. **picolEof**:
+    - Checks for end-of-file condition
+    - Returns

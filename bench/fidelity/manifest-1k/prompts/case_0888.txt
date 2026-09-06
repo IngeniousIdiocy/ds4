@@ -1,0 +1,39 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+
+gitStatus: This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.
+
+Current branch: main
+
+Main branch (you will usually use this for PRs): main
+
+Git user: antirez
+
+Status:
+M picol.c
+ M picol_test.c
+
+Recent commits:
+5f902e9 Fix security issues in #1 + one more.
+a1a2595 README: better readability of the design part.
+27c3d8c README: highlight sentences in the design section.
+eb53d69 README: specify more clearly that we have expr in v2.
+d335311 Picol version 2
+
+## Tools
+
+You have access to a set of tools to help answer the user question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="$TOOL_NAME">
+<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>
+...
+</｜DSML｜invoke>
+<｜DSML｜invoke name="$TOOL_NAME2">
+...
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you

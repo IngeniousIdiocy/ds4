@@ -1,0 +1,27 @@
+ with /fast and is only available on Opus 4.6.
+
+# Context management
+When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.
+
+gitStatus: This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.
+
+Current branch: main
+
+Main branch (you will usually use this for PRs): main
+
+Git user: antirez
+
+Status:
+M picol.c
+ M picol_test.c
+
+Recent commits:
+5f902e9 Fix security issues in #1 + one more.
+a1a2595 README: better readability of the design part.
+27c3d8c README: highlight sentences in the design section.
+eb53d69 README: specify more clearly that we have expr in v2.
+d335311 Picol version 2
+
+## Tools
+
+You have

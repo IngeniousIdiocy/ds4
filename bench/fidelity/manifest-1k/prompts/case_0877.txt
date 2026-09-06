@@ -1,0 +1,101 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+   - Truncates and copies a file
+
+150. **picolFileDelete**:
+   - Deletes a file
+
+151. **picolFileIsDirectory**:
+   - Checks if a path is a directory
+
+152. **picolFileMkdir**:
+   - Creates a directory
+
+153. **picolFileCurrent**:
+   - Gets the current directory
+
+154. **picolFileJoin**:
+   - Joins path components
+
+155. **picolFileList**:
+   - Lists files in a directory
+
+156. **picolFileSplit**:
+   - Splits a path into its components
+
+157. **picolFileVolume**:
+   - Gets the volume of a path
+
+158. **picolFileType**:
+   - Gets file type
+
+159. **picolFileStat**:
+   - Gets file statistics
+
+160. **picolFileCopy**:
+   - Copies a file
+
+161. **picolFileCopyFile**:
+   - Copies a file by copying chunks
+
+162. **picolFileRename**:
+   - Renames a file
+
+163. **picolFileDelete**:
+   - Deletes a file
+
+164. **picolFileMkdir**:
+   - Creates a directory
+
+165. **picolFileIsDir**:
+   - Checks if a path is a directory
+
+166. **picolFileIsFile**:
+   - Checks if a path is a file
+
+167. **picolFileReadDir**:
+   - Reads a directory
+
+168. **picolFileOpen**:
+   - Opens a file for reading/writing
+
+169. **picolFileRead**:
+   - Reads from a file descriptor
+
+170. **picolFileWrite**:
+   - Writes to a file descriptor
+
+171. **picolFileClose**:
+   - Closes a file descriptor
+
+172. **picolFileFlush**:
+   - Flushes file buffers
+
+173. **picolFileTell**:
+   - Returns the current position in a file
+
+174. **picolFileSeek**:
+   - Seeks to a position in a file
+
+175. **picolFileReadBinary**:
+   - Reads binary data from a file
+
+176. **picolFileWriteBinary**:
+   - Writes binary data to a file
+
+177. **picolFileReadWrite**:
+   - Opens a file for reading and writing
+
+178. **picolOpenEvent**:
+   - Opens a file for reading with event-driven I/O
+
+179. **picolOpenEventBinary**:
+   - Opens a binary file for reading with event-driven I/O
+
+180. **picolOpenEventWrite**:
+   - Opens a file for writing with event-driven I/O
+
+181. **picolOpenEventWriteBinary**:
+   - Opens a binary file for writing with event-driven I/O
+
+182.

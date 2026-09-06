@@ -1,0 +1,51 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+
+OPHELIA.
+’Tis in my memory lock’d,
+And you yourself shall keep the key of it.
+
+LAERTES.
+Farewell.
+
+[_Exit._]
+
+POLONIUS.
+What is’t, Ophelia, he hath said to you?
+
+OPHELIA.
+So please you, something touching the Lord Hamlet.
+
+POLONIUS.
+Marry, well bethought:
+’Tis told me he hath very oft of late
+Given private time to you; and you yourself
+Have of your audience been most free and bounteous.
+If it be so,—as so ’tis put on me,
+And that in way of caution,—I must tell you
+You do not understand yourself so clearly
+As it behoves my daughter and your honour.
+What is between you? Give me up the truth.
+
+OPHELIA.
+He hath, my lord, of late made many tenders
+Of his affection to me.
+
+POLONIUS.
+Affection! Pooh! You speak like a green girl,
+Unsifted in such perilous circumstance.
+Do you believe his tenders, as you call them?
+
+OPHELIA.
+I do not know, my lord, what I should think.
+
+POLONIUS.
+Marry, I’ll teach you; think yourself a baby;
+That you have ta’en these tenders for true pay,
+Which are not sterling. Tender yourself more dearly;
+Or,—not to crack the wind of the poor phrase,
+Running it thus,—you’ll tender me a fool.
+
+OPHELIA.
+My lord, he hath importun’d me with love
+In honourable

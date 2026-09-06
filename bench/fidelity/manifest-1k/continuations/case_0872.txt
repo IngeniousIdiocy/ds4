@@ -1,0 +1,32 @@
+ error check. Let me re-read:
+
+```
+int fd = mkstemp(template);
+if (fd == -1) {
+    // error handling
+}
+close(fd);
+```
+
+So `close(fd)` is only called if mkstemp succeeds (fd != -1). That's correct.
+
+Wait, actually looking at the code again:
+```
+int fd = mkstemp(template);
+if (fd == -1) {
+    // error handling
+    return ...
+}
+close(fd);
+```
+Yes, that's correct.
+
+Now let me look at the full diff and provide a thorough code review.</think>
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="Bash">
+<｜DSML｜parameter name="command" string="true">git diff --stat</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>picol.c      | 233 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ picol_test.c |  53 ++++++++++++++
+ 2 files changed, 285 insertions(+), 1

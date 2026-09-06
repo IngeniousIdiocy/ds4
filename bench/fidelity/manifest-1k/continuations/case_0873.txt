@@ -1,0 +1,40 @@
+ minimal.
+
+9. **picolFileRename**:
+   - Renames a file using `rename()` and returns 1 if successful.
+
+10. **picolFileSeparator**:
+   - Returns the path separator (a string) for the platform (e.g., "/" or "\\").
+
+11. **picolFileList**:
+   - Lists files in a directory with a given pattern
+
+12. **picolFileDir**:
+   - Returns directory part of a path
+
+13. **picolFileRoot**:
+   - Returns file root part of a path
+
+14. **picolFileExtension**:
+   - Returns file extension
+
+15. **picolFileTail**:
+   - Returns the tail of a path
+
+16. **picolFileTempfile**:
+   - Returns a temporary file name
+
+17. **picolFileMkdir**:
+   - Creates a directory
+
+18. **picolFileRm**:
+   - Removes a file
+
+19. **picolFileCopy**:
+   - Copies a file
+
+20. **picolFileRename**:
+   - Renames a file
+
+21. **picolFileStat**:
+   -

@@ -1,0 +1,41 @@
+ **picolReturn**:
+    - Return command implementation
+
+255. **picolBreak**:
+    - Break command implementation
+
+256. **picolLet**:
+    - Let command implementation
+
+257. **picolWhile**:
+    - While command implementation
+
+258. **picolFor**:
+    - For command implementation
+
+259. **picolForeach**:
+    - Foreach command implementation
+
+260. **picolCatch**:
+    - Catch command implementation
+
+261. **picolReturnReturnCode**:
+    - Return code handling
+
+262. **picolExpr**:
+    - Expression evaluation implementation
+
+263. **picolSet**:
+    - Set command implementation
+
+264. **picolManipulate**:
+    - Manipulate command implementation
+
+265. **picolIf**:
+    - If command implementation
+
+266. **picolWhile**:
+    - While command implementation
+
+267. **picolFor**:
+    - For command

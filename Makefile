@@ -71,7 +71,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-small-fuse-bench check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -137,6 +137,22 @@ speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
+
+speed-bench/metal_small_fuse_bench.o: speed-bench/metal_small_fuse_bench.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/metal_small_fuse_bench: speed-bench/metal_small_fuse_bench.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+metal-small-fuse-bench: speed-bench/metal_small_fuse_bench
+
+speed-bench/metal_depth_select_bench.o: speed-bench/metal_depth_select_bench.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/metal_depth_select_bench: speed-bench/metal_depth_select_bench.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+metal-depth-select-bench: speed-bench/metal_depth_select_bench
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<

@@ -1,0 +1,45 @@
+ file into the buffer
+
+42. **picolFileRead**:
+   - Reads a line from the file
+
+43. **picolFileEof**:
+   - Checks if the file is at the end
+
+44. **picolFileClose**:
+   - Closes the file
+
+45. **picolFileFlush**:
+   - Flushes the file buffer
+
+46. **picolFileSeek**:
+   - Seeks to a specific position in the file
+
+47. **picolFileTell**:
+   - Returns the current position in the file
+
+48. **picolFileWrite**:
+   - Writes to a file
+
+49. **picolFileRead**:
+   - Reads from a file
+
+50. **picolFileOpen**:
+   - Opens a file
+
+51. **picolFileClose**:
+   - Closes a file
+
+52. **picolFileFlush**:
+   - Flushes the file buffer
+
+53. **picolFileEof**:
+   - Checks for end of file
+
+54. **picolFileSize**:
+   - Gets the size of a file
+
+55. **picolFileTell**:
+   - Gets the current position in a file
+
+56.

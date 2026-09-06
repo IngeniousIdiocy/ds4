@@ -1,0 +1,48 @@
+ file
+
+92. **picolOpenFile**:
+   - Opens a file
+
+93. **picolFlush**:
+   - Flushes file buffer
+
+94. **picolFileClose**:
+   - Closes an open file
+
+95. **picolEof**:
+   - Checks for end of file condition
+
+96. **picolFileSize**:
+   - Returns the size of a file
+
+97. **picolFileTell**:
+   - Reports the current position in a file
+
+98. **picolFileSeek**:
+   - Moves the file position indicator
+
+99. **picolFileRead**:
+   - Reads a file
+
+100. **picolFileWrite**:
+   - Writes to a file
+
+101. **picolFileDelete**:
+   - Deletes a file
+
+102. **picolFileCopy**:
+   - Copies a file
+
+103. **picolFileRename**:
+   - Renames a file
+
+104. **picolFileSplit**:
+   - Splits a file path into components
+
+105. **picolFileJoin**:
+   - Joins file path components
+
+106. **picolFileStat**:
+   - Gets file statistics
+
+107.

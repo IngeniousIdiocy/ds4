@@ -1,0 +1,52 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
++        "read", "write", "delete", "exists",
++        "join", "dirname", "tail",
++        "mkdir", "tempfile", NULL
++    };
++    static int (*funcs[])(struct picolInterp *, int, char **) = {
++        picolFileRead, picolFileWrite, picolFileDelete, picolFileExists,
++        picolFileJoin, picolFileDirname, picolFileTail,
++        picolFileMkdir, picolFileTempfile
++    };
++    int j;
++    for (j = 0; subs[j]; j++) {
++        if (strcmp(argv[1], subs[j]) == 0)
++            return funcs[j](i, argc, argv);
++    }
++    char buf[1024];
++    snprintf(buf,sizeof(buf),"Unknown file subcommand '%s'",argv[1]);
++    picolSetResult(i,buf);
++    return PICOL_ERR;
++}
++
+ void picolRegisterCoreCommands(struct picolInterp *i) {
+     picolRegisterCommand(i,"expr",picolCommandExpr);
+     picolRegisterCommand(i,"set",picolCommandSet);
+@@ -772,6 +1002,7 @@ void picolRegisterCoreCommands(struct picolInterp *i) {
+     picolRegisterCommand(i,"continue",picolCommandRetCodes);
+     picolRegisterCommand(i,"proc",picolCommandProc);
+     picolRegisterCommand(i,"return",picolCommandReturn);
++    picolRegisterCommand(i,"file",picolCommandFile);
+ }
+
+ /* =============================================================================
+diff --git a/picol_test.c b/picol_test.c
+index 4950449..e0a2353 100644
+--- a/picol_test.c
++++ b/picol_test.c
+@@ -246,6 +246,59 @@ int main(void) {
+     test(++t, "set read nonexistent var",
+         picolEval(interp, "set nosuchvar") == PICOL_ERR);
+
++    /* File commands. */
++    test(++t, "file write",
++        eval_ok(interp, "file write /tmp/picol_test.txt {hello world}", "hello world"));
++    test(++t, "file read",
++        eval_ok(interp, "file read /tmp/picol_test.txt", "hello world"));
++    test(++t, "file exists true",
++        eval_ok(interp, "file exists /tmp/picol_test.txt", "1"));
++    test(++t, "file exists false",
++        eval_ok(interp, "file exists /tmp/nonexistent.txt", "0"));
++    test(++t, "file delete",
++        picolEval(interp, "file delete

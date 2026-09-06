@@ -1,0 +1,42 @@
+ a file
+
+136. **picolFileSeek**:
+   - Seeks to a position in a file
+
+137. **picolFileTell**:
+   - Returns the current position in a file
+
+138. **picolFileRead**:
+   - Reads data from a file
+
+139. **picolFileWrite**:
+   - Writes data to a file
+
+140. **picolFileReadBinary**:
+   - Reads binary data from a file
+
+141. **picolFileWriteBinary**:
+   - Writes binary data to a file
+
+142. **picolFileEof**:
+   - Checks for end of file
+
+143. **picolFileFlush**:
+   - Flushes file buffers
+
+144. **picolFileTell**:
+   - Returns the current position in the file
+
+145. **picolFileSeek**:
+   - Sets the position in the file
+
+146. **picolFileAsk**:
+   - Checks if the file has a specific property
+
+147. **picolFileCopy**:
+   - Copies a file
+
+148. **picolFileCopyBuffer**:
+   - Copies a file with a buffer
+
+149.

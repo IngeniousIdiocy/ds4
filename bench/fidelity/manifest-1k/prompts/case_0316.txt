@@ -1,0 +1,56 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+hawk from a handsaw.
+
+Enter Polonius.
+
+POLONIUS.
+Well be with you, gentlemen.
+
+HAMLET.
+Hark you, Guildenstern, and you too, at each ear a hearer. That great
+baby you see there is not yet out of his swaddling clouts.
+
+ROSENCRANTZ.
+Happily he’s the second time come to them; for they say an old man is
+twice a child.
+
+HAMLET.
+I will prophesy he comes to tell me of the players. Mark it.—You say
+right, sir: for a Monday morning ’twas so indeed.
+
+POLONIUS.
+My lord, I have news to tell you.
+
+HAMLET.
+My lord, I have news to tell you. When Roscius was an actor in Rome—
+
+POLONIUS.
+The actors are come hither, my lord.
+
+HAMLET.
+Buzz, buzz.
+
+POLONIUS.
+Upon my honour.
+
+HAMLET.
+Then came each actor on his ass—
+
+POLONIUS.
+The best actors in the world, either for tragedy, comedy, history,
+pastoral, pastoral-comical, historical-pastoral, tragical-historical,
+tragical-comical-historical-pastoral, scene individable, or poem
+unlimited. Seneca cannot be too heavy, nor Plautus too light, for the
+law of writ and the liberty. These are the only men.
+
+HAMLET.
+O Jephthah, judge of Israel, what a treasure hadst thou!
+
+POLONIUS.
+What treasure had he, my lord?
+
+HAMLET.
+Why—
+   ’One fair daughter, and no more,
+ 

@@ -1,0 +1,10 @@
+results/*/server-*.log
+results/*/responses-*.json
+results/gate-*/
+corpus/
+fidelity/corpus/
+fidelity/manifest-long/tok/
+fidelity/manifest-long/prompts/
+fidelity/manifest-long/continuations/
+fidelity/manifest-long/manifest*.tsv
+prompts/

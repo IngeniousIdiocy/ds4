@@ -1,0 +1,15 @@
+ directories on most systems.
+
+   - `picolFileExists`: Uses `stat()` to check existence. Returns "1" or "0".
+
+   - `picolFileJoin`: Joins path components with a '/' separator. This is a naive implementation that doesn't handle edge cases like double slashes, etc.
+
+   - `picolFileDirname`: Returns the directory part of a path. Handles root directory specially.
+
+   - `picolCommandFile`: The dispatch function that routes to the appropriate subcommand based on argv[1].
+
+Let me analyze the code for potential issues:
+
+1. **Security concerns**: The `picolFileRead` function reads a file into a buffer. There's no validation of the filename. An attacker could potentially read any file on the system.
+
+2. **Buffer overflow**: In `picolReadFile`, the buffer grows dynamically, but there's a potential

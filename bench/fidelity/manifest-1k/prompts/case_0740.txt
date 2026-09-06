@@ -1,0 +1,21 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+You will answer a question at the end about this archive.
+
+<｜begin▁of▁sentence｜>You are a careful assistant (note 00000).
+Read the story, remember the assignments, and answer the final task exactly.<｜User｜>You are reading a long story from the harbor town of Bellwether (note 00001).
+The story is ordinary on purpose: people speak, walk, remember, repair things, argue about weather, and sometimes receive a private assignment number written out in words (note 00002).
+Your job at the end is to recover the assignment numbers (note 00003).
+Important rule while reading: only assignments stated as "was assigned the number ..." count (note 00004).
+Other ages, prices, dates, distances, room numbers, rumors, or guesses do not count (note 00005).
+The assignment numbers in the story are written in words, not numerals (note 00006).
+At first light the harbor smelled of rope, rain, and cedar smoke (note 00007).
+Elena crossed the quay with a folded map tucked under one arm, stopping whenever gulls made a mess of the chalk marks near the fish stalls (note 00008).
+Nadia had promised to fix the south gate before supper, but the hinges complained so loudly that everyone pretended not to hear them (note 00009).
+In the bakery window, loaves cooled beneath linen while a child counted shells in a wooden bowl (note 00010).
+No one was in a hurry, because Bellwether moved by tide and habit, not by the bells on the council tower (note 00011).
+The archivist Mara wrote notes in brown ink, never black, because black ink made old ledgers look like court summonses (note 00012).
+She watched Elena and Nadia pass the fountain, then added a line about the morning fog (note 00013).
+Her notes often wandered into small details: the color of a scarf, the chipped rim of a cup, the way a door kept opening after it had been firmly shut (note 00014).
+By noon the market had filled with baskets of pears, lamp oil, brass hooks, and paper flowers (note 00015).
+Owen bargained for twine while Jonas listened to a

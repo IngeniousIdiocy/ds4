@@ -1,0 +1,59 @@
+Continue the following text exactly in the same style. Output only the continuation.
+
+
+ Enter Cleopatra, Enobarbus, Charmian and Iras.
+
+CLEOPATRA.
+What shall we do, Enobarbus?
+
+ENOBARBUS.
+Think, and die.
+
+CLEOPATRA.
+Is Antony or we in fault for this?
+
+ENOBARBUS.
+Antony only, that would make his will
+Lord of his reason. What though you fled
+From that great face of war, whose several ranges
+Frighted each other? Why should he follow?
+The itch of his affection should not then
+Have nicked his captainship, at such a point,
+When half to half the world opposed, he being
+The mered question. ’Twas a shame no less
+Than was his loss, to course your flying flags
+And leave his navy gazing.
+
+CLEOPATRA.
+Prithee, peace.
+
+ Enter the Ambassador with Antony.
+
+ANTONY.
+Is that his answer?
+
+AMBASSADOR.
+Ay, my lord.
+
+ANTONY.
+The Queen shall then have courtesy, so she
+Will yield us up.
+
+AMBASSADOR.
+He says so.
+
+ANTONY.
+Let her know’t.—
+To the boy Caesar send this grizzled head,
+And he will fill thy wishes to the brim
+With principalities.
+
+CLEOPATRA.
+That head, my lord?
+
+ANTONY.
+To him again. Tell him he wears the rose
+Of youth upon him, from which the world should note
+Something particular: his coin, ships, legions,
+May be a coward’s; whose ministers would prevail
+Under the service of a
