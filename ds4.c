@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_dflash_budget.h"
+#include "ds4_glm_expert_bank_policy.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
@@ -39116,6 +39117,8 @@ struct ds4_engine {
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
+    ds4_glm_expert_bank_policy glm_expert_bank_policy;
+    bool glm_expert_bank_policy_resolved;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -41440,6 +41443,11 @@ static uint64_t glm_graph_memory_guard_budget_bytes(
 #ifndef DS4_NO_GPU
 typedef struct ds4_glm_gpu_graph {
     const ds4_weights *weights;
+    /* Copied from the engine's one-time model/device policy resolution.
+     * Prompt length and memory admission remain dynamic, but no routed call
+     * scans model layers or queries the host profile. */
+    ds4_glm_expert_bank_policy expert_bank_policy;
+    bool expert_bank_policy_resolved;
     uint32_t ctx_size;
     uint32_t ctx_cap;
     uint32_t normal_layers;
@@ -44024,12 +44032,17 @@ static bool glm_graph_alloc_slice(
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
-        bool               require_output_head) {
+        bool               require_output_head,
+        const ds4_glm_expert_bank_policy *expert_bank_policy) {
     if (!g || !model || !weights || ctx_size <= 0) return false;
     const int *placement = g->placement;
     memset(g, 0, sizeof(*g));
     g->placement = placement;
     g->weights = weights;
+    if (expert_bank_policy) {
+        g->expert_bank_policy = *expert_bank_policy;
+        g->expert_bank_policy_resolved = true;
+    }
     g->ssd_streaming = ssd_streaming;
     g->ssd_streaming_cold = ssd_streaming_cold;
 
@@ -44484,7 +44497,8 @@ static bool glm_graph_alloc(
         const ds4_weights *weights,
         int                ctx_size,
         bool               ssd_streaming,
-        bool               ssd_streaming_cold) {
+        bool               ssd_streaming_cold,
+        const ds4_glm_expert_bank_policy *expert_bank_policy) {
     const uint32_t normal_layers = glm_graph_normal_layer_count();
     if (normal_layers == 0) {
         fprintf(stderr, "ds4: GLM Metal graph found no normal transformer layers\n");
@@ -44500,8 +44514,81 @@ static bool glm_graph_alloc(
                                  0,
                                  normal_layers - 1u,
                                  true,
-                                 true);
+                                 true,
+                                 expert_bank_policy);
 }
+
+#define DS4_GLM53_PUBLIC_Q4_MODEL_BYTES 185299232064ull
+
+/* Narrow automatic profile.  Size, shape and tensor types identify the public
+ * artifact layout cheaply at startup; they are not a cryptographic identity
+ * check. Release receipts bind the measured file's SHA-256 separately. The
+ * implementation remains available by explicit opt-in for other compatible
+ * files/devices. */
+static bool glm_expert_bank_public_model_profile(
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    if (!model || !weights || !ds4_model_is_glm53() ||
+        model->size != DS4_GLM53_PUBLIC_Q4_MODEL_BYTES ||
+        DS4_N_LAYER != 46u || glm_graph_normal_layer_count() != 45u ||
+        DS4_N_EMBD != 4096u || DS4_N_FF_EXP != 2048u ||
+        DS4_N_EXPERT != 288u || DS4_N_EXPERT_USED != 8u ||
+        DS4_N_LEADING_DENSE != 3u) {
+        return false;
+    }
+    for (uint32_t il = DS4_N_LEADING_DENSE;
+         il < glm_graph_normal_layer_count(); il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+            l->ffn_gate_exps->type != DS4_TENSOR_Q4_K ||
+            l->ffn_up_exps->type != DS4_TENSOR_Q4_K ||
+            l->ffn_down_exps->type != DS4_TENSOR_Q4_K) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static ds4_glm_expert_bank_policy glm_expert_bank_policy_resolve_runtime(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        bool               runtime_eligible) {
+    bool profile_device = false;
+#if defined(__APPLE__)
+    profile_device = runtime_eligible &&
+        ds4_gpu_glm_expert_bank_profile_device() != 0;
+#endif
+    const bool profile_match = profile_device &&
+        glm_expert_bank_public_model_profile(model, weights);
+    ds4_glm_expert_bank_policy p = ds4_glm_expert_bank_policy_resolve(
+        profile_match,
+        getenv("DS4_GLM_ENABLE_EXPERT_BANK"),
+        getenv("DS4_GLM_DISABLE_EXPERT_BANK"),
+        getenv("DS4_GLM_DISABLE_SUPERCHUNK"),
+        getenv("DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB"),
+        getenv("DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS"),
+        getenv("DS4_METAL_MODEL_UNTRACKED"),
+        getenv("DS4_GLM_EXPERT_BANK_MIN_TOKENS"));
+    if (!runtime_eligible) {
+        p.bank = false;
+        p.superchunk = false;
+        p.fused = false;
+        p.pipelined = false;
+    }
+    return p;
+}
+
+#if defined(__APPLE__)
+static const char *glm_expert_bank_policy_mode_name(
+        ds4_glm_expert_bank_policy_mode mode) {
+    switch (mode) {
+    case DS4_GLM_EXPERT_BANK_POLICY_ON:  return "forced-on";
+    case DS4_GLM_EXPERT_BANK_POLICY_OFF: return "forced-off";
+    case DS4_GLM_EXPERT_BANK_POLICY_AUTO:
+    default:                             return "auto";
+    }
+}
+#endif
 
 static uint32_t glm_graph_weight_type_for_offset(
         const ds4_model *model,
@@ -54215,23 +54302,15 @@ static uint32_t glm_graph_superchunk_max_tokens(void) {
     return cached;
 }
 
-/* Break-even length.  One bank expansion costs about 36 ms per layer on the
- * public file (Stage-0 receipt) and the one-batch schedule saves about
- * 2.6 us per token per layer, so a super-chunk pays for itself from roughly
- * 13,700 tokens.  Shorter runs -- every incremental turn, every short suffix,
- * all of decode -- stay on the shipped per-chunk loop. */
-static uint32_t glm_graph_superchunk_min_tokens(void) {
-    static uint32_t cached = 0;
-    if (cached == 0) {
-        uint32_t v = 13700u;
-        const char *s = getenv("DS4_GLM_EXPERT_BANK_MIN_TOKENS");
-        if (s && s[0]) {
-            const long n = strtol(s, NULL, 10);
-            if (n >= 1 && n <= 1000000) v = (uint32_t)n;
-        }
-        cached = v;
-    }
-    return cached;
+/* Conservative automatic boundary: 16,224 tokens lost to the ordinary path
+ * while 62,174 tokens won on the validated profile.  32,768 is an engineering
+ * choice between those observations, not a measured crossover; keep the
+ * fallback below it until the boundary screen is complete. */
+static uint32_t glm_graph_superchunk_min_tokens(
+        const ds4_glm_gpu_graph *g) {
+    return g && g->expert_bank_policy_resolved ?
+        g->expert_bank_policy.min_tokens :
+        DS4_GLM_EXPERT_BANK_AUTO_MIN_TOKENS;
 }
 
 /* Per-token bytes of the cross-pass staging, excluding the routed mid buffer
@@ -54326,12 +54405,8 @@ static bool glm_graph_superchunk_ws_ensure(ds4_glm_gpu_graph *g, uint32_t rows) 
  * engaged proves nothing. */
 static const char *glm_graph_superchunk_refusal(const ds4_glm_gpu_graph *g) {
     if (!g || !g->glm53) return "not a GLM-5.3 graph";
-    if (getenv("DS4_GLM_DISABLE_SUPERCHUNK") != NULL) {
-        return "DS4_GLM_DISABLE_SUPERCHUNK=1";
-    }
-    if (!ds4_gpu_glm_expert_bank_enabled()) {
-        return "expert bank off (default; set DS4_GLM_ENABLE_EXPERT_BANK=1)";
-    }
+    if (!g->expert_bank_policy_resolved) return "expert-bank policy unresolved";
+    if (!g->expert_bank_policy.superchunk) return "expert-bank super-chunk policy off";
     if (g->ssd_streaming) return "SSD streaming";
     if (g->placement) return "multi-tier / TP placement";
     if (g->tp_world > 1) return "tensor-parallel graph";
@@ -54421,7 +54496,7 @@ static uint32_t glm_graph_superchunk_group(const ds4_glm_gpu_graph *g,
         if (!*why) *why = "fewer than two chunks in the run";
         return 0;
     }
-    const uint32_t min_tokens = glm_graph_superchunk_min_tokens();
+    const uint32_t min_tokens = glm_graph_superchunk_min_tokens(g);
     if (used < min_tokens) {
         static char buf[128];
         snprintf(buf, sizeof(buf),
@@ -54571,7 +54646,7 @@ static int glm_graph_forward_indexed_superchunk(
         return 0;
     }
     if (!glm_graph_superchunk_available(g)) return 0;
-    if (total_tokens < glm_graph_superchunk_min_tokens() ||
+    if (total_tokens < glm_graph_superchunk_min_tokens(g) ||
         total_tokens > glm_graph_superchunk_max_tokens()) {
         return 0;
     }
@@ -54589,7 +54664,9 @@ static int glm_graph_forward_indexed_superchunk(
      * command-buffer boundaries per routed layer while retaining the normal
      * path and the earlier async arm as independent controls. */
     const bool fused_layer_cb = !bank_diagnostic_packed &&
-        getenv("DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB") != NULL;
+        g->expert_bank_policy.fused;
+    const bool pipelined_layers = fused_layer_cb &&
+        g->expert_bank_policy.pipelined;
     const bool defer_slices = async_slices || fused_layer_cb;
     const double bank_timing_total_t0 = bank_timing ? now_sec() : 0.0;
     double bank_timing_prepare_ms = 0.0;
@@ -54606,6 +54683,7 @@ static int glm_graph_forward_indexed_superchunk(
     double bank_timing_state_restore_ms = 0.0;
     double bank_timing_dense_deferred_wait_ms = 0.0;
     uint32_t bank_deferred_waits = 0;
+    uint32_t bank_pipelined_flushes = 0;
 
     uint32_t max_chunk = 0;
     for (uint32_t i = 0; i < n_chunks; i++) {
@@ -54731,6 +54809,7 @@ static int glm_graph_forward_indexed_superchunk(
                 "ds4: GLM SUPER-CHUNK prefill ENGAGED: tokens=%u chunks=%u [%s] "
                 "pos=%u..%u layers=%u..%u routed_from=%u passes=3 "
                 "bank_mode=%s async_slices=%u fused_layer_cb=%u "
+                "pipelined_layers=%u "
                 "bank=%.2f GiB staging=%.2f GiB\n",
                 total_tokens, n_chunks, sizes,
                 chunks[0].pos0,
@@ -54738,11 +54817,18 @@ static int glm_graph_forward_indexed_superchunk(
                 g->layer_start, g->layer_end, (uint32_t)DS4_N_LEADING_DENSE,
                 bank_diagnostic_packed ? "packed-diagnostic" : "expanded",
                 defer_slices ? 1u : 0u, fused_layer_cb ? 1u : 0u,
+                pipelined_layers ? 1u : 0u,
                 bank_diagnostic_packed ? 0.0 : bank_bytes / 1073741824.0,
                 stage_bytes / 1073741824.0);
     }
 
     int rc = 1;
+#if defined(DS4_TEST_GLM_SC_FAIL_GROUP)
+    /* Dedicated test object only: unlike DS4_TEST_HOOKS, this does not alter
+     * instance locks or other engine behavior. Count only admitted groups. */
+    static uint64_t test_sc_group_count;
+    const uint64_t test_sc_group = ++test_sc_group_count;
+#endif
     uint32_t hc_parity = 0;
     uint32_t n_routed_layers = 0, n_bank_ok = 0, n_bank_refused = 0;
     uint32_t n_bank_packed = 0;
@@ -54781,7 +54867,7 @@ static int glm_graph_forward_indexed_superchunk(
                                   l->ffn_gate_exps && l->ffn_up_exps &&
                                   l->ffn_down_exps;
         if (cancelled && cancelled(cancel_ud)) { rc = -2; break; }
-        if (ds4_gpu_commands_active()) {
+        if (ds4_gpu_commands_active() && !pipelined_layers) {
             fprintf(stderr,
                     "ds4: GLM super-chunk found an unexpected active command "
                     "batch before layer %u\n", il);
@@ -55032,6 +55118,20 @@ static int glm_graph_forward_indexed_superchunk(
             bank_timing_pass2_encode_ms +=
                 (now_sec() - bank_timing_pass2_t0) * 1000.0;
         }
+#if defined(DS4_TEST_GLM_SC_FAIL_GROUP)
+        if (rc == 1 && test_sc_group == DS4_TEST_GLM_SC_FAIL_GROUP &&
+            n_routed_layers == 8u) {
+            /* The real eighth routed dispatch is already encoded. Normal
+             * failure handling must drain it, restore and invalidate the
+             * caller's checkpoint. This is not a simulated device fault. */
+            fprintf(stderr,
+                    "TEST_SC_ROUTED_FAILURE group=%llu pos=%u tokens=%u "
+                    "layer=%u routed=%u banks=%u refused=%u\n",
+                    (unsigned long long)test_sc_group, chunks[0].pos0,
+                    total_tokens, il, n_routed_layers, n_bank_ok, n_bank_refused);
+            rc = DS4_GLM_SC_FAILED;
+        }
+#endif
 
         /* ---- pass 3: the HC tail, per chunk, in chunk order ---- */
         const double bank_timing_pass3_t0 = bank_timing ? now_sec() : 0.0;
@@ -55051,8 +55151,25 @@ static int glm_graph_forward_indexed_superchunk(
                 (now_sec() - bank_timing_pass3_t0) * 1000.0;
         }
         const double bank_timing_pass23_wait_t0 = bank_timing ? now_sec() : 0.0;
-        if (ds4_gpu_end_commands() == 0) rc = -1;
-        if (g->sc_defer_completion) bank_deferred_waits++;
+        /* A single tracked bank is safe to reuse across command buffers on
+         * this serial queue: the next layer's expansion is submitted after
+         * this layer's bank reads.  Bound the pending queue to at most eight
+         * routed layers (72 slice/layer buffers at the 62k production shape),
+         * then drain for error reporting and cancellation responsiveness. */
+        const bool pipeline_continue =
+            pipelined_layers && il < g->layer_end &&
+            (n_routed_layers % 8u) != 0u;
+        if (pipeline_continue) {
+            if (rc == 1 && ds4_gpu_flush_commands() != 0) {
+                bank_pipelined_flushes++;
+            } else {
+                (void)ds4_gpu_synchronize();
+                rc = -1;
+            }
+        } else {
+            if (ds4_gpu_end_commands() == 0) rc = -1;
+            if (g->sc_defer_completion) bank_deferred_waits++;
+        }
         if (bank_timing) {
             bank_timing_pass23_wait_ms +=
                 (now_sec() - bank_timing_pass23_wait_t0) * 1000.0;
@@ -55194,7 +55311,7 @@ static int glm_graph_forward_indexed_superchunk(
                 "total=%.3f token_upload=%.3f begin=%.3f end_wait=%.3f "
                 "body_and_views=%.3f ms deferred_slices=%u "
                 "skipped_token_uploads=%u deferred_waits=%u "
-                "dense_deferred_wait=%.3f ms\n",
+                "pipelined_layer_flushes=%u dense_deferred_wait=%.3f ms\n",
                 g->sc_timing_slice_calls, bank_timing_pass1_ms,
                 g->sc_timing_token_upload_ms, g->sc_timing_begin_ms,
                 g->sc_timing_end_wait_ms,
@@ -55202,7 +55319,8 @@ static int glm_graph_forward_indexed_superchunk(
                     g->sc_timing_begin_ms - g->sc_timing_end_wait_ms,
                 g->sc_timing_deferred_slices,
                 g->sc_timing_skipped_token_uploads,
-                bank_deferred_waits, bank_timing_dense_deferred_wait_ms);
+                bank_deferred_waits, bank_pipelined_flushes,
+                bank_timing_dense_deferred_wait_ms);
     }
     fprintf(stderr,
             "ds4: GLM SUPER-CHUNK done: status=%d (%s) tokens=%u chunks=%u "
@@ -57562,12 +57680,19 @@ static int generate_glm_metal_argmax(
     }
 
     ds4_glm_gpu_graph g = {0};
+    const ds4_glm_expert_bank_policy expert_bank_policy =
+        glm_expert_bank_policy_resolve_runtime(model, weights,
+                                                !ssd_streaming);
+#if defined(__APPLE__)
+    ds4_gpu_glm_expert_bank_set_enabled(expert_bank_policy.bank);
+#endif
     if (!glm_graph_alloc(&g,
                          model,
                          weights,
                          ctx_size,
                          ssd_streaming,
-                         ssd_streaming_cold)) {
+                         ssd_streaming_cold,
+                         &expert_bank_policy)) {
         fprintf(stderr, "ds4: failed to allocate GLM graph runtime\n");
         return 1;
     }
@@ -62158,7 +62283,9 @@ static int ds4_engine_collect_glm_imatrix(
         int         min_expert_samples) {
     ds4_glm_gpu_graph g;
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
-                         e->ssd_streaming, e->ssd_streaming_cold)) {
+                         e->ssd_streaming, e->ssd_streaming_cold,
+                         e->glm_expert_bank_policy_resolved ?
+                            &e->glm_expert_bank_policy : NULL)) {
         fprintf(stderr, "ds4: failed to allocate GLM imatrix graph\n");
         return 1;
     }
@@ -67567,6 +67694,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static void ds4_engine_resolve_glm_expert_bank_policy(
+        ds4_engine *e,
+        bool        runtime_eligible) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return;
+    e->glm_expert_bank_policy = glm_expert_bank_policy_resolve_runtime(
+        &e->model, &e->weights, runtime_eligible);
+    e->glm_expert_bank_policy_resolved = true;
+    const ds4_glm_expert_bank_policy *p = &e->glm_expert_bank_policy;
+    ds4_gpu_glm_expert_bank_set_enabled(p->bank);
+    ds4_gpu_set_model_untracked(p->model_untracked);
+    fprintf(stderr,
+            "ds4: GLM expert-bank policy profile=%s mode=%s bank=%u "
+            "superchunk=%u fused=%u pipelined=%u model_untracked=%u "
+            "min_tokens=%u\n",
+            p->profile_match ? "m3ultra-public-q4-v1" : "unmatched",
+            glm_expert_bank_policy_mode_name(p->mode),
+            p->bank ? 1u : 0u,
+            p->superchunk ? 1u : 0u,
+            p->fused ? 1u : 0u,
+            p->pipelined ? 1u : 0u,
+            p->model_untracked ? 1u : 0u,
+            p->min_tokens);
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
@@ -68107,6 +68260,25 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Resolve the validated model/device profile before DFlash or target model
+     * mapping creates its first mmap-backed Metal view.  The later init call
+     * is idempotent.  This avoids process-wide setenv state and lets =0 remain
+     * an actual override for DS4_METAL_MODEL_UNTRACKED. */
+    if (graph_backend && e->backend == DS4_BACKEND_METAL && !e->multi_tier) {
+        e->metal_ready = ds4_gpu_init() != 0;
+        if (!e->metal_ready) {
+            fprintf(stderr, "ds4: Metal backend unavailable; aborting startup\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        ds4_engine_resolve_glm_expert_bank_policy(
+            e,
+            !e->ssd_streaming && !load_slice && !tp_shard &&
+            e->distributed.role == DS4_DISTRIBUTED_NONE);
+    }
+#endif
     /* The DFlash2 runtime -- the drafter kernels, the prefill feature seed and
      * the speculative cycle -- is Metal-only (see ds4_dflash_seed.inc and
      * ds4_dflash_glm.inc, both guarded the same way), so the loader that calls
@@ -68119,6 +68291,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->backend != DS4_BACKEND_CPU) {
         model_open(&e->dflash_model, opt->dflash_path, graph_backend, true);
         char dflash_reject[192] = {0};
+        bool dflash_map_attempted = false;
         if (dflash2_bind(&e->dflash_weights, &e->dflash_model) &&
             e->dflash_weights.n_embd == DS4_N_EMBD &&
             ds4_model_is_glm53() &&
@@ -68127,11 +68300,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
              * inside dflash2_embed_row mid-generation. */
             dflash2_target_compatible(&e->dflash_weights, &e->weights,
                                       dflash_reject, sizeof(dflash_reject)) &&
-            ds4_gpu_set_model_map_range(e->dflash_model.map,
+            (dflash_map_attempted = true,
+             ds4_gpu_set_model_map_range(e->dflash_model.map,
                                         e->dflash_model.size,
                                         0,
                                         e->dflash_model.size,
-                                        0) &&
+                                        0)) &&
             dflash_pool_init(e->dflash_weights.n_embd)) {
             e->dflash_ready = true;
             glm_dflash_seed_configure(
@@ -68158,7 +68332,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     opt->dflash_path,
                     dflash_reject[0] ? ": " : "",
                     dflash_reject[0] ? dflash_reject : "");
-            model_close(&e->dflash_model);
+            /* Mapping can register some no-copy Metal views before failing,
+             * or pool setup can fail after registration. Keep that backing
+             * owned until engine_close drains and releases all such views. */
+            if (!dflash_map_attempted) model_close(&e->dflash_model);
         }
     }
 #else
@@ -69421,9 +69598,13 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     if (e->dflash_ready) dflash_overhead_report(stderr);
+    ds4_threads_shutdown();
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (e->tp.active) {
-        ds4_gpu_tp_shutdown();
+    /* No-copy model views do not own their mmap storage. Drain first while
+     * all maps, TP slabs, shared workspace and DFlash buffers still exist. */
+    ds4_gpu_prepare_cleanup();
+    if (e->tp.active || e->tp.slab || e->tp.zero_vec || e->tp.out_views ||
+        e->tp.in_views || e->tp.batch_out_views || e->tp.batch_in_views) {
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
         for (uint32_t i = 0; i < slots; i++) {
             if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
@@ -69445,10 +69626,10 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_expert_profile_close();
     weights_free(&e->weights);
     vocab_free(&e->vocab);
-    ds4_threads_shutdown();
-    if (e->mtp_model.map) model_close(&e->mtp_model);
-    if (e->vision_model.map) model_close(&e->vision_model);
-    model_close(&e->model);
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    dflash_pool_free();
+    glm_dflash_seed_free();
+#endif
 #ifndef DS4_NO_GPU
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
@@ -69456,6 +69637,12 @@ void ds4_engine_close(ds4_engine *e) {
     }
     ds4_gpu_cleanup();
 #endif
+    /* Cleanup has joined GPU/pread work and dropped every backend view before
+     * any backing is unmapped. Also closes a disabled, partially set-up draft. */
+    model_close(&e->dflash_model);
+    model_close(&e->mtp_model);
+    model_close(&e->vision_model);
+    model_close(&e->model);
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
@@ -69694,7 +69881,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                    layer_start,
                                    layer_end,
                                    require_token_embd,
-                                   require_output)) {
+                                   require_output,
+                                   e->glm_expert_bank_policy_resolved ?
+                                       &e->glm_expert_bank_policy : NULL)) {
             free(s);
             return 1;
         }
@@ -71643,6 +71832,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
         } else {
+#if defined(DS4_TEST_GLM_SC_FAIL_GROUP)
+            const int test_prior_len = s->checkpoint.len;
+            const int test_prior_valid = s->checkpoint_valid;
+#endif
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
             s->mtp_draft_valid = false;
@@ -71651,6 +71844,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
                 return 1;
             }
+#if defined(DS4_TEST_GLM_SC_FAIL_GROUP)
+            fprintf(stderr,
+                    "TEST_SC_REPRIME session=%p prior_len=%d prior_valid=%d prompt=%d\n",
+                    (void *)s, test_prior_len, test_prior_valid, prompt->len);
+#endif
         }
 
         /* GLM-5.3 uses bounded layer-major chunks for mHC and recurrent KDA.
@@ -71718,6 +71916,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 s->checkpoint_valid = false;
                             }
                             s->mtp_draft_valid = false;
+#if defined(DS4_TEST_GLM_SC_FAIL_GROUP)
+                            if (sc_st == DS4_GLM_SC_FAILED ||
+                                sc_st == DS4_GLM_SC_STATE_LOST) {
+                                fprintf(stderr,
+                                        "TEST_SC_FAILURE_CALLER session=%p status=%d "
+                                        "checkpoint=%d valid=%d\n",
+                                        (void *)s, sc_st, s->checkpoint.len,
+                                        s->checkpoint_valid);
+                            }
+#endif
                             if (ds4_glm_superchunk_is_interrupt(sc_st)) {
                                 snprintf(err, errlen, "interrupted");
                                 s->checkpoint_valid =

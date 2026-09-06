@@ -43,6 +43,12 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+#if defined(__APPLE__)
+/* Teardown only: stop Metal producers and drain queued commands without
+ * initializing a backend. Keep caller-owned tensors and model maps alive
+ * until this returns; cleanup then releases the backend's no-copy views. */
+void ds4_gpu_prepare_cleanup(void);
+#endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -177,6 +183,8 @@ int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
+/* Resolve mmap-backed Metal model hazard tracking before the first view. */
+void ds4_gpu_set_model_untracked(int enabled);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
@@ -2774,10 +2782,12 @@ int ds4_gpu_glm_routed_moe_one_tensor(
 
 /* --- GLM-5.3 expanded-expert one-layer bank (EXPERT-BANK-DESIGN.md rev 3) ---
  * One routed layer's three expert tensors dequantized once into a half image
- * in the routed GEMM's own A-stage order.  Bit-exact with the packed path by
- * construction; OFF unless DS4_GLM_ENABLE_EXPERT_BANK=1, and
- * DS4_GLM_DISABLE_EXPERT_BANK=1 kills it outright. */
+ * in the routed GEMM's own A-stage order. Bit-exact with the packed path by
+ * construction. The C driver resolves the automatic device/model/length
+ * profile; DS4_GLM_DISABLE_EXPERT_BANK=1 kills it outright. */
+int ds4_gpu_glm_expert_bank_profile_device(void);
 int ds4_gpu_glm_expert_bank_enabled(void);
+void ds4_gpu_glm_expert_bank_set_enabled(int enabled);
 uint64_t ds4_gpu_glm_expert_bank_bytes(uint32_t expert_in_dim,
                                        uint32_t expert_mid_dim,
                                        uint32_t out_dim,

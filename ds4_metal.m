@@ -27,6 +27,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_glm_expert_bank_policy.h"
 #include "ds4_glm53_prefix.h"
 
 /*
@@ -461,6 +462,7 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
 }
 
 static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
+static void ds4_gpu_drain_for_cleanup(void);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
@@ -2322,9 +2324,24 @@ static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
            strcmp(label, "ds4_attention_output_group_ids") == 0;
 }
 
+/* Engine-scoped decisions.  ds4_gpu_cleanup resets both so a later engine may
+ * resolve a different model/environment without rechecking them per view or
+ * routed dispatch. */
+static int g_model_untracked_cached = -1;
+static int g_glm_expert_bank_enabled_cached = -1;
+
+void ds4_gpu_set_model_untracked(int enabled) {
+    g_model_untracked_cached = enabled != 0;
+}
+
 static MTLResourceOptions ds4_gpu_model_resource_options(void) {
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL) {
+    if (g_model_untracked_cached < 0) {
+        const int requested = ds4_glm_expert_bank_bool_value(
+            getenv("DS4_METAL_MODEL_UNTRACKED"));
+        g_model_untracked_cached = requested == 1;
+    }
+    if (g_model_untracked_cached) {
         options |= MTLResourceHazardTrackingModeUntracked;
     }
     return options;
@@ -3558,6 +3575,10 @@ static int ds4_gpu_device_name_contains(const char *needle) {
 int ds4_gpu_dflash_budget_profile_device(void) {
     return strcmp(g_metal_device_name, "Apple M3 Ultra") == 0 &&
         [[NSProcessInfo processInfo] physicalMemory] >= (UINT64_C(500) << 30);
+}
+
+int ds4_gpu_glm_expert_bank_profile_device(void) {
+    return ds4_gpu_dflash_budget_profile_device();
 }
 
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
@@ -11882,21 +11903,27 @@ int ds4_gpu_tp_init(uint32_t rank,
 }
 
 void ds4_gpu_tp_shutdown(void) {
-    if (!g_tp_thread_running) return;
-    pthread_mutex_lock(&g_tp_mutex);
-    g_tp_shutdown = 1;
-    pthread_cond_broadcast(&g_tp_cond);
-    pthread_mutex_unlock(&g_tp_mutex);
-    pthread_join(g_tp_thread, NULL);
-    g_tp_thread_running = 0;
+    if (!g_tp_thread_running && !g_tp_slab_buffer) return;
+    if (g_tp_thread_running) {
+        pthread_mutex_lock(&g_tp_mutex);
+        g_tp_shutdown = 1;
+        pthread_cond_broadcast(&g_tp_cond);
+        pthread_mutex_unlock(&g_tp_mutex);
+        pthread_join(g_tp_thread, NULL);
+        g_tp_thread_running = 0;
+    }
     if (g_tp_keepalive_running) {
         pthread_join(g_tp_keepalive_thread, NULL);
         g_tp_keepalive_running = 0;
-        g_tp_keepalive_queue = nil;
-        g_tp_keepalive_buffer = nil;
     }
+    /* The service releases every queued gate on shutdown. Encoded work can
+     * still reference the poll buffer, even with unretained command buffers. */
+    ds4_gpu_drain_for_cleanup();
+    g_tp_keepalive_queue = nil;
+    g_tp_keepalive_buffer = nil;
     g_tp_exchange_fn = NULL;
     g_tp_batch_exchange_fn = NULL;
+    g_tp_big_exchange_fn = NULL;
     g_tp_exchange_ud = NULL;
     g_tp_split_rank = 0;
     g_tp_split_world = 1;
@@ -11905,6 +11932,15 @@ void ds4_gpu_tp_shutdown(void) {
     g_tp_poll_buffer = nil;
     g_tp_poll_region = NULL;
     g_tp_poll_status = NULL;
+    g_tp_slab_buffer = nil;
+    g_tp_slab_cpu = NULL;
+    g_tp_gpu_flags = NULL;
+    g_tp_check_buffer = nil;
+    g_tp_check_words = NULL;
+    g_tp_gpu_event = nil;
+    g_tp_cpu_event = nil;
+    g_tp_batch_gpu_event = nil;
+    g_tp_batch_cpu_event = nil;
 }
 
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
@@ -12330,9 +12366,11 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
     uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
+    id<MTLCommandBuffer> last_cb = nil;
     while (!g_queue_keepalive_stop) {
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            if (cb) last_cb = cb;
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:scratch offset:0 atIndex:0];
@@ -12344,6 +12382,9 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
         for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50)
             usleep(50000);
     }
+    /* These commands are not in g_pending_cbs. The join must also finish the
+     * last submission before cleanup releases queue residency/model views. */
+    [last_cb waitUntilCompleted];
     return NULL;
 }
 
@@ -12537,25 +12578,42 @@ int ds4_gpu_synchronize(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
 }
 
-void ds4_gpu_cleanup(void) {
-    ds4_gpu_glm_expert_bank_free();
+static void ds4_gpu_drain_for_cleanup(void) {
+    if (!g_initialized) return;
+    if (g_batch_cb) {
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb commit];
+        [g_batch_cb waitUntilCompleted];
+        g_batch_cb = nil;
+        if (g_stream_expert_cache_batch_seq > g_stream_expert_cache_done_seq) {
+            g_stream_expert_cache_done_seq = g_stream_expert_cache_batch_seq;
+        }
+        g_stream_expert_cache_batch_seq = 0;
+    }
+    (void)ds4_gpu_wait_pending_command_buffers("cleanup");
+}
+
+void ds4_gpu_prepare_cleanup(void) {
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
+    /* Shutdown releases pending TP gates before draining their command
+     * buffers, and keeps the poll storage alive until that drain finishes. */
+    ds4_gpu_tp_shutdown();
+    ds4_gpu_drain_for_cleanup();
+}
 
+void ds4_gpu_cleanup(void) {
+    ds4_gpu_prepare_cleanup();
+    ds4_gpu_glm_expert_bank_free();
+    /* Environment/device policy is resolved once per initialized engine. */
+    g_glm_expert_bank_enabled_cached = -1;
+    g_model_untracked_cached = -1;
+    if (!g_initialized) return;
     @autoreleasepool {
+        /* Nothing referenced by an active command may be released before
+         * prepare_cleanup, including when unretained references are enabled. */
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
-        if (g_batch_cb) {
-            ds4_gpu_close_batch_encoder();
-            [g_batch_cb commit];
-            [g_batch_cb waitUntilCompleted];
-            g_batch_cb = nil;
-            if (g_stream_expert_cache_batch_seq > g_stream_expert_cache_done_seq) {
-                g_stream_expert_cache_done_seq = g_stream_expert_cache_batch_seq;
-            }
-            g_stream_expert_cache_batch_seq = 0;
-        }
-        (void)ds4_gpu_wait_pending_command_buffers("cleanup");
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
@@ -44384,9 +44442,10 @@ static ds4_routed_tile_choice ds4_gpu_glm_routed_tile_choice(uint32_t gate_type,
  * output words are unchanged.
  *
  * The bank pays for itself only when it is amortized over many chunks of one
- * layer, which needs the layer-major super-chunk driver in ds4.c.  It is OFF
- * by default: DS4_GLM_ENABLE_EXPERT_BANK=1 arms it, DS4_GLM_DISABLE_EXPERT_BANK=1
- * is an absolute kill switch that wins over the opt-in.
+ * layer, which needs the layer-major super-chunk driver in ds4.c. The C driver
+ * applies and caches the full device/model policy. This lower-level predicate
+ * fails closed until that validation succeeds, retains an explicit research
+ * opt-in, and honors the absolute kill before a bank dispatch can run.
  * ======================================================================== */
 
 static id<MTLBuffer> g_glm_expert_bank_buffer = nil;
@@ -44404,26 +44463,25 @@ static uint64_t      g_glm_expert_bank_expansion_count = 0;
 static double        g_glm_expert_bank_last_ensure_ms = 0.0;
 static double        g_glm_expert_bank_last_model_view_ms = 0.0;
 static double        g_glm_expert_bank_last_command_ms = 0.0;
-
-#ifndef DS4_GLM_EXPERT_BANK_DEFAULT_ON
-#define DS4_GLM_EXPERT_BANK_DEFAULT_ON 0
-#endif
+static int ds4_gpu_glm_expert_bank_private_requested(void) {
+    const char *e = getenv("DS4_GLM_EXPERT_BANK_PRIVATE");
+    return e && e[0] && e[0] != '0';
+}
 
 int ds4_gpu_glm_expert_bank_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        int on = DS4_GLM_EXPERT_BANK_DEFAULT_ON ? 1 : 0;
-        const char *e = getenv("DS4_GLM_ENABLE_EXPERT_BANK");
-        if (e && e[0] && e[0] != '0') on = 1;
-        if (getenv("DS4_GLM_DISABLE_EXPERT_BANK") != NULL) on = 0;
-        cached = on;
-        if (on) {
-            fprintf(stderr,
-                    "ds4: GLM expanded-expert bank enabled "
-                    "(DS4_GLM_DISABLE_EXPERT_BANK=1 to kill)\n");
-        }
+    if (g_glm_expert_bank_enabled_cached < 0) {
+        const int requested = ds4_gpu_env_bool("DS4_GLM_ENABLE_EXPERT_BANK");
+        /* Fail closed until the C driver validates the full model/device
+         * profile. Direct research callers may still force this with =1. */
+        int on = requested < 0 ? 0 : requested;
+        if (ds4_gpu_env_bool("DS4_GLM_DISABLE_EXPERT_BANK") == 1) on = 0;
+        g_glm_expert_bank_enabled_cached = on;
     }
-    return cached;
+    return g_glm_expert_bank_enabled_cached;
+}
+
+void ds4_gpu_glm_expert_bank_set_enabled(int enabled) {
+    g_glm_expert_bank_enabled_cached = enabled != 0;
 }
 
 /* Bytes one layer's bank needs: three expanded half images, no padding.
@@ -44501,7 +44559,10 @@ int ds4_gpu_glm_expert_bank_ensure(uint32_t expert_in_dim,
                                                          out_dim,
                                                          n_total_expert);
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return 0;
-    if (g_glm_expert_bank_buffer && g_glm_expert_bank_capacity >= bytes) {
+    const int private_requested = ds4_gpu_glm_expert_bank_private_requested();
+    if (g_glm_expert_bank_buffer && g_glm_expert_bank_capacity >= bytes &&
+        (!private_requested ||
+         g_glm_expert_bank_buffer.storageMode == MTLStorageModePrivate)) {
         return 1;
     }
 
@@ -44524,12 +44585,35 @@ int ds4_gpu_glm_expert_bank_ensure(uint32_t expert_in_dim,
     /* Reallocating means dropping the old image first: two 13.50 GiB banks
      * must never be live at once (the design's memory ledger assumes one). */
     ds4_gpu_glm_expert_bank_free();
-    if (!ds4_gpu_ensure_scratch_buffer(&g_glm_expert_bank_buffer,
-                                       &g_glm_expert_bank_capacity,
-                                       (NSUInteger)bytes,
-                                       "ds4_glm_expert_bank")) {
-        g_glm_expert_bank_capacity = 0;
-        return 0;
+    if (private_requested) {
+        /* The bank is written completely by the expansion kernels before any
+         * consumer reads it, and neither the production path nor the verifier
+         * accesses its contents from the CPU.  This diagnostic therefore may
+         * use GPU-private storage.  Do not fall back to Shared: a run claiming
+         * to test Private must instead refuse the bank if allocation fails. */
+        g_glm_expert_bank_buffer =
+            [g_device newBufferWithLength:(NSUInteger)bytes
+                                  options:MTLResourceStorageModePrivate];
+        if (!g_glm_expert_bank_buffer ||
+            g_glm_expert_bank_buffer.storageMode != MTLStorageModePrivate) {
+            fprintf(stderr,
+                    "ds4: GLM expert bank private allocation refused "
+                    "(%.2f GiB); running the shipped routed path\n",
+                    bytes / 1073741824.0);
+            g_glm_expert_bank_buffer = nil;
+            g_glm_expert_bank_capacity = 0;
+            return 0;
+        }
+        g_glm_expert_bank_buffer.label = @"ds4_glm_expert_bank";
+        g_glm_expert_bank_capacity = (NSUInteger)bytes;
+    } else {
+        if (!ds4_gpu_ensure_scratch_buffer(&g_glm_expert_bank_buffer,
+                                           &g_glm_expert_bank_capacity,
+                                           (NSUInteger)bytes,
+                                           "ds4_glm_expert_bank")) {
+            g_glm_expert_bank_capacity = 0;
+            return 0;
+        }
     }
     g_glm_expert_bank_allocation_count++;
     g_glm_expert_bank_in_dim = expert_in_dim;
@@ -44542,8 +44626,11 @@ int ds4_gpu_glm_expert_bank_ensure(uint32_t expert_in_dim,
     g_glm_expert_bank_up_section = gate_section;
     g_glm_expert_bank_down_section = 2ull * gate_section;
     fprintf(stderr,
-            "ds4: GLM expert bank allocated %.2f GiB (%u experts, %ux%u/%ux%u)\n",
+            "ds4: GLM expert bank allocated %.2f GiB storage=%s "
+            "(%u experts, %ux%u/%ux%u)\n",
             bytes / 1073741824.0,
+            g_glm_expert_bank_buffer.storageMode == MTLStorageModePrivate ?
+                "private" : "shared",
             n_total_expert, expert_in_dim, expert_mid_dim,
             expert_mid_dim, out_dim);
     return 1;

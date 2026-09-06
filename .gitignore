@@ -69,3 +69,5 @@ __pycache__/
 /tests/test_dflash_fastpath
 
 /tests/test_dflash_mode
+tests/test_metal_teardown
+tests/ds4_server_sc_failure

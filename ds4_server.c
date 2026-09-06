@@ -9389,6 +9389,11 @@ struct job {
 };
 
 static bool job_cancelled(void *ud) {
+    /* The session uses this callback inside long prefills as well as decode.
+     * A connected non-streaming client must not delay graceful shutdown until
+     * its entire prompt finishes. Workers still drain at a backend-safe point
+     * and are joined before any session or engine resources are released. */
+    if (g_stop_requested) return true;
     job *j = ud;
     if (!j) return false;
     pthread_mutex_lock(&j->mu);
@@ -19364,6 +19369,22 @@ static void test_cancel_job_destroy(job *j) {
     pthread_mutex_destroy(&j->mu);
 }
 
+static void test_shutdown_cancels_active_prefill_callback(void) {
+    job j;
+    test_cancel_job_init(&j);
+    const sig_atomic_t saved_stop = g_stop_requested;
+    g_stop_requested = 0;
+    TEST_ASSERT(!job_cancelled(&j));
+    g_stop_requested = 1;
+    TEST_ASSERT(job_cancelled(&j));
+    TEST_ASSERT(!j.cancelled);  /* shutdown needs no client disconnect */
+    server_prefill_progress progress = {.request_job = &j, .prompt_tokens = 100};
+    server_progress_cb(&progress, "prefill_chunk", 50, 100);
+    TEST_ASSERT(!progress.seen);
+    g_stop_requested = saved_stop;
+    test_cancel_job_destroy(&j);
+}
+
 static void test_cancelled_progress_callback_is_inert(void) {
     job j;
     test_cancel_job_init(&j);
@@ -21147,6 +21168,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
+    test_shutdown_cancels_active_prefill_callback();
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();

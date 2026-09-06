@@ -111,6 +111,18 @@ typedef struct {
 } ds4_dflash_pool;
 static ds4_dflash_pool g_dflash_pool;
 
+/* Called only after outstanding GPU commands have drained. Also handles an
+ * allocation failure partway through pool_init. */
+static void dflash_pool_free(void) {
+#ifndef DS4_NO_GPU
+    ds4_gpu_tensor_free(g_dflash_pool.batch_norm);
+    ds4_gpu_tensor_free(g_dflash_pool.batch_logits);
+    ds4_gpu_tensor_free(g_dflash_pool.batch_argmax);
+    ds4_gpu_tensor_free(g_dflash_pool.batch_sel_idx);
+#endif
+    memset(&g_dflash_pool, 0, sizeof(g_dflash_pool));
+}
+
 static int dflash_pool_init(uint32_t n_embd) {
 #ifndef DS4_NO_GPU
     if (g_dflash_pool.inited) return 1;

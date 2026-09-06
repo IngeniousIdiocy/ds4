@@ -663,6 +663,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             fprintf(stderr, "ds4: BENCH id recording disabled (allocation of %d ids failed)\n",
                     max_tokens);
     }
+    const int generation_pos_initial = ds4_session_pos(session);
     const double t_decode0 = cli_now_sec();
     ds4_session_decode_begin(session);
     const bool dflash_capped =
@@ -746,6 +747,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     }
     ds4_session_decode_ack(session, 0, true);
     const double t_decode1 = cli_now_sec();
+    const int generation_pos_final = ds4_session_pos(session);
+    const bool generation_cancelled = cli_interrupt_requested();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
@@ -769,6 +772,21 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
                 prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
                 decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    }
+
+    if (getenv("DS4_GLM_GEN_COUNTERS") != NULL) {
+        const char *stop_reason = generation_cancelled ? "cancel" :
+            (generated >= max_tokens ? "limit" : "earlystop");
+        fprintf(stderr,
+                "ds4: CLI session counters: generated=%d requested=%d "
+                "pos_initial=%d pos_final=%d committed_forward_positions=%d "
+                "decode_s=%.9f resolved_mode=%s stop_reason=%s\n",
+                generated, cfg->gen.n_predict,
+                generation_pos_initial, generation_pos_final,
+                generation_pos_final - generation_pos_initial,
+                decode_s,
+                ds4_dflash_mode_name(ds4_engine_get_dflash_mode(engine)),
+                stop_reason);
     }
 
     if (bench_payload && bench_payload[0]) {

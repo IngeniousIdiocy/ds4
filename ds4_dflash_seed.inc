@@ -20,6 +20,14 @@ typedef struct {
 } ds4_glm_dflash_seed;
 static ds4_glm_dflash_seed g_glm_dflash_seed;
 
+/* Engine teardown, after the Metal drain; no capture owner may survive it. */
+static void glm_dflash_seed_free(void) {
+    ds4_gpu_tensor_free(g_glm_dflash_seed.buf);
+    free(g_glm_dflash_seed.ring);
+    memset(&g_glm_dflash_seed, 0, sizeof(g_glm_dflash_seed));
+    memset(&g_glm_dflash_cap, 0, sizeof(g_glm_dflash_cap));
+}
+
 static void glm_dflash_seed_configure(const ds4_dflash2_weights *dw,
                                       bool speculative) {
     if (!dw || !dw->ready) return;
