@@ -191,6 +191,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8");
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
+            if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER) {
+                opt(fp, c, "--dflash FILE", "GLM-5.3: load a DFlash2 draft GGUF. On this branch the drafter loads but decoding stays serial; see docs/GLM53_M3ULTRA.md.");
+            }
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
             opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
@@ -418,10 +421,119 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+static void print_glm53(FILE *fp, const help_colors *c) {
+    title(fp, c, "GLM-5.3 Metal Switches");
+    para(fp, c, "Environment variables added by the GLM-5.3 M3 Ultra work. Defaults are the shipped fast mode; nothing needs to be set. Registry entries are the DS4_GLM_EXACT list in bench/EXACT-MODE-PLAN.md; the full reference, including opt-in experiments, is docs/GLM53_M3ULTRA.md.");
+    fputc('\n', fp);
+    title(fp, c, "Supported Controls");
+    opt(fp, c, "DS4_ANTHROPIC_DEFAULT_EFFORT", "Default reasoning effort for Anthropic-protocol requests that carry none (e.g. Claude Code); explicit request fields still win.");
+    opt(fp, c, "DS4_DFLASH_CTX_CAP", "Caps the drafter's context rows (default about 256; more rows cost draft latency).");
+    opt(fp, c, "DS4_DFLASH_DISABLE", "Ignores a loaded DFlash2 drafter and decodes serially.");
+    opt(fp, c, "DS4_GLM53_MEMORY_CEILING_GB", "Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe).");
+    opt(fp, c, "DS4_GLM53_PREFILL_CHUNK", "Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks).");
+    opt(fp, c, "DS4_GLM_DSA_TAIL_CHECKED", "=0 restores the legacy unchecked ragged tail in DSA attention (default 1: bounds-checked; registry entry 4).");
+    opt(fp, c, "DS4_GLM_ENABLE_BF16_LOWRANK_SPLITK", "=0 turns the BF16 low-rank split-K off (default on).");
+    opt(fp, c, "DS4_GLM_ENABLE_DSA_BLOCKED_SOFTMAX", "=1 forces the blocked softmax on (default on).");
+    opt(fp, c, "DS4_GLM_ENABLE_HCX_PTAIL", "=1 explicitly selects the ptail HC-expand epilogue (already the default).");
+    opt(fp, c, "DS4_GLM_ENABLE_ROUTED_DOWN_SPLIT", "=1 forces the expert-parallel routed down split on (default on).");
+    opt(fp, c, "DS4_GLM_ENABLE_ROUTER_SHARED_FOLD", "=1 forces the router/shared-expert fold on (it is the default; the kill switch wins).");
+    opt(fp, c, "DS4_GLM_ENABLE_TOPK_FAST", "No-op kept for scripts that set it (the fast path is on by default).");
+    opt(fp, c, "DS4_GLM_EXACT", "=1 exact mode: every registered floating-point-order change off, numerics equal to upstream at the pin (see EXACT-MODE-PLAN.md).");
+    opt(fp, c, "DS4_GLM_HC_PRE_ALGEBRA_A", "=0 turns off hc_pre algebra half A (unscaled split-K dot, scale in the tail; default on, registry entry 6).");
+    opt(fp, c, "DS4_GLM_HC_PRE_SLICES", "=8|16|32 hc_pre split-K slice count (default 16; 32 is faster but out of the fidelity budget).");
+    opt(fp, c, "DS4_GLM_SCORER_XREDUCE_MIN_ROWS", "Candidate-row threshold below which the production scorer is kept even when xr8 is enabled (default 37500; 0 disables the gate).");
+    opt(fp, c, "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP", "Block rows for split8 DSA attention at depth (default 128; registry entry 7).");
+    opt(fp, c, "DS4_GLM_SPLIT8_BLOCK_ROWS_SHALLOW", "Block rows for split8 DSA attention at shallow depth (default 32; registry entry 7).");
+    opt(fp, c, "DS4_GLM_T2S_BF16_NSG", "Simdgroups per threadgroup of the BF16 matvec (registry entry 9; pinned under DS4_GLM_EXACT).");
+    opt(fp, c, "DS4_GLM_T2S_Q8NSG_<FAM>", "Per-family override of the Q8_0 matvec simdgroup count (families KDA, HCX, SDN, SHG, DSAF; registry entry 8; pinned under DS4_GLM_EXACT).");
+    opt(fp, c, "DS4_GLM_TOPK_FAST_MIN_COMP", "Minimum candidate width for the top-k fast path (default 12288; 0 removes the gate).");
+    opt(fp, c, "DS4_SERVER_CHECKPOINT_ON_LENGTH", "=0 stops recording the thinking checkpoint for turns truncated by max_tokens (default: recorded, so the next turn continues from live KV).");
+    opt(fp, c, "DS4_SERVER_CHECKPOINT_WITH_TOOLS", "=0 stops recording the thinking checkpoint for tool-context turns (default: recorded).");
+    opt(fp, c, "DS4_TRACE_MAX_MB", "Caps the live --trace segment at N MB; the previous segment is kept at <path>.1.");
+    fputc('\n', fp);
+    title(fp, c, "Kill Switches");
+    para(fp, c, "Each turns one default-on change off, for A/B measurement and bisection. Unless the meaning says otherwise a switch is read as set to any non-empty value.");
+    opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Disables the adaptive break-even throttle that parks speculation when it cannot pay.");
+    opt(fp, c, "DS4_DFLASH_NO_SELECTOR", "Disables the DFlash2 candidate selector (coherent-chain tracing).");
+    opt(fp, c, "DS4_DFLASH_SDPA_SCALAR", "Forces the scalar SDPA drafter kernel instead of the simdgroup one.");
+    opt(fp, c, "DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK", "Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2).");
+    opt(fp, c, "DS4_GLM_DISABLE_DENSE_HALF_COPY", "Disables the dense-layer half-copy path and its ring.");
+    opt(fp, c, "DS4_GLM_DISABLE_DENSE_HALF_RING", "Disables the half-copy ring alone.");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_BATCH_HOIST", "Batched DSA prefill attention: no hoisting of the shared loads.");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_BATCH_NOROPE", "Batched DSA prefill attention: keep the (dead at this shape) rope path.");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_BATCH_SKIP_RESCALE", "Batched DSA prefill attention: no rescale skipping.");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_BLOCKED_SOFTMAX", "Row-at-a-time softmax in batched DSA attention instead of the blocked online softmax (registry entry 3).");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_GATHER_WIDE", "8-byte gather copies in the blocked DSA kernel instead of 16-byte (bit-identical).");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_INDEXER_FOLD", "Separate dispatches for q_a, kv_a and the three DSA indexer projections instead of one (bit-identical fold).");
+    opt(fp, c, "DS4_GLM_DISABLE_DSA_TAIL_CHECKED", "Kill switch for the checked ragged tail.");
+    opt(fp, c, "DS4_GLM_DISABLE_HCX_PTAIL", "Production HC-expand epilogue instead of the eight-lane ptail epilogue (Tier 1 default; DS4_GLM_EXACT also selects production).");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_ATTN_TAILFUSE", "Residual add + HC expand as separate dispatches after the attention-output matvec.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_CHAIN_COLLAPSE", "Prefill HC chain: separate collapse and weighted RMSNorm passes.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_CHAIN_SCALE", "Prefill HC chain: the RMSNorm materializes its own scaled copy instead of the expand publishing the per-row scale.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_MIX_SPLITK", "Row-per-simdgroup HC mixer instead of the split-K mixer (an FP-order change).");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_NORM_FUSE", "Unfused HC norm dispatches.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_NORM_MIX_FUSE", "Unfused HC norm+mix dispatches.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_PHASEC_HOIST", "Kill switch for the phase-C hoist experiment.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A", "Kill switch for algebra half A.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_B", "Kill switch for algebra half B.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_PRE_ONE_DISPATCH", "Kill switch for the one-dispatch hc_pre experiment.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_PRE_SINGLE", "Unfused hc_pre ladder instead of the single-dispatch fused kernel.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_PRE_WIDE", "hc_pre split-K at the decode default slice count instead of 16 (exact-mode registry entry 1).");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_REFUSE", "Four-dispatch hc_pre instead of the fused rms+split-K / reduce+wsum pair.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_TAILFUSE", "Residual add + HC expand as separate dispatches after the MoE shared-down / dense-down matvec.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_TAIL_W4", "Scalar split-K reduce in the hc_pre tail instead of float4.");
+    opt(fp, c, "DS4_GLM_DISABLE_HC_TAIL_WIDE", "Single 1024-thread hc_pre tail instead of the replicated wide tail.");
+    opt(fp, c, "DS4_GLM_DISABLE_INDEXED_SPLIT8", "Mono DSA decode attention kernel for every n_selected instead of the split8 kernel above 64 rows.");
+    opt(fp, c, "DS4_GLM_DISABLE_INDEXER_CAUSAL_GRID", "Full rectangular indexer score grid in prefill instead of the causal staircase plus fill kernel.");
+    opt(fp, c, "DS4_GLM_DISABLE_INDEXER_HEADFOLD", "Disables the indexer head-fold variant selection (prefill indexer projections).");
+    opt(fp, c, "DS4_GLM_DISABLE_INDEXER_PAIR", "Separate dispatches for the indexer k projection and compressor gate.");
+    opt(fp, c, "DS4_GLM_DISABLE_INDEXER_SCORE_STREAM", "Non-streamed DSA indexer scorer (query re-read per threadgroup).");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_LOWRANK_PACK", "Undoes the KDA low-rank pack (f_a+g_a+beta flat3, f_b+g_b pair2in; de-aliased kda_lowrank2).");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_LOWRANK_PROLOGUE", "f_b/g_b as separate dispatches instead of in prep_state's per-head prologue.");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_OUT_FOLD", "KDA decode_out as its own dispatch instead of folded into the state kernel's tail.");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_PREFILL_C16", "KDA prefill at the C=8 configuration instead of the 16-column recurrence.");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_PREFILL_FAST", "Production three-kernel KDA prefill instead of the fast path.");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_QKV_LOWRANK_FOLD", "Separate dispatch for the three low-rank rows instead of riding in the q/k/v grid's tail.");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_REFUSE", "Three-dispatch KDA decode (prep / state / out) instead of the two-dispatch fused prep+state.");
+    opt(fp, c, "DS4_GLM_DISABLE_KDA_SPLIT", "Single fused KDA decode kernel instead of the split form (falls back one level further).");
+    opt(fp, c, "DS4_GLM_DISABLE_LAZY_BATCH_WS", "=1 allocates every batch workspace tensor eagerly instead of on first use.");
+    opt(fp, c, "DS4_GLM_DISABLE_MOE_BLOCK_DATAFLOW", "Kill switch for the MoE block dataflow kernel.");
+    opt(fp, c, "DS4_GLM_DISABLE_PREFILL_FOLD_FFNADD", "Prefill: FFN residual add as its own pass instead of folded (bit-exact).");
+    opt(fp, c, "DS4_GLM_DISABLE_PREFILL_FOLD_HCEXPAND", "Prefill: width-1 HC expand instead of width-4.");
+    opt(fp, c, "DS4_GLM_DISABLE_PREFILL_FOLD_MOEMAP", "Prefill: single-threadgroup routed work map instead of per-expert threadgroups.");
+    opt(fp, c, "DS4_GLM_DISABLE_PREFILL_FOLD_MOESWIGLU", "Prefill: width-1 SwiGLU passes instead of width-4.");
+    opt(fp, c, "DS4_GLM_DISABLE_QAKV_FUSE", "Separate dispatches for attn q_a and kv_a.");
+    opt(fp, c, "DS4_GLM_DISABLE_QKLOW_BATCH_TILE", "Per-(head, token) qk low-rank prefill kernel instead of the token-tiled one.");
+    opt(fp, c, "DS4_GLM_DISABLE_QKLOW_SG", "Thread-per-row qk low-rank decode kernel instead of the coalesced simdgroup kernel at qk_nope=256.");
+    opt(fp, c, "DS4_GLM_DISABLE_REDUCE_Q8_U16", "Byte-wise Q8_0 value-row loads in the split8 reduce instead of ushort pairs.");
+    opt(fp, c, "DS4_GLM_DISABLE_REDUCE_WIDE_TG", "256-thread split8 reduce dispatch instead of 512.");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTED_ASTAGE_DB", "Disables A-stage double buffering in the routed-expert prefill GEMM (default off at compile time; see DS4_GLM_ROUTED_ASTAGE_DB).");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTED_DEQ_WIDE", "Scalar quant-byte loads in the routed prefill GEMM dequant instead of 16-byte loads.");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTED_DOWN_SPLIT", "Sequential routed-expert down matvec instead of the expert-parallel split (Tier 2; also off under DS4_GLM_EXACT).");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTED_GATEUP_WIDE", "Production routed gate+up kernel instead of the ushort4-load variant.");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTED_TILE_NARROW", "Plain 32-row routed prefill tile instead of the narrow tile selection.");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTER_BATCH_TILE", "Per-token router matvec in prefill instead of the token-tiled kernel.");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTER_SELECT_FAST", "Full 512-wide bitonic sort for router top-k instead of the iterative selection (bit-identical).");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTER_SHARED_FOLD", "Router not folded into the head of the shared-expert gate+up grid (two dispatches instead of one).");
+    opt(fp, c, "DS4_GLM_DISABLE_ROUTER_TAIL_FOLD", "Top-8 router selection as its own dispatch instead of folded onto the logits matvec tail.");
+    opt(fp, c, "DS4_GLM_DISABLE_SCORER_HALF", "Forces the production DSA scorer kernel regardless of any variant request.");
+    opt(fp, c, "DS4_GLM_DISABLE_SCORER_XREDUCE", "Kill switch for the xr* scorers.");
+    opt(fp, c, "DS4_GLM_DISABLE_SINKHORN_PAR", "Sinkhorn comb back behind the barrier it used to wait on (no overlap with the collapse).");
+    opt(fp, c, "DS4_GLM_DISABLE_TOOL_RESULT_REORDER", "Disables the GLM tool-result reorder that renders parallel tool results in the order the chat template expects.");
+    opt(fp, c, "DS4_GLM_DISABLE_TOPK_FAST", "Disables the bounded-radix DSA top-k fast path (Tier 1; its only switch; not clamped by DS4_GLM_EXACT).");
+    opt(fp, c, "DS4_GLM_DISABLE_TOPK_ONESHOT", "Disables the one-shot DSA top-k selection path.");
+    opt(fp, c, "DS4_GLM_MTP_NO_ROWSNAP", "Disables the MTP row-boundary KDA snapshot fast path (inert on real GLM-5.3 graphs on this branch).");
+    opt(fp, c, "DS4_KDA_CONCURRENT_DISABLE", "Runs the six KDA first-level prefill projections serially instead of in one concurrent dispatch level.");
+    opt(fp, c, "DS4_KV_EVICT_RAW", "=1 restores the raw full-length KV store on eviction instead of trimming it to the last client-transcript position (which keeps disk keys reproducible).");
+    opt(fp, c, "DS4_METAL_DISABLE_GLM53_Q8_QKV", "Disables the fused Q8_0 KDA q/k/v decode matvec (separate projections instead).");
+    opt(fp, c, "DS4_SLOT_SCORE_LEGACY", "Restores the legacy slot placement instead of eviction-cost scoring (only matters with --batched-session >= 2).");
+    opt(fp, c, "DS4_STREAM_GUARD_LEGACY", "Restores the old streaming guard that held all answer text until a second </think> when thinking and tools were both enabled.");
+    fputc('\n', fp);
+}
 static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
-    if (streq(topic, "runtime") || streq(topic, "distributed")) return true;
+    if (streq(topic, "runtime") || streq(topic, "distributed") || streq(topic, "glm53")) return true;
     if (streq(topic, "sampling"))
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
     if (streq(topic, "steering"))
@@ -459,6 +571,7 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
     if (tool_has_topic(tool, "sampling"))
         more_line(fp, c, "Sampling full info:", "sampling");
     more_line(fp, c, "Distributed inference:", "distributed");
+    more_line(fp, c, "GLM-5.3 switches:", "glm53");
     if (tool_has_topic(tool, "steering"))
         more_line(fp, c, "Steering full info:", "steering");
     if (tool == DS4_HELP_DS4) {
@@ -504,6 +617,9 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
         }
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
+    } else if (topic_is(topic, "glm53")) {
+        opt(fp, c, "exact mode", "DS4_GLM_EXACT=1 ./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --metal -p \"Hello\"");
+        opt(fp, c, "memory ceiling", "DS4_GLM53_MEMORY_CEILING_GB=280 ./ds4-server -m gguf/GLM-5.3-Flash-Q4_K.gguf --metal --ctx 409600");
     } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
         opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192");
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
@@ -530,6 +646,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
         print_distributed(fp, c);
+        print_glm53(fp, c);
         if (tool == DS4_HELP_DS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
@@ -552,6 +669,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
     else if (streq(topic, "distributed")) print_distributed(fp, c);
+    else if (streq(topic, "glm53")) print_glm53(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);

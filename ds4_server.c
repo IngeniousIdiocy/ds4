@@ -2697,6 +2697,135 @@ static void append_glm_tool_result_message(buf *b, const chat_msg *m) {
     append_glm_tool_response(b, content, strlen(content));
 }
 
+/* GLM's chat template renders the responses of one <|observation|> block in
+ * the order of the preceding assistant turn's tool_calls, but only when every
+ * response carries an id that is unique within the block and names one of
+ * those calls, and every call id is present and unique.  A call without a
+ * response is simply skipped; any other irregularity keeps message order.
+ * Mirrors the ns_chk.can_sort logic of chat_template.jinja. */
+typedef struct {
+    const char *id;
+    const char *body;
+    size_t body_len;
+} glm_tool_response_entry;
+
+typedef struct {
+    glm_tool_response_entry *v;
+    int len;
+    int cap;
+} glm_tool_response_entries;
+
+static void glm_tool_response_entries_push(glm_tool_response_entries *es,
+                                           const char *id, const char *body,
+                                           size_t body_len) {
+    if (es->len == es->cap) {
+        es->cap = es->cap ? es->cap * 2 : 4;
+        es->v = xrealloc(es->v, (size_t)es->cap * sizeof(es->v[0]));
+    }
+    es->v[es->len].id = id;
+    es->v[es->len].body = body;
+    es->v[es->len].body_len = body_len;
+    es->len++;
+}
+
+static bool glm_tool_result_reorder_disabled(void) {
+    const char *v = getenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+/* Collect one message's responses as (id, body) entries in message order.
+ * Returns false when the entries cannot be paired with ids one-to-one.  The
+ * Anthropic parser records only unique, non-empty ids, so a block count that
+ * differs from the id count means a block had no id or a duplicate id, which
+ * is exactly what the template refuses to sort. */
+static bool glm_collect_tool_response_entries(const chat_msg *m,
+                                              glm_tool_response_entries *es) {
+    const char *content = m->content ? m->content : "";
+    if (strcmp(m->role, "user") != 0) {
+        glm_tool_response_entries_push(es, m->tool_call_id, content,
+                                       strlen(content));
+        return true;
+    }
+    static const char open[] = "<tool_result>";
+    static const char close[] = "</tool_result>";
+    const char *p = content;
+    int blocks = 0;
+    while ((p = strstr(p, open)) != NULL) {
+        const char *body = p + sizeof(open) - 1;
+        const char *end = strstr(body, close);
+        if (!end) break;
+        if (blocks < m->tool_call_ids_len)
+            glm_tool_response_entries_push(es, m->tool_call_ids[blocks], body,
+                                           (size_t)(end - body));
+        blocks++;
+        p = end + sizeof(close) - 1;
+    }
+    if (blocks == 0) {
+        glm_tool_response_entries_push(
+            es, m->tool_call_ids_len == 1 ? m->tool_call_ids[0] : NULL,
+            content, strlen(content));
+        return true;
+    }
+    return blocks == m->tool_call_ids_len;
+}
+
+static bool tool_calls_have_id(const tool_calls *calls, const char *id) {
+    for (int i = 0; i < calls->len; i++) {
+        if (calls->v[i].id && !strcmp(calls->v[i].id, id)) return true;
+    }
+    return false;
+}
+
+/* Render the observation block starting at msgs->v[start] in tool_call order
+ * when the template's can_sort conditions hold.  Returns the index of the
+ * last message rendered, or -1 (nothing written) when the block must stay in
+ * message order. */
+static int append_glm_sorted_tool_results(buf *b, const chat_msgs *msgs,
+                                          int start) {
+    if (start <= 0 || glm_tool_result_reorder_disabled()) return -1;
+    const chat_msg *a = &msgs->v[start - 1];
+    const tool_calls *calls = &a->calls;
+    if (strcmp(a->role, "assistant") != 0 || calls->len == 0) return -1;
+    int end = start;
+    while (end + 1 < msgs->len && chat_msg_is_glm_tool_result(&msgs->v[end + 1]))
+        end++;
+
+    glm_tool_response_entries es = {0};
+    bool can_sort = true;
+    for (int k = start; k <= end && can_sort; k++)
+        can_sort = glm_collect_tool_response_entries(&msgs->v[k], &es);
+    for (int e = 0; can_sort && e < es.len; e++) {
+        const char *id = es.v[e].id;
+        if (!id || !id[0] || !tool_calls_have_id(calls, id)) {
+            can_sort = false;
+            break;
+        }
+        for (int f = e + 1; f < es.len; f++) {
+            if (es.v[f].id && !strcmp(es.v[f].id, id)) can_sort = false;
+        }
+    }
+    for (int c = 0; can_sort && c < calls->len; c++) {
+        const char *id = calls->v[c].id;
+        if (!id || !id[0]) {
+            can_sort = false;
+            break;
+        }
+        for (int d = c + 1; d < calls->len; d++) {
+            if (calls->v[d].id && !strcmp(calls->v[d].id, id)) can_sort = false;
+        }
+    }
+    if (can_sort) {
+        for (int c = 0; c < calls->len; c++) {
+            for (int e = 0; e < es.len; e++) {
+                if (!strcmp(es.v[e].id, calls->v[c].id))
+                    append_glm_tool_response(b, es.v[e].body, es.v[e].body_len);
+            }
+        }
+    }
+    free(es.v);
+    return can_sort ? end : -1;
+}
+
 static void append_tool_result_text(buf *b, const char *s) {
     /* Tool output is data.  DeepSeek's renderer keeps it as ordinary text inside
      * <tool_result>...</tool_result>, so preserving literal '<', '>' and '&' is
@@ -3038,7 +3167,10 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
             if (!observation_open) buf_puts(&out, "<|observation|>");
-            append_glm_tool_result_message(&out, m);
+            int sorted_end = observation_open ? -1
+                : append_glm_sorted_tool_results(&out, msgs, i);
+            if (sorted_end < 0) append_glm_tool_result_message(&out, m);
+            else i = sorted_end;
             observation_open = true;
             pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
@@ -3250,7 +3382,10 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
             if (!observation_open) buf_puts(&out, "<|observation|>");
-            append_glm_tool_result_message(&out, m);
+            int sorted_end = observation_open ? -1
+                : append_glm_sorted_tool_results(&out, msgs, i);
+            if (sorted_end < 0) append_glm_tool_result_message(&out, m);
+            else i = sorted_end;
             observation_open = true;
             pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
@@ -3718,6 +3853,12 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    /* Clients that cannot emit reasoning_effort (e.g. Claude Code) get the
+     * deployment default from the environment; explicit request fields below
+     * still win since they overwrite this initial value. */
+    const char *env_effort = getenv("DS4_ANTHROPIC_DEFAULT_EFFORT");
+    if (env_effort && *env_effort)
+        parse_reasoning_effort_name(env_effort, &reasoning_effort);
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -6395,6 +6536,67 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
 
+/* After the first "</think>" the model sometimes re-opens reasoning instead of
+ * answering.  While that is still possible we must not stream the pending bytes
+ * as visible text.  The window is narrow though: it only lasts as long as the
+ * pending text could still become a "<think>" (or already is one), so an
+ * ordinary answer starts streaming on its very first token. */
+typedef enum {
+    STREAM_GUARD_HOLD,          /* pending bytes may still open reasoning */
+    STREAM_GUARD_EMIT_THINKING, /* second reasoning block closed at *close_at */
+    STREAM_GUARD_CLEAR          /* ordinary text, disarm and stream normally */
+} stream_guard_action;
+
+/* Not cached: only consulted while the guard is armed (a handful of updates
+ * right after the first "</think>"), and tests flip it per case. */
+static bool stream_guard_legacy(void) {
+    const char *env = getenv("DS4_STREAM_GUARD_LEGACY");
+    return env && env[0] && strcmp(env, "0");
+}
+
+static bool stream_guard_pending_may_open(const char *raw, size_t emit_pos,
+                                          size_t raw_len) {
+    static const char open[] = "<think>";
+    const size_t open_len = sizeof(open) - 1;
+    size_t i = emit_pos;
+    /* The re-open is usually preceded by "\n\n", which is separator syntax. */
+    while (i < raw_len && isspace((unsigned char)raw[i])) i++;
+    const size_t pending = raw_len - i;
+    if (pending == 0) return true;
+    if (pending < open_len) return !strncmp(raw + i, open, pending);
+    return !strncmp(raw + i, open, open_len);
+}
+
+/* On STREAM_GUARD_EMIT_THINKING, [*start_at, *close_at) is the second reasoning
+ * body: the separator whitespace and a literal re-opened "<think>" are syntax,
+ * so they are skipped rather than streamed as thinking content. */
+static stream_guard_action stream_guard_step(const char *raw, size_t emit_pos,
+                                             size_t raw_len, bool has_tools,
+                                             bool final, size_t *start_at,
+                                             size_t *close_at) {
+    const char *close = strstr(raw + emit_pos, "</think>");
+    const char *tool = has_tools ? find_any_tool_start(raw + emit_pos) : NULL;
+    if (close && (!tool || close < tool)) {
+        static const char open[] = "<think>";
+        const size_t open_len = sizeof(open) - 1;
+        size_t body = emit_pos;
+        while (body < raw_len && isspace((unsigned char)raw[body])) body++;
+        if (body + open_len <= (size_t)(close - raw) &&
+            !strncmp(raw + body, open, open_len)) {
+            body += open_len;
+        } else {
+            body = emit_pos;
+        }
+        *start_at = body;
+        *close_at = (size_t)(close - raw);
+        return STREAM_GUARD_EMIT_THINKING;
+    }
+    if (tool || final) return STREAM_GUARD_CLEAR;
+    if (stream_guard_legacy()) return STREAM_GUARD_HOLD;
+    return stream_guard_pending_may_open(raw, emit_pos, raw_len) ?
+        STREAM_GUARD_HOLD : STREAM_GUARD_CLEAR;
+}
+
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
     if (len == 0) return true;
@@ -7186,23 +7388,20 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
     if (st->mode == OPENAI_STREAM_TEXT) {
         if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
+            size_t start_at = st->emit_pos, close_at = 0;
+            const stream_guard_action act =
+                stream_guard_step(raw, st->emit_pos, raw_len, r->has_tools,
+                                  final, &start_at, &close_at);
+            if (act == STREAM_GUARD_HOLD) return true;
+            if (act == STREAM_GUARD_EMIT_THINKING) {
+                if (close_at > start_at &&
                     !sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                      raw + st->emit_pos,
-                                      limit - st->emit_pos)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
+                                      raw + start_at,
+                                      close_at - start_at)) return false;
+                if (close_at > start_at) st->sent_reasoning = true;
+                st->emit_pos = close_at + strlen("</think>");
             }
+            st->guard_second_reasoning = false;
         }
 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
@@ -8820,26 +9019,23 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
 
     if (st->mode == ANTH_STREAM_TEXT) {
         if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos) {
+            size_t start_at = st->emit_pos, close_at = 0;
+            const stream_guard_action act =
+                stream_guard_step(raw, st->emit_pos, raw_len, r->has_tools,
+                                  final, &start_at, &close_at);
+            if (act == STREAM_GUARD_HOLD) return true;
+            if (act == STREAM_GUARD_EMIT_THINKING) {
+                if (close_at > start_at) {
                     if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
                     if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
-                                                  raw + st->emit_pos,
-                                                  limit - st->emit_pos)) return false;
+                                                  raw + start_at,
+                                                  close_at - start_at)) return false;
                     st->sent_thinking = true;
                 }
                 if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
+                st->emit_pos = close_at + strlen("</think>");
             }
+            st->guard_second_reasoning = false;
         }
 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
@@ -9067,6 +9263,16 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* Second candidate spelling of the same frontier.  Whether the next
+     * request replays this turn's reasoning is a client property we cannot
+     * observe when we record the checkpoint: Anthropic clients (Claude Code)
+     * replay thinking blocks, plain chat clients drop reasoning_content.  Both
+     * spellings share the request's prompt prefix and differ only in the bytes
+     * between <think> and </think>, so remembering both costs one string and
+     * one byte comparison and removes the guess.  Only visible_text is offered
+     * to the disk cache as a key; alt_visible_text is live-match only. */
+    char *alt_visible_text;
+    size_t alt_visible_len;
 } visible_live_state;
 
 struct server_slot {
@@ -9077,6 +9283,14 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Live position right after the last request's prompt finished prefilling.
+     * Everything past it is raw sampled output (hidden thinking, DSML tool
+     * markup) that a client may or may not replay verbatim, so it is the last
+     * position this slot can offer as a client-reproducible disk cache key. */
+    int last_prompt_tokens;
+    /* Monotonic assignment stamp used to break slot-placement ties in favour of
+     * the least recently used slot. */
+    uint64_t last_use_seq;
 
     job *assigned;
     job *running;
@@ -9119,6 +9333,7 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    uint64_t slot_use_seq;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -9127,6 +9342,7 @@ struct server {
     bool stopping;
     int clients;
     FILE *trace;
+    const char *trace_path;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
@@ -9396,6 +9612,9 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    free(st->alt_visible_text);
+    st->alt_visible_text = NULL;
+    st->alt_visible_len = 0;
     st->live_tokens = 0;
     st->valid = false;
 }
@@ -9414,12 +9633,19 @@ static void thinking_live_clear(server *s, server_slot *slot) {
 }
 
 static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text) {
+                                   const char *visible_text,
+                                   const char *alt_visible_text) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
     slot->thinking_live.visible_text = xstrdup(visible_text);
     slot->thinking_live.visible_len = strlen(visible_text);
+    if (alt_visible_text && alt_visible_text[0] &&
+        strcmp(alt_visible_text, visible_text) != 0)
+    {
+        slot->thinking_live.alt_visible_text = xstrdup(alt_visible_text);
+        slot->thinking_live.alt_visible_len = strlen(alt_visible_text);
+    }
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
     slot->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
@@ -10191,33 +10417,94 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
+/* Without a visible checkpoint the disk key is the rendered sampled text, whose
+ * tail is hidden thinking plus DSML tool markup.  Clients that replay an
+ * assistant turn byte-exactly still match that key, but the ones that reshape it
+ * (trimmed content, dropped reasoning, re-serialized tool calls) never do, and a
+ * key that misses is a full re-prefill.  Trimming the store back to the last
+ * position that came from the client's own transcript keeps the key reproducible
+ * by construction and costs only the sampled tail.  DS4_KV_EVICT_RAW=1 restores
+ * the raw full-length store for A/B. */
+static bool kv_cache_evict_raw_store(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_KV_EVICT_RAW");
+        cached = env && env[0] && strcmp(env, "0") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* 0 means "store the full live length".  The boundary is used verbatim rather
+ * than through ds4_kvstore_store_len(): boundary_trim_tokens/boundary_align
+ * exist to chop a possibly dynamic tail off a *cold* client prompt, while this
+ * position is the end of a prompt the client has already committed to and will
+ * re-send as the head of its next turn.  min_tokens still applies, because a
+ * trim below it would make the store fail outright.
+ *
+ * GLM-5.3 is excluded because the trim needs the graph to step back to the
+ * boundary and its KDA layers carry a recurrent state that only rolls back one
+ * speculative step: ds4_session_rewind() calls ds4_session_glm_mtp_rewind(),
+ * which fails for any larger step and then clears checkpoint_valid, so the
+ * store would be skipped entirely instead of merely shortened.  On that model
+ * the fallback for an unreproducible sampled tail has to come from a shorter
+ * forward-only checkpoint (--kv-cache-continued-interval-tokens). */
+static bool kv_cache_can_trim_live_prefix(const server *s) {
+    return s && s->engine && !ds4_engine_is_glm53(s->engine);
+}
+
+static int kv_cache_prompt_boundary_store_len(const server *s,
+                                              const server_slot *slot,
+                                              int live_len, bool can_trim) {
+    if (!s || !slot || !can_trim || kv_cache_evict_raw_store()) return 0;
+    const int boundary = slot->last_prompt_tokens;
+    if (boundary <= 0 || boundary >= live_len) return 0;
+    if (boundary < s->kv.opt.min_tokens) return 0;
+    return boundary;
+}
+
+/* tool_mu must be held.  A visible checkpoint only describes the live frontier
+ * it was taken at, so a stale one (live_tokens != live_len) is refused and the
+ * caller falls back to the prompt-boundary trim. */
+static char *kv_cache_visible_store_key_locked(const server_slot *slot,
+                                               int live_len,
+                                               uint8_t *ext_out,
+                                               const char **key_out) {
+    *ext_out = 0;
+    *key_out = NULL;
+    if (!slot) return NULL;
+    if (slot->responses_live.valid &&
+        slot->responses_live.live_tokens == live_len &&
+        slot->responses_live.visible_text &&
+        slot->responses_live.visible_text[0])
+    {
+        *ext_out = KV_EXT_RESPONSES_VISIBLE;
+        *key_out = "responses-visible";
+        return xstrdup(slot->responses_live.visible_text);
+    }
+    if (slot->thinking_live.valid &&
+        slot->thinking_live.live_tokens == live_len &&
+        slot->thinking_live.visible_text &&
+        slot->thinking_live.visible_text[0])
+    {
+        *ext_out = KV_EXT_THINKING_VISIBLE;
+        *key_out = "thinking-visible";
+        return xstrdup(slot->thinking_live.visible_text);
+    }
+    return NULL;
+}
+
 static void kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
 
-    char *visible_text = NULL;
     uint8_t visible_ext = 0;
     const char *visible_key = NULL;
     pthread_mutex_lock(&s->tool_mu);
-    if (slot->responses_live.valid &&
-        slot->responses_live.live_tokens == tokens->len &&
-        slot->responses_live.visible_text &&
-        slot->responses_live.visible_text[0])
-    {
-        visible_text = xstrdup(slot->responses_live.visible_text);
-        visible_ext = KV_EXT_RESPONSES_VISIBLE;
-        visible_key = "responses-visible";
-    } else if (slot->thinking_live.valid &&
-               slot->thinking_live.live_tokens == tokens->len &&
-               slot->thinking_live.visible_text &&
-               slot->thinking_live.visible_text[0])
-    {
-        visible_text = xstrdup(slot->thinking_live.visible_text);
-        visible_ext = KV_EXT_THINKING_VISIBLE;
-        visible_key = "thinking-visible";
-    }
+    char *visible_text = kv_cache_visible_store_key_locked(slot, tokens->len,
+                                                           &visible_ext,
+                                                           &visible_key);
     pthread_mutex_unlock(&s->tool_mu);
 
     /* A visible live checkpoint can contain hidden reasoning that the client
@@ -10229,9 +10516,36 @@ static void kv_cache_store_current(server *s, server_slot *slot,
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
                                         visible_text, visible_ext, visible_key);
         free(visible_text);
-    } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        return;
     }
+
+    const int trim_to = kv_cache_prompt_boundary_store_len(
+        s, slot, tokens->len, kv_cache_can_trim_live_prefix(s));
+    if (trim_to > 0) {
+        /* ds4_kvstore_store_live_prefix* refuses to write a header shorter than
+         * the payload, so the graph itself has to step back to the boundary.
+         * This is only reached on the eviction and shutdown paths, where the
+         * sampled tail is about to be discarded anyway. */
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_rewind(slot->session, trim_to);
+        pthread_mutex_unlock(&s->inference_mu);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache trimmed live %d to prompt boundary %d reason=%s",
+                   tokens->len, trim_to, reason);
+        tokens = ds4_session_tokens(slot->session);
+        if (!tokens || tokens->len != trim_to) return;
+    } else if (slot->last_prompt_tokens > 0 &&
+               slot->last_prompt_tokens < tokens->len) {
+        /* Kept for the operator: this many tokens of the key are raw sampled
+         * output.  If the client reshapes the turn when it replays it, this
+         * entry can never match its next prompt, and only a shorter checkpoint
+         * (--kv-cache-continued-interval-tokens) will. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache %s key covers %d sampled tokens past the last client prompt boundary %d",
+                   reason, tokens->len - slot->last_prompt_tokens,
+                   slot->last_prompt_tokens);
+    }
+    kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -10292,6 +10606,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
+    slot->last_prompt_tokens = 0;
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
@@ -10385,6 +10700,24 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
         s->engine, live_tokens, req->prompt_text + live_text_len,
         effective_prompt);
     free(live_text);
+    /* A text match only proves the live TOKENS render to this prefix; the
+     * session must also be able to serve it.  After a GLM 5.3 live-prefix
+     * rewind that could not restore the recurrent state, the checkpoint is
+     * invalid and ds4_session_common_prefix() reports 0 -- claiming the
+     * prefix here would report cached tokens while the whole prompt is
+     * rebuilt, and it would also skip the disk-snapshot path (tried only
+     * when nothing live was claimed). */
+    pthread_mutex_lock(&s->inference_mu);
+    const int servable =
+        ds4_session_common_prefix(slot->session, effective_prompt);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (servable != live_tokens->len) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: live text prefix of %d tokens matched but only %d are servable; not claiming it (disk snapshot may be used)",
+                   live_tokens->len, servable);
+        ds4_tokens_free(effective_prompt);
+        return 0;
+    }
     return live_tokens->len;
 }
 
@@ -10510,14 +10843,26 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
+    const bool frontier_ok = slot->thinking_live.valid &&
+                             slot->thinking_live.live_tokens == live_pos;
+    bool ok = frontier_ok &&
               slot->thinking_live.visible_text &&
               slot->thinking_live.visible_len < prompt_len &&
               byte_prefix_match(req->prompt_text, prompt_len,
                                 slot->thinking_live.visible_text,
                                 slot->thinking_live.visible_len);
-    if (ok) visible_len = slot->thinking_live.visible_len;
+    if (ok) {
+        visible_len = slot->thinking_live.visible_len;
+    } else if (frontier_ok &&
+               slot->thinking_live.alt_visible_text &&
+               slot->thinking_live.alt_visible_len < prompt_len &&
+               byte_prefix_match(req->prompt_text, prompt_len,
+                                 slot->thinking_live.alt_visible_text,
+                                 slot->thinking_live.alt_visible_len))
+    {
+        ok = true;
+        visible_len = slot->thinking_live.alt_visible_len;
+    }
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -10726,6 +11071,27 @@ static void trace_time(FILE *fp) {
     fputs(buf, fp);
 }
 
+/* Called with trace_mu held, at request boundaries only. DS4_TRACE_MAX_MB
+ * caps the live trace segment; the previous segment is kept at <path>.1. */
+static void trace_maybe_rotate(server *s) {
+    if (!s->trace || !s->trace_path) return;
+    const char *env = getenv("DS4_TRACE_MAX_MB");
+    if (!env || !env[0]) return;
+    long cap_mb = atol(env);
+    if (cap_mb <= 0) return;
+    long pos = ftell(s->trace);
+    if (pos < 0 || pos < cap_mb * 1024L * 1024L) return;
+    char old_path[4096];
+    snprintf(old_path, sizeof(old_path), "%s.1", s->trace_path);
+    fclose(s->trace);
+    rename(s->trace_path, old_path);
+    s->trace = fopen(s->trace_path, "w");
+    if (s->trace) {
+        setvbuf(s->trace, NULL, _IONBF, 0);
+        fprintf(s->trace, "(trace rotated; previous segment at %s)\n", old_path);
+    }
+}
+
 static uint64_t trace_begin(
         server *s,
         const job *j,
@@ -10738,6 +11104,11 @@ static uint64_t trace_begin(
     if (!s->trace) return 0;
 
     pthread_mutex_lock(&s->trace_mu);
+    trace_maybe_rotate(s);
+    if (!s->trace) {
+        pthread_mutex_unlock(&s->trace_mu);
+        return 0;
+    }
     uint64_t id = ++s->trace_seq;
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
@@ -10785,6 +11156,7 @@ static uint64_t trace_begin(
 static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
     if (!s->trace || !id || !piece || !len) return;
     pthread_mutex_lock(&s->trace_mu);
+    if (!s->trace) { pthread_mutex_unlock(&s->trace_mu); return; }
     fwrite(piece, 1, len, s->trace);
     fflush(s->trace);
     pthread_mutex_unlock(&s->trace_mu);
@@ -10793,6 +11165,7 @@ static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
 static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
     if (!s->trace || !id) return;
     pthread_mutex_lock(&s->trace_mu);
+    if (!s->trace) { pthread_mutex_unlock(&s->trace_mu); return; }
     fputs("\n\n--- trace: ", s->trace);
     va_list ap;
     va_start(ap, fmt);
@@ -10818,6 +11191,7 @@ static void trace_finish(
     if (!s->trace || !id) return;
 
     pthread_mutex_lock(&s->trace_mu);
+    if (!s->trace) { pthread_mutex_unlock(&s->trace_mu); return; }
     fprintf(s->trace,
             "\n\n--- parsed message ---\nfinish: %s\ngenerated_tokens: %d\ndsml_start: %d\ndsml_end: %d\nelapsed_sec: %.3f\n",
             final_finish,
@@ -11319,14 +11693,44 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
     return ok;
 }
 
+/* Kill switches for the two behaviours added on top of the original
+ * tool-less/complete-turn-only gate.  Set either to 0 to restore it. */
+static bool checkpoint_switch_on(const char *name) {
+    const char *v = getenv(name);
+    return !(v && v[0] == '0' && v[1] == '\0');
+}
+
+/* Which finished turns get a live thinking checkpoint.
+ *
+ * The original gate only remembered a checkpoint for a tool-less request whose
+ * generation ran to a natural stop outside thinking.  Five days of production
+ * traffic show that rule losing 31 real conversation continuations and
+ * 540 931 re-prefilled tokens: 23 of them Claude Code turns that ended in plain
+ * text with a `tools` array present, 4 truncated by max_tokens.  Both are now
+ * checkpointed:
+ *
+ *  - `length` (max_tokens): the client replays whatever text it received, so
+ *    the visible key describes the frontier exactly like any other turn.  When
+ *    truncation happened inside thinking the caller closes the block first, so
+ *    the sampled KV stays well formed and the visible spelling stays honest.
+ *  - `has_tools` / `prompt_preserves_reasoning`: the renderer replays this
+ *    turn's reasoning when the client sends it back, which is a different
+ *    visible spelling, not an unmatched one.  remember_thinking_checkpoint()
+ *    records both spellings; the matcher accepts either.
+ *
+ * `error` stays excluded: the live session may not describe any real turn. */
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
-    if (r->prompt_preserves_reasoning) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
-    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
-    if (thinking && thinking->inside) return false;
+    if ((r->has_tools || r->prompt_preserves_reasoning) &&
+        !checkpoint_switch_on("DS4_SERVER_CHECKPOINT_WITH_TOOLS")) return false;
+    if (finish && !strcmp(finish, "error")) return false;
+    const bool truncated = finish && !strcmp(finish, "length");
+    if (truncated && !checkpoint_switch_on("DS4_SERVER_CHECKPOINT_ON_LENGTH"))
+        return false;
+    if (thinking && thinking->inside && !truncated) return false;
     return true;
 }
 
@@ -11516,16 +11920,28 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * reasoning bytes, so the next request would miss the session cache even though
  * the visible conversation prefix is logically the same.
  *
+ * DeepSeek replays a reasoning-free assistant turn as:
+ *
  *   prompt-without-final-<think> + </think> + visible-content + eos
  *
- * is exactly the visible prefix that render_chat_prompt_text() will produce on
- * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
- * that caused long post-answer pauses and threw away useful sampled state.
- * Instead, remember the visible bytes as a key for the current sampled frontier.
+ * GLM replays it as:
+ *
+ *   prompt-including-final-<think> + </think> + trimmed-visible-content
+ *
+ * Do not rebuild the KV cache to erase hidden reasoning here: that caused long
+ * post-answer pauses and threw away useful sampled state.  Instead, remember
+ * the syntax-correct visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
-static char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content) {
+/* `reasoning` NULL renders the reasoning-free replay above.  Passing the
+ * sampled reasoning instead renders the other legal spelling of the same turn:
+ * both GLM and DeepSeek keep the assistant's own reasoning between <think> and
+ * </think> when the client sends it back (Anthropic thinking blocks do exactly
+ * that, which is why every Claude Code turn that ends in plain text used to
+ * fall out of the live cache). */
+static char *build_thinking_visible_text(const request *r,
+                                         const char *content,
+                                         const char *reasoning) {
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
@@ -11536,29 +11952,84 @@ static char *build_toolless_thinking_visible_text(const request *r,
         memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
         return NULL;
     }
+    if (reasoning && !reasoning[0]) return NULL;
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
-    buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+        /* render_glm_chat_prompt_text() keeps the opening tag when it drops old
+         * reasoning, trims assistant text, and has no DeepSeek EOS marker. */
+        buf_append(&visible, r->prompt_text, pt_len);
+        if (reasoning) buf_puts(&visible, reasoning);
+        buf_puts(&visible, "</think>");
+        append_trimmed_text(&visible, content);
+    } else {
+        if (reasoning) {
+            buf_append(&visible, r->prompt_text, pt_len);
+            buf_puts(&visible, reasoning);
+        } else {
+            buf_append(&visible, r->prompt_text, pt_len - tag_len);
+        }
+        buf_puts(&visible, "</think>");
+        buf_puts(&visible, content ? content : "");
+        buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    }
     return buf_take(&visible);
 }
 
+static char *build_toolless_thinking_visible_text(const request *r,
+                                                  const char *content) {
+    return build_thinking_visible_text(r, content, NULL);
+}
+
+/* Record the frontier under both spellings a client may replay.
+ *
+ * `close_thinking` is set when generation was cut off by max_tokens before
+ * </think> arrived.  The </think> is appended to the live session first (one
+ * token) so the sampled KV is a well-formed assistant turn instead of an open
+ * reasoning block followed by the next user message, and so the frontier
+ * matches the visible text we are about to remember for it.  If that append
+ * fails the checkpoint is skipped and the next request falls back to disk. */
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
-    if (!visible) return;
+                                         uint64_t trace_id, const char *content,
+                                         const char *reasoning,
+                                         bool close_thinking) {
+    const bool preserves = j->req.prompt_preserves_reasoning;
+    char *toolless = build_toolless_thinking_visible_text(&j->req, content);
+    char *replayed = build_thinking_visible_text(&j->req, content, reasoning);
+    char *primary = preserves && replayed ? replayed : toolless;
+    char *alt = primary == replayed ? toolless : replayed;
+    if (!primary) goto done;
 
-    thinking_live_remember(s, slot, visible);
+    if (close_thinking) {
+        int appended = 0;
+        char err[160] = {0};
+        if (!append_rendered_suffix_to_live_session(s, slot, "</think>",
+                                                   &appended, err, sizeof(err)))
+        {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: thinking live checkpoint skipped ctx=%s reason=close-thinking-failed detail=%s",
+                       ctx, err[0] ? err : "unknown error");
+            thinking_live_clear(s, slot);
+            goto done;
+        }
+        trace_event(s, trace_id,
+                    "thinking live checkpoint closed truncated reasoning: appended=%d",
+                    appended);
+    }
+
+    thinking_live_remember(s, slot, primary, alt);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(slot->session), strlen(visible));
+               "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu alt=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(primary),
+               alt ? strlen(alt) : (size_t)0);
     trace_event(s, trace_id,
-                "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(slot->session), strlen(visible));
-    free(visible);
+                "thinking live checkpoint remembered: live=%d visible=%zu alt=%zu",
+                ds4_session_pos(slot->session), strlen(primary),
+                alt ? strlen(alt) : (size_t)0);
+done:
+    free(toolless);
+    free(replayed);
 }
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -12299,6 +12770,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&effective_prompt);
         return;
     }
+    /* The live graph now ends exactly where the client-rendered prompt ended.
+     * Remember it: tokens sampled from here on are not guaranteed to come back
+     * in the next request, so this is the last position that can serve as a
+     * client-reproducible disk cache key for this slot. */
+    slot->last_prompt_tokens = ds4_session_pos(slot->session);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
@@ -13027,7 +13503,9 @@ decode_again:
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
+                                     parsed_content ? parsed_content : "",
+                                     parsed_reasoning,
+                                     thinking.inside);
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -13216,6 +13694,57 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+static bool job_slot_score_legacy(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_SLOT_SCORE_LEGACY");
+        cached = env && env[0] && strcmp(env, "0") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* A prompt that shares only the leading chat markers with a slot scores 2 there
+ * and 0 against an empty slot, so plain longest-common-prefix placement sends
+ * every unrelated request at the slot holding the biggest conversation and
+ * evicts it.  Reuse is only worth a resident session when the shared prefix
+ * actually covers that session; otherwise place by eviction cost. */
+static bool job_slot_reuse_is_substantial(const server *s, int common, int live) {
+    if (common <= 0 || live <= 0) return false;
+    /* s->kv.opt is zeroed when the disk cache is off, so keep a floor. */
+    const int min_tokens = s->kv.opt.min_tokens > 0 ? s->kv.opt.min_tokens : 512;
+    if (common < min_tokens) return false;
+    return common * 2 >= live;
+}
+
+/* 0 for the least recently used slot, higher for more recently used ones. */
+static int slot_recency_rank(const server *s, const server_slot *slot) {
+    int rank = 0;
+    for (int i = 0; i < s->slot_count; i++) {
+        const server_slot *other = &s->slots[i];
+        if (other == slot) continue;
+        if (other->last_use_seq < slot->last_use_seq) rank++;
+    }
+    return rank;
+}
+
+/* live * this must stay below INT_MAX; live is capped by ctx_size. */
+#define JOB_SLOT_RECENCY_SCALE 1024
+#define JOB_SLOT_REUSE_BASE (1 << 28)
+
+static int job_slot_place_score(const server *s, int common, int live,
+                                int recency_rank) {
+    if (job_slot_reuse_is_substantial(s, common, live)) {
+        return JOB_SLOT_REUSE_BASE + common;
+    }
+    /* No usable reuse: this slot's live KV is about to be thrown away, so rank
+     * by what that costs.  Empty slot (live 0) wins, then the smallest live
+     * session, then the least recently used one. */
+    const int live_cap = INT_MAX / JOB_SLOT_RECENCY_SCALE - 1;
+    if (live > live_cap) live = live_cap;
+    if (live < 0) live = 0;
+    return -(live * JOB_SLOT_RECENCY_SCALE) - recency_rank;
+}
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
@@ -13227,7 +13756,9 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
         return -1;
     }
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+    if (job_slot_score_legacy()) return common;
+    return job_slot_place_score(s, common, ds4_session_pos(slot->session),
+                                slot_recency_rank(s, slot));
 }
 
 static void dispatch_jobs_locked(server *s) {
@@ -13260,7 +13791,6 @@ static void dispatch_jobs_locked(server *s) {
             }
         }
         pthread_mutex_unlock(&s->tool_mu);
-        (void)chosen_score;
         if (!chosen || !chosen_slot) break;
 
         if (chosen_prev) chosen_prev->next = chosen->next;
@@ -13269,6 +13799,13 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        chosen_slot->last_use_seq = ++s->slot_use_seq;
+        /* Placement is otherwise invisible in the logs, and it decides which
+         * resident conversation survives. */
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: slot %d assigned prompt=%d live=%d score=%d",
+                   chosen_slot->id, chosen->req.prompt.len,
+                   ds4_session_pos(chosen_slot->session), chosen_score);
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -13966,6 +14503,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "--dflash")) {
+            c.engine.dflash_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -14334,6 +14873,7 @@ int main(int argc, char **argv) {
     }
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
+        s.trace_path = cfg.trace_path;
         if (!s.trace) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
@@ -14478,6 +15018,105 @@ static void test_server_bind_slot(server *s, server_slot *slot) {
     slot->id = 0;
     s->slots = slot;
     s->slot_count = 1;
+}
+
+/* An unrelated small prompt must not be placed on the slot holding a large
+ * conversation just because it shares the leading chat markers. */
+static void test_job_slot_placement_prefers_cheap_eviction(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    s.kv.opt = kv_cache_default_options();
+    const int big = 23922;
+
+    /* Scenario 1: slot 0 holds the agent session, slot 1 is empty. */
+    int score_big = job_slot_place_score(&s, 2, big, 1);
+    int score_empty = job_slot_place_score(&s, 0, 0, 0);
+    TEST_ASSERT(score_empty > score_big);
+
+    /* Scenario 2: both slots hold live sessions, neither is reusable.  The
+     * smaller one is the cheaper eviction. */
+    int score_small_live = job_slot_place_score(&s, 2, 1241, 0);
+    TEST_ASSERT(score_small_live > score_big);
+
+    /* Scenario 3: a request that really does continue the big session still
+     * wins that slot over an empty one. */
+    int score_reuse = job_slot_place_score(&s, big - 100, big, 1);
+    TEST_ASSERT(score_reuse > score_empty);
+    TEST_ASSERT(score_reuse > job_slot_place_score(&s, big - 200, big, 0));
+
+    /* A shared prefix too small to be worth the eviction is not reuse. */
+    TEST_ASSERT(!job_slot_reuse_is_substantial(&s, 2, big));
+    TEST_ASSERT(!job_slot_reuse_is_substantial(&s, 1024, big));
+    TEST_ASSERT(job_slot_reuse_is_substantial(&s, big - 100, big));
+
+    /* Ties between equally cheap slots go to the least recently used. */
+    TEST_ASSERT(job_slot_place_score(&s, 0, 0, 0) >
+                job_slot_place_score(&s, 0, 0, 1));
+    slots[0].last_use_seq = 7;
+    slots[1].last_use_seq = 3;
+    TEST_ASSERT(slot_recency_rank(&s, &slots[0]) == 1);
+    TEST_ASSERT(slot_recency_rank(&s, &slots[1]) == 0);
+
+    /* Busy or already-assigned slots stay ineligible, and an explicit live-tool
+     * binding still overrides placement.  Both are checked before the session
+     * is touched, so a slot without a session is safe here. */
+    job j = {0};
+    slots[0].busy = true;
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, -1) == INT_MIN);
+    slots[0].busy = false;
+    slots[0].assigned = &j;
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, -1) == INT_MIN);
+    slots[0].assigned = NULL;
+    slots[0].id = 0;
+    slots[1].id = 1;
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &j, 1) == INT_MAX);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, 1) == INT_MIN);
+    TEST_ASSERT(!job_slot_score_legacy());
+}
+
+/* Layer 2: with no visible checkpoint the evict store must fall back to the
+ * last client-rendered prompt boundary instead of the raw sampled frontier. */
+static void test_kv_cache_evict_store_trims_to_prompt_boundary(void) {
+    server s = {0};
+    server_slot slot = {0};
+    test_server_bind_slot(&s, &slot);
+    s.kv.opt = kv_cache_default_options();
+    const int live = 23922;
+    slot.last_prompt_tokens = 23541;
+
+    TEST_ASSERT(kv_cache_prompt_boundary_store_len(&s, &slot, live, true) == 23541);
+    /* Backends that cannot rewind the live graph (GLM-5.3: recurrent KDA state)
+     * must keep the full-length store rather than lose it. */
+    TEST_ASSERT(kv_cache_prompt_boundary_store_len(&s, &slot, live, false) == 0);
+    /* No boundary recorded yet, boundary at or past the frontier, and a
+     * boundary below min_tokens all keep the full-length store. */
+    slot.last_prompt_tokens = 0;
+    TEST_ASSERT(kv_cache_prompt_boundary_store_len(&s, &slot, live, true) == 0);
+    slot.last_prompt_tokens = live;
+    TEST_ASSERT(kv_cache_prompt_boundary_store_len(&s, &slot, live, true) == 0);
+    slot.last_prompt_tokens = s.kv.opt.min_tokens - 1;
+    TEST_ASSERT(kv_cache_prompt_boundary_store_len(&s, &slot, live, true) == 0);
+    TEST_ASSERT(!kv_cache_evict_raw_store());
+
+    /* A valid visible checkpoint at the live frontier still wins, and a stale
+     * one falls through to the boundary trim. */
+    slot.last_prompt_tokens = 23541;
+    uint8_t ext = 0;
+    const char *key = NULL;
+    slot.thinking_live.valid = true;
+    slot.thinking_live.live_tokens = live;
+    slot.thinking_live.visible_text = xstrdup("visible transcript");
+    char *visible = kv_cache_visible_store_key_locked(&slot, live, &ext, &key);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(ext == KV_EXT_THINKING_VISIBLE);
+    TEST_ASSERT(key != NULL && !strcmp(key, "thinking-visible"));
+    free(visible);
+    slot.thinking_live.live_tokens = live - 7;
+    TEST_ASSERT(kv_cache_visible_store_key_locked(&slot, live, &ext, &key) == NULL);
+    TEST_ASSERT(kv_cache_prompt_boundary_store_len(&s, &slot, live, true) == 23541);
+    visible_live_clear_locked(&slot.thinking_live);
 }
 
 static void test_batched_prefill_round_robin(void) {
@@ -14838,6 +15477,12 @@ static tool_schema_orders make_bash_order(void) {
     return orders;
 }
 
+static int count_substr(const char *hay, const char *needle) {
+    int n = 0;
+    for (const char *p = hay; (p = strstr(p, needle)); p++) n++;
+    return n;
+}
+
 static char *read_socket_text(int fd) {
     buf b = {0};
     char tmp[1024];
@@ -15016,10 +15661,15 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     close(sv[1]);
 }
 
-static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
+/* Legacy guard: hold every post-</think> byte until a tool call or the final
+ * flush, so a bare second "</think>" (no re-opened "<think>") can retroactively
+ * reclassify the interstitial text as reasoning.  That hold is what stalled the
+ * whole answer into one delta, so it now only happens under the kill switch. */
+static void test_anthropic_stream_legacy_guard_reroutes_second_reasoning_pass(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
+    setenv("DS4_STREAM_GUARD_LEGACY", "1", 1);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15045,6 +15695,155 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
     TEST_ASSERT(strstr(out, "\"text\":\"final answer\"") != NULL);
     TEST_ASSERT(strstr(out, "\"text\":\"escaped draft") == NULL);
     TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+    unsetenv("DS4_STREAM_GUARD_LEGACY");
+}
+
+/* Thinking + tools is what Claude Code always sends.  An ordinary answer must
+ * start streaming on its first token instead of being buffered until the final
+ * flush, so these assertions are made without ever passing final=true. */
+static void test_anthropic_stream_sends_text_before_final_flush(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_live_text", 4, &st));
+    static const char *steps[] = {
+        "<think>abc</thi",
+        "<think>abc</think>",
+        "<think>abc</think>Hello",
+        "<think>abc</think>Hello world,",
+        "<think>abc</think>Hello world, this is a normal answer.",
+    };
+    for (size_t i = 0; i < sizeof(steps)/sizeof(steps[0]); i++) {
+        TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_live_text",
+                                                &st, steps[i], strlen(steps[i]),
+                                                false));
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *thinking = strstr(out, "\"type\":\"thinking_delta\"");
+    const char *first_text = strstr(out, "\"text\":\"Hello\"");
+    TEST_ASSERT(thinking != NULL);
+    TEST_ASSERT(first_text != NULL);
+    TEST_ASSERT(thinking < first_text);
+    TEST_ASSERT(strstr(out, "\"text\":\" world,\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\" this is a normal answer.\"") != NULL);
+    TEST_ASSERT(strstr(out, "<think>") == NULL);
+
+    TEST_ASSERT(count_substr(out, "\"type\":\"text_delta\"") == 3);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* The guard still earns its keep: a "<think>" re-opened right after the first
+ * "</think>" routes to thinking, and only the answer after it becomes text. */
+static void test_anthropic_stream_routes_immediate_second_think_block(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_reopen", 4, &st));
+    static const char *steps[] = {
+        "<think>a</think>",
+        "<think>a</think>\n\n",
+        "<think>a</think>\n\n<think>",
+        "<think>a</think>\n\n<think>b",
+        "<think>a</think>\n\n<think>b</think>",
+        "<think>a</think>\n\n<think>b</think>Answer",
+    };
+    for (size_t i = 0; i < sizeof(steps)/sizeof(steps[0]); i++) {
+        TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_reopen",
+                                                &st, steps[i], strlen(steps[i]),
+                                                false));
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *second = strstr(out, "\"thinking\":\"b\"");
+    const char *answer = strstr(out, "\"text\":\"Answer\"");
+    TEST_ASSERT(strstr(out, "\"thinking\":\"a\"") != NULL);
+    TEST_ASSERT(second != NULL);
+    TEST_ASSERT(answer != NULL);
+    TEST_ASSERT(second < answer);
+    TEST_ASSERT(strstr(out, "\"text\":\"b\"") == NULL);
+    TEST_ASSERT(strstr(out, "<think>") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* A partial "<thi" could still become "<think>", so it is held.  Once it
+ * diverges the reasoning guard disarms; text_stream_safe_limit then keeps its
+ * own separate hold on the trailing '<' (a possible partial "<tool_calls>")
+ * until the 80-byte marker window slides past it. */
+static void test_anthropic_stream_holds_only_partial_think_prefix(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_prefix", 4, &st));
+
+    const char *held = "<think>a</think><thi";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_prefix", &st,
+                                            held, strlen(held), false));
+    const char *diverged = "<think>a</think><this is text";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_prefix", &st,
+                                            diverged, strlen(diverged), false));
+    const char *flowing =
+        "<think>a</think><this is text and it keeps going until the partial "
+        "marker window has slid well past that opening angle bracket.";
+    TEST_ASSERT(strlen(flowing) > 96);
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_prefix", &st,
+                                            flowing, strlen(flowing), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"thinking\":\"a\"") != NULL);
+    TEST_ASSERT(strstr(out, "<this is text and it keeps going") != NULL);
+    /* Held bytes stream exactly once, never twice. */
+    TEST_ASSERT(count_substr(out, "\"type\":\"text_delta\"") == 1);
 
     free(out);
     anthropic_stream_free(&st);
@@ -15246,10 +16045,12 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     close(sv[1]);
 }
 
-static void test_openai_stream_reroutes_second_reasoning_pass(void) {
+/* OpenAI twin of the Anthropic legacy-guard case: see the note there. */
+static void test_openai_stream_legacy_guard_reroutes_second_reasoning_pass(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
+    setenv("DS4_STREAM_GUARD_LEGACY", "1", 1);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15276,6 +16077,144 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     TEST_ASSERT(strstr(out, "\"content\":\"final answer\"") != NULL);
     TEST_ASSERT(strstr(out, "\"content\":\"escaped draft") == NULL);
     TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+    unsetenv("DS4_STREAM_GUARD_LEGACY");
+}
+
+static void test_openai_stream_sends_content_before_final_flush(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    static const char *steps[] = {
+        "<think>abc</thi",
+        "<think>abc</think>",
+        "<think>abc</think>Hello",
+        "<think>abc</think>Hello world,",
+        "<think>abc</think>Hello world, this is a normal answer.",
+    };
+    for (size_t i = 0; i < sizeof(steps)/sizeof(steps[0]); i++) {
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_live_text",
+                                             &st, steps[i], strlen(steps[i]),
+                                             false));
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *reasoning = strstr(out, "\"reasoning_content\":\"a\"");
+    const char *first = strstr(out, "\"delta\":{\"content\":\"Hello\"}");
+    TEST_ASSERT(reasoning != NULL);
+    TEST_ASSERT(first != NULL);
+    TEST_ASSERT(reasoning < first);
+    TEST_ASSERT(strstr(out, "\"delta\":{\"content\":\" world,\"}") != NULL);
+    TEST_ASSERT(strstr(out, "\"delta\":{\"content\":\" this is a normal answer.\"}") != NULL);
+    TEST_ASSERT(count_substr(out, "\"delta\":{\"content\":") == 3);
+    TEST_ASSERT(strstr(out, "<think>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_stream_routes_immediate_second_think_block(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    static const char *steps[] = {
+        "<think>a</think>",
+        "<think>a</think>\n\n",
+        "<think>a</think>\n\n<think>",
+        "<think>a</think>\n\n<think>b",
+        "<think>a</think>\n\n<think>b</think>",
+        "<think>a</think>\n\n<think>b</think>Answer",
+    };
+    for (size_t i = 0; i < sizeof(steps)/sizeof(steps[0]); i++) {
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_reopen",
+                                             &st, steps[i], strlen(steps[i]),
+                                             false));
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *second = strstr(out, "\"reasoning_content\":\"b\"");
+    const char *answer = strstr(out, "\"delta\":{\"content\":\"Answer\"}");
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"a\"") != NULL);
+    TEST_ASSERT(second != NULL);
+    TEST_ASSERT(answer != NULL);
+    TEST_ASSERT(second < answer);
+    TEST_ASSERT(strstr(out, "\"delta\":{\"content\":\"b\"}") == NULL);
+    TEST_ASSERT(strstr(out, "<think>") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_stream_holds_only_partial_think_prefix(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+
+    const char *held = "<think>a</think><thi";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_prefix", &st,
+                                         held, strlen(held), false));
+    const char *diverged = "<think>a</think><this is text";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_prefix", &st,
+                                         diverged, strlen(diverged), false));
+    const char *flowing =
+        "<think>a</think><this is text and it keeps going until the partial "
+        "marker window has slid well past that opening angle bracket.";
+    TEST_ASSERT(strlen(flowing) > 96);
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_prefix", &st,
+                                         flowing, strlen(flowing), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"a\"") != NULL);
+    TEST_ASSERT(strstr(out, "<this is text and it keeps going") != NULL);
+    TEST_ASSERT(count_substr(out, "\"delta\":{\"content\":") == 1);
 
     free(out);
     openai_stream_free(&st);
@@ -16169,6 +17108,81 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+/* The disk cache key for an evicted agent session is the rendered text of the
+ * sampled tokens, so a client that replays a tool-call turn must re-render to
+ * the same bytes or the entry can never match its next prompt.  GLM keeps the
+ * sampled reasoning in tool context and replays the exact sampled DSML, so the
+ * transcript grows as an append-only byte stream.  Guard that. */
+static void test_render_glm_tool_context_replays_sampled_bytes(void) {
+    const char *sampled_dsml =
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call>";
+    const char *sampled =
+        "checking the repo</think>Let me look."
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call>";
+
+    chat_msgs msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("first");
+    chat_msgs_push(&msgs, user1);
+
+    tool_schema_orders orders = make_bash_order();
+    char *before = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(before != NULL);
+    /* The generation prompt hands the model an open <think>; everything in
+     * "sampled" is what the model itself produced after it. */
+    const size_t before_len = strlen(before);
+    TEST_ASSERT(before_len >= 7 && !strcmp(before + before_len - 7, "<think>"));
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("checking the repo");
+    assistant.content = xstrdup("Let me look.");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    assistant.calls.raw_tool_text = xstrdup(sampled_dsml);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    char *after = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(after != NULL);
+
+    buf live = {0};
+    buf_puts(&live, before);
+    buf_puts(&live, sampled);
+    TEST_ASSERT(strlen(after) >= live.len);
+    TEST_ASSERT(!memcmp(after, live.ptr, live.len));
+    TEST_ASSERT(!strcmp(after + live.len,
+                        "<|observation|><tool_response>/tmp</tool_response>"
+                        "<|assistant|><think>"));
+
+    /* Without client-supplied reasoning the re-render collapses the sampled
+     * thinking to <think></think>, so a rendered-token key cannot match.  That
+     * case is what the visible-transcript checkpoint key exists for. */
+    free(msgs.v[1].reasoning);
+    msgs.v[1].reasoning = NULL;
+    char *no_reasoning = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(no_reasoning != NULL);
+    TEST_ASSERT(memcmp(no_reasoning, live.ptr, live.len) != 0);
+
+    free(no_reasoning);
+    free(after);
+    free(before);
+    buf_free(&live);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_groups_tool_results(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -16215,6 +17229,194 @@ static void test_render_glm_groups_tool_results(void) {
     TEST_ASSERT(strstr(prompt, "<|user|><tool_result>") == NULL);
     free(prompt);
     chat_msgs_free(&anthropic);
+}
+
+static chat_msg make_glm_reorder_msg(const char *role, const char *content,
+                                     const char *tool_call_id) {
+    chat_msg m = {0};
+    m.role = xstrdup(role);
+    m.content = xstrdup(content);
+    chat_msg_add_tool_call_id(&m, tool_call_id);
+    return m;
+}
+
+static chat_msg make_glm_reorder_assistant(const char *const *ids, int n) {
+    chat_msg m = {0};
+    m.role = xstrdup("assistant");
+    m.content = xstrdup("");
+    static const char *const cmds[] = {"pwd", "ls", "id"};
+    for (int i = 0; i < n; i++) {
+        tool_call tc = {0};
+        tc.id = ids[i] ? xstrdup(ids[i]) : NULL;
+        tc.name = xstrdup("bash");
+        char args[64];
+        snprintf(args, sizeof(args), "{\"command\":\"%s\"}", cmds[i]);
+        tc.arguments = xstrdup(args);
+        tool_calls_push(&m.calls, tc);
+    }
+    return m;
+}
+
+/* Expected bytes come from the reference chat template rendered by
+ * tests/glm_tool_result_reorder_ref.py; the observation block is the only
+ * part that differs between cases. */
+static void check_glm_reorder_case(const chat_msgs *msgs, int ncalls,
+                                   const char *observation) {
+    static const char head[] =
+        "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>run both"
+        "<|assistant|><think></think>\n"
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call><tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>ls</arg_value></tool_call>";
+    static const char third[] =
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>id</arg_value>"
+        "</tool_call>";
+    buf expected = {0};
+    buf_puts(&expected, head);
+    if (ncalls == 3) buf_puts(&expected, third);
+    buf_puts(&expected, "\n<|observation|>");
+    buf_puts(&expected, observation);
+    buf_puts(&expected, "<|assistant|><think>");
+    tool_schema_orders orders = make_bash_order();
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt, expected.ptr));
+    free(prompt);
+    tool_schema_orders_free(&orders);
+    buf_free(&expected);
+}
+
+static void test_render_glm_reorders_tool_results(void) {
+    static const char *const ab[] = {"call_a", "call_b"};
+    static const char *const abc[] = {"call_a", "call_b", "call_c"};
+    static const char *const aa[] = {"call_a", "call_a"};
+    const char *sorted =
+        "<tool_response>/tmp</tool_response><tool_response>a b</tool_response>";
+    const char *as_sent =
+        "<tool_response>a b</tool_response><tool_response>/tmp</tool_response>";
+    unsetenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER");
+
+    /* In order: bytes identical with and without the reorder path. */
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(ab, 2));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "/tmp", "call_a"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "a b", "call_b"));
+    check_glm_reorder_case(&msgs, 2, sorted);
+    setenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER", "1", 1);
+    check_glm_reorder_case(&msgs, 2, sorted);
+    unsetenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER");
+    chat_msgs_free(&msgs);
+
+    /* Out of order, OpenAI-style separate tool messages: sorted unless the
+     * kill switch is set. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(ab, 2));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "a b", "call_b"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "/tmp", "call_a"));
+    check_glm_reorder_case(&msgs, 2, sorted);
+    setenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER", "1", 1);
+    check_glm_reorder_case(&msgs, 2, as_sent);
+    unsetenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER");
+    chat_msgs_free(&msgs);
+
+    /* Three calls, one response missing: the template still sorts what is
+     * there (a call without a response is skipped, not a sort blocker). */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(abc, 3));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "uid=0", "call_c"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "/tmp", "call_a"));
+    check_glm_reorder_case(&msgs, 3,
+        "<tool_response>/tmp</tool_response><tool_response>uid=0</tool_response>");
+    chat_msgs_free(&msgs);
+
+    /* Duplicate call ids: message order. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(aa, 2));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "a b", "call_a"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "/tmp", "call_a"));
+    check_glm_reorder_case(&msgs, 2, as_sent);
+    chat_msgs_free(&msgs);
+
+    /* Duplicate response ids: message order. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(ab, 2));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "a b", "call_b"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "again", "call_b"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "/tmp", "call_a"));
+    check_glm_reorder_case(&msgs, 2,
+        "<tool_response>a b</tool_response><tool_response>again</tool_response>"
+        "<tool_response>/tmp</tool_response>");
+    chat_msgs_free(&msgs);
+
+    /* A response whose id matches no call: message order. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(ab, 2));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "a b", "call_b"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "stray", "call_zzz"));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("tool", "/tmp", "call_a"));
+    check_glm_reorder_case(&msgs, 2,
+        "<tool_response>a b</tool_response><tool_response>stray</tool_response>"
+        "<tool_response>/tmp</tool_response>");
+    chat_msgs_free(&msgs);
+
+    /* Anthropic wire shape: one user message carrying two tool_result blocks
+     * out of order, parsed by the real Anthropic parser. */
+    const char *anthropic_json =
+        "[{\"role\":\"user\",\"content\":\"run both\"},"
+        "{\"role\":\"assistant\",\"content\":["
+        "{\"type\":\"tool_use\",\"id\":\"call_a\",\"name\":\"bash\","
+        "\"input\":{\"command\":\"pwd\"}},"
+        "{\"type\":\"tool_use\",\"id\":\"call_b\",\"name\":\"bash\","
+        "\"input\":{\"command\":\"ls\"}}]},"
+        "{\"role\":\"user\",\"content\":["
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"call_b\",\"content\":\"a b\"},"
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"call_a\",\"content\":\"/tmp\"}]}]";
+    memset(&msgs, 0, sizeof(msgs));
+    const char *p = anthropic_json;
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3 && msgs.v[2].tool_call_ids_len == 2);
+    check_glm_reorder_case(&msgs, 2, sorted);
+    setenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER", "1", 1);
+    check_glm_reorder_case(&msgs, 2, as_sent);
+    unsetenv("DS4_GLM_DISABLE_TOOL_RESULT_REORDER");
+    chat_msgs_free(&msgs);
+
+    /* Anthropic blocks with a duplicate id, and with a block lacking an id:
+     * the parser records only unique ids, so the block/id counts disagree and
+     * the block keeps message order, as the template does. */
+    memset(&msgs, 0, sizeof(msgs));
+    chat_msgs_push(&msgs, make_glm_reorder_msg("user", "run both", NULL));
+    chat_msgs_push(&msgs, make_glm_reorder_assistant(ab, 2));
+    chat_msg dup = make_glm_reorder_msg("user",
+        "<tool_result>a b</tool_result><tool_result>/tmp</tool_result>", "call_b");
+    chat_msg_add_tool_call_id(&dup, "call_b");
+    chat_msgs_push(&msgs, dup);
+    check_glm_reorder_case(&msgs, 2, as_sent);
+    chat_msgs_free(&msgs);
+
+    /* OpenAI wire shape through the real parser. */
+    const char *openai_json =
+        "[{\"role\":\"user\",\"content\":\"run both\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+        "{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"bash\","
+        "\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}},"
+        "{\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"bash\","
+        "\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_b\",\"content\":\"a b\"},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"/tmp\"}]";
+    memset(&msgs, 0, sizeof(msgs));
+    p = openai_json;
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 4);
+    check_glm_reorder_case(&msgs, 2, sorted);
+    chat_msgs_free(&msgs);
 }
 
 static void test_dsml_tool_args_preserve_call_order(void) {
@@ -18242,23 +19444,241 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    /* Truncated by max_tokens while still inside thinking: checkpointed now
+     * (the caller closes the block first).  A `stop` that lands inside
+     * thinking is still refused — that is a malformed turn, not a truncated
+     * one, and nothing closes it. */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "length"));
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "error"));
 
     st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "length"));
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "error"));
 
+    /* Tool-context turns: the renderer replays this turn's reasoning, which is
+     * a second visible spelling rather than an unmatchable one. */
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "length"));
+
+    /* Kill switches restore the original gate exactly. */
+    setenv("DS4_SERVER_CHECKPOINT_WITH_TOOLS", "0", 1);
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.has_tools = false;
+    r.prompt_preserves_reasoning = true;
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    unsetenv("DS4_SERVER_CHECKPOINT_WITH_TOOLS");
+    r.prompt_preserves_reasoning = false;
+
+    setenv("DS4_SERVER_CHECKPOINT_ON_LENGTH", "0", 1);
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    st.inside = true;
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    st.inside = false;
+    setenv("DS4_SERVER_CHECKPOINT_ON_LENGTH", "1", 1);
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "length"));
+    unsetenv("DS4_SERVER_CHECKPOINT_ON_LENGTH");
+
     r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.think_mode = DS4_THINK_HIGH;
+    r.kind = REQ_COMPLETION;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     request_free(&r);
+}
+
+/* Build the request the way generate_job_inner sees it after rendering. */
+static request test_make_glm_thinking_request(const chat_msgs *msgs,
+                                              const char *tool_schemas) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.has_tools = tool_schemas && tool_schemas[0];
+    r.prompt_preserves_reasoning =
+        chat_history_uses_tool_context(msgs, tool_schemas);
+    r.prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, msgs, tool_schemas, NULL, DS4_THINK_HIGH);
+    return r;
+}
+
+static void test_push_msg(chat_msgs *msgs, const char *role, const char *content,
+                          const char *reasoning) {
+    chat_msg m = {0};
+    m.role = xstrdup(role);
+    m.content = xstrdup(content ? content : "");
+    if (reasoning) m.reasoning = xstrdup(reasoning);
+    chat_msgs_push(msgs, m);
+}
+
+/* The Claude Code shape: a `tools` array is present and the turn ends in plain
+ * text.  The live KV holds the sampled bytes "</think>\n\nanswer"; the next
+ * request renders the same turn with the reasoning replayed and the answer
+ * whitespace-trimmed, so a raw token comparison diverges at the first sampled
+ * reasoning token.  The reasoning-replay visible key is a byte prefix of that
+ * next prompt, which is what lets the continuation ladder keep the live KV. */
+static void test_thinking_checkpoint_key_matches_tool_replay(void) {
+    const char *tools =
+        "{\"name\":\"Bash\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{}}}}";
+    const char *reasoning = "the user wants the file listed";
+    const char *content = "\n\nHere is the listing.";
+
+    chat_msgs turn1 = {0};
+    test_push_msg(&turn1, "system", "You are Claude Code.", NULL);
+    test_push_msg(&turn1, "user", "list the files", NULL);
+    request r1 = test_make_glm_thinking_request(&turn1, tools);
+    TEST_ASSERT(r1.prompt_text != NULL);
+    TEST_ASSERT(r1.prompt_preserves_reasoning);
+
+    char *primary = build_thinking_visible_text(&r1, content, reasoning);
+    char *alt = build_toolless_thinking_visible_text(&r1, content);
+    TEST_ASSERT(primary && alt && strcmp(primary, alt) != 0);
+
+    /* What the live KV actually holds after this turn. */
+    buf live = {0};
+    buf_puts(&live, r1.prompt_text);
+    buf_puts(&live, reasoning);
+    buf_puts(&live, "</think>");
+    buf_puts(&live, content);
+
+    chat_msgs turn2 = {0};
+    test_push_msg(&turn2, "system", "You are Claude Code.", NULL);
+    test_push_msg(&turn2, "user", "list the files", NULL);
+    test_push_msg(&turn2, "assistant", content, reasoning);
+    test_push_msg(&turn2, "user", "now count them", NULL);
+    request r2 = test_make_glm_thinking_request(&turn2, tools);
+    TEST_ASSERT(r2.prompt_text != NULL);
+    const size_t p2 = strlen(r2.prompt_text);
+
+    /* The defect: the sampled transcript is not a prefix of the next prompt,
+     * because the renderer trims the assistant text the model actually
+     * emitted.  This is why reason=token-mismatch fires. */
+    TEST_ASSERT(!byte_prefix_match(r2.prompt_text, p2, live.ptr, live.len));
+    /* The fix: the reasoning-replay spelling is. */
+    TEST_ASSERT(byte_prefix_match(r2.prompt_text, p2, primary, strlen(primary)));
+    TEST_ASSERT(!byte_prefix_match(r2.prompt_text, p2, alt, strlen(alt)));
+    TEST_ASSERT(!strncmp(r2.prompt_text + strlen(primary), "<|user|>now count them", 22));
+
+    buf_free(&live);
+    free(primary);
+    free(alt);
+    request_free(&r1);
+    request_free(&r2);
+    chat_msgs_free(&turn1);
+    chat_msgs_free(&turn2);
+}
+
+/* The same turn from a client that does not replay reasoning (Open WebUI, the
+ * bench harness): the tool-less spelling is the one that matches, and the
+ * matcher has to accept whichever of the two the client chose. */
+static void test_thinking_checkpoint_key_matches_reasoning_free_replay(void) {
+    const char *reasoning = "count on fingers";
+    const char *content = "\n\nFour.";
+
+    chat_msgs turn1 = {0};
+    test_push_msg(&turn1, "user", "how many?", NULL);
+    request r1 = test_make_glm_thinking_request(&turn1, NULL);
+    TEST_ASSERT(!r1.prompt_preserves_reasoning);
+    char *primary = build_toolless_thinking_visible_text(&r1, content);
+    char *alt = build_thinking_visible_text(&r1, content, reasoning);
+    TEST_ASSERT(primary && alt);
+
+    chat_msgs turn2 = {0};
+    test_push_msg(&turn2, "user", "how many?", NULL);
+    test_push_msg(&turn2, "assistant", content, NULL);
+    test_push_msg(&turn2, "user", "and again?", NULL);
+    request r2 = test_make_glm_thinking_request(&turn2, NULL);
+    const size_t p2 = strlen(r2.prompt_text);
+    TEST_ASSERT(byte_prefix_match(r2.prompt_text, p2, primary, strlen(primary)));
+    TEST_ASSERT(!byte_prefix_match(r2.prompt_text, p2, alt, strlen(alt)));
+
+    free(primary);
+    free(alt);
+    request_free(&r1);
+    request_free(&r2);
+    chat_msgs_free(&turn1);
+    chat_msgs_free(&turn2);
+}
+
+/* max_tokens truncation inside thinking.  The visible turn is empty, and the
+ * server closes the reasoning block before recording the checkpoint, so both
+ * spellings describe a well-formed assistant turn.  A client that replays the
+ * (empty) assistant turn matches; a client that omits it entirely must not
+ * match anything, so the next request falls back to disk instead of continuing
+ * from a frontier that does not describe it. */
+static void test_thinking_checkpoint_key_after_length_inside_thinking(void) {
+    const char *reasoning = "still working on it and then the cap hit";
+
+    chat_msgs turn1 = {0};
+    test_push_msg(&turn1, "user", "solve it", NULL);
+    request r1 = test_make_glm_thinking_request(&turn1, NULL);
+    char *toolless = build_toolless_thinking_visible_text(&r1, "");
+    char *replayed = build_thinking_visible_text(&r1, "", reasoning);
+    TEST_ASSERT(toolless && replayed);
+
+    chat_msgs replay = {0};
+    test_push_msg(&replay, "user", "solve it", NULL);
+    test_push_msg(&replay, "assistant", "", NULL);
+    test_push_msg(&replay, "user", "keep going", NULL);
+    request r2 = test_make_glm_thinking_request(&replay, NULL);
+    TEST_ASSERT(byte_prefix_match(r2.prompt_text, strlen(r2.prompt_text),
+                                  toolless, strlen(toolless)));
+
+    /* Anthropic clients replay the truncated thinking block verbatim, and the
+     * renderer keeps it when the history has tool context.  Without tool
+     * context the renderer drops replayed reasoning for a turn that is no
+     * longer the last one, so only the tool-less spelling can match there —
+     * which is exactly why both spellings are remembered. */
+    const char *tools =
+        "{\"name\":\"Bash\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{}}}}";
+    chat_msgs tool_turn1 = {0};
+    test_push_msg(&tool_turn1, "user", "solve it", NULL);
+    request rt1 = test_make_glm_thinking_request(&tool_turn1, tools);
+    char *tool_replayed = build_thinking_visible_text(&rt1, "", reasoning);
+    TEST_ASSERT(tool_replayed != NULL);
+
+    chat_msgs replay_thinking = {0};
+    test_push_msg(&replay_thinking, "user", "solve it", NULL);
+    test_push_msg(&replay_thinking, "assistant", "", reasoning);
+    test_push_msg(&replay_thinking, "user", "keep going", NULL);
+    request r3 = test_make_glm_thinking_request(&replay_thinking, tools);
+    TEST_ASSERT(byte_prefix_match(r3.prompt_text, strlen(r3.prompt_text),
+                                  tool_replayed, strlen(tool_replayed)));
+    free(tool_replayed);
+    request_free(&rt1);
+    chat_msgs_free(&tool_turn1);
+
+    /* The bench client drops the assistant turn entirely; neither spelling may
+     * match, or the server would continue from a frontier the request does not
+     * describe. */
+    chat_msgs dropped = {0};
+    test_push_msg(&dropped, "user", "solve it", NULL);
+    test_push_msg(&dropped, "user", "keep going", NULL);
+    request r4 = test_make_glm_thinking_request(&dropped, NULL);
+    TEST_ASSERT(!byte_prefix_match(r4.prompt_text, strlen(r4.prompt_text),
+                                   toolless, strlen(toolless)));
+    TEST_ASSERT(!byte_prefix_match(r4.prompt_text, strlen(r4.prompt_text),
+                                   replayed, strlen(replayed)));
+
+    free(toolless);
+    free(replayed);
+    request_free(&r1);
+    request_free(&r2);
+    request_free(&r3);
+    request_free(&r4);
+    chat_msgs_free(&turn1);
+    chat_msgs_free(&replay);
+    chat_msgs_free(&replay_thinking);
+    chat_msgs_free(&dropped);
 }
 
 static void test_tool_marker_state_ignores_orphan_end(void) {
@@ -19148,6 +20568,65 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
+static void test_glm_thinking_checkpoint_canonical_matches_future_prompt(void) {
+    /* GLM keeps the opening <think> tag when old reasoning is omitted, trims
+     * assistant content, and does not terminate the assistant turn with the
+     * DeepSeek EOS marker.  The remembered visible key must match that exact
+     * rendering so a real thinking turn can continue from live KV. */
+    chat_msgs prefix_msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&prefix_msgs, user1);
+
+    char *prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &prefix_msgs, NULL, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    const char *reasoning = "Let me think... 2+2 = 4";
+    const char *content = "  The answer is 4.  \n";
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
+    char *visible = build_toolless_thinking_visible_text(&r, content);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(visible, "<|assistant|><think></think>The answer is 4.") != NULL);
+    TEST_ASSERT(strstr(visible, "<｜end▁of▁sentence｜>") == NULL);
+    request_free(&r);
+
+    chat_msgs future_msgs = {0};
+    chat_msg h_user1 = {0};
+    h_user1.role = xstrdup("user");
+    h_user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&future_msgs, h_user1);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup(reasoning);
+    h_asst.content = xstrdup(content);
+    chat_msgs_push(&future_msgs, h_asst);
+    chat_msg h_user2 = {0};
+    h_user2.role = xstrdup("user");
+    h_user2.content = xstrdup("Thanks!");
+    chat_msgs_push(&future_msgs, h_user2);
+
+    char *future_prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &future_msgs, NULL, NULL, DS4_THINK_HIGH);
+    size_t visible_len = strlen(visible);
+    TEST_ASSERT(strlen(future_prompt) > visible_len);
+    TEST_ASSERT(!memcmp(future_prompt, visible, visible_len));
+    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);
+
+    free(future_prompt);
+    free(visible);
+    free(prompt_text);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&future_msgs);
+}
+
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -19407,6 +20886,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
+    test_job_slot_placement_prefers_cheap_eviction();
+    test_kv_cache_evict_store_trims_to_prompt_boundary();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
@@ -19420,7 +20901,9 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
+    test_render_glm_tool_context_replays_sampled_bytes();
     test_render_glm_groups_tool_results();
+    test_render_glm_reorders_tool_results();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
@@ -19438,11 +20921,17 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
-    test_anthropic_stream_reroutes_second_reasoning_pass();
+    test_anthropic_stream_legacy_guard_reroutes_second_reasoning_pass();
+    test_anthropic_stream_sends_text_before_final_flush();
+    test_anthropic_stream_routes_immediate_second_think_block();
+    test_anthropic_stream_holds_only_partial_think_prefix();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
-    test_openai_stream_reroutes_second_reasoning_pass();
+    test_openai_stream_legacy_guard_reroutes_second_reasoning_pass();
+    test_openai_stream_sends_content_before_final_flush();
+    test_openai_stream_routes_immediate_second_think_block();
+    test_openai_stream_holds_only_partial_think_prefix();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
@@ -19483,6 +20972,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_glm_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
@@ -19513,6 +21003,9 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
+    test_thinking_checkpoint_key_matches_tool_replay();
+    test_thinking_checkpoint_key_matches_reasoning_free_replay();
+    test_thinking_checkpoint_key_after_length_inside_thinking();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
