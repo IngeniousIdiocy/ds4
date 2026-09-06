@@ -1,0 +1,76 @@
+{
+  "schema": "ds4.glm53.affected-runtime.v1",
+  "build": {
+    "compiled_source_commit": "538c37c0455a58df5024bec58be99a4ecfef58a7",
+    "compiled_source_tree": "f4141a9f7aa258e03f3f8f8145e65e052091402c",
+    "curated_tree_equivalent_commit": "26e454fbd93ee545eec1a928ab8f2a0d47dc23cd",
+    "ds4_sha256": "79dd8f58f1d74d6f43a6ce3dbd52c60d5eda0119ab821d37d72f52b6a17d027b",
+    "ds4_server_sha256": "9347f0d9d50050e627018621ba7d6bb9b973116d8a0554463155ce72d5dc6429"
+  },
+  "model": {
+    "bytes": 185299232064,
+    "known_sha256": "828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0"
+  },
+  "startup_and_server": {
+    "passed": 16,
+    "failed": 0,
+    "inconclusive": 0,
+    "coverage": [
+      "explicit serial bypasses a nonexistent drafter even against a legacy speculative environment switch",
+      "explicit conservative and speculative modes override a legacy disable switch",
+      "GLM-5.3 model id leads the model list and all documented aliases resolve",
+      "bank cancellation restores state and the same server returns normalized healthy content",
+      "conservative request-credit admission is observed",
+      "a speculative partial block is stopped and the next request returns normalized healthy content",
+      "a natural-EOS case exercises a DFlash cycle and is followed by normalized healthy content",
+      "owned servers exit without signalling a foreign process"
+    ],
+    "preserved_receipt_label": "ASTRAL-RUNTIME-20260906T203554Z",
+    "checks_tsv_sha256": "7df7a9e780be5b3313f8ac9fbfb7d090ad98c566023f240de6f8cefd44eb5c7a"
+  },
+  "pipelined_cancel_and_sigterm": {
+    "passed": true,
+    "pipelined_layer_flushes": 7,
+    "routed_batches": 8,
+    "routed_layers": 8,
+    "expanded_banks": 8,
+    "status": "cancelled, state restored",
+    "connected_client_sigterm_observed": true,
+    "preserved_receipt_label": "ASTRAL-BANK-PIPELINE-DRAIN-20260906T203938Z",
+    "coverage_json_sha256": "e4f8fdab71b79a1080e7283b70e6e762a944e29a29710a0f7892a525bb47f108"
+  },
+  "metal_model_view_teardown": {
+    "passed": true,
+    "maps": 4,
+    "pending_and_open_batches": true,
+    "results": 256,
+    "reference_ownership_case": "unretained",
+    "test_binary_sha256": "dee83a010108247d9f150cb7418930220435c8c2431ae1431983a3ec6e77a1d4",
+    "preserved_receipt_label": "ASTRAL-FINAL-teardown-20260906T203517Z",
+    "result_log_sha256": "da509151f640544a586fb98a4b4f4f9ccdff1c7941b1b0b28dc462bbc9763a73"
+  },
+  "routed_failure_reprime": {
+    "comparator_v2_reanalysis_passed": true,
+    "comparator_v3_runtime_passed": true,
+    "fault_checkpoint": 36864,
+    "routed_layers_before_fault": 8,
+    "expanded_banks_before_fault": 8,
+    "fault_layer": 10,
+    "same_session_reprime": true,
+    "http_statuses": [200, 500, 200],
+    "baseline_generated": 128,
+    "recovery_generated": 128,
+    "prompt_tokens_each": 40,
+    "cached_prompt_tokens_each": 0,
+    "assistant_bytes_each": 183,
+    "assistant_byte_identical": true,
+    "server_returncode": 0,
+    "original_harness_result_preserved_as_failure": true,
+    "preserved_v2_receipt_label": "ASTRAL-FINAL-failure-20260906T204052Z",
+    "v2_reanalysis_sha256": "9c3ef7d9bba0c3fac7760188f585d4fc92b71771ec41829f160f9a57c53a7cf4",
+    "preserved_v3_receipt_label": "ASTRAL-FINAL-failure-20260906T210951Z",
+    "v3_result_json_sha256": "c59c326531a287377c63015e589a6e565dbaf6a3c00575b6080dee89b3275370",
+    "v3_identity_json_sha256": "948e2cafdf1e7fab72db8147c6f9ee6e3acfaaa88c0f47caa364ecc2875944a6"
+  },
+  "scope": "Affected runtime checks only. This does not replace broad unchanged quality matrices. Comparator v3 covers one deterministic group-2 routed failure and same-session recovery frontier, not arbitrary later failures."
+}

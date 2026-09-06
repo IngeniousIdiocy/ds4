@@ -1,0 +1,65 @@
+{
+  "schema": "ds4.glm53.native-gate.v1",
+  "case": "native-default-62174",
+  "completed_utc": "2026-09-06T20:56:52.412776+00:00",
+  "build": {
+    "compiled_source_commit": "538c37c0455a58df5024bec58be99a4ecfef58a7",
+    "compiled_source_tree": "f4141a9f7aa258e03f3f8f8145e65e052091402c",
+    "run_checkout_commit": "d1838d7f202f5001ff9603d25ebc3a977f339c78",
+    "curated_tree_equivalent_commit": "26e454fbd93ee545eec1a928ab8f2a0d47dc23cd",
+    "ds4_sha256": "79dd8f58f1d74d6f43a6ce3dbd52c60d5eda0119ab821d37d72f52b6a17d027b"
+  },
+  "inputs": {
+    "model_bytes": 185299232064,
+    "model_known_sha256": "828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0",
+    "prompt_tokens": 62174,
+    "prompt_sha256": "e15ce96e009e4684d7006be75e6c24d2f8bfabf0a1ebacf9bc06a850034a6b9b"
+  },
+  "command": [
+    "./ds4", "-m", "$MODEL", "--metal", "--nothink", "--temp", "0",
+    "-c", "70000", "-n", "2048", "--prompt-file", "$PROMPT62"
+  ],
+  "environment_overrides": {
+    "DS4_GLM_GEN_COUNTERS": "1",
+    "DS4_GLM_IGNORE_EOS": "1"
+  },
+  "resolved_policy": {
+    "profile": "m3ultra-public-q4-v1",
+    "mode": "auto",
+    "bank": 1,
+    "superchunk": 1,
+    "fused": 1,
+    "pipelined": 1,
+    "model_untracked": 1,
+    "min_tokens": 32768
+  },
+  "measured": {
+    "prefill_tokens_per_second": 550.27,
+    "decode_tokens_per_second": 37.868944385054384,
+    "decode_seconds": 54.081254,
+    "n_generated": 2048,
+    "n_decode_eval": 2047,
+    "stop": "predict_limit",
+    "final_position": 64222,
+    "bank_routed_layers": 42,
+    "bank_expanded_layers": 42,
+    "bank_refusals": 0,
+    "output_bytes": 8969,
+    "output_sha256": "1bb479580d47c8863438e01585b5db9d14e532a8da207a635a3d57686eae7df5"
+  },
+  "release_gates": {
+    "prefill_at_least_550": true,
+    "decode_at_least_37": true
+  },
+  "gate_scope": "The preserved staging driver also recorded decode_gate_met=false against its older 38 t/s threshold. The release threshold evaluated here is 37 t/s.",
+  "comparison": {
+    "reference": "BASE62-v3-20260906T133801Z, all three retained controls",
+    "output_byte_identical": true
+  },
+  "scope": "One cold native CLI run with a fixed 2048-token horizon. DS4_GLM_IGNORE_EOS changes generated text; visible marker counts are not exact EOS-token counts. This establishes achieved capability, not run-to-run variance.",
+  "preserved_staging_receipts": {
+    "directory_label": "ASTRAL-NATIVE-DEFAULT62-20260906T205402Z",
+    "receipt_json_sha256": "b2276505b79caf6c967678aa64ce992f91570fc6b704780f3233f846a95fd3f5",
+    "command_json_sha256": "efd9c133b20c8a6a4921af635affe147728c4d9e27bb0844b4a523fb82411edf"
+  }
+}

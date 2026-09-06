@@ -93,7 +93,7 @@ Comparator v2 (commit 186d064) reanalyzed those unchanged receipts successfully,
 including zero cached prompt tokens and the original failure result in its
 output. No engine hook, binary, saved receipt or GPU run changed.
 
-## Recovery sensitivity, v3 — runtime pending
+## Recovery sensitivity, v3 — runtime passed
 
 The retained v2 receipt compared only `healthy`: seven bytes and one generated
 token. Its measured scope remains unchanged. It does not establish the stronger
@@ -108,6 +108,9 @@ in addition to the existing frontier and content mismatches. The saved
 recovery prompt, its hash, the requested cap and both measured completion
 counts are recorded in the new artifacts.
 
-`--receipts` uses the current v3 criterion and must reject the old one-word
-receipt. A new root-scheduled runtime screen after the native gates is required
-to claim v3 coverage. No such runtime measurement is claimed by this update.
+`--receipts` uses the current v3 criterion and must reject the old one-word receipt.
+The final v3 screen passed at group 2 after eight routed layers/banks: HTTP statuses
+200/500/200, 128 generated tokens and zero cached prompt tokens in each healthy arm,
+183 byte-identical assistant bytes, same-session re-prime and server exit 0. The compact
+public record is `bench/receipts/glm53-m3ultra/final-runtime.json`. This is one bounded
+failure frontier, not a claim about arbitrary later failures.

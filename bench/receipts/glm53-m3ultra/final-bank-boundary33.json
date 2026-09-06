@@ -1,0 +1,51 @@
+{
+  "schema": "ds4.glm53.bank-boundary.v1",
+  "case": "guarded-default-above-32768",
+  "completed_utc": "2026-09-06T20:45:51.010335+00:00",
+  "build": {
+    "compiled_source_commit": "538c37c0455a58df5024bec58be99a4ecfef58a7",
+    "compiled_source_tree": "f4141a9f7aa258e03f3f8f8145e65e052091402c",
+    "curated_tree_equivalent_commit": "26e454fbd93ee545eec1a928ab8f2a0d47dc23cd",
+    "ds4_sha256": "79dd8f58f1d74d6f43a6ce3dbd52c60d5eda0119ab821d37d72f52b6a17d027b"
+  },
+  "inputs": {
+    "model_bytes": 185299232064,
+    "model_known_sha256": "828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0",
+    "native_prompt_tokens": 33148,
+    "prompt_sha256": "95e2283270d3a55b8badcc669d94711038e70b9068d10799dcecf7008494ec45"
+  },
+  "arm_order": ["auto", "bankoff"],
+  "arms": {
+    "auto": {
+      "prefill_tokens_per_second": 556.73,
+      "policy": "profile=m3ultra-public-q4-v1 mode=auto bank=1 superchunk=1 fused=1 pipelined=1 model_untracked=1 min_tokens=32768",
+      "completed_routed_layers": 42,
+      "expanded_banks": 42,
+      "bank_refusals": 0
+    },
+    "bankoff": {
+      "prefill_tokens_per_second": 540.64,
+      "environment_override": "DS4_GLM_DISABLE_EXPERT_BANK=1",
+      "policy": "profile=m3ultra-public-q4-v1 mode=auto bank=0 superchunk=0 fused=0 pipelined=0 model_untracked=1 min_tokens=32768"
+    }
+  },
+  "comparison": {
+    "auto_minus_bankoff_tokens_per_second": 16.09,
+    "auto_relative_gain_percent": 2.9761,
+    "approximate_time_saved_ms_from_rounded_rates": 1771.99,
+    "output_byte_identical": true,
+    "output_bytes_each": 77,
+    "output_sha256_each": "231f355c72b08c0c8f23beec2d9b7d2a525b157e32c6ea95309a4a0a14b9312e",
+    "threshold_decision": "keep_min_tokens_32768"
+  },
+  "reanalysis": {
+    "required": true,
+    "reason": "The original driver expected 33135 tokens from a dump-only path; native raw generation tokenized 33148. Both arms shared the native token vector, and the bank-off refusal log independently reported 33148.",
+    "limitation": "Fixed arm order and rounded rates; this proves a positive discriminator immediately above the boundary, not the exact crossover or variance."
+  },
+  "preserved_staging_receipts": {
+    "directory_label": "ASTRAL-BANK-BOUNDARY33-20260906T204344Z",
+    "original_receipt_sha256": "6780166dbd5e2e1d2c87b088364db366ce6c6d78dc57d2aa3d40178cf092a5f2",
+    "reanalysis_receipt_sha256": "78e8a4d75d02c8b7d50da6f8b8b3c0eb736ca1786926421750f85c2672aa6586"
+  }
+}

@@ -4,8 +4,8 @@ An engineering account of what this branch changes relative to upstream ds4 at
 `9ab7053`, written for a reviewer of the code. User-facing details (configuration,
 switches, status, known issues) are in `docs/GLM53_M3ULTRA.md`; the fidelity rules in
 `bench/FIDELITY.md`; the exact-mode diagnostic in `bench/EXACT-MODE-PLAN.md`. Current
-capability numbers are kept in `bench/RELEASE-EVIDENCE.md`, where `b723dfa` is separated
-from the still-pending final rebuilt artifact. The historical
+capability numbers are kept in `bench/RELEASE-EVIDENCE.md`, where the earlier
+`b723dfa` capability build is separated from the final `538c37c` artifact. The historical
 per-round numbers, measured on a retired custom quantization, are kept only in
 `bench/README.md` under a historical heading.
 
@@ -149,10 +149,11 @@ changes, is in `bench/FIDELITY.md`.
 weights once per layer-major prompt group, reuse that bank across the group's token
 tiles, encode the layer in one fused command buffer and pipeline up to eight layers.
 On `b723dfa`, the forced configuration reached 550.72 prefill tokens/s at 62,174
-prompt tokens and 473.75 at 300,000. Guarded C defaults are being merged separately:
-automatic admission is restricted to exactly M3 Ultra with at least 500 GiB RAM and
-the full unsliced, non-SSD, non-TP 185,299,232,064-byte public Q4_K profile. A planned
-32768-token prompt threshold is provisional until the final 32k screen. The ordinary
+prompt tokens and 473.75 at 300,000. The final guarded C defaults restrict automatic
+admission to exactly M3 Ultra with at least 500 GiB RAM and the full unsliced, non-SSD,
+non-TP 185,299,232,064-byte public Q4_K profile. The final 33,148-token boundary pair
+measured 556.73 t/s with AUTO versus 540.64 with the same-binary bank-off control, so
+the conservative 32768-token threshold was retained. The ordinary
 path remains the refusal/failure fallback, and explicit enable/disable, schedule and
 model-mapping controls are documented in `docs/GLM53_M3ULTRA.md`.
 
@@ -160,8 +161,9 @@ The guarded profile also defaults the mmap-backed Metal model view to untracked 
 when `DS4_METAL_MODEL_UNTRACKED` is unset. This decision happens after weight binding,
 is independent of the bank kill switch, and does not widen CPU inspection, SSD,
 multi-tier or tensor-parallel paths. Explicit `=0` disables it and `=1` enables it on
-other compatible Metal profiles. The implementation and final startup receipt remain
-pending at this documentation commit.
+other compatible Metal profiles. The final 62,174-token receipt resolved
+`model_untracked=1` with the guarded bank, fused command buffer and fixed eight-layer
+pipeline enabled.
 
 ## 3. DFlash2 speculative decoding
 
@@ -305,11 +307,15 @@ summarized in `bench/README.md` ("Campaign notes").
 
 ## How this was built
 
-The kernel, server and harness work was carried out by AI coding agents (Anthropic's
-Claude models, through Claude Code) working under the direction of the repository
-owner, who set the targets, chose the fidelity rules, reviewed and gated every adoption,
-and ran the machine; independent review of the fidelity methodology was also
-AI-assisted. The commits are attributed accordingly rather than relabelled: the git
-author field is the owner's configured identity, and the `Co-Authored-By` trailer names
-the model that produced the code. The engineering claims are meant to stand on their
-receipts, not on who typed them.
+This was a collaborative agent feedback loop. Fable, working through Claude Code,
+implemented the early decode and prefill rounds. Astral, working through Codex,
+independently audited the code and sized the next opportunities through shared written
+notes, then took implementation, integration and GPU-run ownership when Fable reached
+its usage cap. Fable returned as a consulting peer; Astral used Astra and Sol agents for
+bounded implementation and review tasks. The agents worked as peers, with Astral acting
+as tie breaker only when a disagreement remained unresolved. Mark set the goals and
+constraints and steered priorities.
+
+The existing commit authors and contributor trailers preserve the original record; the
+curated history does not invent per-commit identities. Performance and fidelity claims
+stand on the measured evidence rather than on any contributor's assessment.

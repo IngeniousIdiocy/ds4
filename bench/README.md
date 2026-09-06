@@ -69,20 +69,20 @@ substituted:
 export MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf
 export PROMPT62=/path/to/needle-64k.txt
 export PROMPT300=/path/to/prompt-300k.txt
-export DS4_GLM53_MEMORY_CEILING_GB=280
 export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1
 
-./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+./ds4 -m "$MODEL" --metal --nothink --temp 0 \
       -c 70000 -n 2048 --prompt-file "$PROMPT62"
-./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+./ds4 -m "$MODEL" --metal --nothink --temp 0 \
       -c 320000 -n 2048 --prompt-file "$PROMPT300"
 ```
 
-`DS4_GLM53_MEMORY_CEILING_GB=280` is an optional conservative admission cap for the
-512 GB machine. The prefill chunk already defaults to 8192. The final guarded-profile
-build is intended to resolve its model mapping and expert-bank schedule without force
-environment variables; the `b723dfa` receipts used explicit bank, fused, pipeline,
-`xr8` and untracked-view controls and are labeled accordingly.
+`DS4_GLM53_MEMORY_CEILING_GB=280` remains an optional conservative admission cap for
+the 512 GB machine, but it was absent from the final default receipts. The prefill chunk
+already defaults to 8192. The final guarded-profile build resolves its model mapping and
+expert-bank schedule without force environment variables; the `b723dfa` receipts used
+explicit bank, fused, pipeline, `xr8` and untracked-view controls and are labeled
+accordingly.
 
 To reproduce the named `b723dfa` capability configuration before running either command
 above, add:
@@ -95,20 +95,34 @@ export DS4_GLM_ENABLE_SCORER_XREDUCE=1
 export DS4_GLM_DISABLE_ROUTER_SPLITK_B4=1
 ```
 
-A block is valid only when the CLI session counters report `generated=2048`,
-`requested=2048`, `stop=limit`, and 2,047 committed forward positions after the
-initial sampled token. One complete block records achieved capability. Interleaved
-matched runs are required to assign a speed difference or quantify repeatability.
+A block is valid only when the native generation record reports `n_generated=2048`,
+`n_decode_eval=2047`, and `stop=predict_limit`. The session record also reports
+`generated=2048`, `requested=2048` and 2,048 committed forward positions. One complete
+block records achieved capability. Interleaved matched runs are required to assign a
+speed difference or quantify repeatability.
 `DS4_GLM_IGNORE_EOS=1` is a benchmark-only fixed-horizon control and changes the text.
+With no `--dflash` weights, bare startup resolves serial mode and allocates no drafter.
 
 ## Results
 
 ### Public-artifact release epoch
 
-The current measured rows come from the public 185,299,232,064-byte GGUF at sha256
-`828f413c…` and integration commit `b723dfa`. They establish capability for the named
-forced configuration; the final rebuilt release artifact column remains open in
-`RELEASE-EVIDENCE.md`.
+The final `538c37c` artifact and the earlier `b723dfa` capability build use the public
+185,299,232,064-byte GGUF at sha256 `828f413c…`. The complete identity, scope and open
+rows are in `RELEASE-EVIDENCE.md`; compact final receipts are under
+`receipts/glm53-m3ultra/`.
+
+| final measurement | result | scope / receipt |
+|---|---:|---|
+| 62,174-token native prefill | **550.27 t/s** | bare guarded bank/fused/pipeline8/untracked policy; `final-native62.json` |
+| same-prompt native serial decode | **37.868944385 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; same receipt |
+| 33,148-token bank boundary | **556.73 AUTO / 540.64 OFF t/s** | same 77 output bytes; `final-bank-boundary33.json` |
+| affected server runtime | **16/16 plus 4/4 pipeline/SIGTERM passed** | `final-runtime.json` |
+| routed failure/re-prime | **comparator v3 passed** | 128 native tokens in both arms, identical 183-byte response, zero cache |
+| 300,000-token native prefill | **473.64 t/s** | five bank groups, 210 routed layers, no refusal; `final-native300.json` |
+| 300,000-token native serial decode | **37.187023218 t/s** | complete 2,048-token native block; same receipt |
+
+Earlier `b723dfa` capability rows:
 
 | measurement | `b723dfa` capability | scope / receipt |
 |---|---:|---|

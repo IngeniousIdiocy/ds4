@@ -77,10 +77,11 @@ clamps the model's memory guard so other work on a 512 GB machine stays safe (28
 leaves room for a 400k context; 400 GB is used for scorer runs).
 
 Kernel defaults are the "fast mode" of `bench/FIDELITY.md`: every adopted kernel
-change on, including the eleven registered floating-point-order changes. The final
-release also plans a guarded M3 Ultra/public-Q4 mapping and expert-bank profile described
-below. That policy is still pending its final merge and screen, so `b723dfa` required
-explicit bank and mapping controls for its capability receipts.
+change on, including the eleven registered floating-point-order changes. On the exact
+M3 Ultra/public-Q4 profile described below, the final release also resolves untracked
+model views and the guarded expert-bank, fused command-buffer and fixed eight-layer
+pipeline defaults. The earlier `b723dfa` capability receipts used explicit bank and
+mapping controls.
 
 ### Model ids
 
@@ -140,17 +141,17 @@ are deliberately separate.
 
 | feature | implemented / default | validated on the merged branch with the public artifact |
 |---|---|---|
-| Decode kernel set (HC-pre single dispatch and wide tail, hc-mix split-K, KDA low-rank pack/fold and glue, DSA indexer fold and pair, routed-down split, router shared fold and tail fold, top-k radix fast path, epilogue fusions) | implemented, default on, each with a kill switch | `b723dfa`: complete native 300k serial block at 37.2994 t/s; final rebuilt release receipt pending |
-| Prefill kernel set (KDA prefill fast path, BF16 low-rank split-K, blocked DSA softmax, checked DSA tail, token-tiled router and qk low-rank, dense half copy/ring, indexer causal grid, prefill folds) | implemented, default on, each with a kill switch | `b723dfa`: 550.72 t/s at 62,174 prompt tokens and 473.75 t/s at 300,000; final rebuilt release receipt pending |
-| Long-prompt expert bank | implemented on the integration line; guarded defaults are being merged after `b723dfa` | intended auto profile is exactly M3 Ultra with at least 500 GiB RAM and the full unsliced, non-SSD, non-TP 185,299,232,064-byte Q4_K artifact; `b723dfa` capability receipts used forced bank controls, so the final default build and 32k boundary still need screening |
+| Decode kernel set (HC-pre single dispatch and wide tail, hc-mix split-K, KDA low-rank pack/fold and glue, DSA indexer fold and pair, routed-down split, router shared fold and tail fold, top-k radix fast path, epilogue fusions) | implemented, default on, each with a kill switch | final `538c37c`: complete native blocks at 37.868944 t/s at 62k and 37.187023 t/s at 300k |
+| Prefill kernel set (KDA prefill fast path, BF16 low-rank split-K, blocked DSA softmax, checked DSA tail, token-tiled router and qk low-rank, dense half copy/ring, indexer causal grid, prefill folds) | implemented, default on, each with a kill switch | final `538c37c`: 550.27 t/s at 62,174 and 473.64 t/s at 300,000 |
+| Long-prompt expert bank | implemented with guarded defaults | AUTO is limited to exactly M3 Ultra with at least 500 GiB RAM and the full unsliced, non-SSD, non-TP 185,299,232,064-byte Q4_K profile; final 33,148-token AUTO 556.73 vs bank-off 540.64 t/s, same 77 output bytes |
 | `ptail` HC-expand epilogue (kernel in `metal/t2screen.metal`) | implemented, default on (`DS4_GLM_DISABLE_HCX_PTAIL=1` off) | Tier 1 receipt on the pre-merge tree; dispatch confirmed in the E1 log (`T2SCREEN first-dispatch HCXTAIL`) |
 | `DS4_GLM_EXACT` umbrella, 11 registry entries | implemented | three long-context diagnostics within 0.0042 total NLL per case; full public-artifact diagnostic remains pending |
 | MoE block dataflow kernel, hc_pre algebra half B, one-dispatch hc_pre, `xr8` scorer, split8 opt-ins | implemented, **opt-in** (measured slower, or unexplained divergence in the case of `xr8`) | not part of the validated defaults |
 | All-Q8 KDA projection fusion (`DS4_GLM_ENABLE_KDA_PROJ_FUSE`) | implemented, opt-in; the first path written for this file's all-Q8 KDA layout | **not validated**; needs an identity check against the default before it can be recommended |
-| Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | affected runtime driver on `b723dfa`: 16/16 checks passed, including model aliases, explicit DFlash mode precedence, bank cancellation and healthy reuse, speculative stop and natural EOS; final rebuilt receipt pending |
+| Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | final `538c37c`: 16/16 affected runtime checks, pipelined routed cancellation, connected-client SIGTERM and substantial recovery comparator v3 passed |
 | Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge | **re-validation pending** on a vision prompt |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
-| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to conservative request-credit scheduling; `--dflash-mode speculative` selects the uncapped policy. Positive temperature decodes serially. | `b723dfa` passed the affected runtime suite. On one favorable fixed 8,192-token SQL horizon: serial 38.5850, conservative 47.2064, speculative 60.7875 t/s; final rebuilt receipt pending. |
+| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to conservative request-credit scheduling; `--dflash-mode speculative` selects the uncapped policy. Positive temperature decodes serially. | final `538c37c` passed the 16/16 affected runtime suite. On the earlier `b723dfa` favorable fixed 8,192-token SQL horizon: serial 38.5850, conservative 47.2064, speculative 60.7875 t/s. |
 | CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
 
 **How DFlash2's rollback was completed.** Verification snapshots both the KDA
@@ -165,8 +166,9 @@ while changing rejected tokens, including the first rejected row and a pooled-ke
 boundary. These tests establish causality for the tested frontiers. They do not
 promise byte equality between all batched and serial arithmetic. See
 `tests/DFLASH-PREFIX.md` for the test scope and reproduction commands. The final
-combined branch still needs its affected correctness, serving and performance
-checks; the adaptive admission policy remains under development.
+artifact passed its focused 16/16 startup and server runtime suite, pipelined routed
+cancellation, connected-client SIGTERM, Metal-view teardown, and the 128-token
+failure/re-prime comparator v3 checks.
 
 ### Dispositions
 
@@ -192,16 +194,18 @@ Stated once, so a reader does not have to infer them from the table:
   restart against a warm disk cache, a session reset, or eviction under disk-space
   pressure; those paths are upstream's and remain **not validated here**.
 
-### Guarded expert-bank defaults pending final integration
+### Guarded expert-bank defaults
 
-The planned C defaults enable the expert bank only when all of these checks pass:
+The C defaults enable the expert bank only when all of these checks pass:
 Metal reports exactly Apple M3 Ultra, physical memory is at least 500 GiB, and the
 model is the full unsliced, non-SSD, non-TP public GLM-5.3 Q4_K profile with the
 185,299,232,064-byte artifact shape and all 42 routed-expert tensors in Q4_K. The
 automatic schedule uses the bank, fused layer command buffer and an eight-layer
-pipeline only for prompts at or above `DS4_GLM_EXPERT_BANK_MIN_TOKENS` (planned
-default 32768). That threshold is a conservative engineering boundary pending the
-final 32k screen, not a measured crossover.
+pipeline only for prompts at or above `DS4_GLM_EXPERT_BANK_MIN_TOKENS` (default
+32768). The final boundary pair was positive immediately above it: at 33,148 native
+tokens, AUTO measured 556.73 t/s versus 540.64 with the bank disabled and emitted the
+same 77 bytes. This fixed-order pair supports the conservative boundary; it does not
+locate a precise crossover or estimate variance.
 
 `DS4_GLM_ENABLE_EXPERT_BANK=1` force-enables another compatible profile; `=0` forces
 it off. Forcing the bank on an unmatched profile does not also force the fused command
@@ -211,16 +215,16 @@ unset taking the guarded profile default. `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS`
 boolean; `=1` selects the fixed eight-layer bound rather than accepting a layer count,
 and it requires the fused layer command buffer. `DS4_GLM_DISABLE_SUPERCHUNK=1` is the
 strong schedule kill. Dynamic memory admission and ordinary fallback still apply.
-These defaults are not present at the `b723dfa` capability commit: release
-documentation must not call them shipped until their implementation, final build and
-boundary screen are complete.
+These defaults are present in the final `538c37c` build. Its 62,174-token native
+receipt resolved `bank=1 superchunk=1 fused=1 pipelined=1 model_untracked=1` with no
+bank or mapping force variables.
 
 Speculative DFlash prefill seeding captures tap-layer activations inside the ordinary
 per-chunk schedule, so an armed speculative seed makes the expert-bank superchunk
 refuse. Conservative mode does no speculative prefill capture and remains eligible for
 the bank; serial mode loads no drafter and is eligible as well.
 
-For the same validated profile, the planned Metal mapping default also enables
+For the same validated profile, the Metal mapping default also enables
 untracked model views when `DS4_METAL_MODEL_UNTRACKED` is unset. `=0` disables that
 mapping explicitly and `=1` enables it elsewhere. The mapping decision is independent
 of the bank kill switch, so an auto-vs-disabled bank comparison keeps the model view
@@ -256,11 +260,11 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_DFLASH_DISABLE` | supported control | With no explicit `--dflash-mode`, selects serial startup and avoids loading the drafter. An explicit mode wins. | `ds4.c`, DFlash mode resolver |
 | `DS4_GLM53_MEMORY_CEILING_GB` | supported control | Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe). | `ds4.c:42037` |
 | `DS4_GLM53_PREFILL_CHUNK` | supported control | Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks). | `ds4.c:37902` |
-| `DS4_GLM_ENABLE_EXPERT_BANK` | supported control (pending guarded default) | Unset selects the exact M3 Ultra/public-Q4 profile automatically; `1` forces another compatible profile; `0` forces off. Final implementation and screen pending. | expert-bank admission |
-| `DS4_GLM_EXPERT_BANK_MIN_TOKENS` | supported control (pending guarded default) | Minimum prompt tokens for the automatic bank schedule; planned default 32768, a provisional engineering boundary pending the final 32k screen. | expert-bank admission |
-| `DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB` | supported control (pending guarded default) | Unset takes the guarded profile default; `1` enables and `0` disables the fused layer command buffer. | expert-bank scheduler |
-| `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS` | supported control (pending guarded default) | Boolean: unset takes the guarded profile default, `1` enables the fixed eight-layer pipeline, and `0` disables it. It is not a layer-count setting and requires the fused layer command buffer. | expert-bank scheduler |
-| `DS4_METAL_MODEL_UNTRACKED` | supported control (pending guarded default) | Unset enables untracked model views only on the validated Metal M3 Ultra/public-Q4 profile; `1` enables elsewhere and `0` disables explicitly. Independent of bank admission. | Metal model mapping |
+| `DS4_GLM_ENABLE_EXPERT_BANK` | supported control | Unset selects the exact M3 Ultra/public-Q4 profile automatically; `1` forces another compatible profile; `0` forces off. | expert-bank admission |
+| `DS4_GLM_EXPERT_BANK_MIN_TOKENS` | supported control | Minimum prompt tokens for the automatic bank schedule; default 32768, supported by the final fixed-order 33,148-token boundary pair. | expert-bank admission |
+| `DS4_GLM_EXPERT_BANK_FUSED_LAYER_CB` | supported control | Unset takes the guarded profile default; `1` enables and `0` disables the fused layer command buffer. | expert-bank scheduler |
+| `DS4_GLM_EXPERT_BANK_PIPELINED_LAYERS` | supported control | Boolean: unset takes the guarded profile default, `1` enables the fixed eight-layer pipeline, and `0` disables it. It is not a layer-count setting and requires the fused layer command buffer. | expert-bank scheduler |
+| `DS4_METAL_MODEL_UNTRACKED` | supported control | Unset enables untracked model views only on the validated Metal M3 Ultra/public-Q4 profile; `1` enables elsewhere and `0` disables explicitly. Independent of bank admission. | Metal model mapping |
 | `DS4_GLM_DSA_TAIL_CHECKED` | supported control | =0 restores the legacy unchecked ragged tail in DSA attention (default 1: bounds-checked; registry entry 4). | `ds4_metal.m:41060` |
 | `DS4_GLM_ENABLE_BF16_LOWRANK_SPLITK` | supported control | =0 turns the BF16 low-rank split-K off (default on since bundle round 1). | `ds4_metal.m:52171` |
 | `DS4_GLM_ENABLE_DSA_BLOCKED_SOFTMAX` | supported control | =1 forces the blocked softmax on (default on). | `ds4_metal.m:41029` |
@@ -291,8 +295,8 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_DFLASH_FAIL` | developer instrumentation (bench-only) | Inject a cycle failure at `state_save`, `after_arm` or `after_verify` to exercise the cleanup on those exits. | `ds4_dflash2.inc` |
 | `DS4_DFLASH_NO_SELECTOR` | kill switch | Disables the DFlash2 candidate selector (coherent-chain tracing). | `ds4_dflash_selector.inc:29` |
 | `DS4_DFLASH_SDPA_SCALAR` | kill switch | Forces the scalar SDPA drafter kernel instead of the simdgroup one. | `ds4_metal.m:56113` |
-| `DS4_GLM_DISABLE_EXPERT_BANK` | kill switch (pending guarded default) | `=1` strongly disables expert-bank admission; `=0` is a no-op. | expert-bank admission |
-| `DS4_GLM_DISABLE_SUPERCHUNK` | kill switch (pending guarded default) | `=1` strongly disables the bank superchunk schedule; `=0` is a no-op. | expert-bank scheduler |
+| `DS4_GLM_DISABLE_EXPERT_BANK` | kill switch | `=1` strongly disables expert-bank admission; `=0` is a no-op. | expert-bank admission |
+| `DS4_GLM_DISABLE_SUPERCHUNK` | kill switch | `=1` strongly disables the bank superchunk schedule; `=0` is a no-op. | expert-bank scheduler |
 | `DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK` | kill switch | Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2). | `ds4_metal.m:52173` |
 | `DS4_GLM_DISABLE_DENSE_HALF_COPY` | kill switch | Disables the dense-layer half-copy path and its ring (prefill lever 24). | `ds4_metal.m:21155` |
 | `DS4_GLM_DISABLE_DENSE_HALF_RING` | kill switch | Disables the half-copy ring alone. | `ds4_metal.m:21299` |
@@ -469,28 +473,28 @@ local files with those digests before running:
 export MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf
 export PROMPT62=/path/to/needle-64k.txt
 export PROMPT300=/path/to/prompt-300k.txt
-export DS4_GLM53_MEMORY_CEILING_GB=280
 export DS4_GLM_GEN_COUNTERS=1 DS4_GLM_IGNORE_EOS=1
 
 # Serial native generation gate. The final guarded-profile build resolves model
 # mapping and expert-bank defaults itself; force flags below reproduce b723dfa only.
-./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+./ds4 -m "$MODEL" --metal --nothink --temp 0 \
       -c 70000 -n 2048 --prompt-file "$PROMPT62"
-./ds4 -m "$MODEL" --metal --dflash-mode serial --nothink --temp 0 \
+./ds4 -m "$MODEL" --metal --nothink --temp 0 \
       -c 320000 -n 2048 --prompt-file "$PROMPT300"
 ```
 
-A native decode block counts only when the normal CLI session loop reports
-`generated=2048`, `requested=2048`, `stop=limit`, and 2,047 committed forward
-positions after the initial sampled token. One valid complete block records achieved
+A native decode block counts only when the normal CLI generation record reports
+`n_generated=2048`, `n_decode_eval=2047`, and `stop=predict_limit`. The session record
+also reports `generated=2048`, `requested=2048` and 2,048 committed forward positions. One valid complete block records achieved
 capability. Interleaved matched runs are still required to attribute a speed difference
 or characterize repeatability. `DS4_GLM_IGNORE_EOS=1` is a benchmark-only fixed-horizon
 control and changes the generated text.
+With no `--dflash` weights, bare startup resolves serial mode and allocates no drafter.
 
 The `b723dfa` capability receipts forced the bank, fused layer command buffer,
 eight-layer pipeline, `xr8` at its depth gate, untracked model view, and serial DFlash.
-They are evidence for that named configuration. The final release recipe should use the
-guarded defaults after their implementation and record the resolved startup policy.
+They are evidence for that named configuration. The final release recipe uses the
+guarded defaults and records the resolved startup policy.
 
 For an exact `b723dfa` configuration reproduction, export
 `DS4_METAL_MODEL_UNTRACKED=1`, `DS4_GLM_ENABLE_EXPERT_BANK=1`,
@@ -521,9 +525,22 @@ identity is not assumed.
 
 ## Results
 
-These are capability receipts from `b723dfa7594dbadc6480cf2872751ae22e551754`
-(`ds4` sha256 `31139ed7…`) on the public 185,299,232,064-byte GGUF. They are not yet
-receipts for the final rebuilt artifact.
+The final compiled artifact is source `538c37c0455a58df5024bec58be99a4ecfef58a7`
+(`ds4` sha256 `79dd8f58…`). Its curated source-equivalent checkpoint is `26e454f`.
+Repository-contained receipts are linked from `bench/RELEASE-EVIDENCE.md`.
+
+| final measurement | result | scope |
+|---|---:|---|
+| native prefill, 62,174 prompt tokens | **550.27 t/s** | bare guarded policy selected bank + fused command buffer + fixed pipeline8; 42/42 routed layers banked |
+| native serial decode, same prompt | **37.868944385 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 54.081254 s |
+| guarded bank boundary, 33,148 native tokens | **556.73 AUTO / 540.64 OFF t/s** | fixed-order same-binary pair, same 77 output bytes; retain 32768 threshold |
+| affected server runtime | **16/16 plus 4/4 pipeline/SIGTERM checks passed** | comparator v3 also passed with 128 native tokens in both recovery arms |
+| native 300,000-token prefill | **473.64 t/s** | five groups, 210 routed layers, zero refusals |
+| native serial decode, 300,000-token prompt | **37.187023218 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 55.072975 s |
+
+The following are earlier capability receipts from
+`b723dfa7594dbadc6480cf2872751ae22e551754` (`ds4` sha256 `31139ed7…`) on the same
+public GGUF:
 
 | measurement | `b723dfa` result | scope | staging receipt |
 |---|---:|---|---|
@@ -540,10 +557,9 @@ same 22,036 bytes on the SQL fixture. They reached the fixed token horizon rathe
 completing the requested task, so the result must not be presented as average workload
 speed.
 
-The concise evidence ledger and final-release placeholders are in
+The concise evidence ledger and repository-contained final receipts are in
 [`bench/RELEASE-EVIDENCE.md`](../bench/RELEASE-EVIDENCE.md). Binary, source, model and
-prompt identities belong in each retained receipt; the final release rows stay pending
-until the rebuilt artifact is screened.
+prompt identities are recorded in each receipt.
 
 ## Known issues
 
@@ -605,19 +621,18 @@ until the rebuilt artifact is screened.
 
 ## Checklist for publication
 
-- [ ] Build the final merged artifact and replace the pending column in
-      `bench/RELEASE-EVIDENCE.md` with its binary/source identities and retained
+- [x] Build the final merged artifact and record its binary/source identities in
       repository-relative receipts.
-- [ ] Confirm the guarded M3 Ultra/public-Q4 startup policy, including the untracked
+- [x] Confirm the guarded M3 Ultra/public-Q4 startup policy, including the untracked
       model view, expert bank, fused layer command buffer and eight-layer pipeline.
-- [ ] Run the focused 32k auto-vs-disabled screen before freezing the provisional
-      32768-token expert-bank boundary.
+- [x] Run the focused above-32k auto-vs-disabled screen and retain the 32768-token
+      expert-bank boundary.
 - [ ] Record the exact-mode upstream diagnostic on the final artifact; report measured
       deltas and do not assume byte identity because the DSA pad-row fix remains active.
 - [ ] Re-validate a vision prompt after the multimodal session-reuse change.
-- [ ] Re-run only the affected DFlash startup/lifecycle checks on the final artifact;
-      keep the `b723dfa` 16/16 result as capability evidence rather than repeating
-      unchanged broad matrices.
+- [x] Run the focused DFlash startup/lifecycle, routed pipeline cancellation,
+      connected-client SIGTERM and Metal-view teardown checks on the final artifact.
+- [x] Run comparator v3's 64..128-token same-session recovery check.
 - [ ] Decide DFlash2 sampled operation: compute the rejection residual against the
       target's original filtered support instead of masking a logit, or leave the mode
       greedy-only.

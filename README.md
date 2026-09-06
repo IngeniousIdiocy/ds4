@@ -236,10 +236,11 @@ fidelity harness for GLM-5.3-Flash on a 512 GB Mac Studio. Start with
 measured scope of `DS4_GLM_EXACT=1`, feature status, switch reference and known
 issues — and read
 [CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relative to upstream and why.
-The current `b723dfa` capability receipts record 550.72 prefill tokens/s at 62,174
-prompt tokens and 37.2994 decode tokens/s for a complete 2,048-token block at a
-300,000-token prompt. These are pinned configuration records; the final rebuilt
-release artifact still needs its own receipts. See the
+The final `538c37c` artifact records 550.27 prefill tokens/s and 37.868944 native
+serial decode tokens/s for a complete 2,048-token block at a 62,174-token prompt, with
+all output bytes matching the three retained reference controls. At a 300,000-token
+prompt the same final binary records 473.64 prefill tokens/s and 37.187023 decode
+tokens/s for the complete native block. See the
 [release evidence index](bench/RELEASE-EVIDENCE.md) for scope and open gates.
 `./ds4 --help glm53` lists the supported controls and kill switches.
 
