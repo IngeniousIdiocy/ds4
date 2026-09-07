@@ -182,6 +182,19 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+#ifdef __APPLE__
+/* Diagnostic-only census window.  Requires DS4_KERNEL_LEDGER=1; begin drops
+ * all earlier counts and dump writes the current counters to `path`. */
+int ds4_gpu_kernel_ledger_window_begin(void);
+int ds4_gpu_kernel_ledger_window_dump(const char *path);
+/* Verifier experiments: process-global selectors are changed only around one
+ * serialized target forward and restored immediately afterwards. */
+void ds4_gpu_glm53_indexer_small_tiled_set(int enabled);
+int ds4_gpu_glm53_indexer_small_tiled_get(void);
+void ds4_gpu_glm53_bf16_mv_max_set(uint32_t v);
+uint32_t ds4_gpu_glm53_bf16_mv_max_get(void);
+#endif
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 /* Resolve mmap-backed Metal model hazard tracking before the first view. */
 void ds4_gpu_set_model_untracked(int enabled);
@@ -3385,6 +3398,29 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
          * order, instead of reading routed_out. */
         const ds4_gpu_tensor *routed_partials,
         uint32_t                n_slots);
+
+/* Opt-in DFlash capture sibling of the routed-slot path above.  It writes the
+ * ordinary HC result unchanged and also collapses its four just-produced F32
+ * streams with mean_weights into capture_out.  The caller keeps the ordinary
+ * path as the fallback and reference. */
+int ds4_gpu_shared_down_hc_expand_capture_q8_0_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        const ds4_gpu_tensor *routed_partials,
+        uint32_t                n_slots,
+        ds4_gpu_tensor       *capture_out,
+        const ds4_gpu_tensor *mean_weights);
 
 int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,

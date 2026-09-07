@@ -1,0 +1,9 @@
+Answer the question using only the three passages below. If the passages do not support a detail, say that the detail is not provided. Give a concise answer and cite passages as [1], [2], or [3].
+
+[1] The Harbor Loop ferry operates from April through October. On weekdays, the first boat leaves North Pier at 6:40 a.m. and the last return leaves Island Dock at 9:10 p.m. Bicycles are carried at no extra charge, but riders must load and secure their own bicycles. The operator may limit bicycles when emergency equipment access would be blocked.
+
+[2] Standard Harbor Loop tickets are valid for one ride in either direction. A day pass permits unlimited ferry rides on the date printed on the pass. Neither ticket includes admission to the Island History Museum. Children under six ride free with an adult, while students ages six and older use the standard fare unless they hold a regional student transit card.
+
+[3] The Island History Museum is a twelve-minute walk from Island Dock. From May through September it opens Tuesday through Sunday at 10:00 a.m. and closes at 5:00 p.m. The museum is closed on Mondays. Its bicycle rack is outdoors and uncovered. Large bags must be left at the staffed coat desk, which closes fifteen minutes before the galleries.
+
+Question: A student with a regional student transit card wants to take a bicycle from North Pier on a July Monday, visit the museum, and return that evening. What can the passages establish about the ferry schedule, bicycle transport, fare, and museum visit?

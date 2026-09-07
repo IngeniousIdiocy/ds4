@@ -1,0 +1,1 @@
+Output a JSON array of 30 user records. Each record has: id (integer), name, email, phone, address (object with street, city, state, zip), roles (array of 3 strings), active (boolean), created_at (ISO 8601 timestamp). Output only the JSON, pretty-printed with 2-space indentation.

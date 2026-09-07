@@ -1,0 +1,7 @@
+ds4: dflash admission policy=confidence-prefix adaptive=1 n_min=1 n_max=7 n_start=3 p_min=0.750000 valid=1
+ds4: dflash adaptive pos=200 operation=verify chosen=3 proposed=3 verified=1 accepted=0 returned=1 next=1 p_min=0.750000 confidence_first=0.810000 confidence_min=0.620000 bootstrap_rows=20 setup_ms=0.500 draft_ms=0.700 verify_ms=1.500 heads_ms=0.300 tail_ms=0.100 serial_ms=0.000 total_ms=4.200 status=ok
+ds4: dflash adaptive_ack consumed=1 done=0 returned=1 total_consumed=1 total_returned=1 total_ms=4.300 invalid=0
+ds4: dflash adaptive pos=201 operation=verify chosen=1 proposed=1 verified=1 accepted=0 returned=1 next=1 p_min=0.750000 confidence_first=0.760000 confidence_min=0.760000 bootstrap_rows=21 setup_ms=0.100 draft_ms=0.400 verify_ms=1.300 heads_ms=0.200 tail_ms=0.100 serial_ms=0.000 total_ms=2.300 status=ok
+ds4: dflash adaptive_ack consumed=1 done=1 returned=1 total_consumed=2 total_returned=2 total_ms=6.700 invalid=0
+ds4: dflash adaptive_totals done=1 calls=2 drafted=4 proposed=4 verified=2 accepted=0 returned=2 consumed=2 setup_ms=0.600 refresh_ms=0.000 draft_ms=1.100 verify_ms=2.800 heads_ms=0.500 tail_ms=0.200 total_ms=6.800 invalid=0
+ds4: CLI session counters: generated=2 requested=2 pos_initial=200 pos_final=202 committed_forward_positions=2 decode_s=0.006800000 resolved_mode=conservative stop_reason=limit

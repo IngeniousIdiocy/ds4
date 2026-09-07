@@ -162,8 +162,15 @@ in the CLI or `view_image` in the native agent.
 Speculative decoding is opt-in. GLM uses `--mtp`; Flash DSpark needs a matching
 support GGUF. GLM-5.3 also supports an optional, separately obtained DFlash2
 drafter. A bare startup is serial; supplying `--dflash FILE` selects the
-conservative scheduler unless `--dflash-mode` says otherwise. It can improve
-generation, but not every workload benefits. Read
+conservative confidence-prefix scheduler unless `--dflash-mode` says otherwise.
+Both DFlash public modes run the trained anchor-plus-seven proposal and require
+target verification. Conservative selects a confidence prefix and uses measured
+width economics, 1% retry tuning, a soft meter, and consumed-savings funding.
+Speculative continuously offers all seven draft positions whenever the causal
+context and response room permit; it has no confidence, economics, retry,
+backoff, or meter policy. DFlash is greedy-only. Speculative can be much slower
+on an unfavorable request, and either verified mode can take a numerically
+different valid continuation from the ordinary serial path. Read
 [speculative decoding](docs/SPECULATIVE_DECODING.md) for MTP/DSpark and the
 [GLM-5.3 DFlash2 guide](docs/DFLASH_GLM53.md) for the drafter recipe and startup
 policies.

@@ -15,9 +15,16 @@ typedef struct {
     bool pending_optional;
 } ds4_dflash_budget;
 
+/* Preserve representation inspection under Clang -ffast-math: an ordinary
+ * memcpy bitcast may be folded back into a finite floating predicate. */
+static inline uint64_t dflash_budget_f64_bits(double value) {
+    volatile uint64_t bits;
+    memcpy((void *)&bits, &value, sizeof(bits));
+    return bits;
+}
+
 static inline bool dflash_budget_ns(double seconds, bool round_up, uint64_t *out) {
-    uint64_t bits;
-    memcpy(&bits, &seconds, sizeof(bits));
+    const uint64_t bits = dflash_budget_f64_bits(seconds);
     if ((bits >> 63) || (bits & UINT64_C(0x7ff0000000000000)) ==
         UINT64_C(0x7ff0000000000000) || seconds <= 0.0) return false;
     if (seconds >= (double)DS4_DFLASH_BUDGET_LIMIT / 1e9) return false;
@@ -35,8 +42,7 @@ static inline bool dflash_budget_ns(double seconds, bool round_up, uint64_t *out
 static inline bool dflash_budget_account_ns(double seconds, uint64_t quantum_ns,
                                             uint64_t *out) {
     if (!quantum_ns || quantum_ns > DS4_DFLASH_BUDGET_LIMIT) return false;
-    uint64_t bits;
-    memcpy(&bits, &seconds, sizeof(bits));
+    const uint64_t bits = dflash_budget_f64_bits(seconds);
     if ((bits & UINT64_C(0x7fffffffffffffff)) == 0) {
         *out = quantum_ns;
         return true;

@@ -1293,6 +1293,125 @@ kernel void kernel_dsv4_shared_down_hc_expand4_slots_q8_0(
     }
 }
 
+// DFlash diagnostic/opt-in sibling of the routed-slot kernel.  The shared
+// down, routed-slot sum, residual add and four HC outputs are statement-for-
+// statement identical to the default kernel.  The owning output lane also
+// applies the ordinary HC mean reduction to those four F32 results.  Keeping a
+// sibling preserves the default pipeline and provides a strict reference.
+kernel void kernel_dsv4_shared_down_hc_expand4_slots_capture_q8_0(
+        constant ds4_metal_args_mul_mv          & mv,
+        constant ds4_metal_args_dsv4_hc_expand & hc,
+        device  const char * weight,
+        device  const char * shared_mid,
+        device        char * shared_out,
+        device  const char * routed_partials,
+        constant ds4_metal_args_dsv4_routed_slots & slots,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device        char * dst,
+        device  const char * mean_weights,
+        device        char * capture,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (hc.n_hc != 4 || hc.n_tokens != 1) {
+        return;
+    }
+
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+
+    const int nb = mv.ne00 / QK8_0;
+    const int row0 = tgpig.x * NR0;
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+
+    device const float *y = (device const float *)(shared_mid);
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        const uint64_t off0 = (uint64_t)(row0 + row) * mv.nb01;
+        ax[row] = (device const block_q8_0 *)(weight + off0);
+    }
+
+    float sumf[NR0] = { 0.0f };
+    float yl[NQ];
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL(short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        FOR_UNROLL(short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.0f;
+            FOR_UNROLL(short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+        yb += NSG * NQ * QK8_0;
+    }
+
+    threadgroup float *shmem_f32[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *)shmem + NW * row;
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        const int d = row0 + row;
+        if (d >= mv.ne01) {
+            continue;
+        }
+        const float shared_v = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            *((device float *)(shared_out + (uint64_t)d * sizeof(float))) = shared_v;
+
+            device const float *row_partials =
+                (device const float *)routed_partials +
+                (uint64_t)d * (uint64_t)slots.n_slots;
+            float block_v = 0.0f;
+            for (uint s = 0; s < slots.n_slots; ++s) {
+                block_v += row_partials[s];
+            }
+            block_v += shared_v;
+
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+            float collapsed = 0.0f;
+            for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+                const float w = *((device const float *)(mean_weights +
+                                  dst_hc * sizeof(float)));
+                collapsed += acc * w;
+            }
+            *((device float *)(capture + (uint64_t)d * sizeof(float))) = collapsed;
+        }
+    }
+}
+
 // Decode-time attention output tail fusion:
 //
 //     attn_out = attn_low @ Wob

@@ -1,5 +1,10 @@
 # DFlash request-credit admission
 
+Historical policy: the active conservative implementation is now the
+[confidence-prefix candidate](DFLASH-CONFIDENCE.md). The reserve policy and
+its receipts below describe the previous implementation and must not be used
+as performance evidence for the new candidate.
+
 The default policy targets less than 2% added generated-work elapsed time
 (about 1.96% throughput loss) on the calibrated profile below. It is a measured
 production requirement, not an unconditional hardware-time guarantee. Optional

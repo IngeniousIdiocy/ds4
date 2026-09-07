@@ -1,0 +1,1 @@
+ds4: GLM gen counters: n_generated=24 n_decode_eval=23 prompt_len=13 final_pos=37 ctx=320000 n_predict=24 decode_s=0.593269000 ms_per_eval=25.794300000 stop=predict_limit

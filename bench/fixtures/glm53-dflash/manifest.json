@@ -1,0 +1,103 @@
+{
+  "schema": 2,
+  "middle_suite": {
+    "label": "category-inspired coverage; not an actual Spec-Bench score",
+    "provenance": "All six prompts are original and were frozen before GPU execution; no dataset examples were copied.",
+    "category_reference": "https://github.com/hemingkx/Spec-Bench",
+    "related_dflash_reference": "https://github.com/z-lab/dflash",
+    "generation": "maximum 512 greedy tokens with natural EOS honored",
+    "arms": ["serial", "conservative", "speculative"]
+  },
+  "workloads": [
+    {
+      "name": "json512",
+      "file": "json512.txt",
+      "sha256": "fadec862c336c4492b0560d4200bbfa8aa68cafbcec0d2a6f0e7e8bd631b69c2",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "source_artifact": "ASTRAL-DFLASH-JSON-20260906T173129Z/prompt.txt"
+    },
+    {
+      "name": "prose512",
+      "file": "prose512.txt",
+      "sha256": "1da700200dbc79ad1b6afc5149fa89967caa2ab2f5fdc9a3253b7e3a100e867e",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "source_artifact": "astral-dflash-adaptive-fixtures/prose-unfavorable.txt"
+    },
+    {
+      "name": "sql512",
+      "file": "sql512.txt",
+      "sha256": "6fde91a5a71998ea43ee71abbf09794aae9a43e8bd01e31b955370dcc0d96fed",
+      "max_generated_tokens": 512,
+      "context": 16384,
+      "source_artifact": "astral-dflash-three-mode-demo/sql-fixtures.txt"
+    },
+    {
+      "name": "middle-chat512",
+      "file": "middle-chat512.txt",
+      "sha256": "71419d7dcd648cfe1a3e26ec809beb66cae411f1008bc7e5417d4d189239d17b",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "natural_eos": true,
+      "category": "multi-turn conversation",
+      "category_shape": "MT-Bench-inspired two-prior-turn continuation",
+      "provenance": "Original prompt authored for this validation; no dataset text copied."
+    },
+    {
+      "name": "middle-summary512",
+      "file": "middle-summary512.txt",
+      "sha256": "f6c10c6bc7ac393de2b1411eb3141a2475e841314cc93e2527ef4218492ea4c0",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "natural_eos": true,
+      "category": "summarization",
+      "category_shape": "CNN/DailyMail-inspired supplied-article summary; original article of approximately 1,500 model tokens",
+      "provenance": "Original prompt and article authored for this validation; no dataset text copied."
+    },
+    {
+      "name": "middle-rag512",
+      "file": "middle-rag512.txt",
+      "sha256": "0dae436f7c36e1f5246e80eb4b3ba32750a03838cf1869c7f50e49bbaa7144b9",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "natural_eos": true,
+      "category": "retrieval-augmented generation",
+      "category_shape": "DPR-style answer over three supplied passages",
+      "provenance": "Original prompt and passages authored for this validation; no dataset text copied."
+    },
+    {
+      "name": "middle-factual512",
+      "file": "middle-factual512.txt",
+      "sha256": "760084e741e67d7762e44ce24defcd8ec90e8aa7c07d307c573e05d1d1bcadda",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "natural_eos": true,
+      "category": "factual question answering",
+      "category_shape": "Natural Questions-inspired short factual answer",
+      "provenance": "Original wording authored for this validation; no dataset text copied."
+    },
+    {
+      "name": "middle-math512",
+      "file": "middle-math512.txt",
+      "sha256": "c8d22a5424b1f01d62db9389e35f3f3f032dabf1a569301d3b0bb01a4680a33b",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "natural_eos": true,
+      "category": "mathematical reasoning",
+      "category_shape": "GSM8K-inspired multi-step word problem",
+      "provenance": "Original problem authored for this validation; no dataset text copied."
+    },
+    {
+      "name": "middle-code512",
+      "file": "middle-code512.txt",
+      "sha256": "f7780f36d5d5bad5fe2a61652b6514c94f211b8b505d51aadd5d60db12cb4452",
+      "max_generated_tokens": 512,
+      "context": 8192,
+      "natural_eos": true,
+      "category": "code generation",
+      "category_shape": "HumanEval-inspired Python function completion",
+      "provenance": "Original function and tests-in-docstring authored for this validation; no dataset text copied."
+    }
+  ]
+}

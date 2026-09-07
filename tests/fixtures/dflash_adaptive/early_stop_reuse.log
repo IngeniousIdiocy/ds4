@@ -1,0 +1,10 @@
+ds4: dflash admission policy=confidence-prefix adaptive=1 n_min=1 n_max=7 n_start=3 p_min=0.750000 valid=1
+ds4: dflash adaptive pos=500 operation=verify chosen=3 proposed=3 verified=3 accepted=3 returned=4 next=4 p_min=0.750000 confidence_first=0.990000 confidence_min=0.960000 bootstrap_rows=50 setup_ms=0.500 draft_ms=0.700 verify_ms=1.900 heads_ms=0.300 tail_ms=0.100 serial_ms=0.000 total_ms=4.500 status=ok
+ds4: dflash adaptive_ack consumed=1 done=1 returned=4 total_consumed=1 total_returned=4 total_ms=4.600 invalid=0
+ds4: dflash adaptive_totals done=1 calls=1 drafted=3 proposed=3 verified=3 accepted=3 returned=4 consumed=1 setup_ms=0.500 refresh_ms=0.000 draft_ms=0.700 verify_ms=1.900 heads_ms=0.300 tail_ms=0.100 total_ms=4.700 invalid=0
+ds4: CLI session counters: generated=1 requested=8 pos_initial=500 pos_final=504 committed_forward_positions=4 decode_s=0.004700000 resolved_mode=conservative stop_reason=earlystop
+ds4: dflash admission policy=confidence-prefix adaptive=1 n_min=1 n_max=7 n_start=3 p_min=0.750000 valid=1
+ds4: dflash adaptive pos=600 operation=verify chosen=3 proposed=1 verified=1 accepted=1 returned=2 next=2 p_min=0.750000 confidence_first=0.880000 confidence_min=0.730000 bootstrap_rows=60 setup_ms=0.500 draft_ms=0.500 verify_ms=1.500 heads_ms=0.300 tail_ms=0.100 serial_ms=0.000 total_ms=4.000 status=ok
+ds4: dflash adaptive_ack consumed=2 done=1 returned=2 total_consumed=2 total_returned=2 total_ms=4.100 invalid=0
+ds4: dflash adaptive_totals done=1 calls=1 drafted=3 proposed=1 verified=1 accepted=1 returned=2 consumed=2 setup_ms=0.500 refresh_ms=0.000 draft_ms=0.500 verify_ms=1.500 heads_ms=0.300 tail_ms=0.100 total_ms=4.200 invalid=0
+ds4: CLI session counters: generated=2 requested=2 pos_initial=600 pos_final=602 committed_forward_positions=2 decode_s=0.004200000 resolved_mode=conservative stop_reason=limit

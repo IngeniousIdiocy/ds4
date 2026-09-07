@@ -645,18 +645,19 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
-    /* BENCH-ONLY (mirrors the argmax path's RUNFX_IDS; ordered 2026-09-06):
-     * under the SAME condition as the payload adapter -- DS4_GLM_LOAD_PAYLOAD
-     * set -- record the generated token ids so a byte divergence between two
-     * blocks names the first differing EVALUATION instead of needing another
-     * campaign to find it.  The ids are printed AFTER the timed region.
-     * Without the flag `bench_ids` stays NULL, every record site below is one
+    /* BENCH-ONLY: payload runs and explicit DS4_CLI_TOKEN_TRACE=1 record
+     * generated ids and piece lengths for exact output/segment audits.
+     * Use DS4_CLI_FORCE_SESSION=1 to trace the serial CLI too. Recording does
+     * not change token selection or EOS behavior. The ids are printed AFTER
+     * the timed region. Without either flag `bench_ids` stays NULL, every record site below is one
      * predictable NULL test, and nothing about the generation changes: no
      * numerics, no sampling, no stop policy, no output bytes. */
     int *bench_ids = NULL;
     int *bench_lens = NULL;   /* bytes this token contributed to stdout */
     int bench_nids = 0;
-    if (bench_payload && bench_payload[0] && max_tokens > 0) {
+    const char *token_trace_flag = getenv("DS4_CLI_TOKEN_TRACE");
+    const bool token_trace = token_trace_flag && !strcmp(token_trace_flag, "1");
+    if (((bench_payload && bench_payload[0]) || token_trace) && max_tokens > 0) {
         bench_ids = (int *)calloc((size_t)max_tokens, sizeof(int));
         bench_lens = (int *)calloc((size_t)max_tokens, sizeof(int));
         if (!bench_ids || !bench_lens)
@@ -794,7 +795,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             "ds4: BENCH RECORD route=CLI-session-loop-forced payload=%s pos_initial=%d pos_final=%d "
             "requested=%d generated=%d evaluated=%d decode_s=%.9f restore_s=%.9f rate_gen_per_s=%.9f stop=%s\n",
             bench_payload, bench_pos0, ds4_session_pos(session),
-            cfg->gen.n_predict, generated, generated > 0 ? generated - 1 : 0,
+            cfg->gen.n_predict, generated,
+            generation_pos_final - generation_pos_initial,
             decode_s, bench_restore_s,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0,
             generated >= cfg->gen.n_predict ? "predict_limit" : "early_stop");

@@ -1,0 +1,2 @@
+ds4: CLI session counters: generated=24 requested=24 pos_initial=299994 pos_final=300018 committed_forward_positions=24 decode_s=0.697939000 resolved_mode=speculative stop_reason=limit
+ds4: RUNFX_IDS tag=cli-session-loop-forced count=24 11804 53 1348 12 3126 17335 56 12 21 99698 16 271 785 2038 7951 304 264 3175 11646 21527 1119 279 3364 11

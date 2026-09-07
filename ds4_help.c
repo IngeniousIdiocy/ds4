@@ -192,7 +192,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
             if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER) {
-                opt(fp, c, "--dflash FILE", "GLM-5.3: load a DFlash2 draft GGUF and speculate (optional; drafter weights are not bundled). See docs/DFLASH_GLM53.md.");
+                opt(fp, c, "--dflash FILE", "GLM-5.3: load an optional DFlash2 drafter for greedy decoding (--temp 0, or temperature: 0 in server requests). Weights are not bundled. See docs/DFLASH_GLM53.md.");
                 opt(fp, c, "--dflash-mode MODE", "DFlash scheduling: conservative (default with --dflash), speculative (uncapped), or serial (do not load the drafter).");
             }
         } else if (tool == DS4_HELP_BENCH) {
@@ -428,8 +428,8 @@ static void print_glm53(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     title(fp, c, "Supported Controls");
     opt(fp, c, "DS4_ANTHROPIC_DEFAULT_EFFORT", "Default reasoning effort for Anthropic-protocol requests that carry none (e.g. Claude Code); explicit request fields still win.");
-    opt(fp, c, "DS4_DFLASH_CTX_CAP", "Caps the drafter's context rows (default about 256; more rows cost draft latency).");
-    opt(fp, c, "DS4_DFLASH_DISABLE", "Ignores a loaded DFlash2 drafter and decodes serially.");
+    opt(fp, c, "DS4_DFLASH_CTX_CAP", "Drafter history rows: default 256, range 1..2047 for the pinned GLM-5.3 DFlash2 model. More rows cost draft latency.");
+    opt(fp, c, "DS4_DFLASH_DISABLE", "Legacy serial startup when --dflash-mode is omitted; the drafter is not loaded.");
     opt(fp, c, "DS4_GLM53_MEMORY_CEILING_GB", "Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe).");
     opt(fp, c, "DS4_GLM53_PREFILL_CHUNK", "Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks).");
     opt(fp, c, "DS4_GLM_DSA_TAIL_CHECKED", "=0 restores the legacy unchecked ragged tail in DSA attention (default 1: bounds-checked; registry entry 4).");
@@ -455,7 +455,8 @@ static void print_glm53(FILE *fp, const help_colors *c) {
     title(fp, c, "Kill Switches");
     para(fp, c, "Each turns one default-on change off, for A/B measurement and bisection. Unless the meaning says otherwise a switch is read as set to any non-empty value.");
     opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Legacy fallback when --dflash-mode is omitted: uncapped DFlash experiment with prefill seeding; no 2% slowdown claim.");
-    opt(fp, c, "DS4_DFLASH_BUDGET_MS", "Diagnostic positive full refresh/proposal budget estimate; default 500ms on the calibrated M3 Ultra public-model profile. Invalid values stay serial.");
+    opt(fp, c, "DS4_DFLASH_P_MIN", "Minimum normalized draft probability for the conservative verified prefix (default 0.75). The first lower probability ends the prefix.");
+    opt(fp, c, "DS4_DFLASH_ADAPTIVE", "=1 enables experimental accepted-count adaptation of the verifier prefix cap; default 0 retains the trained full-block cap.");
     opt(fp, c, "DS4_DFLASH_NO_SELECTOR", "Disables the DFlash2 candidate selector (coherent-chain tracing).");
     opt(fp, c, "DS4_DFLASH_SDPA_SCALAR", "Forces the scalar SDPA drafter kernel instead of the simdgroup one.");
     opt(fp, c, "DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK", "Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2).");

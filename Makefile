@@ -19,13 +19,17 @@ QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
+# ds4.c includes these directly or through the drafter. Keep every engine
+# compilation (including CPU and include-ds4.c test variants) in sync.
+DS4_DFLASH_DEPS := $(wildcard ds4_dflash*.inc ds4_dflash*.h)
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
+DFLASH_CONFIDENCE_LDLIBS := -lm -framework Accelerate
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
@@ -66,6 +70,7 @@ ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
+DFLASH_CONFIDENCE_LDLIBS := -lm
 endif
 
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm expert-bank-policy-test
@@ -336,13 +341,20 @@ tests/test_glm_expert_bank_policy: tests/test_glm_expert_bank_policy.c ds4_glm_e
 expert-bank-policy-test: tests/test_glm_expert_bank_policy
 	./tests/test_glm_expert_bank_policy
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_glm_expert_bank_policy.h ds4_dflash2.inc ds4_dflash_glm.inc ds4_dflash_script.inc ds4_dflash_rollback.h ds4_dflash_budget.h ds4_dflash_fastpath.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_glm_expert_bank_policy.h $(DS4_DFLASH_DEPS)
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ifeq ($(UNAME_S),Darwin)
+# Inspection-only vehicle; never launched by make or by the CPU test suite.
+tests/test_dflash_seed_gpu.o: tests/test_dflash_seed_gpu.c ds4.c ds4.h ds4_gpu.h $(DS4_DFLASH_DEPS) $(wildcard ds4_*.inc ds4_*.h)
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dflash_seed_gpu: tests/test_dflash_seed_gpu.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 # Deliberately separate from ds4.o and DS4_TEST_HOOKS: no production fault hook
 # or instance-lock bypass. Reuse the identical normal Metal and server objects.
-tests/ds4_sc_failure.o: ds4.c ds4.h ds4_gpu.h $(wildcard ds4_*.inc ds4_*.h)
+tests/ds4_sc_failure.o: ds4.c ds4.h ds4_gpu.h $(DS4_DFLASH_DEPS) $(wildcard ds4_*.inc ds4_*.h)
 	$(CC) $(CFLAGS) -DDS4_TEST_GLM_SC_FAIL_GROUP=2 -I. -c -o $@ ds4.c
 
 tests/ds4_server_sc_failure: tests/ds4_sc_failure.o ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -409,7 +421,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm_expert_bank_policy.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm_expert_bank_policy.h $(DS4_DFLASH_DEPS)
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h
@@ -628,7 +640,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm_expert_bank_policy.h ds4_dflash2.inc ds4_dflash_rollback.h ds4_dflash_budget.h ds4_dflash_fastpath.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm_expert_bank_policy.h $(DS4_DFLASH_DEPS)
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -681,6 +693,15 @@ tests/test_dflash_lifecycle: tests/test_dflash_lifecycle.o ds4_cpu_test_hooks.o 
 dflash-lifecycle-test: tests/test_dflash_lifecycle
 	./tests/test_dflash_lifecycle
 
+ifeq ($(UNAME_S),Darwin)
+tests/test_dflash_seed: tests/test_dflash_seed.c ds4_dflash_seed.inc
+	$(CC) $(CFLAGS) -o $@ $<
+
+.PHONY: dflash-seed-test
+dflash-seed-test: tests/test_dflash_seed
+	./tests/test_dflash_seed
+endif
+
 tests/test_dflash_sampling.o: tests/test_dflash_sampling.c
 	$(CC) $(CFLAGS) -fno-finite-math-only -I. -c -o $@ $<
 
@@ -711,13 +732,13 @@ endif
 .PHONY: dflash-cached-depth
 dflash-cached-depth: tests/dflash_cached_depth
 
-tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h $(DS4_DFLASH_DEPS)
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
 tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h $(DS4_DFLASH_DEPS)
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_session_state_gpu: tests/test_session_state_gpu.o $(filter-out ds4.o,$(CORE_OBJS))
@@ -757,7 +778,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm_expert_bank_policy.h
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm_expert_bank_policy.h $(DS4_DFLASH_DEPS)
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -817,7 +838,7 @@ tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test dflash-confidence-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_dflash_mode tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/test_glm_superchunk_state tests/test_glm_expert_bank_policy $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -881,7 +902,8 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
-	rm -f tests/test_dflash_prefix tests/test_dflash_budget tests/test_dflash_mode tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state tests/test_glm_expert_bank_policy tests/test_dflash_fastpath
+	rm -f speed-bench/dflash_confidence_bench
+	rm -f tests/test_dflash_entry tests/test_dflash_clock tests/test_dflash_prefix tests/test_dflash_budget tests/test_dflash_adaptive tests/test_dflash_fault tests/test_dflash_retry tests/test_dflash_seed tests/test_dflash_seed_gpu tests/test_dflash_mode tests/test_dflash2_embed_q8 tests/test_dflash_confidence tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/dflash_cached_depth tests/test_glm_superchunk_state tests/test_glm_expert_bank_policy tests/test_dflash_fastpath
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
@@ -899,6 +921,27 @@ dflash-budget-test: tests/test_dflash_budget
 tests/test_dflash_budget: tests/test_dflash_budget.c ds4_dflash_budget.h
 	$(CC) $(CFLAGS) -o $@ tests/test_dflash_budget.c
 
+.PHONY: dflash-adaptive-test
+dflash-adaptive-test: tests/test_dflash_adaptive
+	./tests/test_dflash_adaptive
+
+tests/test_dflash_adaptive: tests/test_dflash_adaptive.c ds4_dflash_adaptive.h ds4_dflash_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_adaptive.c
+
+.PHONY: dflash-fault-test
+dflash-fault-test: tests/test_dflash_fault
+	./tests/test_dflash_fault
+
+tests/test_dflash_fault: tests/test_dflash_fault.c ds4_dflash_fault.h ds4_dflash_confidence.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_fault.c -lm
+
+.PHONY: dflash-retry-test
+dflash-retry-test: tests/test_dflash_retry
+	./tests/test_dflash_retry
+
+tests/test_dflash_retry: tests/test_dflash_retry.c ds4_dflash_history.h ds4_dflash_adaptive.h ds4_dflash_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_retry.c
+
 .PHONY: dflash-mode-test
 dflash-mode-test: tests/test_dflash_mode
 	./tests/test_dflash_mode
@@ -912,3 +955,31 @@ dflash-fastpath-test: tests/test_dflash_fastpath
 
 tests/test_dflash_fastpath: tests/test_dflash_fastpath.c ds4_dflash_fastpath.h
 	$(CC) -std=c11 -Wall -Wextra -O0 -o $@ $<
+
+.PHONY: dflash-confidence-test
+dflash-confidence-test: tests/test_dflash_confidence
+	./tests/test_dflash_confidence
+
+tests/test_dflash_confidence: tests/test_dflash_confidence.c ds4_dflash_confidence.h
+	$(CC) $(CFLAGS) -I. -o $@ $< $(DFLASH_CONFIDENCE_LDLIBS)
+
+.PHONY: dflash-confidence-bench
+dflash-confidence-bench: speed-bench/dflash_confidence_bench
+	./speed-bench/dflash_confidence_bench
+
+speed-bench/dflash_confidence_bench: speed-bench/dflash_confidence_bench.c ds4_dflash_confidence.h
+	$(CC) $(CFLAGS) -I. -o $@ $< $(DFLASH_CONFIDENCE_LDLIBS)
+
+.PHONY: dflash-clock-test
+dflash-clock-test: tests/test_dflash_clock
+	./tests/test_dflash_clock
+
+tests/test_dflash_clock: tests/test_dflash_clock.c ds4_dflash_clock.h ds4_dflash_adaptive.h ds4_dflash_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_clock.c
+
+.PHONY: dflash-entry-test
+dflash-entry-test: tests/test_dflash_entry
+	./tests/test_dflash_entry
+
+tests/test_dflash_entry: tests/test_dflash_entry.c ds4_dflash_adaptive.h ds4_dflash_history.h ds4_dflash_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_entry.c

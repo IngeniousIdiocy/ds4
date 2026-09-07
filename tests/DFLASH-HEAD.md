@@ -7,8 +7,9 @@ the 185299232064-byte target and 2342595168-byte drafter, 4096 hidden width,
 drafter with block 8, window 2048, BF16 FC 20480-to-4096, FFN 12288, 32 query
 heads and 8 KV heads of width 128. File sizes are applicability guards, not
 content identity; no model hashing is performed. The two paths are independent
-of admission: speculative mode uses them directly and conservative mode uses
-them only after earning request credit. Serial mode does not use the drafter.
+of admission: full-block speculative uses them on every eligible verification,
+and conservative uses them when its confidence/economics/retry policy admits
+verifier work. Serial mode does not use the drafter.
 
 `DS4_DFLASH_DISABLE_HEAD_NT4=1` forces the scalar head and suppresses NT4
 comparison/benchmark dispatch. `DS4_DFLASH_DISABLE_FC_MM=1` retains the original
@@ -62,8 +63,9 @@ rows. Then price generation under explicitly uncapped speculative mode
 `DS4_DFLASH_NO_ADAPTIVE=1`). Compare automatic defaults against
 `DS4_DFLASH_DISABLE_HEAD_NT4=1`, holding the FC kill setting fixed. For an FC
 pair, toggle only `DS4_DFLASH_DISABLE_FC_MM=1` and keep head policy fixed.
-Use `DS4_DFLASH_STATS=1` to confirm actual engagement. The request-credit default
-may stay serial on this short request and has a separate performance claim.
+Use `DS4_DFLASH_STATS=1` to confirm actual engagement. Conservative may decline
+verification or defer later proposals on this short request and has a separate
+complete-request performance claim.
 Partial final blocks remain scalar. Never leave
 comparison or benchmark flags enabled in a throughput pair.
 

@@ -3,6 +3,50 @@
 #include "../ds4.c"
 #include <assert.h>
 
+/* The ignore-EOS speculative suffix uses this same predicate, then leaves
+ * the rejected row's logits intact for this selector at the next frontier.
+ * Exercise that contract without loading a model or initializing a GPU. */
+static void test_ignore_eos_frontier(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    g_ds4_shape.n_vocab = 16;
+    ds4_engine e = { .backend = DS4_BACKEND_CPU };
+    e.vocab.eos_id = 1;
+    e.vocab.system_id = 2;
+    e.vocab.user_id = 3;
+    e.vocab.assistant_id = 4;
+    e.vocab.observation_id = 5;
+    e.vocab.think_start_id = 6;
+    e.vocab.think_end_id = 7;
+    float logits[16], original[16];
+    ds4_session s = { .engine = &e, .checkpoint_valid = true,
+                      .logits = logits };
+    const ds4_think_mode modes[] = {
+        DS4_THINK_NONE, DS4_THINK_HIGH, DS4_THINK_MAX
+    };
+    for (unsigned m = 0; m < sizeof(modes) / sizeof(*modes); m++) {
+        for (int control = 1; control <= 7; control++) {
+            for (unsigned i = 0; i < 16; i++) logits[i] = -10.0f;
+            logits[control] = 30.0f;
+            logits[10] = logits[11] = 20.0f;
+            memcpy(original, logits, sizeof(logits));
+            const bool excluded = control <= 5 || modes[m] == DS4_THINK_NONE;
+            assert(ds4_token_is_stop_for_think_mode(&e, control, modes[m]) == excluded);
+            assert(ds4_session_argmax(&s) == control);
+            assert(ds4_session_argmax_ignoring_eos(&s, modes[m]) ==
+                   (excluded ? 10 : control));
+            /* No residual mask may leak into a later normal selection.
+             * Equal permitted logits retain the ordinary lower-ID tie. */
+            assert(memcmp(logits, original, sizeof(logits)) == 0);
+            assert(ds4_session_argmax(&s) == control);
+        }
+    }
+    assert(!ds4_token_is_stop_for_think_mode(&e, 10, DS4_THINK_NONE));
+    s.checkpoint_valid = false;
+    assert(ds4_session_argmax_ignoring_eos(&s, DS4_THINK_NONE) == -1);
+    g_ds4_shape = saved_shape;
+}
+
 static void test_rewind(void) {
     ds4_engine e = { .backend = DS4_BACKEND_CPU };
     ds4_session *s = calloc(1, sizeof(*s));
@@ -228,6 +272,7 @@ static void test_glm_spec_rollback(void) {
 #endif
 
 int main(void) {
+    test_ignore_eos_frontier();
     test_rewind();
     test_session_memory();
     test_payload_tokens();

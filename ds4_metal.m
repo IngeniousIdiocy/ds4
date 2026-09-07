@@ -656,6 +656,15 @@ static id<MTLComputePipelineState> g_glm53_indexer_scores_causal_pipeline;
 static id<MTLComputePipelineState> g_glm53_indexer_scores_fill_dead_pipeline;
 static id<MTLComputePipelineState> g_glm53_indexer_scores_headfold_pipeline;
 static NSUInteger g_glm53_indexer_headfold_smem;
+static int g_glm53_indexer_small_tiled;
+
+void ds4_gpu_glm53_indexer_small_tiled_set(int enabled) {
+    g_glm53_indexer_small_tiled = enabled != 0;
+}
+
+int ds4_gpu_glm53_indexer_small_tiled_get(void) {
+    return g_glm53_indexer_small_tiled;
+}
 
 /* --------------------------------------------------------------------------
  * Prefill lever 18 (Tier 1): fold the indexer scorer's head axis into the
@@ -1548,6 +1557,7 @@ static uint64_t g_ledger_reset_at;         /* DS4_KERNEL_LEDGER_RESET_AFTER */
 static int      g_ledger_by_tg;            /* DS4_KERNEL_LEDGER_BY_TG */
 
 static void ds4_ledger_dump(void);
+static int ds4_ledger_dump_to(const char *path_override);
 
 static inline int ds4_ledger_on(void) { return g_ledger_mode != 0; }
 
@@ -1877,13 +1887,15 @@ static int ds4_ledger_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static void ds4_ledger_dump(void) {
-    if (!ds4_ledger_on()) return;
+static int ds4_ledger_dump_to(const char *path_override) {
+    if (!ds4_ledger_on()) return 0;
     FILE *out = stderr;
-    const char *path = getenv("DS4_KERNEL_LEDGER_DUMP");
+    const char *path = path_override && path_override[0] ?
+        path_override : getenv("DS4_KERNEL_LEDGER_DUMP");
     if (path && *path) {
         FILE *f = fopen(path, "w");
-        if (f) out = f;
+        if (!f) return 0;
+        out = f;
     }
     ds4_ledger_kernel *sorted = calloc((size_t)g_ledger_nk, sizeof(*sorted));
     if (sorted) {
@@ -1919,6 +1931,24 @@ static void ds4_ledger_dump(void) {
     free(sorted);
     fflush(out);
     if (out != stderr) fclose(out);
+    return 1;
+}
+
+static void ds4_ledger_dump(void) {
+    (void)ds4_ledger_dump_to(NULL);
+}
+
+int ds4_gpu_kernel_ledger_window_begin(void) {
+    /* Mode 2 deliberately changes encoder structure, so a phase census must
+     * refuse it rather than quietly perturbing the verifier being measured. */
+    if (g_ledger_mode != 1) return 0;
+    ds4_ledger_reset_counters();
+    return 1;
+}
+
+int ds4_gpu_kernel_ledger_window_dump(const char *path) {
+    if (g_ledger_mode != 1 || !path || !path[0]) return 0;
+    return ds4_ledger_dump_to(path);
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
@@ -39574,7 +39604,10 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
 
         const bool force_scalar = g_quality_mode;
         const bool use_tiled_f32 = false;
-        const bool use_tiled = !force_scalar && n_tokens >= 8u &&
+        const bool use_tiled = !force_scalar &&
+                               (n_tokens >= 8u ||
+                                (g_glm53_indexer_small_tiled &&
+                                 !glm53_exact_mode())) &&
                                n_head == 32u && head_dim == 128u;
         id<MTLComputePipelineState> pipeline =
             use_tiled
@@ -52458,7 +52491,7 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(
     return 0;
 }
 
-int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+static int ds4_gpu_shared_down_hc_expand_q8_0_impl(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,
@@ -52473,9 +52506,13 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc,
         const ds4_gpu_tensor *routed_partials,
-        uint32_t                n_slots) {
+        uint32_t                n_slots,
+        ds4_gpu_tensor       *capture_out,
+        const ds4_gpu_tensor *mean_weights) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (routed_partials && (n_slots == 0u || n_slots > 32u)) return 0;
+    if ((capture_out == NULL) != (mean_weights == NULL) ||
+        (capture_out && !routed_partials)) return 0;
     if (!out_hc || !shared_out || !model_map || !shared_mid || !routed_out ||
         !residual_hc || !split || n_embd == 0 || n_hc == 0 ||
         n_hc != 4 || out_dim != n_embd || (in_dim & 31u) != 0 ||
@@ -52492,6 +52529,10 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
         id<MTLBuffer> splitbuf = ds4_gpu_tensor_buffer(split);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
+        id<MTLBuffer> capturebuf = capture_out ?
+            ds4_gpu_tensor_buffer(capture_out) : nil;
+        id<MTLBuffer> meanbuf = mean_weights ?
+            ds4_gpu_tensor_buffer(mean_weights) : nil;
 
         const uint64_t row_bytes = (in_dim / 32u) * 34u;
         const uint64_t weight_bytes = out_dim * row_bytes;
@@ -52506,12 +52547,16 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
             return 0;
         }
         if (!midbuf || !sharedbuf || !routedbuf || !resbuf || !splitbuf || !outbuf ||
+            (capture_out && (!capturebuf || !meanbuf)) ||
             ds4_gpu_tensor_bytes(shared_mid) < shared_mid_bytes ||
             ds4_gpu_tensor_bytes(shared_out) < embd_bytes ||
             ds4_gpu_tensor_bytes(routed_out) < embd_bytes ||
             ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
             ds4_gpu_tensor_bytes(split) < split_bytes ||
-            ds4_gpu_tensor_bytes(out_hc) < hc_bytes) {
+            ds4_gpu_tensor_bytes(out_hc) < hc_bytes ||
+            (capture_out &&
+             (ds4_gpu_tensor_bytes(capture_out) < embd_bytes ||
+              ds4_gpu_tensor_bytes(mean_weights) < (uint64_t)n_hc * sizeof(float)))) {
             fprintf(stderr, "ds4: Metal shared-down HC fusion received undersized buffers\n");
             return 0;
         }
@@ -52565,6 +52610,8 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         }
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
+                capture_out ?
+                    "kernel_dsv4_shared_down_hc_expand4_slots_capture_q8_0" :
                 routed_partials ?
                     "kernel_dsv4_shared_down_hc_expand4_slots_q8_0" :
                     "kernel_dsv4_shared_down_hc_expand4_q8_0",
@@ -52589,6 +52636,10 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
             [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float) atIndex:8];
             [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:9];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:10];
+            if (capture_out) {
+                [enc setBuffer:meanbuf offset:ds4_gpu_tensor_offset(mean_weights) atIndex:11];
+                [enc setBuffer:capturebuf offset:ds4_gpu_tensor_offset(capture_out) atIndex:12];
+            }
         } else {
             [enc setBuffer:routedbuf offset:ds4_gpu_tensor_offset(routed_out) atIndex:5];
             [enc setBuffer:resbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:6];
@@ -52608,6 +52659,35 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *shared_out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *shared_mid, const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc,
+        const ds4_gpu_tensor *routed_partials, uint32_t n_slots) {
+    return ds4_gpu_shared_down_hc_expand_q8_0_impl(
+        out_hc, shared_out, model_map, model_size, weight_offset, in_dim,
+        out_dim, shared_mid, routed_out, residual_hc, split, n_embd, n_hc,
+        routed_partials, n_slots, NULL, NULL);
+}
+
+int ds4_gpu_shared_down_hc_expand_capture_q8_0_tensor(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *shared_out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *shared_mid, const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc,
+        const ds4_gpu_tensor *routed_partials, uint32_t n_slots,
+        ds4_gpu_tensor *capture_out, const ds4_gpu_tensor *mean_weights) {
+    return ds4_gpu_shared_down_hc_expand_q8_0_impl(
+        out_hc, shared_out, model_map, model_size, weight_offset, in_dim,
+        out_dim, shared_mid, routed_out, residual_hc, split, n_embd, n_hc,
+        routed_partials, n_slots, capture_out, mean_weights);
 }
 
 /* HCXTAIL default (campaign-t2-screen).  The parallel HC epilogue is bit-exact

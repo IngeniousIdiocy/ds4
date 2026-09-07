@@ -174,24 +174,36 @@ DFlash/DFlash2 block-diffusion draft engine from antirez/ds4 PR #844 (MIT source
 attribution details in
 `THIRD_PARTY.md`): a simdgroup SDPA drafter kernel, BF16 drafter weights, a persistent
 sliding-window context-KV cache, the z-lab candidate selector, exact rejection sampling
-for the sampled path, and two greedy scheduling policies. Bare startup is serial and
-does not load draft weights; `--dflash FILE` defaults to conservative request-credit
-admission; `--dflash-mode speculative` selects the uncapped policy. Explicit modes win
-over the legacy environment switches regardless of argument order.
+machinery retained for testing, and two greedy public profiles. The upstream drafter is trained
+for a fixed anchor-plus-seven block. ds4 preserves that geometry, computes normalized
+full-vocabulary confidence for conservative admission, and commits only rows accepted by
+the target verifier. Bare startup is serial and does
+not load draft weights; `--dflash FILE` defaults to conservative confidence-prefix
+admission. Explicit modes win over the legacy environment switches regardless of
+argument order.
 
-**Rollback.** Upstream includes the DSA indexer tail ring in the speculative state it
-restores after a rejected draft, while the per-step snapshot taken inside a DFlash verify
-covers the KDA conv/recurrent state only — and all three verify routes write the ring for
-every drafted row. A partial acceptance therefore used to leave rejected rows in the
-ring, which is why this branch refused the cycle outright. The cycle now saves the
-complete speculative state before the verify and, on a partial acceptance, restores it
-and replays the committed prefix one token at a time through the ordinary serial forward:
-upstream's own MTP rejection contract, applied to a block of rows, so every per-token
-producer is re-derived rather than patched. `DS4_DFLASH_NO_WIDE_ROLLBACK=1` restores the
-previous refusal; `DS4_DFLASH_FORCE_REPLAY=1` selects the replay unconditionally as an
-A/B oracle. The same incompleteness in upstream's MTP row-snapshot fast path is handled
-by a guard (`ds4.c:68578`) that makes the fast path fall through to upstream's full
-restore+replay on every real GLM-5.3 graph.
+**Public profiles.** Conservative uses measured width economics and retry backoff with
+a 1% retry-tax setting, a soft request loss meter, and retry funding from savings that
+already-consumed work established. Speculative is the full-block profile: whenever causal
+conditioning and context/response room permit, it drafts and offers all seven positions
+without confidence admission, width economics, retry, backoff, or a loss meter. The target
+still verifies every offered row; history ownership, exact rollback and the session fault
+latch still apply. Conservative permits an immediate first proposal by default
+(`DS4_DFLASH_MIN_SERIAL_TOKENS=0`); the three-token startup policy remains diagnostic only.
+Its 1% retry setting and 3% soft meter are scheduling inputs, not universal request-downside
+caps. `DS4_DFLASH_BLIND_RESEARCH` is obsolete: speculative now names the full-block policy
+directly, and the withdrawn 5% aggressive confidence profile is no longer public.
+Full-block speculative can be much slower on bad input. Both verified profiles may
+produce a numerically different valid continuation; serial remains the ordinary
+serial-arithmetic path.
+
+**Rollback.** Verification advances both KDA conv/recurrent state and the DSA indexer
+tail ring for every offered row. The verifier now captures both state families at each
+causal prefix. A partial acceptance restores the accepted-prefix snapshot; a missing or
+incomplete snapshot restores the complete pre-block backup and replays the committed
+prefix through the ordinary serial forward. `DS4_DFLASH_NO_WIDE_ROLLBACK=1` restores the
+previous refusal; `DS4_DFLASH_FORCE_REPLAY=1` selects the replay oracle. Rejected compact
+cache rows remain outside the visible frontier until overwritten.
 
 **Greedy only, and request-state ownership.** Positive temperature does not enter the
 speculative cycle: its rejection masks the rejected token's logit and every caller then
@@ -222,9 +234,16 @@ affected runtime driver passed 16/16 startup, model-id, cancellation, stop, natu
 and healthy-reuse checks. Its favorable fixed 8,192-token SQL horizon measured
 38.5850 / 47.2064 / 60.7875 t/s for serial / conservative / speculative, with all arms
 reaching the fixed limit during tuple 483 of a requested 2,000 rather than completing
-the task. The personal-use recreation recipe for the drafter — pinned
+the task. Those `b723dfa` labels describe that historical runtime and do not certify the
+current conservative scheduler or current public full-block implementation. The
+personal-use recreation recipe for the drafter — pinned
 revision, checksums, converter command, launch flags and smoke tests — is
 `docs/DFLASH_GLM53.md`; no drafter weights are redistributed.
+
+Experimental serial-capture epilogue fusion, verifier BF16-MM, verifier indexer and
+padded proposer-head paths remain off by default. Their diagnostic force/comparison
+switches are not part of either public profile and require their own numerical and
+timing evidence before any default change.
 
 ## 4. Server
 

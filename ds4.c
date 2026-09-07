@@ -42,6 +42,10 @@
 
 #include "ds4.h"
 #include "ds4_dflash_budget.h"
+#include "ds4_dflash_clock.h"
+#include "ds4_dflash_adaptive.h"
+#include "ds4_dflash_fault.h"
+#include "ds4_dflash_history.h"
 #include "ds4_glm_expert_bank_policy.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -46820,7 +46824,10 @@ typedef struct {
     ds4_gpu_tensor       *out_hc;       /* hc_next  */
     const ds4_gpu_tensor *residual_hc;  /* hc_after_attn */
     const ds4_gpu_tensor *split;        /* hc_split (pre|post|comb) */
+    ds4_gpu_tensor       *capture_out;  /* optional DFlash mean collapse */
+    const ds4_gpu_tensor *capture_mean;
     bool                  folded;       /* set when the tail was absorbed */
+    bool                  capture_folded;
 } glm53_ffn_hc_fold;
 
 static bool glm53_ffn_hc_tailfuse_enabled(void) {
@@ -47355,22 +47362,50 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                 stage_t0);
         }
         if (ok && fold_shared_down_hc) {
-            ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
-                    hc_fold->out_hc,
-                    ffn_sum,
-                    model->map,
-                    model->size,
-                    l->ffn_down_shexp->abs_offset,
-                    DS4_N_FF_EXP,
-                    DS4_N_EMBD,
-                    shared_mid,
-                    ffn_out,
-                    hc_fold->residual_hc,
-                    hc_fold->split,
-                    DS4_N_EMBD,
-                    DS4_N_HC,
-                    routed_down_split ? g->routed_partials : NULL,
-                    routed_down_split ? DS4_N_EXPERT_USED : 0u) != 0;
+            bool capture_done = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (routed_down_split && hc_fold->capture_out &&
+                hc_fold->capture_mean) {
+                capture_done =
+                    ds4_gpu_shared_down_hc_expand_capture_q8_0_tensor(
+                        hc_fold->out_hc,
+                        ffn_sum,
+                        model->map,
+                        model->size,
+                        l->ffn_down_shexp->abs_offset,
+                        DS4_N_FF_EXP,
+                        DS4_N_EMBD,
+                        shared_mid,
+                        ffn_out,
+                        hc_fold->residual_hc,
+                        hc_fold->split,
+                        DS4_N_EMBD,
+                        DS4_N_HC,
+                        g->routed_partials,
+                        DS4_N_EXPERT_USED,
+                        hc_fold->capture_out,
+                        hc_fold->capture_mean) != 0;
+            }
+#endif
+            if (!capture_done) {
+                ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+                        hc_fold->out_hc,
+                        ffn_sum,
+                        model->map,
+                        model->size,
+                        l->ffn_down_shexp->abs_offset,
+                        DS4_N_FF_EXP,
+                        DS4_N_EMBD,
+                        shared_mid,
+                        ffn_out,
+                        hc_fold->residual_hc,
+                        hc_fold->split,
+                        DS4_N_EMBD,
+                        DS4_N_HC,
+                        routed_down_split ? g->routed_partials : NULL,
+                        routed_down_split ? DS4_N_EXPERT_USED : 0u) != 0;
+            }
+            hc_fold->capture_folded = capture_done;
             if (ok) hc_fold->folded = true;
         } else if (ok) {
             ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
@@ -47633,7 +47668,10 @@ static bool glm53_graph_encode_ffn_tail_one(
         uint32_t                 il,
         uint32_t                 pos,
         bool                     stage_profile,
-        double                  *stage_t0) {
+        double                  *stage_t0,
+        ds4_gpu_tensor          *capture_out,
+        const ds4_gpu_tensor    *capture_mean,
+        bool                    *capture_folded) {
     /* Ask the sparse FFN to absorb the residual add and the mHC expand into
      * the shared-down matvec's epilogue.  Withheld when anything still needs
      * the un-expanded `next` row. */
@@ -47648,6 +47686,8 @@ static bool glm53_graph_encode_ffn_tail_one(
         fold.out_hc      = g->hc_next;
         fold.residual_hc = g->hc_after_attn;
         fold.split       = g->hc_split;
+        fold.capture_out = capture_out;
+        fold.capture_mean = capture_mean;
     }
     bool ok = glm_graph_encode_ffn_one_normed_from(g,
                                                    model,
@@ -47684,6 +47724,7 @@ static bool glm53_graph_encode_ffn_tail_one(
                                       DS4_N_EMBD,
                                       DS4_N_HC) != 0;
     }
+    if (capture_folded) *capture_folded = fold.capture_folded;
     return ok;
 }
 
@@ -49380,8 +49421,14 @@ static uint32_t glm_graph_mtp_cache_cap(const ds4_glm_gpu_graph *g) {
  * SGLang's hc_contract-of-(hidden+residual) capture). */
 typedef struct {
     int enabled;
+    int fuse_sdn;
+    int fuse_replace;
     ds4_gpu_tensor *buf;
+    ds4_gpu_tensor *fused_buf;
     uint32_t n_rows;
+    uint32_t source_row;
+    uint32_t captured_taps;
+    uint32_t fused_taps;
     uint32_t n_taps;
     uint32_t taps[DS4_DFLASH2_MAX_TARGET];
 } ds4_glm_dflash_capture;
@@ -49395,6 +49442,33 @@ static int glm_dflash_capture_tap_index(uint32_t il) {
     return -1;
 }
 
+static bool glm_dflash_capture_sdn_requested(void) {
+    const char *value = getenv("DS4_DFLASH_CAPTURE_SDN_FUSE");
+    const char *compare = getenv("DS4_DFLASH_CAPTURE_COMPARE");
+    const char *bench = getenv("DS4_DFLASH_CAPTURE_BENCH");
+    return value && value[0] && strcmp(value, "0") != 0 &&
+           (!compare || !compare[0] || strcmp(compare, "0") == 0) &&
+           (!bench || !bench[0] || strcmp(bench, "0") == 0) &&
+           !glm53_exact_mode_c();
+}
+
+/* The serial SDN epilogue can only capture its one resident row.  Verifier
+ * batches and any unfused/fallback FFN keep using the standalone collapse. */
+static ds4_gpu_tensor *glm_dflash_capture_sdn_view(uint32_t il) {
+    const int tap = glm_dflash_capture_tap_index(il);
+    if (tap < 0 || !g_glm_dflash_cap.fuse_sdn ||
+        g_glm_dflash_cap.n_rows != 1u || g_glm_dflash_cap.source_row != 0u) {
+        return NULL;
+    }
+    ds4_gpu_tensor *base = g_glm_dflash_cap.fused_buf ?
+        g_glm_dflash_cap.fused_buf : g_glm_dflash_cap.buf;
+    if (!base) return NULL;
+    return ds4_gpu_tensor_view(
+        base,
+        (uint64_t)(uint32_t)tap * DS4_N_EMBD * sizeof(float),
+        (uint64_t)DS4_N_EMBD * sizeof(float));
+}
+
 static bool glm_dflash_capture_rows(
         ds4_glm_gpu_graph *g,
         const ds4_gpu_tensor *hc_rows,
@@ -49402,13 +49476,23 @@ static bool glm_dflash_capture_rows(
         uint32_t n_rows) {
     const int tap = glm_dflash_capture_tap_index(il);
     if (tap < 0) return true;
-    if (n_rows > g_glm_dflash_cap.n_rows) return false;
+    const uint32_t tap_bit = 1u << (uint32_t)tap;
+    if (g_glm_dflash_cap.fuse_replace &&
+        (g_glm_dflash_cap.fused_taps & tap_bit)) {
+        g_glm_dflash_cap.captured_taps |= tap_bit;
+        return true;
+    }
+    if (g_glm_dflash_cap.source_row > n_rows ||
+        n_rows - g_glm_dflash_cap.source_row != g_glm_dflash_cap.n_rows)
+        return false;
+    n_rows = g_glm_dflash_cap.n_rows;
     const uint64_t hc_row = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t out_row = (uint64_t)g_glm_dflash_cap.n_taps * DS4_N_EMBD;
     bool ok = true;
     for (uint32_t r = 0; ok && r < n_rows; r++) {
         ds4_gpu_tensor *src = glm_graph_tensor_row_view_strided(
-                (ds4_gpu_tensor *)hc_rows, r, hc_row, hc_row);
+                (ds4_gpu_tensor *)hc_rows,
+                r + g_glm_dflash_cap.source_row, hc_row, hc_row);
         ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
                 g_glm_dflash_cap.buf,
                 ((uint64_t)r * out_row + (uint64_t)tap * DS4_N_EMBD) *
@@ -49420,6 +49504,7 @@ static bool glm_dflash_capture_rows(
         ds4_gpu_tensor_free(src);
         ds4_gpu_tensor_free(dst);
     }
+    if (ok) g_glm_dflash_cap.captured_taps |= tap_bit;
     return ok;
 }
 #endif
@@ -51104,7 +51189,7 @@ static bool glm_graph_forward_tokens(
     /* All direct-return setup failures precede seed arming. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const bool dflash_seed_armed =
-        ok && !g_glm_dflash_cap.enabled && g->glm53 &&
+        ok && !g->sc_active && !g_glm_dflash_cap.enabled && g->glm53 &&
         glm_dflash_seed_chunk_begin(n_tokens);
 #endif
     ds4_gpu_tensor *cur = g->glm53 ? cur_view : g->batch_cur;
@@ -52559,7 +52644,7 @@ static bool glm_graph_forward_indexed_tokens(
     /* All direct-return setup failures precede seed arming. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const bool dflash_seed_armed =
-        ok && !g_glm_dflash_cap.enabled && g->glm53 &&
+        ok && !g->sc_active && !g_glm_dflash_cap.enabled && g->glm53 &&
         glm_dflash_seed_chunk_begin(n_tokens);
 #endif
     ds4_gpu_tensor *cur = g->glm53 ? cur_view : g->batch_cur;
@@ -54420,11 +54505,10 @@ static const char *glm_graph_superchunk_refusal(const ds4_glm_gpu_graph *g) {
     if (glm_debug_hidden_dump_layer() != -1) return "DS4_GLM_HIDDEN_DUMP_LAYER set";
     if (metal_graph_debug_get_config()->prefix != NULL) return "Metal debug dump set";
 #if !defined(DS4_NO_GPU)
-    /* DFlash2 prefill seeding captures tap-layer HC rows from inside the HC
-     * tail, which pass 3 runs on the driver's own schedule; leave the seeded
-     * cycle on the shipped per-chunk loop until the two are reconciled. */
-    if (g_glm_dflash_seed.enabled || g_glm_dflash_cap.enabled) {
-        return "DFlash2 prefill seeding armed";
+    /* A live verifier capture cannot change schedule. Prompt seeding is
+     * handled by the super-chunk driver after each completed HC tail. */
+    if (g_glm_dflash_cap.enabled) {
+        return "DFlash2 verifier capture armed";
     }
 #endif
     return NULL;
@@ -54623,6 +54707,32 @@ static bool glm_sc_hc_tail(const glm_sc_binding *v,
     *hc_scale_valid = scale_ok;
     return true;
 }
+
+#if !defined(DS4_NO_GPU)
+/* Capture only the recent prompt window, directly from the post-layer HC
+ * staging. Queue order keeps every tap ahead of its source's next overwrite;
+ * readback happens only after the complete super-chunk has drained. */
+static bool glm_sc_dflash_seed_layer(ds4_glm_gpu_graph *g,
+                                     ds4_gpu_tensor *hc,
+                                     uint32_t il, uint32_t total_rows) {
+    bool tapped = false;
+    for (uint32_t j = 0; j < g_glm_dflash_seed.n_taps; j++) {
+        if (g_glm_dflash_seed.taps[j] == il) tapped = true;
+    }
+    if (!tapped) return true;
+    const bool own_commands = !ds4_gpu_commands_active();
+    if (own_commands && !ds4_gpu_begin_commands()) return false;
+    g_glm_dflash_cap.enabled = 1;
+    g_glm_dflash_cap.source_row = total_rows - g_glm_dflash_cap.n_rows;
+    bool ok = glm_dflash_capture_rows(g, hc, il, total_rows);
+    g_glm_dflash_cap.enabled = 0;
+    g_glm_dflash_cap.source_row = 0;
+    if (own_commands) {
+        if (!ds4_gpu_end_commands()) ok = false;
+    }
+    return ok;
+}
+#endif
 
 /* 0 = not taken (the caller runs the shipped per-chunk loop), 1 = done,
  * -1 = failed, -2 = cancelled with the state restored. */
@@ -54861,6 +54971,16 @@ static int glm_graph_forward_indexed_superchunk(
     g->sc_timing_skipped_token_uploads = 0;
     g->sc_hold_commands = false;
 
+#if !defined(DS4_NO_GPU)
+    const uint32_t dflash_seed_rows = total_tokens < g_glm_dflash_seed.ring_cap ?
+        total_tokens : g_glm_dflash_seed.ring_cap;
+    const bool dflash_seed_armed =
+        glm_dflash_seed_chunk_begin(dflash_seed_rows);
+    /* Slice forwards must not capture incomplete layers. The driver owns
+     * the destination and arms it only around a completed layer below. */
+    if (dflash_seed_armed) g_glm_dflash_cap.enabled = 0;
+#endif
+
     for (uint32_t il = g->layer_start; rc == 1 && il <= g->layer_end; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         const bool routed_layer = il >= DS4_N_LEADING_DENSE &&
@@ -55014,6 +55134,14 @@ static int glm_graph_forward_indexed_superchunk(
             }
             /* A leading dense layer completes inside pass 1, including its own
              * HC tail, so only the staging parity moves on. */
+#if !defined(DS4_NO_GPU)
+            if (dflash_seed_armed &&
+                !glm_sc_dflash_seed_layer(g, g->sc_hc[hc_parity ^ 1u],
+                                           il, total_tokens)) {
+                rc = -1;
+                break;
+            }
+#endif
             hc_parity ^= 1u;
             continue;
         }
@@ -55146,6 +55274,11 @@ static int glm_graph_forward_indexed_superchunk(
             else chunk_scale_valid[ci] = scale_valid;
             glm_sc_binding_free_views(&views);
         }
+#if !defined(DS4_NO_GPU)
+        if (rc == 1 && dflash_seed_armed &&
+            !glm_sc_dflash_seed_layer(g, g->sc_hc[hc_parity ^ 1u],
+                                       il, total_tokens)) rc = -1;
+#endif
         if (bank_timing) {
             bank_timing_pass3_encode_ms +=
                 (now_sec() - bank_timing_pass3_t0) * 1000.0;
@@ -55252,6 +55385,18 @@ static int glm_graph_forward_indexed_superchunk(
                 (now_sec() - bank_timing_restore_t0) * 1000.0;
         }
     }
+#if !defined(DS4_NO_GPU)
+    if (dflash_seed_armed) {
+        const glm_sc_chunk *last = &chunks[n_chunks - 1u];
+        glm_dflash_seed_chunk_end(total_tokens, last->pos0 + last->n_tokens,
+                                  status == DS4_GLM_SC_DONE);
+        if (getenv("DS4_DFLASH_STATS")) {
+            fprintf(stderr, "ds4: dflash super-chunk seed rows=%u end=%u valid=%u\n",
+                    g_glm_dflash_seed.ring_len, last->pos0 + last->n_tokens,
+                    g_glm_dflash_seed.owner_gen != 0 ? 1u : 0u);
+        }
+    }
+#endif
     if (bank_timing) {
         ds4_gpu_glm_expert_bank_stats bank_stats_end;
         ds4_gpu_glm_expert_bank_get_stats(&bank_stats_end);
@@ -56901,6 +57046,11 @@ glm53_attention_done:
         DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_ffn", "ffn_norm");
         DS4_GLM_FT_STAGE("FFN");
         if (ok && g->glm53) {
+            ds4_gpu_tensor *dflash_capture_out = NULL;
+            bool dflash_capture_folded = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            dflash_capture_out = glm_dflash_capture_sdn_view(il);
+#endif
             bool graph_ok = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
             graph_ok = !g->placement && g->tp_world <= 1 &&
@@ -56930,11 +57080,15 @@ glm53_attention_done:
                     }
                     if (state == 0) {
                         const bool captured = glm53_graph_encode_ffn_tail_one(
-                                g, model, l, il, pos, false, NULL);
+                                g, model, l, il, pos, false, NULL,
+                                dflash_capture_out, g->hc_mean_weights,
+                                &dflash_capture_folded);
                         if (!captured) {
                             ds4_gpu_decode_graph_abort(&key);
                             tail_ok = glm53_graph_encode_ffn_tail_one(
-                                    g, model, l, il, pos, false, NULL);
+                                    g, model, l, il, pos, false, NULL,
+                                    dflash_capture_out, g->hc_mean_weights,
+                                    &dflash_capture_folded);
                             break;
                         }
                         if (ds4_gpu_decode_graph_end(&key) == 0) {
@@ -56944,7 +57098,9 @@ glm53_attention_done:
                         continue;
                     }
                     tail_ok = glm53_graph_encode_ffn_tail_one(
-                            g, model, l, il, pos, false, NULL);
+                            g, model, l, il, pos, false, NULL,
+                            dflash_capture_out, g->hc_mean_weights,
+                            &dflash_capture_folded);
                     break;
                 }
             } else {
@@ -56955,8 +57111,17 @@ glm53_attention_done:
                         il,
                         pos,
                         decode_stage_profile,
-                        decode_stage_profile ? &decode_stage_t0 : NULL);
+                        decode_stage_profile ? &decode_stage_t0 : NULL,
+                        dflash_capture_out,
+                        g->hc_mean_weights,
+                        &dflash_capture_folded);
             }
+            ds4_gpu_tensor_free(dflash_capture_out);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            const int dflash_tap = glm_dflash_capture_tap_index(il);
+            if (tail_ok && dflash_capture_folded && dflash_tap >= 0)
+                g_glm_dflash_cap.fused_taps |= 1u << (uint32_t)dflash_tap;
+#endif
             ok = tail_ok;
             DS4_GLM_FT_STAGE("FFN mHC expand");
             if (ok) {
@@ -58771,13 +58936,17 @@ struct ds4_session {
      * boundary token differs from that parent. */
     ds4_dflash_cache dflash_cache;
     float *dflash_pending;          /* [rows][n_target*embd] verify features */
+    uint32_t dflash_pending_capacity;
+    float *dflash_history_rows;
+    ds4_dflash_history dflash_history;
     uint32_t dflash_pending_rows;
-    uint32_t dflash_pending_cap;
+    uint32_t dflash_pending_end_pos;
+    uint32_t dflash_cache_end_pos;
+    ds4_dflash_adaptive dflash_adaptive;
+    ds4_dflash_fault dflash_fault;
+    ds4_dflash_adaptive_trace dflash_trace;
+    bool dflash_full_block; /* request-stable public speculative mode */
     int dflash_warm;
-    float dflash_ema;               /* EMA of committed tokens per cycle */
-    uint32_t dflash_lowrun;         /* cycles spent in low-acceptance mode */
-    uint32_t dflash_probe_fails;    /* consecutive failed probes (backoff) */
-    uint32_t dflash_cycles;         /* full speculation cycles run */
     uint32_t dflash_last_pos;       /* rewind detector (server slot reuse) */
     /* Conditioning identity: dflash_gen changes whenever this session's
      * prefix stops being an extension of what it was; dflash_bound_gen is
@@ -58786,11 +58955,7 @@ struct ds4_session {
     uint64_t dflash_bound_gen;
     float dflash_cycle_ms;          /* EMA of full-cycle wall time */
     float dflash_serial_ms;         /* EMA of serial fallback token time */
-    ds4_dflash_budget dflash_budget;
-    uint64_t dflash_budget_gen;
-    uint64_t dflash_budget_estimate_ns;
-    uint64_t dflash_budget_clock_ns;
-    bool dflash_budget_attempted;
+    uint64_t dflash_clock_ns;
     int glm_mtp_draft;
     int glm_mtp_parent;
     int glm_mtp_have;
@@ -60983,17 +61148,17 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 
 #ifndef DS4_NO_GPU
 /* Drop the drafter conditioning this session carries: its context-KV cache,
- * its staged tap features, and the throttle state that was measured against
+ * its staged tap features, and the acceptance evidence measured against
  * the old content. Cheap -- it clears lengths and counters, it does not free
  * the buffers, so the next request reuses the same allocations. */
 static void ds4_session_dflash_reset_conditioning(ds4_session *s) {
     if (!s) return;
     s->dflash_pending_rows = 0;
+    s->dflash_history.len = s->dflash_history.head = s->dflash_history.end = 0;
+    s->dflash_pending_end_pos = 0;
+    s->dflash_cache_end_pos = 0;
+    dflash_adaptive_reset_evidence(&s->dflash_adaptive);
     s->dflash_warm = 0;
-    s->dflash_ema = 0.0f;
-    s->dflash_lowrun = 0;
-    s->dflash_probe_fails = 0;
-    s->dflash_cycles = 0;
     s->dflash_last_pos = 0;
     /* A new content generation can also jump to a different cached depth.
      * Seed both costs again from that generation's actual work. */
@@ -61020,80 +61185,143 @@ static void ds4_session_dflash_reset_conditioning(ds4_session *s) { (void)s; }
 static void ds4_session_dflash_new_generation(ds4_session *s) { (void)s; }
 #endif
 
-/* Empirical M3 Ultra profile, not a physical upper bound. Provenance and
- * scope: tests/DFLASH-ADMISSION.md. Override is diagnostic, never required. */
+/* Confidence thresholds are bounded configuration, not performance promises.
+ * Adaptive verifier length is an explicit extension of confidence-prefix
+ * DFlash; the drafter always retains its trained block geometry. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-static uint64_t dflash_budget_profile(ds4_session *s) {
-    const char *override = getenv("DS4_DFLASH_BUDGET_MS");
-    if (override) {
+static bool dflash_config_uint(const char *name, uint32_t *value) {
+    const char *setting = getenv(name);
+    if (!setting) return true;
+    char *end = NULL;
+    errno = 0;
+    unsigned long n = strtoul(setting, &end, 10);
+    if (errno || end == setting || *end || n < 1u || n > DS4_DFLASH_ADAPTIVE_MAX)
+        return false;
+    *value = (uint32_t)n;
+    return true;
+}
+
+static ds4_dflash_adaptive_config dflash_adaptive_config_read(bool full_block, bool *valid) {
+    ds4_dflash_adaptive_config c = dflash_adaptive_profile_config(full_block);
+    /* Public speculative has no confidence/admission policy. Conservative
+     * tuning variables cannot silently turn it back into an adaptive mode. */
+    *valid = true;
+    if (full_block) return c;
+    const char *adaptive = getenv("DS4_DFLASH_ADAPTIVE");
+    *valid = !adaptive || !strcmp(adaptive, "0") || !strcmp(adaptive, "1");
+    c.adaptive = adaptive && !strcmp(adaptive, "1");
+    const char *retry = getenv("DS4_DFLASH_RETRY");
+    *valid = (!retry || !strcmp(retry, "0") || !strcmp(retry, "1")) && *valid;
+    c.retry = !retry || !strcmp(retry, "1");
+    const char *recovery = getenv("DS4_DFLASH_EARLY_RECOVERY");
+    *valid = (!recovery || !strcmp(recovery, "0") || !strcmp(recovery, "1")) && *valid;
+    c.early_recovery = !recovery || !strcmp(recovery, "1");
+    const char *savings = getenv("DS4_DFLASH_SAVINGS_RETRY");
+    *valid = (!savings || !strcmp(savings, "0") || !strcmp(savings, "1")) && *valid;
+    c.savings_retry = !savings || !strcmp(savings, "1");
+    const char *retry_max = getenv("DS4_DFLASH_RETRY_MAX");
+    if (retry_max) {
         char *end = NULL;
         errno = 0;
-        const double ms = strtod(override, &end);
-        uint64_t ns = 0;
-        return errno == 0 && end != override && *end == '\0' &&
-            dflash_budget_ns(ms / 1000.0, true, &ns) ? ns : 0;
+        const unsigned long n = strtoul(retry_max, &end, 10);
+        if (errno || end == retry_max || *end || n < 1u || n > 4096u) *valid = false;
+        else c.retry_max = (uint32_t)n;
     }
-    ds4_engine *e = s->engine;
-    const ds4_dflash2_weights *dw = &e->dflash_weights;
-    if (!ds4_gpu_dflash_budget_profile_device() || !ds4_model_is_glm53() ||
-        DS4_N_LAYER - DS4_N_NEXTN_PREDICT != 45u || DS4_N_EMBD != 4096u ||
-        DS4_N_VOCAB != 154880u || s->ctx_size > 320000 ||
-        e->model.size != UINT64_C(185299232064) ||
-        e->dflash_model.size != UINT64_C(2342595168) ||
-        !e->weights.output || e->weights.output->type != DS4_TENSOR_Q8_0 ||
-        !dw->fc || dw->fc->type != DS4_TENSOR_BF16 || dw->n_layer != 5u ||
-        dw->n_embd != 4096u || dw->n_target != 5u || dw->block_size != 8u ||
-        dw->sliding_window != 2048u || dw->classic || dw->n_ff != 12288u ||
-        dw->n_head != 32u || dw->n_head_kv != 8u || dw->head_dim != 128u ||
-        dw->fc->dim[0] != 20480u ||
-        getenv("DS4_DFLASH_SDPA_SCALAR") ||
-        getenv("DS4_DFLASH_FORCE_REPLAY") || getenv("DS4_DFLASH_SCRIPT") ||
-        getenv("DS4_DFLASH_HEAD_COMPARE") || getenv("DS4_DFLASH_HEAD_BENCH") ||
-        getenv("DS4_DFLASH_FORCE_DRAFTS") || getenv("DS4_DFLASH_ZERO_FEATURES")) return 0;
-    const char *cap = getenv("DS4_DFLASH_CTX_CAP");
-    if (cap) {
+    const char *float_names[] = {"DS4_DFLASH_RETRY_TAX", "DS4_DFLASH_LOSS_BUDGET"};
+    float *float_values[] = {&c.retry_tax, &c.loss_budget};
+    for (unsigned i = 0; i < 2; i++) {
+        const char *value = getenv(float_names[i]);
+        if (!value) continue;
         char *end = NULL;
-        const unsigned long n = strtoul(cap, &end, 10);
-        if (end == cap || *end || n == 0 || n > 256u) return 0;
+        errno = 0;
+        *float_values[i] = strtof(value, &end);
+        if (errno || end == value || *end) *valid = false;
     }
-    return UINT64_C(500000000);
+    *valid = dflash_config_uint("DS4_DFLASH_MIN_DRAFT", &c.n_min) && *valid;
+    *valid = dflash_config_uint("DS4_DFLASH_MAX_DRAFT", &c.n_max) && *valid;
+    if (!getenv("DS4_DFLASH_START_DRAFT")) {
+        if (c.n_start > c.n_max) c.n_start = c.n_max;
+        if (c.n_start < c.n_min) c.n_start = c.n_min;
+    }
+    *valid = dflash_config_uint("DS4_DFLASH_START_DRAFT", &c.n_start) && *valid;
+    const char *p = getenv("DS4_DFLASH_P_MIN");
+    if (p) {
+        char *end = NULL;
+        errno = 0;
+        c.p_min = strtof(p, &end);
+        *valid = !errno && end != p && !*end && *valid;
+    }
+    *valid = dflash_adaptive_entry_configure(&c,
+        getenv("DS4_DFLASH_MIN_SERIAL_TOKENS")) && *valid;
+    *valid = dflash_adaptive_config_valid(&c) && *valid;
+    return c;
+}
+
+static void ds4_session_dflash_fault_report(const ds4_session *s, const char *event) {
+    const ds4_dflash_fault *f = &s->dflash_fault;
+    fprintf(stderr, "ds4: dflash fault event=%s mode=%s generation=%llu "
+            "request=%llu attempts=%llu failures=%llu skips=%llu disabled=%d safe=%d\n",
+            event, ds4_dflash_mode_name(s->engine->dflash_mode),
+            (unsigned long long)s->dflash_gen, (unsigned long long)f->requests,
+            (unsigned long long)f->attempts, (unsigned long long)f->failures,
+            (unsigned long long)f->skips, f->disabled, !f->unsafe);
+}
+
+static void ds4_session_dflash_request_report(const ds4_session *s, const char *event) {
+    if (getenv("DS4_DFLASH_STATS"))
+        fprintf(stderr, "ds4: dflash request event=%s generation=%llu request=%llu "
+                "mode=%s disabled=%d\n", event,
+                (unsigned long long)s->dflash_gen,
+                (unsigned long long)s->dflash_fault.requests,
+                ds4_dflash_mode_name(s->engine->dflash_mode), s->dflash_fault.disabled);
+}
+
+static void ds4_session_dflash_request_finish(ds4_session *s) {
+    if (s->dflash_fault.request_done) return;
+    s->dflash_fault.request_done = true;
+    if (s->dflash_fault.disabled) ds4_session_dflash_fault_report(s, "request_end");
+    ds4_session_dflash_request_report(s, "end");
 }
 #endif
 
 void ds4_session_decode_begin(ds4_session *s) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (!s || !s->engine || !s->engine->dflash_ready) return;
-    const double account_start = now_sec();
-    dflash_budget_begin(&s->dflash_budget);
-    /* Cache the reported quantum once per request, never on each ACK. The
-     * M3 Ultra CLOCK_MONOTONIC quantum is 1000ns; zero bookkeeping is common. */
-    struct timespec clock_resolution = {0};
-    s->dflash_budget_clock_ns = 0;
-    if (clock_getres(CLOCK_MONOTONIC, &clock_resolution) == 0 &&
-        clock_resolution.tv_sec >= 0 && clock_resolution.tv_nsec >= 0 &&
-        clock_resolution.tv_nsec < 1000000000L &&
-        (uint64_t)clock_resolution.tv_sec < DS4_DFLASH_BUDGET_LIMIT / 1000000000u) {
-        s->dflash_budget_clock_ns = (uint64_t)clock_resolution.tv_sec * 1000000000u +
-            (uint64_t)clock_resolution.tv_nsec;
-    }
-    s->dflash_budget_gen = s->dflash_gen;
-    s->dflash_budget_estimate_ns = dflash_budget_profile(s);
+    const uint64_t account_start = dflash_clock_now_ns();
+    dflash_fault_begin_request(&s->dflash_fault);
+    ds4_session_dflash_request_report(s, "begin");
+    if (s->dflash_fault.disabled)
+        ds4_session_dflash_fault_report(s, "request_begin");
+    bool config_valid;
+    s->dflash_full_block = s->engine->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE;
+    const ds4_dflash_adaptive_config config = dflash_adaptive_config_read(
+        s->dflash_full_block, &config_valid);
+    dflash_adaptive_begin(&s->dflash_adaptive, config);
+    if (!config_valid) s->dflash_adaptive.invalid = true;
+    struct timespec resolution = {0};
+    s->dflash_clock_ns = 0;
+    if (clock_getres(CLOCK_MONOTONIC, &resolution) == 0 &&
+        resolution.tv_sec >= 0 && resolution.tv_nsec >= 0 &&
+        resolution.tv_nsec < 1000000000L &&
+        (uint64_t)resolution.tv_sec < DS4_DFLASH_BUDGET_LIMIT / 1000000000u)
+        s->dflash_clock_ns = (uint64_t)resolution.tv_sec * 1000000000u +
+            (uint64_t)resolution.tv_nsec;
     ds4_session_dflash_reset_conditioning(s);
     s->dflash_bound_gen = s->dflash_gen;
     s->dflash_last_pos = (uint32_t)s->checkpoint.len;
-    if (s->engine->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE)
-        s->dflash_budget.active = false;
-    if (getenv("DS4_DFLASH_STATS")) {
-        fprintf(stderr, "ds4: dflash admission policy=%s profile=%s estimate_ms=%.3f ctx=%d\n",
-            s->dflash_budget.active ? "request-credit" : "uncapped-experiment",
-            getenv("DS4_DFLASH_BUDGET_MS") ? "diagnostic-override" : "m3ultra-public-v1",
-            (double)s->dflash_budget_estimate_ns / 1e6, s->ctx_size);
-    }
-    if (s->dflash_budget.active) {
-        uint64_t ns = 0;
-        (void)dflash_budget_account_ns(now_sec() - account_start, s->dflash_budget_clock_ns, &ns);
-        dflash_budget_account(&s->dflash_budget, ns);
-    }
+    if (!config_valid)
+        fprintf(stderr, "ds4: invalid DFlash confidence configuration; decoding serially\n");
+    if (getenv("DS4_DFLASH_STATS"))
+        fprintf(stderr, "ds4: dflash admission policy=%s adaptive=%d "
+                "n_min=%u n_max=%u n_start=%u p_min=%.6f valid=%d retry=%d retry_max=%u retry_tax=%.6f loss_budget=%.6f early_recovery=%d savings_retry=%d min_serial_tokens=%u profile=%s loss_meter=%d\n",
+                s->dflash_full_block ? "full-block" : "confidence-prefix",
+                config.adaptive, config.n_min, config.n_max, config.n_start,
+                config.p_min, config_valid, config.retry, config.retry_max, config.retry_tax,
+                config.loss_budget, config.early_recovery, config.savings_retry, config.min_serial_tokens,
+                s->dflash_full_block ? "speculative" : "conservative", config.loss_meter);
+    uint64_t ns = 0;
+    (void)dflash_clock_account_ns(account_start, dflash_clock_now_ns(), s->dflash_clock_ns, &ns);
+    dflash_adaptive_charge(&s->dflash_adaptive, ns);
 #else
     (void)s;
 #endif
@@ -61101,29 +61329,95 @@ void ds4_session_decode_begin(ds4_session *s) {
 
 void ds4_session_decode_ack(ds4_session *s, int consumed, bool done) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (!s || !s->engine || !s->engine->dflash_ready || !s->dflash_budget.active) return;
-    const double account_start = now_sec();
-    ds4_dflash_budget *b = &s->dflash_budget;
-    const bool report = done || (b->pending_optional && b->pending_rows);
-    const bool was_parked = b->parked;
-    /* Positive-temperature GLM and other ordinary paths have no pending
-     * DFlash call. They receive no invented credit. */
-    if (b->pending_rows || done) dflash_budget_ack(b, consumed < 0 ? UINT32_MAX : (uint32_t)consumed, done);
-    if (getenv("DS4_DFLASH_STATS") && (report || (!was_parked && b->parked))) {
-        uint64_t ref = 0;
-        (void)dflash_budget_reference(b, &ref);
-        fprintf(stderr, "ds4: dflash budget consumed=%d done=%d actual_ms=%.3f reference_ms=%.3f "
-                "credit_ms=%.3f escrow_ms=%.3f probes=%u overruns=%u parked=%d\n",
-                consumed, done, (double)b->actual_ns / 1e6, (double)ref / 1e6,
-                (double)dflash_budget_credit(b) / 1e6, (double)b->escrow_ns / 1e6,
-                b->probes, b->overruns, b->parked);
+    if (!s || !s->engine || !s->engine->dflash_ready) return;
+    if (!s->dflash_adaptive.active) {
+        if (done) ds4_session_dflash_request_finish(s);
+        return;
     }
+    const uint64_t account_start = dflash_clock_now_ns();
+    ds4_dflash_adaptive *a = &s->dflash_adaptive;
+    const uint32_t returned = a->pending_rows;
+    /* Ordinary positive-temperature GLM never entered the DFlash path. */
+    if (!returned && !a->calls && !done) return;
+    dflash_adaptive_ack(a, consumed < 0 ? UINT32_MAX : (uint32_t)consumed, done);
     uint64_t ns = 0;
-    (void)dflash_budget_account_ns(now_sec() - account_start, s->dflash_budget_clock_ns, &ns);
-    const uint32_t previous_overruns = b->overruns;
-    dflash_budget_account(b, ns);
-    if (b->overruns != previous_overruns)
-        fprintf(stderr, "ds4: dflash budget accounting OVERRUN; parked for request\n");
+    (void)dflash_clock_account_ns(account_start, dflash_clock_now_ns(), s->dflash_clock_ns, &ns);
+    dflash_adaptive_charge(a, ns);
+    if (getenv("DS4_DFLASH_STATS")) {
+        const uint64_t report_start = dflash_clock_now_ns();
+        const char *floor_source;
+        const double loss_floor = dflash_adaptive_loss_floor(a, &floor_source);
+        fprintf(stderr, "ds4: dflash adaptive_ack consumed=%d done=%d returned=%u "
+                "total_consumed=%llu total_returned=%llu total_ms=%.6f invalid=%d "
+                "net_ms=%.6f reference_ms=%.6f probe_only=%d retry_remaining=%u "
+                "reference_step_ms=%.6f reference_source=serial-actual+verify-median9 loss_floor_ms=%.6f floor_source=%s "
+                "recovery_used=%d recovery_pending=%d recovery_checks=%llu "
+                "savings_ms=%.6f draft_estimate_ms=%.6f funded_retries=%llu "
+                "funded_draft_ms=%.6f nonescalating_declines=%llu "
+                "serial_min_ms=%.6f serial_central_ms=%.6f serial_samples=%u serial_window=%u "
+                "reference_call_step_ms=%.6f reference_serial_added_ms=%.6f reference_verify_added_ms=%.6f "
+                "bootstrap_added_ms=%.6f bootstrap_reprice_ms=%.6f reference_unpriced_rows=%llu "
+                "reference_serial_ms=%.6f reference_verify_ms=%.6f bootstrap_repriced_ms=%.6f "
+                "bootstrap_rows=%llu bootstrap_step_ms=%.6f serial_consumed=%llu entry_serial_tokens=%llu\n",
+                consumed, done, returned, (unsigned long long)a->consumed,
+                (unsigned long long)a->returned, (double)a->actual_ns / 1e6, a->invalid,
+                dflash_adaptive_net_ms(a), a->serial_reference_ms, a->probe_only, a->skip_remaining,
+                a->reference_step_ms, loss_floor, floor_source, a->recovery_used, a->recovery_pending,
+                (unsigned long long)a->recovery_checks, dflash_adaptive_savings_ms(a),
+                a->draft_estimate_ms, (unsigned long long)a->funded_retries,
+                a->funded_draft_ms, (unsigned long long)a->nonescalating_declines,
+                a->serial_min_ms, a->serial_ms, a->serial_sample_count, DS4_DFLASH_SERIAL_WINDOW,
+                a->reference_call_step_ms, a->reference_serial_added_ms, a->reference_verify_added_ms,
+                a->bootstrap_added_ms, a->bootstrap_reprice_ms, (unsigned long long)a->reference_unpriced_rows,
+                a->reference_serial_ms, a->reference_verify_ms, a->bootstrap_repriced_ms,
+                (unsigned long long)a->bootstrap_rows, a->bootstrap_step_ms,
+                (unsigned long long)a->serial_consumed, (unsigned long long)a->entry_serial_tokens);
+        ns = 0;
+        (void)dflash_clock_account_ns(report_start, dflash_clock_now_ns(), s->dflash_clock_ns, &ns);
+        dflash_adaptive_charge(a, ns);
+        if (done)
+            fprintf(stderr, "ds4: dflash adaptive_totals done=1 calls=%llu drafted=%llu "
+                    "proposed=%llu verified=%llu accepted=%llu returned=%llu consumed=%llu "
+                    "setup_ms=%.6f refresh_ms=%.6f draft_ms=%.6f verify_ms=%.6f "
+                    "heads_ms=%.6f tail_ms=%.6f total_ms=%.6f invalid=%d "
+                    "zero_prefix=%llu skipped_steps=%llu economic_declines=%llu "
+                    "losing_cycles=%llu calibrations=%llu serial_calibrations=%llu net_ms=%.6f reference_ms=%.6f "
+                    "net_percent=%.6f probe_only=%d probe_entries=%llu probe_entry_consumed=%llu "
+                    "reference_step_ms=%.6f reference_source=serial-actual+verify-median9 loss_floor_ms=%.6f floor_source=%s "
+                    "recovery_used=%d recovery_pending=%d recovery_checks=%llu "
+                "savings_ms=%.6f draft_estimate_ms=%.6f funded_retries=%llu "
+                "funded_draft_ms=%.6f nonescalating_declines=%llu "
+                "serial_min_ms=%.6f serial_central_ms=%.6f serial_samples=%u serial_window=%u "
+                "reference_call_step_ms=%.6f reference_serial_added_ms=%.6f reference_verify_added_ms=%.6f "
+                "bootstrap_added_ms=%.6f bootstrap_reprice_ms=%.6f reference_unpriced_rows=%llu "
+                "reference_serial_ms=%.6f reference_verify_ms=%.6f bootstrap_repriced_ms=%.6f "
+                "bootstrap_rows=%llu bootstrap_step_ms=%.6f serial_consumed=%llu entry_serial_tokens=%llu\n",
+                    (unsigned long long)a->calls, (unsigned long long)a->drafted,
+                    (unsigned long long)a->proposed,
+                    (unsigned long long)a->verified, (unsigned long long)a->accepted,
+                    (unsigned long long)a->returned, (unsigned long long)a->consumed,
+                    a->setup_ms, a->refresh_ms, a->draft_ms, a->verify_ms,
+                    a->heads_ms, a->tail_ms, (double)a->actual_ns / 1e6, a->invalid,
+                    (unsigned long long)a->zero_prefix, (unsigned long long)a->skipped_steps,
+                    (unsigned long long)a->economic_declines, (unsigned long long)a->losing_cycles,
+                    (unsigned long long)a->calibrations, (unsigned long long)a->serial_calibrations,
+                    dflash_adaptive_net_ms(a),
+                    a->serial_reference_ms, a->actual_ns ?
+                        100.0 * dflash_adaptive_net_ms(a) / ((double)a->actual_ns / 1e6) : 0.0,
+                    a->probe_only, (unsigned long long)a->probe_entries,
+                    (unsigned long long)a->probe_entry_consumed, a->reference_step_ms,
+                    loss_floor, floor_source, a->recovery_used, a->recovery_pending,
+                    (unsigned long long)a->recovery_checks, dflash_adaptive_savings_ms(a),
+                a->draft_estimate_ms, (unsigned long long)a->funded_retries,
+                a->funded_draft_ms, (unsigned long long)a->nonescalating_declines,
+                a->serial_min_ms, a->serial_ms, a->serial_sample_count, DS4_DFLASH_SERIAL_WINDOW,
+                a->reference_call_step_ms, a->reference_serial_added_ms, a->reference_verify_added_ms,
+                a->bootstrap_added_ms, a->bootstrap_reprice_ms, (unsigned long long)a->reference_unpriced_rows,
+                a->reference_serial_ms, a->reference_verify_ms, a->bootstrap_repriced_ms,
+                (unsigned long long)a->bootstrap_rows, a->bootstrap_step_ms,
+                (unsigned long long)a->serial_consumed, (unsigned long long)a->entry_serial_tokens);
+    }
+    if (done) ds4_session_dflash_request_finish(s);
 #else
     (void)s; (void)consumed; (void)done;
 #endif
@@ -68310,7 +68604,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->dflash_ready = true;
             glm_dflash_seed_configure(
                 &e->dflash_weights,
-                e->dflash_mode == DS4_DFLASH_MODE_SPECULATIVE);
+                e->dflash_mode != DS4_DFLASH_MODE_SERIAL);
             dflash2_golden_selftest(&e->dflash_model, &e->dflash_weights,
                                     &e->model, &e->weights);
             fprintf(stderr,
@@ -70175,6 +70469,7 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     dflash_cache_free(&s->dflash_cache);
     free(s->dflash_pending);
+    free(s->dflash_history_rows);
     s->dflash_pending = NULL;
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
@@ -71697,6 +71992,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "missing session or prompt");
         return 1;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->dflash_fault.unsafe) {
+        snprintf(err, errlen, "dflash: unsafe drafter failure requires a new session");
+        return 1;
+    }
+#endif
     if (prompt->len <= 0) {
         snprintf(err, errlen, "empty prompt");
         return 1;
@@ -71723,6 +72024,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* stamp the prefill that is about to run, so its seed ring names its
      * owner rather than only its end position */
+    g_glm_dflash_seed.enabled = s->engine->dflash_ready &&
+        s->engine->dflash_mode != DS4_DFLASH_MODE_SERIAL && !s->dflash_fault.disabled;
     glm_dflash_seed_bind_owner(s->dflash_gen);
 #endif
     if (s->distributed) {
@@ -79369,6 +79672,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         if (s->engine->dflash_ready && s->glm_graph_ready &&
             !s->engine->tp.active) {
             return ds4_session_glm_dflash_cycle_argmax(s, first_token,
+                                                       ignore_eos, think_mode,
                                                        accepted, accepted_cap,
                                                        err, errlen);
         }

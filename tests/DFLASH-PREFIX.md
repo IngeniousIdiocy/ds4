@@ -34,7 +34,7 @@ can differ from serial, so this is not a universal identical-generation claim.
 The default path retains causal batched arithmetic for all accepted prefixes;
 serial-versus-batched numerical quality needs separate measurement.
 
-The adaptive controller also seeds its serial EMA from successful feature-
+The conservative scheduler also seeds its serial EMA from successful feature-
 refresh evaluations, without adding any model work. Conditioning reset clears
 both timing EMAs because a new/restored request may have a different depth.
 

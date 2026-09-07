@@ -12,6 +12,7 @@
 #define DS4_DFLASH2_MAX_DRAFT 7
 
 #include "ds4_dflash_fastpath.h"
+#include "ds4_dflash_confidence.h"
 
 typedef struct {
 #ifndef DS4_NO_GPU
@@ -105,6 +106,8 @@ typedef struct {
     ds4_gpu_tensor *batch_logits;
     ds4_gpu_tensor *batch_argmax;
     ds4_gpu_tensor *batch_sel_idx;
+    ds4_gpu_tensor *batch_logits_compare;
+    float *confidence_scratch;
 #endif
     uint32_t spec_cap;
     int inited;
@@ -119,9 +122,184 @@ static void dflash_pool_free(void) {
     ds4_gpu_tensor_free(g_dflash_pool.batch_logits);
     ds4_gpu_tensor_free(g_dflash_pool.batch_argmax);
     ds4_gpu_tensor_free(g_dflash_pool.batch_sel_idx);
+    ds4_gpu_tensor_free(g_dflash_pool.batch_logits_compare);
+    free(g_dflash_pool.confidence_scratch);
 #endif
     memset(&g_dflash_pool, 0, sizeof(g_dflash_pool));
 }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* The scratch buffer avoids modifying shared GPU logits.  Allocation failure
+ * and the validation opt-out both retain the exact scalar full partition. */
+static float *dflash_confidence_partition_scratch(void) {
+    if (getenv("DS4_DFLASH_CONFIDENCE_SCALAR")) return NULL;
+    if (!g_dflash_pool.confidence_scratch) {
+        g_dflash_pool.confidence_scratch =
+            malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    return g_dflash_pool.confidence_scratch;
+}
+
+/* The trained proposer has seven output rows, while the existing NT4 target
+ * head is an exact eight-row kernel. Row seven below is padding only: copy a
+ * real normalized row so the kernel sees finite initialized input, then ignore
+ * its logits. Comparison/benchmark modes retain the current seven-row mv_ext
+ * result used by proposal selection and confidence gating. */
+static bool dflash2_proposer_head_shape(
+        const ds4_weights *tw, uint32_t hidden, uint32_t rows) {
+    return tw && tw->output && tw->output->type == DS4_TENSOR_Q8_0 &&
+        hidden == 4096u && DS4_N_VOCAB == 154880u && rows == 7u &&
+        g_dflash_pool.spec_cap >= 8u;
+}
+
+static bool dflash2_proposer_head_diagnostic(void) {
+    static bool claimed;
+    const bool requested =
+        getenv("DS4_DFLASH_PROPOSER_HEAD_COMPARE") != NULL ||
+        getenv("DS4_DFLASH_PROPOSER_HEAD_BENCH") != NULL;
+    if (!requested || claimed) return false;
+    claimed = true;
+    return true;
+}
+
+static ds4_gpu_tensor *dflash2_proposer_head_compare_buffer(void) {
+    if (!g_dflash_pool.batch_logits_compare) {
+        g_dflash_pool.batch_logits_compare = ds4_gpu_tensor_alloc(
+            UINT64_C(8) * DS4_N_VOCAB * sizeof(float));
+    }
+    return g_dflash_pool.batch_logits_compare;
+}
+
+static int dflash2_proposer_head_pad(uint32_t hidden) {
+    return ds4_gpu_tensor_copy(
+        g_dflash_pool.batch_norm, UINT64_C(7) * hidden * sizeof(float),
+        g_dflash_pool.batch_norm, UINT64_C(6) * hidden * sizeof(float),
+        (uint64_t)hidden * sizeof(float));
+}
+
+static float dflash2_proposer_head_compare_pmin(int *valid) {
+    float value = 0.75f;
+    const char *setting = getenv("DS4_DFLASH_P_MIN");
+    *valid = 1;
+    if (setting) {
+        char *end = NULL;
+        value = strtof(setting, &end);
+        *valid = end != setting && *end == '\0' &&
+            dflash_confidence_f32_finite(value) &&
+            value >= 0.0f && value <= 1.0f;
+    }
+    return value;
+}
+
+static void dflash2_proposer_head_compare(
+        uint32_t pos, const float *reference, const float *candidate) {
+    float ref_conf[7], nt4_conf[7];
+    int threshold_valid = 0;
+    const float p_min = dflash2_proposer_head_compare_pmin(&threshold_valid);
+    float *scratch = dflash_confidence_partition_scratch();
+    uint64_t total_different = 0;
+    uint32_t total_nonfinite = 0;
+    for (uint32_t row = 0; row < 7u; row++) {
+        const float *a = reference + (uint64_t)row * DS4_N_VOCAB;
+        const float *b = candidate + (uint64_t)row * DS4_N_VOCAB;
+        uint32_t different = 0, nonfinite = 0;
+        double max_abs = 0.0;
+        for (uint32_t j = 0; j < DS4_N_VOCAB; j++) {
+            uint32_t ab, bb;
+            memcpy(&ab, a + j, sizeof(ab));
+            memcpy(&bb, b + j, sizeof(bb));
+            different += ab != bb;
+            if (!dflash_confidence_f32_finite(a[j]) ||
+                !dflash_confidence_f32_finite(b[j])) {
+                nonfinite++;
+            } else {
+                const double delta = fabs((double)a[j] - (double)b[j]);
+                if (delta > max_abs) max_abs = delta;
+            }
+        }
+        int ai = -1, bi = -1;
+        float am = -1.0f, bm = -1.0f;
+        ref_conf[row] = nt4_conf[row] = -1.0f;
+        const int aok = dflash_logits_summary_scratch(
+            a, DS4_N_VOCAB, &ai, &am, &ref_conf[row], scratch);
+        const int bok = dflash_logits_summary_scratch(
+            b, DS4_N_VOCAB, &bi, &bm, &nt4_conf[row], scratch);
+        total_different += different;
+        total_nonfinite += nonfinite;
+        fprintf(stderr,
+            "ds4: dflash proposer head compare pos=%u row=%u words=%u "
+            "different=%u nonfinite=%u max_abs=%.9g ref_ok=%d nt4_ok=%d "
+            "ref_argmax=%d nt4_argmax=%d ref_confidence=%.9g "
+            "nt4_confidence=%.9g p_min=%.9g ref_pass=%d nt4_pass=%d "
+            "reference_logits_retained=1\n",
+            pos, row, (unsigned)DS4_N_VOCAB, different, nonfinite, max_abs,
+            aok, bok, ai, bi, ref_conf[row], nt4_conf[row], p_min,
+            threshold_valid && dflash_confidence_valid(ref_conf[row]) &&
+                ref_conf[row] >= p_min,
+            threshold_valid && dflash_confidence_valid(nt4_conf[row]) &&
+                nt4_conf[row] >= p_min);
+    }
+    const int ref_prefix = threshold_valid ?
+        dflash_confident_prefix(ref_conf, 7, p_min) : 0;
+    const int nt4_prefix = threshold_valid ?
+        dflash_confident_prefix(nt4_conf, 7, p_min) : 0;
+    fprintf(stderr,
+        "ds4: dflash proposer head compare summary pos=%u rows=7 "
+        "words=%u different=%llu nonfinite=%u p_min=%.9g "
+        "p_min_valid=%d ref_prefix=%d nt4_prefix=%d "
+        "confidence_decision_equal=%d reference_logits_retained=1\n",
+        pos, 7u * (unsigned)DS4_N_VOCAB,
+        (unsigned long long)total_different, total_nonfinite, p_min,
+        threshold_valid, ref_prefix, nt4_prefix, ref_prefix == nt4_prefix);
+}
+
+/* One actual-input component screen. Both arms reuse the resident seven
+ * normalized proposer rows; the NT4 arm additionally consumes the initialized
+ * ignored eighth row. Timings include command encoding/completion only. */
+static int dflash2_proposer_head_bench(
+        const ds4_model *tm, const ds4_weights *tw, uint32_t pos) {
+    static bool done;
+    const char *setting = getenv("DS4_DFLASH_PROPOSER_HEAD_BENCH");
+    if (!setting || done) return 1;
+    done = true;
+    uint32_t count = (uint32_t)strtoul(setting, NULL, 10);
+    if (count == 0u) count = 4u;
+    if (count > 32u) count = 32u;
+    ds4_gpu_tensor *out = dflash2_proposer_head_compare_buffer();
+    if (!out) return 0;
+    for (uint32_t trial = 0; trial < 3u; trial++) {
+        for (uint32_t order = 0; order < 2u; order++) {
+            const bool nt4 = ((trial + order) & 1u) != 0u;
+            const double t0 = now_sec();
+            int ok = ds4_gpu_begin_commands() != 0;
+            for (uint32_t i = 0; ok && i < count; i++) {
+                if (nt4) {
+                    ok = dflash2_proposer_head_pad(4096u) &&
+                        ds4_gpu_dflash_head_nt4_tensor(
+                            out, tm->map, tm->size, tw->output->abs_offset,
+                            4096u, DS4_N_VOCAB,
+                            g_dflash_pool.batch_norm, 8u);
+                } else {
+                    ok = ds4_gpu_matmul_quant_tensor(
+                        out, tm->map, tm->size, tw->output->abs_offset,
+                        tw->output->type, 4096u, DS4_N_VOCAB,
+                        g_dflash_pool.batch_norm, 7u);
+                }
+            }
+            if (!ds4_gpu_end_commands()) ok = 0;
+            fprintf(stderr,
+                "ds4: dflash proposer head bench pos=%u trial=%u arm=%s "
+                "iterations=%u real_rows=7 kernel_rows=%u pad_copy=%d "
+                "mean_wall_ms=%.6f ok=%d\n",
+                pos, trial + 1u, nt4 ? "nt4_padded8" : "mv_ext7",
+                count, nt4 ? 8u : 7u, nt4,
+                (now_sec() - t0) * 1000.0 / count, ok);
+            if (!ok) return 0;
+        }
+    }
+    return 1;
+}
+#endif
 
 static int dflash_pool_init(uint32_t n_embd) {
 #ifndef DS4_NO_GPU
@@ -949,6 +1127,7 @@ typedef enum {
     DS4_DFLASH_FAIL_STATE_SAVE,
     DS4_DFLASH_FAIL_AFTER_ARM,
     DS4_DFLASH_FAIL_AFTER_VERIFY,
+    DS4_DFLASH_FAIL_DRAFTER_ONCE,
 } ds4_dflash_fail_point;
 
 static const char *dflash_fail_point_name(ds4_dflash_fail_point p) {
@@ -956,6 +1135,7 @@ static const char *dflash_fail_point_name(ds4_dflash_fail_point p) {
     case DS4_DFLASH_FAIL_STATE_SAVE:   return "state_save";
     case DS4_DFLASH_FAIL_AFTER_ARM:    return "after_arm";
     case DS4_DFLASH_FAIL_AFTER_VERIFY: return "after_verify";
+    case DS4_DFLASH_FAIL_DRAFTER_ONCE: return "drafter_once";
     default:                           return "";
     }
 }
@@ -1175,7 +1355,8 @@ static int dflash_cache_make_room(
             ds4_gpu_tensor_alloc((uint64_t)keep * row_bytes);
         if (!tmp) return 0;
         const uint64_t src_off = (uint64_t)(layer->len - keep) * row_bytes;
-        int ok = ds4_gpu_begin_commands() &&
+        const int started = ds4_gpu_begin_commands();
+        int ok = started &&
                  ds4_gpu_tensor_copy(tmp, 0, layer->k, src_off,
                                      (uint64_t)keep * row_bytes) &&
                  ds4_gpu_tensor_copy(layer->k, 0, tmp, 0,
@@ -1183,8 +1364,8 @@ static int dflash_cache_make_room(
                  ds4_gpu_tensor_copy(tmp, 0, layer->v, src_off,
                                      (uint64_t)keep * row_bytes) &&
                  ds4_gpu_tensor_copy(layer->v, 0, tmp, 0,
-                                     (uint64_t)keep * row_bytes) &&
-                 ds4_gpu_end_commands();
+                                     (uint64_t)keep * row_bytes);
+        if (started && !ds4_gpu_end_commands()) ok = 0;
         ds4_gpu_tensor_free(tmp);
         if (!ok) return 0;
         layer->len = keep;
@@ -1672,7 +1853,7 @@ static float dflash2_min_margin(void) {
 #include "ds4_dflash_selector.inc"
 #include "ds4_dflash_golden.inc"
 
-static int dflash2_propose(
+static inline int dflash2_propose(
         int *drafts,
         int n_draft,
         const ds4_model *dm,
@@ -1683,10 +1864,43 @@ static int dflash2_propose(
         uint32_t target_rows,
         ds4_dflash_cache *cache,
         int anchor,
-        uint32_t noise_pos) {
+        uint32_t noise_pos);
+
+/* Confidence-capable proposer contract:
+ *
+ * - position_confidence[t] is the full-vocabulary normalized maximum
+ *   probability of the logit row which produced drafts[t], at position
+ *   noise_pos + t + 1;
+ * - every output slot starts invalid (-1), and a non-finite logit truncates
+ *   the returned prefix before that row;
+ * - a cached Metal-forward failure invalidates every drafter-cache length and
+ *   returns -1.  The caller must fall back to a target-only step; this routine
+ *   does not mutate target decode state.
+ *
+ * Passing NULL avoids the full-row probability scan. apply_margin_gate=false
+ * also bypasses the legacy environment-controlled margin scan/truncation for
+ * public full-block mode, without changing process environment state. */
+static int dflash2_propose_confident(
+        int *drafts,
+        int n_draft,
+        const ds4_model *dm,
+        const ds4_dflash2_weights *dw,
+        const ds4_model *tm,
+        const ds4_weights *tw,
+        const float *target_concat,
+        uint32_t target_rows,
+        ds4_dflash_cache *cache,
+        int anchor,
+        uint32_t noise_pos,
+        float *position_confidence,
+        bool apply_margin_gate) {
+    if (position_confidence && n_draft > 0) {
+        for (int t = 0; t < n_draft; t++) position_confidence[t] = -1.0f;
+    }
     if (n_draft <= 0 || target_rows == 0) return 0;
     if (cache && noise_pos < target_rows) return 0;
     if (dw->classic && !cache) return 0;
+    const float min_margin = apply_margin_gate ? dflash2_min_margin() : -1.0f;
     const uint32_t H = dw->n_embd;
     const uint32_t L = (uint32_t)n_draft + 1u;
     /* Per-row top1-top2 logit margin; INFINITY = unknown (no truncation). */
@@ -1740,7 +1954,9 @@ static int dflash2_propose(
     if (cache && !dflash_cache_make_room(cache, dw, target_rows)) {
         ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
         free(h); free(fc_out); free(h_ctx);
-        return 0;
+        return dflash_cached_failure(
+            cache->n_layer ? &cache->layer[0].len : NULL,
+            sizeof(cache->layer[0]), cache->n_layer);
     }
     h_live = 0;
     if (g_dflash_pool.inited && ds4_gpu_begin_commands()) {
@@ -1752,11 +1968,23 @@ static int dflash2_propose(
             ok = dflash2_layer_forward_gpu(
                 h, h_ctx, target_rows, layer_cache, il,
                 dm, &dw->layer[il], dw, L, noise_pos);
+            if (ok && cache && il == 0u) {
+                static bool injected;
+                if (dflash_fault_inject_once(
+                        dflash_fail_injected(DS4_DFLASH_FAIL_DRAFTER_ONCE), &injected)) {
+                    fprintf(stderr, "ds4: dflash injected drafter failure pos=%u layer=%u\n",
+                            noise_pos, il);
+                    ok = 0;
+                }
+            }
             if (!ok) fail_il = il;
             else (void)ds4_gpu_flush_encoder();
         }
         if (ok) ok = dflash2_gpu_finish_h(h, L, H);
-        else (void)ds4_gpu_end_commands();
+        else {
+            (void)ds4_gpu_end_commands();
+            h_live = 0;
+        }
         gpu_all = ok;
         static int nbat;
         if (nbat++ < 3) fprintf(stderr, "ds4: dflash batched gpu_all=%d fail_il=%u n_layer=%u\n",
@@ -1770,7 +1998,12 @@ static int dflash2_propose(
     ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
 #endif
     if (!gpu_all) {
-        if (cache) ds4_die("DFlash Metal forward with context cache failed");
+        if (cache) {
+            free(h); free(fc_out); free(h_ctx);
+            return dflash_cached_failure(
+                cache->n_layer ? &cache->layer[0].len : NULL,
+                sizeof(cache->layer[0]), cache->n_layer);
+        }
         for (uint32_t il = 0; il < dw->n_layer; il++) {
             dflash2_layer_forward(h, h_ctx, dm, &dw->layer[il], dw, L, noise_pos - 1u);
         }
@@ -1791,10 +2024,51 @@ static int dflash2_propose(
             g_dflash_pool.batch_norm, 0, normed + H,
             (uint64_t)n_draft * H * sizeof(float)) &&
         ds4_gpu_begin_commands()) {
+#if defined(__APPLE__)
+        const bool proposer_head_shape = dflash2_proposer_head_shape(
+            tw, H, (uint32_t)n_draft);
+        const bool proposer_head_killed =
+            getenv("DS4_DFLASH_DISABLE_PROPOSER_HEAD_NT4") != NULL;
+        const bool proposer_head_compare = proposer_head_shape &&
+            !proposer_head_killed && dflash2_proposer_head_diagnostic();
+        const bool proposer_head_use = !proposer_head_compare &&
+            dflash_fast_path_enabled(
+                proposer_head_shape, false,
+                getenv("DS4_DFLASH_PROPOSER_HEAD_NT4"),
+                getenv("DS4_DFLASH_DISABLE_PROPOSER_HEAD_NT4"),
+                getenv("DS4_GLM_EXACT"));
+        ds4_gpu_tensor *proposer_head_candidate = proposer_head_compare ?
+            dflash2_proposer_head_compare_buffer() : NULL;
+        int proposer_head_nt4_ran = 0;
+        int proposer_head_compare_ran = 0;
+        const int proposer_head_padded =
+            !(proposer_head_use || proposer_head_compare) ||
+            dflash2_proposer_head_pad(H);
+        if (proposer_head_padded && proposer_head_use) {
+            proposer_head_nt4_ran = ds4_gpu_dflash_head_nt4_tensor(
+                g_dflash_pool.batch_logits, tm->map, tm->size,
+                tw->output->abs_offset, H, DS4_N_VOCAB,
+                g_dflash_pool.batch_norm, 8u);
+        }
+        int ok = proposer_head_nt4_ran || ds4_gpu_matmul_quant_tensor(
+                g_dflash_pool.batch_logits, tm->map, tm->size,
+                tw->output->abs_offset, tw->output->type,
+                H, DS4_N_VOCAB, g_dflash_pool.batch_norm,
+                (uint32_t)n_draft);
+        if (ok && proposer_head_compare && proposer_head_candidate &&
+            proposer_head_padded) {
+            proposer_head_compare_ran = ds4_gpu_dflash_head_nt4_tensor(
+                proposer_head_candidate, tm->map, tm->size,
+                tw->output->abs_offset, H, DS4_N_VOCAB,
+                g_dflash_pool.batch_norm, 8u);
+        }
+#else
         int ok = ds4_gpu_matmul_quant_tensor(
             g_dflash_pool.batch_logits, tm->map, tm->size,
             tw->output->abs_offset, tw->output->type,
-            H, DS4_N_VOCAB, g_dflash_pool.batch_norm, (uint32_t)n_draft);
+            H, DS4_N_VOCAB, g_dflash_pool.batch_norm,
+            (uint32_t)n_draft);
+#endif
         if (!ok) {
             ok = 1;
             for (int t = 0; ok && t < n_draft; t++) {
@@ -1828,6 +2102,42 @@ static int dflash2_propose(
                 DS4_N_VOCAB, (uint32_t)n_draft, 16u) != 0;
         }
         if (!ds4_gpu_end_commands()) ok = 0;
+#if defined(__APPLE__)
+        if (ok && proposer_head_compare_ran) {
+            const float *reference = (const float *)ds4_gpu_tensor_contents(
+                g_dflash_pool.batch_logits);
+            const float *candidate = (const float *)ds4_gpu_tensor_contents(
+                proposer_head_candidate);
+            if (reference && candidate) {
+                dflash2_proposer_head_compare(
+                    noise_pos, reference, candidate);
+                if (!dflash2_proposer_head_bench(tm, tw, noise_pos)) {
+                    fprintf(stderr,
+                        "ds4: dflash proposer head bench failed pos=%u; "
+                        "reference_logits_retained=1\n", noise_pos);
+                }
+            } else {
+                fprintf(stderr,
+                    "ds4: dflash proposer head compare unavailable pos=%u; "
+                    "reference_logits_retained=1\n", noise_pos);
+            }
+        } else if (ok && proposer_head_compare) {
+            fprintf(stderr,
+                "ds4: dflash proposer head compare unavailable pos=%u; "
+                "reference_logits_retained=1\n", noise_pos);
+        }
+        if (getenv("DS4_DFLASH_STATS") &&
+            (proposer_head_use || proposer_head_compare)) {
+            const int proposer_head_nt4_observed = proposer_head_use ?
+                proposer_head_nt4_ran : proposer_head_compare_ran;
+            fprintf(stderr,
+                "ds4: dflash proposer head pos=%u real_rows=%d kernel_rows=%u "
+                "nt4=%d reference_logits_retained=%d\n",
+                noise_pos, n_draft, proposer_head_nt4_observed ? 8u :
+                (uint32_t)n_draft, proposer_head_nt4_observed,
+                proposer_head_compare || !proposer_head_nt4_ran);
+        }
+#endif
         if (ok && use_selector) {
             uint32_t sel_idx[DS4_DFLASH2_MAX_BLOCK * 16];
             const float *logits_host = (const float *)
@@ -1858,27 +2168,27 @@ static int dflash2_propose(
             }
             if (ok) n_out = n_draft;
         }
-        if (ok && n_out == n_draft && dflash2_min_margin() >= 0.0f) {
-            const size_t nrows = (size_t)n_draft * DS4_N_VOCAB;
-            float *lrows = xmalloc(nrows * sizeof(float));
-            if (ds4_gpu_tensor_read(
-                    g_dflash_pool.batch_logits, 0, lrows,
-                    (uint64_t)nrows * sizeof(float))) {
-                for (int t = 0; t < n_draft; t++) {
-                    float best = -1e30f, second = -1e30f;
-                    const float *row = lrows + (size_t)t * DS4_N_VOCAB;
-                    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
-                        if (row[i] > best) {
-                            second = best;
-                            best = row[i];
-                        } else if (row[i] > second) {
-                            second = row[i];
-                        }
-                    }
-                    margins[t] = best - second;
+        if (ok && n_out == n_draft &&
+            (position_confidence || min_margin >= 0.0f)) {
+            const float *lrows = (const float *)ds4_gpu_tensor_contents(
+                (ds4_gpu_tensor *)g_dflash_pool.batch_logits);
+#if defined(__APPLE__)
+            float *partition_scratch = position_confidence ?
+                dflash_confidence_partition_scratch() : NULL;
+#else
+            float *partition_scratch = NULL;
+#endif
+            for (int t = 0; lrows && t < n_draft; t++) {
+                float probability = -1.0f;
+                if (dflash_logits_summary_scratch(
+                        lrows + (size_t)t * DS4_N_VOCAB,
+                        DS4_N_VOCAB, NULL, &margins[t],
+                        position_confidence ? &probability : NULL,
+                        partition_scratch) &&
+                    position_confidence) {
+                    position_confidence[t] = probability;
                 }
             }
-            free(lrows);
         }
     } else {
         (void)ds4_gpu_end_commands();
@@ -1888,19 +2198,14 @@ static int dflash2_propose(
         float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         for (uint32_t t = 1; t < L && n_out < n_draft; t++) {
             dflash2_matvec(logits, tm, tw->output, normed + (size_t)t * H);
-            int best = 0;
-            float best_v = logits[0], second_v = -1e30f;
-            for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
-                if (logits[i] > best_v) {
-                    second_v = best_v;
-                    best_v = logits[i];
-                    best = (int)i;
-                } else if (logits[i] > second_v) {
-                    second_v = logits[i];
-                }
-            }
+            int best = -1;
+            float probability = -1.0f;
+            const int logits_ok = dflash_logits_summary(
+                logits, DS4_N_VOCAB, &best, &margins[n_out],
+                position_confidence ? &probability : NULL);
+            if (!logits_ok) break;
             drafts[n_out] = best;
-            margins[n_out] = best_v - second_v;
+            if (position_confidence) position_confidence[n_out] = probability;
             n_out++;
         }
         free(logits);
@@ -1912,10 +2217,29 @@ static int dflash2_propose(
                 (tp_layers - tp_fc) * 1000.0,
                 (now_sec() - tp_layers) * 1000.0);
     }
-    const float min_margin = dflash2_min_margin();
-    if (min_margin >= 0.0f) {
-        while (n_out > 0 && margins[n_out - 1] < min_margin) n_out--;
+    n_out = dflash_legacy_margin_prefix(
+        margins, n_out, min_margin, apply_margin_gate);
+    if (position_confidence) {
+        n_out = dflash_confident_prefix(position_confidence, n_out, 0.0f);
     }
     free(normed); free(h); free(fc_out); free(h_ctx);
     return n_out;
+}
+
+/* Compatibility wrapper for legacy research and golden callers. */
+static inline int dflash2_propose(
+        int *drafts,
+        int n_draft,
+        const ds4_model *dm,
+        const ds4_dflash2_weights *dw,
+        const ds4_model *tm,
+        const ds4_weights *tw,
+        const float *target_concat,
+        uint32_t target_rows,
+        ds4_dflash_cache *cache,
+        int anchor,
+        uint32_t noise_pos) {
+    return dflash2_propose_confident(
+        drafts, n_draft, dm, dw, tm, tw, target_concat, target_rows,
+        cache, anchor, noise_pos, NULL, true);
 }

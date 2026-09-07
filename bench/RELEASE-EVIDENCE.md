@@ -1,5 +1,8 @@
 # GLM-5.3 M3 Ultra release evidence
 
+> **Current DFlash candidate is still under validation.** The final `538c37c` results below certify the preserved earlier artifact. They do not certify the new confidence, retry, history or failure-recovery implementation. See [current DFlash policy and validation scope](../tests/DFLASH-CONFIDENCE.md). Updated whole-request receipts and final selected-artifact checks are required before calling this candidate release ready.
+
+
 This ledger separates the final `538c37c` artifact from the earlier `b723dfa`
 capability build. Compact final receipts live under
 [`bench/receipts/glm53-m3ultra/`](receipts/glm53-m3ultra/); their staging labels and
