@@ -29,6 +29,7 @@
 #include "ds4_image.h"
 #include "ds4_glm_expert_bank_policy.h"
 #include "ds4_glm53_prefix.h"
+#include "ds4_metal_source.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -5603,7 +5604,7 @@ static const char *ds4_gpu_source =
 
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
-    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *executable_path = ds4_metal_executable_path();
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
@@ -5645,41 +5646,54 @@ static NSString *ds4_gpu_full_source(void) {
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
+    CC_SHA256_CTX aggregate;
+    ds4_metal_digest_init(&aggregate);
+    ds4_metal_digest_part(&aggregate, @"embedded",
+        [NSData dataWithBytes:ds4_gpu_source length:strlen(ds4_gpu_source)]);
+    unsigned overrides = 0, cwd_fallbacks = 0;
     for (NSArray<NSString *> *spec in required_sources) {
-        const char *override_path = getenv([spec[0] UTF8String]);
-        NSMutableArray<NSString *> *paths = [NSMutableArray array];
-        if (override_path && override_path[0]) {
-            [paths addObject:[NSString stringWithUTF8String:override_path]];
-        }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
-
-        NSString *loaded = nil;
-        NSString *loaded_path = nil;
-        for (NSString *path in paths) {
-            if (![fm fileExistsAtPath:path]) continue;
-
-            NSError *error = nil;
-            loaded = [NSString stringWithContentsOfFile:path
-                                               encoding:NSUTF8StringEncoding
-                                                  error:&error];
-            if (!loaded) {
-                fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
-                        [path UTF8String], [[error localizedDescription] UTF8String]);
-                return nil;
-            }
-            loaded_path = path;
-            break;
-        }
-
-        if (!loaded) {
+        ds4_metal_source_origin origin;
+        NSString *loaded_path = ds4_metal_source_path(executable_path, spec[1],
+            getenv([spec[0] UTF8String]), &origin);
+        if (!loaded_path) {
             fprintf(stderr,
                     "ds4: Metal source %s not found (set %s to override)\n",
                     [spec[1] UTF8String], [spec[0] UTF8String]);
             return nil;
         }
+        if (origin == DS4_METAL_SOURCE_CWD) {
+            cwd_fallbacks++;
+            fprintf(stderr,
+                    "ds4: warning: Metal source %s loaded from CWD fallback; "
+                    "no matching file beside executable %s\n",
+                    [loaded_path UTF8String],
+                    executable_path ? [executable_path UTF8String] : "unavailable");
+        } else if (origin == DS4_METAL_SOURCE_OVERRIDE) {
+            overrides++;
+        }
+        /* Hash the same immutable bytes decoded for compilation: do not
+         * reopen a source file after deciding which kernel text to use. */
+        NSError *error = nil;
+        NSData *bytes = [NSData dataWithContentsOfFile:loaded_path options:0 error:&error];
+        NSString *loaded = bytes ? [[NSString alloc] initWithData:bytes
+            encoding:NSUTF8StringEncoding] : nil;
+        if (!loaded) {
+            fprintf(stderr, "ds4: failed to read UTF-8 Metal source %s: %s\n",
+                    [loaded_path UTF8String], error ? [[error localizedDescription] UTF8String] : "invalid UTF-8");
+            return nil;
+        }
+        ds4_metal_digest_part(&aggregate, spec[1], bytes);
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
+    NSString *binary_hash = ds4_metal_binary_sha256(executable_path);
+    NSString *metal_hash = ds4_metal_digest_finish(&aggregate);
+    if (!binary_hash)
+        fprintf(stderr, "ds4: warning: could not hash the running executable\n");
+    fprintf(stderr,
+            "ds4: Metal source identity binary_sha256=%s metal_aggregate_sha256=%s "
+            "aggregate_format=ds4-metal-source-v1 parts=%lu overrides=%u cwd_fallbacks=%u\n",
+            binary_hash ? [binary_hash UTF8String] : "unavailable", [metal_hash UTF8String],
+            (unsigned long)[required_sources count] + 1u, overrides, cwd_fallbacks);
     return source;
 }
 

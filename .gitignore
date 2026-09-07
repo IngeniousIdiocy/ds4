@@ -80,3 +80,5 @@ tests/ds4_server_sc_failure
 
 /tests/test_dflash_clock
 /tests/test_dflash_entry
+
+/tests/test_metal_source
