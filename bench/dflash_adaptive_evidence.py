@@ -336,11 +336,13 @@ def _validate_policy(item: Dict[str, Any], line_no: int) -> None:
             raise EvidenceError(f"line {line_no}: min_serial_tokens outside 0..64")
         if item["loss_meter"] not in (0, 1):
             raise EvidenceError(f"line {line_no}: loss_meter must be 0 or 1")
-        expected_meter = int(item["profile"] == "conservative")
+        expected_meter = int(item["profile"] == "conservative" and
+                             item["policy"] != "windowed-confidence")
         if item["loss_meter"] != expected_meter:
             raise EvidenceError(f"line {line_no}: profile/loss_meter mismatch")
         if "savings_retry" in item:
-            expected_savings = int(item["profile"] == "conservative")
+            expected_savings = int(item["profile"] == "conservative" and
+                                   item["policy"] != "windowed-confidence")
             if item["savings_retry"] != expected_savings:
                 raise EvidenceError(f"line {line_no}: profile/savings_retry mismatch")
     if full_block:
@@ -683,7 +685,11 @@ def _finish_request(request: AdaptiveRequest) -> None:
             raise EvidenceError(
                 f"request line {request.policy_line}: call follows done ACK"
             )
+        # Calls that made no proposal (entry wait, reasoning-serial, a final
+        # token with no draft room) report next=0 under the windowed controller.
         if call["status"] == "ok" and not (
+            request.policy.get("policy") == "windowed-confidence" and call.get("chosen") == 0
+        ) and not (
             request.policy["n_min"] <= call["next"] <= request.policy["n_max"]
         ):
             raise EvidenceError(
