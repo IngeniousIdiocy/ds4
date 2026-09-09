@@ -749,8 +749,15 @@ typedef struct {
 } tool_schema_orders;
 
 typedef struct {
+    size_t offset, len;
+    bool tool_result;
+} anthropic_content_part;
+
+typedef struct {
     char *role;
     char *content;
+    anthropic_content_part *parts;
+    int parts_len;
     server_image_inputs images;
     char *reasoning;
     char *tool_call_id;
@@ -884,6 +891,7 @@ static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
 }
 
 static void chat_msg_free(chat_msg *m) {
+    free(m->parts);
     free(m->role);
     free(m->content);
     server_image_inputs_free(&m->images);
@@ -2107,6 +2115,7 @@ static bool parse_anthropic_image_source(const char **p,
  * escaped text because DS4 sees tool results in its chat template. */
 static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
     (void)role;
+    const size_t content_before = msg->content ? strlen(msg->content) : 0;
     if (**p != '{') return false;
     (*p)++;
     char *type = NULL;
@@ -2227,6 +2236,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         }
     }
 
+    const size_t content_after = msg->content ? strlen(msg->content) : 0;
+    if (content_after > content_before) {
+        msg->parts = xrealloc(msg->parts, (size_t)(msg->parts_len + 1) * sizeof(*msg->parts));
+        msg->parts[msg->parts_len++] = (anthropic_content_part){
+            content_before, content_after - content_before, type && !strcmp(type, "tool_result")};
+    }
     free(type);
     free(text);
     free(thinking);
@@ -2266,11 +2281,17 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
         if (**p == '"') {
             char *s = NULL;
             if (!json_string(p, &s)) return false;
+            const size_t part_offset = msg->content ? strlen(msg->content) : 0;
             buf b = {0};
             buf_puts(&b, msg->content ? msg->content : "");
             buf_puts(&b, s);
             free(msg->content);
             msg->content = buf_take(&b);
+            const size_t part_len = strlen(msg->content) - part_offset;
+            if (part_len) {
+                msg->parts = xrealloc(msg->parts, (size_t)(msg->parts_len + 1) * sizeof(*msg->parts));
+                msg->parts[msg->parts_len++] = (anthropic_content_part){part_offset, part_len, false};
+            }
             free(s);
         } else if (**p == '{') {
             if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
@@ -2315,6 +2336,9 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
+                free(msg.parts);
+                msg.parts = NULL;
+                msg.parts_len = 0;
                 if (!parse_anthropic_content(p, &msg)) {
                     free(key);
                     goto fail;
@@ -2752,6 +2776,9 @@ static bool glm_tool_result_reorder_disabled(void) {
  * is exactly what the template refuses to sort. */
 static bool glm_collect_tool_response_entries(const chat_msg *m,
                                               glm_tool_response_entries *es) {
+    /* A mixed user message is ordered content, not a sortable tool-only block. */
+    for (int i = 0; i < m->parts_len; ++i)
+        if (!m->parts[i].tool_result) return false;
     const char *content = m->content ? m->content : "";
     if (strcmp(m->role, "user") != 0) {
         glm_tool_response_entries_push(es, m->tool_call_id, content,
@@ -2854,6 +2881,54 @@ static void append_tool_result_text(buf *b, const char *s) {
             buf_putc(b, *s++);
         }
     }
+}
+
+/* Preserve typed user blocks around tool results. These offsets originate in
+ * the JSON parser, so literal <tool_result> text cannot masquerade as a tool.
+ * Use the same routine for full prompts and live continuations. */
+static int append_glm_observation_messages(buf *out, const chat_msgs *msgs,
+                                          int start, bool *observation_open) {
+    const chat_msg *m = &msgs->v[start];
+    if (!*observation_open) {
+        buf sorted = {0};
+        int end = append_glm_sorted_tool_results(&sorted, msgs, start);
+        if (end >= 0) {
+            buf_puts(out, "<|observation|>");
+            buf_append(out, sorted.ptr, sorted.len);
+            buf_free(&sorted);
+            *observation_open = true;
+            return end;
+        }
+        buf_free(&sorted);
+    }
+    bool mixed = false;
+    for (int i = 0; i < m->parts_len; ++i)
+        if (!m->parts[i].tool_result) mixed = true;
+    if (!mixed) {
+        if (!*observation_open) buf_puts(out, "<|observation|>");
+        append_glm_tool_result_message(out, m);
+        *observation_open = true;
+        return start;
+    }
+    bool user_open = false;
+    for (int i = 0; i < m->parts_len; ++i) {
+        const anthropic_content_part *p = &m->parts[i];
+        const char *text = m->content + p->offset;
+        if (p->tool_result) {
+            const size_t open_len = sizeof("<tool_result>") - 1;
+            const size_t close_len = sizeof("</tool_result>") - 1;
+            if (!*observation_open) buf_puts(out, "<|observation|>");
+            append_glm_tool_response(out, text + open_len, p->len - open_len - close_len);
+            *observation_open = true;
+            user_open = false;
+        } else {
+            if (!user_open) buf_puts(out, "<|user|>");
+            buf_append(out, text, p->len);
+            *observation_open = false;
+            user_open = true;
+        }
+    }
+    return start;
 }
 
 static void append_dsml_json_literal(buf *b, const char *s) {
@@ -3178,12 +3253,7 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
             observation_open = false;
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
-            if (!observation_open) buf_puts(&out, "<|observation|>");
-            int sorted_end = observation_open ? -1
-                : append_glm_sorted_tool_results(&out, msgs, i);
-            if (sorted_end < 0) append_glm_tool_result_message(&out, m);
-            else i = sorted_end;
-            observation_open = true;
+            i = append_glm_observation_messages(&out, msgs, i, &observation_open);
             pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
             observation_open = false;
@@ -3393,12 +3463,7 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
             observation_open = false;
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
-            if (!observation_open) buf_puts(&out, "<|observation|>");
-            int sorted_end = observation_open ? -1
-                : append_glm_sorted_tool_results(&out, msgs, i);
-            if (sorted_end < 0) append_glm_tool_result_message(&out, m);
-            else i = sorted_end;
-            observation_open = true;
+            i = append_glm_observation_messages(&out, msgs, i, &observation_open);
             pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
             observation_open = false;
@@ -18050,6 +18115,41 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_glm_mixed_tool_result_instructions(void) {
+    const char *json = "[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"Bash\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"Bash\",\"input\":{}}]},"
+        "{\"content\":[{\"type\":\"text\",\"text\":\"BEFORE <tool_result>literal</tool_result>\"},"
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"b\",\"content\":\"RESULT_B\"},"
+        "{\"type\":\"text\",\"text\":\"BETWEEN\"},"
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"a\",\"content\":\"RESULT_A\"},"
+        "{\"type\":\"text\",\"text\":\"COMPACTION SUMMARY INSTRUCTION\"},\" STRING\",{\"type\":\"text\",\"text\":\" ADJACENT\"}],\"role\":\"user\"}]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 2 && msgs.v[1].parts_len == 7);
+    char *full = render_glm_chat_prompt_text(&msgs, "[]", NULL, DS4_THINK_HIGH);
+    char *tail = render_glm_live_tool_tail(&msgs, 1, NULL, DS4_THINK_HIGH);
+    for (int i = 0; i < 2; ++i) {
+        const char *text = i ? tail : full;
+        const char *before = strstr(text, "<|user|>BEFORE <tool_result>literal</tool_result>");
+        const char *b = strstr(text, "<tool_response>RESULT_B</tool_response>");
+        const char *between = strstr(text, "<|user|>BETWEEN");
+        const char *a = strstr(text, "<tool_response>RESULT_A</tool_response>");
+        const char *after = strstr(text, "<|user|>COMPACTION SUMMARY INSTRUCTION");
+        TEST_ASSERT(before && b && between && a && after);
+        TEST_ASSERT(before < b && b < between && between < a && a < after);
+        TEST_ASSERT(!strstr(text, "<tool_response>literal</tool_response>"));
+        TEST_ASSERT(strstr(after, "COMPACTION SUMMARY INSTRUCTION STRING ADJACENT<|assistant|><think>"));
+        TEST_ASSERT(!strstr(after + 8, "<|user|>COMPACTION SUMMARY INSTRUCTION"));
+    }
+    request r; request_init(&r, REQ_CHAT, 256);
+    r.api = API_ANTHROPIC; r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    anthropic_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 2);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "COMPACTION SUMMARY INSTRUCTION"));
+    request_free(&r); free(full); free(tail); chat_msgs_free(&msgs);
+}
+
 static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
@@ -21125,6 +21225,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_glm_tool_checkpoint_suffix_is_canonical();
+    test_glm_mixed_tool_result_instructions();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
