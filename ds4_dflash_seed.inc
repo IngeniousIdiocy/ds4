@@ -29,9 +29,12 @@ static void glm_dflash_seed_free(void) {
     memset(&g_glm_dflash_cap, 0, sizeof(g_glm_dflash_cap));
 }
 
+/* Default: the drafter's full sliding window (2047 rows for this checkpoint).
+ * Split-KV draft attention keeps the full window cheap; the accepted
+ * real-agent configuration used it. DS4_DFLASH_CTX_CAP=N retains fewer rows. */
 static uint32_t glm_dflash_context_capacity(const ds4_dflash2_weights *dw) {
     const uint32_t limit = dw->sliding_window ? dw->sliding_window - 1u : 2047u;
-    const uint32_t fallback = limit < 256u ? limit : 256u;
+    const uint32_t fallback = limit;
     const char *value = getenv("DS4_DFLASH_CTX_CAP");
     if (!value) return fallback;
     char *end = NULL;

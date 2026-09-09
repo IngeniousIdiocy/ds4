@@ -428,7 +428,7 @@ static void print_glm53(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     title(fp, c, "Supported Controls");
     opt(fp, c, "DS4_ANTHROPIC_DEFAULT_EFFORT", "Default reasoning effort for Anthropic-protocol requests that carry none (e.g. Claude Code); explicit request fields still win.");
-    opt(fp, c, "DS4_DFLASH_CTX_CAP", "Drafter history rows: default 256, range 1..2047 for the pinned GLM-5.3 DFlash2 model. More rows cost draft latency.");
+    opt(fp, c, "DS4_DFLASH_CTX_CAP", "Drafter history rows: default 2047 (the drafter's full sliding window), range 1..2047 for the pinned GLM-5.3 DFlash2 model.");
     opt(fp, c, "DS4_DFLASH_DISABLE", "Legacy serial startup when --dflash-mode is omitted; the drafter is not loaded.");
     opt(fp, c, "DS4_GLM53_MEMORY_CEILING_GB", "Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe).");
     opt(fp, c, "DS4_GLM53_PREFILL_CHUNK", "Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks).");
