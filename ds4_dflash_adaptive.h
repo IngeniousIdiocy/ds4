@@ -2,6 +2,8 @@
 #define DS4_DFLASH_ADAPTIVE_H
 
 #include "ds4_dflash_budget.h"
+#include <stdlib.h>
+#include <string.h>
 
 #define DS4_DFLASH_ADAPTIVE_MAX 7u
 #define DS4_DFLASH_SERIAL_WINDOW 9u
@@ -22,16 +24,28 @@ typedef struct {
     bool early_recovery, savings_retry;
     uint32_t min_serial_tokens;
     bool loss_meter;
+    bool windowed;
 } ds4_dflash_adaptive_config;
 
 /* Full-block mode reuses the consumed-prefix cost ledger for diagnostics;
- * no confidence, width, retry, entry, savings, or meter decision gates it. */
+ * no confidence, width, retry, entry, savings, or meter decision gates it.
+ *
+ * Conservative mode defaults to the windowed cost-feedback controller: a
+ * minimum useful prefix of four drafts admitted at raw confidence 0.75, entry
+ * after 16 consumed serial tokens, and three complete proposal/verification
+ * attempts judged together against observed serial cost (see
+ * dflash_adaptive_window_feedback). DS4_DFLASH_WINDOWED=0 selects the earlier
+ * per-attempt savings ledger (loss meter, savings-funded retry). */
 static inline ds4_dflash_adaptive_config dflash_adaptive_profile_config(bool full_block) {
     const ds4_dflash_adaptive_config full = {1u, 7u, 7u, 0.0f, false, false, 0u,
-        0.0f, 0.0f, false, false, 0u, false};
-    const ds4_dflash_adaptive_config conservative = {1u, 7u, 3u, .75f, false, true, 512u,
-        .01f, .03f, true, true, 0u, true};
-    return full_block ? full : conservative;
+        0.0f, 0.0f, false, false, 0u, false, false};
+    const ds4_dflash_adaptive_config windowed = {4u, 7u, 7u, .75f, false, true, 512u,
+        .01f, .03f, false, false, 16u, false, true};
+    const ds4_dflash_adaptive_config ledger = {1u, 7u, 3u, .75f, false, true, 512u,
+        .01f, .03f, true, true, 0u, true, false};
+    if (full_block) return full;
+    const char *setting = getenv("DS4_DFLASH_WINDOWED");
+    return setting && !strcmp(setting, "0") ? ledger : windowed;
 }
 
 typedef struct {
@@ -69,6 +83,9 @@ typedef struct {
     double reference_serial_added_ms, reference_verify_added_ms;
     double bootstrap_added_ms, bootstrap_reprice_ms, reference_call_step_ms;
     double setup_ms, draft_ms, verify_ms, heads_ms, tail_ms, refresh_ms;
+    bool reasoning;
+    uint32_t window_calls;
+    double window_net_ms;
 } ds4_dflash_adaptive;
 
 typedef struct {
@@ -113,7 +130,8 @@ static inline bool dflash_adaptive_entry_configure(ds4_dflash_adaptive_config *c
 }
 
 static inline bool dflash_adaptive_config_valid(const ds4_dflash_adaptive_config *c) {
-    return c->min_serial_tokens <= DS4_DFLASH_ENTRY_MAX && c->n_min >= 1u && c->n_min <= c->n_start &&
+    return (!c->windowed || (c->retry && c->min_serial_tokens > 0u)) &&
+        c->min_serial_tokens <= DS4_DFLASH_ENTRY_MAX && c->n_min >= 1u && c->n_min <= c->n_start &&
         c->n_start <= c->n_max && c->n_max <= DS4_DFLASH_ADAPTIVE_MAX &&
         dflash_adaptive_probability(c->p_min) && (!c->retry ||
         (c->retry_max >= 1u && c->retry_max <= 4096u &&
@@ -136,6 +154,8 @@ static inline void dflash_adaptive_reset_evidence(ds4_dflash_adaptive *a) {
     a->draft_estimate_ms = a->draft_ema_ms = 0.0;
     a->engaged = a->reprobe = a->need_serial = false;
     a->bad_run = 0;
+    a->window_calls = 0;
+    a->window_net_ms = 0.0;
     /* Conditioning resets discard evidence, never request debt or the spent
      * early opportunity. A probe-only wait must survive those resets too. */
     /* skip_remaining is request policy state and is preserved. */
@@ -275,7 +295,7 @@ static inline double dflash_adaptive_loss_floor(const ds4_dflash_adaptive *a,
 static inline bool dflash_adaptive_economic(const ds4_dflash_adaptive *a,
         uint32_t n, bool *calibration) {
     *calibration = false;
-    if (!a->config.retry || !n || n > 7u || a->serial_ms <= 0.0) return true;
+    if (a->config.windowed || !a->config.retry || !n || n > 7u || a->serial_ms <= 0.0) return true;
     const char *source;
     const double target = dflash_adaptive_target_cost(a, n, &source);
     if (target <= 0.0) { *calibration = true; return true; }
@@ -438,6 +458,39 @@ static inline void dflash_adaptive_finish(ds4_dflash_adaptive *a,
     if (rows && t->serial_ms > 0.0) dflash_adaptive_serial_sample(a, t->serial_ms);
 }
 
+/* Judge complete attempts in small windows so an entry cost can be repaid by
+ * consecutive verification. Losing windows back off by token count; no saved
+ * time or percentage allowance is required to try again. The request ledger
+ * remains cumulative and includes every failed proposal. */
+static inline void dflash_adaptive_window_feedback(ds4_dflash_adaptive *a,
+                                                   uint32_t consumed) {
+    if (!a->pending_chosen || consumed != a->pending_rows || a->serial_ms <= 0.0) return;
+    const double net = a->pending_ms - consumed * a->serial_ms;
+    a->window_net_ms += net;
+    a->window_calls++;
+    a->losing_cycles += a->pending_verified && net >= 0.0;
+    if (a->window_calls < 3u) return;
+    if (a->window_net_ms < 0.0) {
+        a->engaged = true;
+        a->bad_run = a->skip_remaining = 0u;
+    } else {
+        a->engaged = false;
+        if (a->bad_run < 4u) a->bad_run++;
+        a->skip_remaining = 16u << (a->bad_run - 1u);
+    }
+    a->window_calls = 0u;
+    a->window_net_ms = 0.0;
+}
+
+static inline void dflash_adaptive_reasoning(ds4_dflash_adaptive *a, bool inside) {
+    if (a->config.windowed && a->reasoning && !inside) {
+        a->window_calls = a->bad_run = a->skip_remaining = 0u;
+        a->window_net_ms = 0.0;
+        a->engaged = false;
+    }
+    a->reasoning = inside;
+}
+
 static inline void dflash_adaptive_ack(ds4_dflash_adaptive *a,
                                       uint32_t consumed, bool done) {
     a->reference_serial_added_ms = a->reference_verify_added_ms = 0.0;
@@ -513,7 +566,9 @@ static inline void dflash_adaptive_ack(ds4_dflash_adaptive *a,
             if (a->next < a->config.n_min) a->next = a->config.n_min;
             if (a->next > a->config.n_max) a->next = a->config.n_max;
         }
-        if (decide && a->config.retry && consumed == a->pending_rows && a->pending_chosen) {
+        if (decide && a->config.windowed)
+            dflash_adaptive_window_feedback(a, consumed);
+        if (decide && a->config.retry && !a->config.windowed && consumed == a->pending_rows && a->pending_chosen) {
             const bool profitable = a->pending_accepted > 0 && a->serial_ms > 0.0 &&
                 a->pending_ms < consumed * a->serial_ms;
             if (a->serial_ms <= 0.0) {
@@ -539,7 +594,7 @@ static inline void dflash_adaptive_ack(ds4_dflash_adaptive *a,
                 if (!done) dflash_adaptive_offer_recovery(a, a->pending_accepted);
             }
         }
-        if (decide && a->config.retry && a->config.loss_meter && a->drafted && a->serial_ms > 0.0) {
+        if (decide && a->config.retry && !a->config.windowed && a->config.loss_meter && a->drafted && a->serial_ms > 0.0) {
             const bool recovered = consumed == a->pending_rows &&
                 a->pending_verified >= a->config.n_max &&
                 a->pending_accepted == a->pending_verified && a->pending_verified &&

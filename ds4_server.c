@@ -13037,6 +13037,7 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
+        ds4_session_decode_reasoning(slot->session, thinking.inside);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             if (!multimodal) kv_cache_maybe_store_continued(s, slot);
         }

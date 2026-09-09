@@ -17,7 +17,7 @@ int main(void) {
     assert(dflash_clock_account_ns(ticks[0], ticks[1], 1, &ns) && ns == 1);
     assert(!dflash_clock_account_ns(ticks[2], ticks[0], 1, &ns));
     assert(!dflash_clock_account_ns(ticks[0], ticks[1], 0, &ns));
-    ds4_dflash_adaptive_config c = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, true, 0, true};
+    ds4_dflash_adaptive_config c = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, true, 0, true, false};
     ds4_dflash_adaptive a;
     dflash_adaptive_begin(&a, c);
     ds4_dflash_adaptive_trace trace = {.operation="refresh", .draft_ms=empty,

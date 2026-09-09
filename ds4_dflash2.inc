@@ -14,6 +14,20 @@
 #include "ds4_dflash_fastpath.h"
 #include "ds4_dflash_confidence.h"
 
+/* DS4_DFLASH_STATS=summary retains request totals without per-token
+ * diagnostic I/O; any other value prints per-call detail. */
+static bool dflash_stats_detail(void) {
+    const char *setting = getenv("DS4_DFLASH_STATS");
+    return setting && strcmp(setting, "summary") != 0;
+}
+
+/* Shipped DFlash paths default on; "=0" disables one without touching the
+ * rest. Absent and any other value both mean enabled. */
+static bool dflash_default_on(const char *name) {
+    const char *setting = getenv(name);
+    return !(setting && !strcmp(setting, "0"));
+}
+
 typedef struct {
 #ifndef DS4_NO_GPU
     ds4_gpu_tensor *k;
@@ -1447,7 +1461,10 @@ static int dflash2_gpu_gemm(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
          * weight per row. For block-sized row counts, pad to 32 rows in
          * scratch: weights stream once, the padded rows' outputs are
          * ignored. */
-        if (n_tok >= 2 && n_tok < 32 && in_dim <= 20480 && out_dim >= 1024) {
+        /* Block-sized draft rows (<= 8) run unpadded by default; the padded
+         * 32-row scratch path remains for DS4_DFLASH_DRAFT_UNPADDED=0. */
+        const bool use_unpadded = n_tok <= 8u && dflash_default_on("DS4_DFLASH_DRAFT_UNPADDED");
+        if (!use_unpadded && n_tok >= 2 && n_tok < 32 && in_dim <= 20480 && out_dim >= 1024) {
             static ds4_gpu_tensor *px = NULL, *py = NULL;
             static uint64_t pxc = 0, pyc = 0;
             const uint64_t xb = 32ull * in_dim * sizeof(float);
@@ -1866,11 +1883,29 @@ static inline int dflash2_propose(
         int anchor,
         uint32_t noise_pos);
 
+/* Process totals for completed proposals, including declined proposals. The
+ * request ledger remains authoritative for failures and all other costs. */
+static struct {
+    uint64_t completed;
+    double fc_ms, layers_ms, head_ms;
+} g_dflash_proposer_profile;
+
+static void dflash2_proposer_profile_print(void) {
+    if (!g_dflash_proposer_profile.completed) return;
+    fprintf(stderr, "ds4: dflash proposer_totals completed=%llu fc_ms=%.3f layers_ms=%.3f head_ms=%.3f\n",
+        (unsigned long long)g_dflash_proposer_profile.completed,
+        g_dflash_proposer_profile.fc_ms, g_dflash_proposer_profile.layers_ms,
+        g_dflash_proposer_profile.head_ms);
+}
+
 /* Confidence-capable proposer contract:
  *
- * - position_confidence[t] is the full-vocabulary normalized maximum
- *   probability of the logit row which produced drafts[t], at position
- *   noise_pos + t + 1;
+ * - position_confidence[t] is the selector's conditional top-K distribution
+ *   maximum when the selector is active (default), or the full-vocabulary
+ *   normalized maximum probability of the logit row which produced
+ *   drafts[t], at position noise_pos + t + 1, when the selector is off or
+ *   DS4_DFLASH_SELECTOR_CONFIDENCE=0. Either is an admission heuristic, not
+ *   a calibrated target-acceptance probability;
  * - every output slot starts invalid (-1), and a non-finite logit truncates
  *   the returned prefix before that row;
  * - a cached Metal-forward failure invalidates every drafter-cache length and
@@ -1906,7 +1941,8 @@ static int dflash2_propose_confident(
     /* Per-row top1-top2 logit margin; INFINITY = unknown (no truncation). */
     float margins[DS4_DFLASH2_MAX_BLOCK];
     for (int t = 0; t < DS4_DFLASH2_MAX_BLOCK; t++) margins[t] = 1e30f;
-    const double tp0 = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
+    const bool profile = getenv("DS4_DFLASH_STATS") != NULL;
+    const double tp0 = profile ? now_sec() : 0.0;
     float *h_ctx = xmalloc((size_t)target_rows * H * sizeof(float));
     float *fc_out = xmalloc((size_t)target_rows * H * sizeof(float));
     int fc_mm_ran = 0;
@@ -1932,7 +1968,7 @@ static int dflash2_propose_confident(
     }
 #endif
     if (!fc_mm_ran) dflash2_matvecs(fc_out, dm, dw->fc, target_concat, target_rows);
-    if (getenv("DS4_DFLASH_STATS")) {
+    if (dflash_stats_detail()) {
         fprintf(stderr, "ds4: dflash fc rows=%u mm=%d\n", target_rows, fc_mm_ran);
     }
     for (uint32_t t = 0; t < target_rows; t++) {
@@ -1940,7 +1976,7 @@ static int dflash2_propose_confident(
                         tensor_data(dm, dw->enc_output_norm), H, dw->rms_eps);
     }
 
-    const double tp_fc = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
+    const double tp_fc = profile ? now_sec() : 0.0;
     float *h = xmalloc((size_t)L * H * sizeof(float));
     dflash2_embed_row(h, tm, tw->token_embd, anchor);
     for (uint32_t t = 1; t < L; t++) {
@@ -2008,7 +2044,7 @@ static int dflash2_propose_confident(
             dflash2_layer_forward(h, h_ctx, dm, &dw->layer[il], dw, L, noise_pos - 1u);
         }
     }
-    const double tp_layers = getenv("DS4_DFLASH_STATS") ? now_sec() : 0.0;
+    const double tp_layers = profile ? now_sec() : 0.0;
     float *normed = xmalloc((size_t)L * H * sizeof(float));
     for (uint32_t t = 0; t < L; t++) {
         rms_norm_weight(normed + (size_t)t * H, h + (size_t)t * H,
@@ -2088,6 +2124,8 @@ static int dflash2_propose_confident(
             }
         }
         const int use_selector = ok && dflash2_selector_ready(dw, dm);
+        const bool selector_confidence = use_selector && position_confidence &&
+            dflash_default_on("DS4_DFLASH_SELECTOR_CONFIDENCE");
         if (ok && !use_selector) {
             ok = ds4_gpu_indexer_topk_tensor(
                 g_dflash_pool.batch_argmax, g_dflash_pool.batch_logits,
@@ -2126,7 +2164,7 @@ static int dflash2_propose_confident(
                 "ds4: dflash proposer head compare unavailable pos=%u; "
                 "reference_logits_retained=1\n", noise_pos);
         }
-        if (getenv("DS4_DFLASH_STATS") &&
+        if (dflash_stats_detail() &&
             (proposer_head_use || proposer_head_compare)) {
             const int proposer_head_nt4_observed = proposer_head_use ?
                 proposer_head_nt4_ran : proposer_head_compare_ran;
@@ -2149,7 +2187,8 @@ static int dflash2_propose_confident(
                     (uint64_t)n_draft * 16u * sizeof(uint32_t))) {
                 dflash2_selector_chain_topk(dw, dm, normed + H, logits_host,
                                             sel_idx, 16u,
-                                            anchor, drafts, n_draft);
+                                            anchor, drafts, n_draft,
+                                            selector_confidence ? position_confidence : NULL);
                 n_out = n_draft;
             } else {
                 ok = 0;
@@ -2169,11 +2208,11 @@ static int dflash2_propose_confident(
             if (ok) n_out = n_draft;
         }
         if (ok && n_out == n_draft &&
-            (position_confidence || min_margin >= 0.0f)) {
+            ((position_confidence && !selector_confidence) || min_margin >= 0.0f)) {
             const float *lrows = (const float *)ds4_gpu_tensor_contents(
                 (ds4_gpu_tensor *)g_dflash_pool.batch_logits);
 #if defined(__APPLE__)
-            float *partition_scratch = position_confidence ?
+            float *partition_scratch = position_confidence && !selector_confidence ?
                 dflash_confidence_partition_scratch() : NULL;
 #else
             float *partition_scratch = NULL;
@@ -2183,9 +2222,9 @@ static int dflash2_propose_confident(
                 if (dflash_logits_summary_scratch(
                         lrows + (size_t)t * DS4_N_VOCAB,
                         DS4_N_VOCAB, NULL, &margins[t],
-                        position_confidence ? &probability : NULL,
+                        position_confidence && !selector_confidence ? &probability : NULL,
                         partition_scratch) &&
-                    position_confidence) {
+                    position_confidence && !selector_confidence) {
                     position_confidence[t] = probability;
                 }
             }
@@ -2210,7 +2249,13 @@ static int dflash2_propose_confident(
         }
         free(logits);
     }
-    if (getenv("DS4_DFLASH_STATS")) {
+    if (profile) {
+        g_dflash_proposer_profile.completed++;
+        g_dflash_proposer_profile.fc_ms += (tp_fc - tp0) * 1000.0;
+        g_dflash_proposer_profile.layers_ms += (tp_layers - tp_fc) * 1000.0;
+        g_dflash_proposer_profile.head_ms += (now_sec() - tp_layers) * 1000.0;
+    }
+    if (dflash_stats_detail()) {
         fprintf(stderr,
                 "ds4: dflash propose fc=%.1fms layers=%.1fms head=%.1fms\n",
                 (tp_fc - tp0) * 1000.0,

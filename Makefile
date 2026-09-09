@@ -838,7 +838,7 @@ tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test dflash-confidence-test test-session-state test-linux-memory \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test dflash-confidence-test dflash-windowed-test dflash-selector-confidence-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_dflash_mode tests/test_dflash2_embed_q8 tests/test_dflash_rollback tests/test_dflash_lifecycle tests/test_dflash_sampling tests/test_glm_superchunk_state tests/test_glm_expert_bank_policy $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -983,6 +983,31 @@ dflash-entry-test: tests/test_dflash_entry
 
 tests/test_dflash_entry: tests/test_dflash_entry.c ds4_dflash_adaptive.h ds4_dflash_history.h ds4_dflash_budget.h
 	$(CC) $(CFLAGS) -o $@ tests/test_dflash_entry.c
+
+.PHONY: dflash-windowed-test
+dflash-windowed-test: tests/test_dflash_windowed
+	./tests/test_dflash_windowed
+
+tests/test_dflash_windowed: tests/test_dflash_windowed.c ds4_dflash_adaptive.h ds4_dflash_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_dflash_windowed.c
+
+.PHONY: dflash-selector-confidence-test
+dflash-selector-confidence-test: tests/test_dflash_selector_confidence
+	./tests/test_dflash_selector_confidence
+
+tests/test_dflash_selector_confidence: tests/test_dflash_selector_confidence.c ds4_dflash_selector.inc ds4_dflash_confidence.h
+	$(CC) $(CFLAGS) -I. -o $@ $< $(DFLASH_CONFIDENCE_LDLIBS)
+
+ifeq ($(UNAME_S),Darwin)
+# GPU: split-KV drafter attention against the single-pass kernel and an
+# independent double-precision CPU softmax. Needs a Metal device, no model.
+.PHONY: dflash-sdpa-test
+dflash-sdpa-test: tests/test_dflash_sdpa
+	./tests/test_dflash_sdpa
+
+tests/test_dflash_sdpa: tests/test_dflash_sdpa.c ds4_gpu.h ds4_metal.o ds4_image.o
+	$(CC) -O2 -g -Wall -Wextra -I. -o $@ tests/test_dflash_sdpa.c ds4_metal.o ds4_image.o $(METAL_LDLIBS)
+endif
 
 ifeq ($(UNAME_S),Darwin)
 # Startup path/hash utility only: no Metal device or model initialization.

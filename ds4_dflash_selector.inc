@@ -141,11 +141,18 @@ static void dflash2_selector_chain_topk(
         uint32_t k,
         int anchor,
         int *drafts,
-        int n) {
+        int n,
+        float *conditional_confidence) {
     const uint32_t R = dw->selector_rank;
     const uint32_t H = dw->n_embd;
     uint32_t K = dw->selector_top_k;
     if (K > k) K = k;
+    if (conditional_confidence) {
+        for (int p = 0; p < n; p++) conditional_confidence[p] = -1.0f;
+        if (!K || K > 32u || anchor < 0 || anchor >= (int)DS4_N_VOCAB) return;
+        for (int p = 0; p < n; p++) for (uint32_t j = 0; j < K; j++)
+            if (cand_idx[(size_t)p * k + j] >= DS4_N_VOCAB) return;
+    }
     const uint16_t *pred_cb =
         (const uint16_t *)tensor_data(dm, dw->selector_predecessor);
     const uint16_t *succ_cb =
@@ -168,6 +175,7 @@ static void dflash2_selector_chain_topk(
         }
         int best = (int)cand[0];
         float best_score = -1e30f;
+        float scores[32];
         for (uint32_t j = 0; j < K; j++) {
             const int c = (int)cand[j];
             if (c < 0 || c >= (int)DS4_N_VOCAB) continue;
@@ -177,12 +185,19 @@ static void dflash2_selector_chain_topk(
                 edge += hp[r] * dflash2_bf16_at(sr, r);
             }
             const float score = logits[c] + edge;
+            if (conditional_confidence) scores[j] = score;
             if (score > best_score) {
                 best_score = score;
                 best = c;
             }
         }
         drafts[p] = best;
+        /* This is the selector's conditional distribution over its candidates,
+         * including the predecessor correction, as in upstream DFlash2. It is
+         * an admission signal, not a calibrated target-acceptance probability.
+         * Target verification remains mandatory for every returned token. */
+        if (conditional_confidence && !dflash_logits_summary(
+                scores, K, NULL, NULL, &conditional_confidence[p])) break;
         prev = best;
     }
     free(hp);

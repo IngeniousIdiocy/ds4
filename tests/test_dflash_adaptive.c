@@ -26,7 +26,7 @@ static void check_nonfinite_inputs(void) {
         float confidence[] = {0.99f, value, 0.99f};
         assert(dflash_adaptive_prefix(confidence, 3, 3, 0, 1) == 1);
         assert(dflash_adaptive_prefix(confidence, 1, 1, value, 1) == 0);
-        ds4_dflash_adaptive_config base = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, true, 0, true};
+        ds4_dflash_adaptive_config base = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, true, 0, true, false};
         for (unsigned field = 0; field < 3; field++) {
             ds4_dflash_adaptive_config config = base;
             if (field == 0) config.p_min = value;
@@ -46,7 +46,7 @@ static void check_nonfinite_inputs(void) {
         memcpy(&value, &word, sizeof(value));
         assert(!dflash_budget_ns(value, true, &ns) && ns == 123);
         assert(!dflash_budget_account_ns(value, 1, &ns) && ns == 123);
-        ds4_dflash_adaptive_config config = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, true, 0, true};
+        ds4_dflash_adaptive_config config = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, true, 0, true, false};
         ds4_dflash_adaptive direct;
         dflash_adaptive_begin(&direct, config);
         direct.serial_reference_ms = 100;
@@ -74,7 +74,7 @@ static void check_nonfinite_inputs(void) {
 
 int main(void) {
     check_nonfinite_inputs();
-    ds4_dflash_adaptive_config c = {1, 7, 3, 0.75f, true, false, 512, 0.01f, 0.03f, true, false, 0, true};
+    ds4_dflash_adaptive_config c = {1, 7, 3, 0.75f, true, false, 512, 0.01f, 0.03f, true, false, 0, true, false};
     ds4_dflash_adaptive a;
     dflash_adaptive_begin(&a, c);
     assert(dflash_adaptive_limit(&a) == 3);

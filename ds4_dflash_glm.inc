@@ -127,6 +127,12 @@ static bool dflash_verify_env_on(const char *name) {
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
+/* Shipped verifier paths default on; only "=0" disables one. */
+static bool dflash_verify_default_on(const char *name) {
+    const char *v = getenv(name);
+    return !(v && !strcmp(v, "0"));
+}
+
 /* Run exactly one target verifier forward with process-global experimental
  * selectors scoped to that forward. Restore both before returning because
  * drafting uses the same BF16 selector. These opt-ins are discriminator
@@ -737,7 +743,8 @@ static int ds4_session_glm_dflash_cycle_impl(
         s->dflash_history_rows = xmalloc((size_t)history_cap * n_taps * H * sizeof(float));
         s->dflash_history.cap = history_cap;
     }
-    if (controlled && dflash_adaptive_entry_wait(&s->dflash_adaptive)) {
+    if (controlled && (s->dflash_adaptive.reasoning ||
+                      dflash_adaptive_entry_wait(&s->dflash_adaptive))) {
         /* Keep the recent prompt tail followed by every real entry row. A
          * delayed first proposal must not silently lose prompt conditioning. */
         if (!s->dflash_warm) {
@@ -751,8 +758,8 @@ static int ds4_session_glm_dflash_cycle_impl(
             }
             s->dflash_warm = 1;
         }
-        trace->operation = "entry-serial";
-        trace->entry = true;
+        trace->operation = s->dflash_adaptive.reasoning ? "reasoning-serial" : "entry-serial";
+        trace->entry = !s->dflash_adaptive.reasoning;
         trace->setup_ms = dflash_clock_elapsed_ms(call_start);
         return ds4_session_glm_dflash_capture_serial(s, first_token, accepted, err, errlen);
     }
@@ -921,6 +928,18 @@ static int ds4_session_glm_dflash_cycle_impl(
                 n_draft = (int)dflash_adaptive_prefix(confidence, (uint32_t)n_draft,
                     limit, s->dflash_adaptive.config.p_min,
                     s->dflash_adaptive.config.n_min);
+                /* Admit on confidence, but verify the efficient eight-row
+                 * target shape (default; DS4_DFLASH_VERIFY_FULL_BLOCK=0 verifies
+                 * only the admitted prefix). The remaining real proposals are
+                 * still target-verified; this neither fabricates padding tokens
+                 * nor bypasses rejection. Context/output limits and developer
+                 * width caps remain binding. */
+                if (n_draft && dflash_verify_default_on("DS4_DFLASH_VERIFY_FULL_BLOCK")) {
+                    n_draft = (int)(trace->proposed < l_clamp - 1u ?
+                        trace->proposed : l_clamp - 1u);
+                    if ((uint32_t)n_draft > s->dflash_adaptive.config.n_max)
+                        n_draft = (int)s->dflash_adaptive.config.n_max;
+                }
             }
         }
     }
@@ -1217,7 +1236,7 @@ static int ds4_session_glm_dflash_cycle_impl(
         ds4_gpu_glm53_kda_stepsnap_complete(kda_bytes) &&
         ds4_gpu_glm53_tail_stepsnap_complete();
     dflash_cycle_disarm();
-    if (verified && !stepsnap_complete && getenv("DS4_DFLASH_STATS")) {
+    if (verified && !stepsnap_complete && dflash_stats_detail()) {
         fprintf(stderr, "ds4: dflash incomplete prefix capture; using replay\n");
     }
     const uint64_t t_verify = dflash_clock_now_ns();
@@ -1251,7 +1270,13 @@ static int ds4_session_glm_dflash_cycle_impl(
     /* NT4 defaults on only for the measured device/model profile. A force
      * broadens that profile, never the kernel shape; the kill dominates both
      * dispatch and diagnostics. Compare/bench retain scalar acceptance. */
-    const bool head_shape = H == 4096u && DS4_N_VOCAB == 154880u && L == 8u &&
+    /* Partial-width verification pads the vocabulary head to the measured
+     * eight-row NT4 shape by default; DS4_DFLASH_HEAD_PADDED=0 keeps the
+     * scalar per-row head for widths below eight. */
+    const bool head_pad = L >= 2u && L < 8u &&
+        dflash_verify_default_on("DS4_DFLASH_HEAD_PADDED");
+    const uint32_t head_rows = head_pad ? 8u : L;
+    const bool head_shape = H == 4096u && DS4_N_VOCAB == 154880u && head_rows == 8u &&
         e->weights.output->type == DS4_TENSOR_Q8_0;
     const bool head_killed = getenv("DS4_DFLASH_DISABLE_HEAD_NT4") != NULL;
     const bool head_compare = head_shape && !head_killed &&
@@ -1292,11 +1317,21 @@ static int ds4_session_glm_dflash_cycle_impl(
                     e->weights.output_norm->abs_offset,
                     DS4_N_EMBD, L, DS4_RMS_EPS) != 0;
         }
+        /* Only the vocabulary head is padded. Extra normalized rows copy a
+         * real finite row and are ignored; target verification, snapshots and
+         * consumed token counts retain the actual L rows. */
+        if (ok && head_pad && (head_use || head_compare)) {
+            for (uint32_t r = L; ok && r < head_rows; r++)
+                ok = ds4_gpu_tensor_copy(g_dflash_pool.batch_norm,
+                    (uint64_t)r * H * sizeof(float), g_dflash_pool.batch_norm,
+                    (uint64_t)(L - 1u) * H * sizeof(float),
+                    (uint64_t)H * sizeof(float)) != 0;
+        }
         if (ok && head_use) {
             head_nt4_ran = ds4_gpu_dflash_head_nt4_tensor(
                 g_dflash_pool.batch_logits, e->model.map, e->model.size,
                 e->weights.output->abs_offset, H, DS4_N_VOCAB,
-                g_dflash_pool.batch_norm, L) != 0;
+                g_dflash_pool.batch_norm, head_rows) != 0;
         }
         if (ok && !head_nt4_ran) {
             for (uint32_t r = 0; ok && r < L; r++) {
@@ -1322,7 +1357,7 @@ static int ds4_session_glm_dflash_cycle_impl(
             head_nt4_ran = ds4_gpu_dflash_head_nt4_tensor(
                 g->dflash_head_compare, e->model.map, e->model.size,
                 e->weights.output->abs_offset, H, DS4_N_VOCAB,
-                g_dflash_pool.batch_norm, L) != 0;
+                g_dflash_pool.batch_norm, head_rows) != 0;
             ok = head_nt4_ran;
         }
         if (!ds4_gpu_end_commands()) ok = false;
@@ -1346,7 +1381,7 @@ static int ds4_session_glm_dflash_cycle_impl(
             return -1;
         }
     }
-    if (getenv("DS4_DFLASH_STATS")) {
+    if (dflash_stats_detail()) {
         fprintf(stderr, "ds4: dflash head pos=%u rows=%u nt4=%d scalar_logits_retained=%d\n",
                 pos, L, head_nt4_ran, !head_use || !head_nt4_ran);
     }
@@ -1498,7 +1533,7 @@ static int ds4_session_glm_dflash_cycle_impl(
     }
     s->dflash_warm = 1;
     trace->tail_ms = dflash_clock_elapsed_ms(t_heads);
-    if (getenv("DS4_DFLASH_STATS")) {
+    if (dflash_stats_detail()) {
         fprintf(stderr,
                 "ds4: dflash cycle drafted=%d accepted=%d rollback=%s "
                 "ctx=%u draft=%.1fms verify=%.1fms heads=%.1fms tail=%.1fms "
@@ -1568,7 +1603,7 @@ static int ds4_session_glm_dflash_cycle_argmax(
     (void)dflash_clock_account_ns(start, account_start, s->dflash_clock_ns, &actual_ns);
     if (a->active) dflash_adaptive_finish(a, actual_ns,
             rc > 0 ? (uint32_t)rc : 0u, trace);
-    if (getenv("DS4_DFLASH_STATS") && a->active) {
+    if (dflash_stats_detail() && a->active) {
         fprintf(stderr, "ds4: dflash adaptive pos=%u operation=%s chosen=%u "
                 "proposed=%u verified=%u accepted=%u returned=%d next=%u "
                 "p_min=%.6f confidence_first=%.6f confidence_min=%.6f "

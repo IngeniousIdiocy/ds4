@@ -140,6 +140,7 @@ enum {
 @class DS4MetalQ4ExpertTable;
 
 static id<MTLDevice> g_device;
+static id<MTLBuffer> g_dflash_sdpa_scratch;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
@@ -12663,6 +12664,7 @@ void ds4_gpu_cleanup(void) {
             ds4_gpu_print_memory_report("at cleanup");
         }
         g_selected_readback_event = nil;
+        g_dflash_sdpa_scratch = nil;
         g_selected_readback_event_value = 0;
         [g_transient_buffers removeAllObjects];
         ds4_gpu_stream_expert_pread_pool_shutdown();
@@ -57206,10 +57208,35 @@ int ds4_gpu_dflash2_sdpa(
     if (L == 0 || n_ctx == 0 || n_head == 0 || n_kv == 0 ||
         head_dim == 0 || head_dim > 128u) return 0;
     if ((n_head % n_kv) != 0) return 0;
+    if (!glm53_gpu_tensor_has(q, (uint64_t)L * n_head * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)L * n_head * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(k_ctx, (uint64_t)n_ctx * n_kv * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(v_ctx, (uint64_t)n_ctx * n_kv * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(k_prop, (uint64_t)L * n_kv * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(v_prop, (uint64_t)L * n_kv * head_dim, sizeof(float))) return 0;
     /* simdgroup kernel needs head_dim to be a multiple of 32 (<=128);
      * fall back to the scalar kernel otherwise or on request */
     const int use_sg = (head_dim % 32u) == 0u &&
                        getenv("DS4_DFLASH_SDPA_SCALAR") == NULL;
+    /* Split-KV (Flash-Decoding) drafter attention is the default for the
+     * simdgroup shape: 16 independent KV partitions per query, merged by a
+     * stable softmax reduction. DS4_DFLASH_SDPA_SPLIT=0 keeps the single-pass
+     * simdgroup kernel; any allocation or pipeline failure falls back to it. */
+    const char *split_env = getenv("DS4_DFLASH_SDPA_SPLIT");
+    int use_split = use_sg && !(split_env && strcmp(split_env, "0") == 0);
+    id<MTLComputePipelineState> split_pipe = nil, merge_pipe = nil;
+    if (use_split) {
+        const uint64_t scratch_bytes = (uint64_t)L * n_head * 16u * (head_dim + 2u) * sizeof(float);
+        split_pipe = ds4_gpu_get_pipeline("kernel_dflash2_sdpa_split");
+        merge_pipe = ds4_gpu_get_pipeline("kernel_dflash2_sdpa_merge");
+        if (split_pipe && merge_pipe && (!g_dflash_sdpa_scratch || g_dflash_sdpa_scratch.length < scratch_bytes)) {
+            /* Also retain the old allocation for unretained command buffers. */
+            if (g_dflash_sdpa_scratch) [g_transient_buffers addObject:g_dflash_sdpa_scratch];
+            g_dflash_sdpa_scratch = [g_device newBufferWithLength:(NSUInteger)scratch_bytes
+                                             options:MTLResourceStorageModePrivate];
+        }
+        use_split = split_pipe && merge_pipe && g_dflash_sdpa_scratch;
+    }
     id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline(
             use_sg ? "kernel_dflash2_sdpa_sg" : "kernel_dflash2_sdpa");
     if (!pipe) return 0;
@@ -57220,19 +57247,36 @@ int ds4_gpu_dflash2_sdpa(
         uint32_t n_tok, n_ctx, n_head, n_kv, head_dim, causal, window;
     } args = { L, n_ctx, n_head, n_kv, head_dim, causal ? 1u : 0u, window };
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:pipe];
+    if (!enc) return 0;
+    const BOOL needs_barrier = g_batch_cb && cb == g_batch_cb && g_batch_encoder_concurrent;
+    if (use_split && needs_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:use_split ? split_pipe : pipe];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
     [enc setBuffer:ds4_gpu_tensor_buffer(k_ctx) offset:ds4_gpu_tensor_offset(k_ctx) atIndex:2];
     [enc setBuffer:ds4_gpu_tensor_buffer(v_ctx) offset:ds4_gpu_tensor_offset(v_ctx) atIndex:3];
     [enc setBuffer:ds4_gpu_tensor_buffer(k_prop) offset:ds4_gpu_tensor_offset(k_prop) atIndex:4];
     [enc setBuffer:ds4_gpu_tensor_buffer(v_prop) offset:ds4_gpu_tensor_offset(v_prop) atIndex:5];
-    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:6];
-    if (use_sg) {
+    if (use_split) {
+        const NSUInteger sgs = (NSUInteger)L * n_head;
+        [enc setBuffer:g_dflash_sdpa_scratch offset:0 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((sgs * 16u + 3u) / 4u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        if (needs_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:merge_pipe];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:g_dflash_sdpa_scratch offset:0 atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((sgs + 3u) / 4u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        if (needs_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    } else if (use_sg) {
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:6];
         const NSUInteger sgs = (NSUInteger)L * n_head;
         [enc dispatchThreadgroups:MTLSizeMake((sgs + 3u) / 4u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
     } else {
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:6];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)L * n_head, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }

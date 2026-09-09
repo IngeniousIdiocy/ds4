@@ -82,3 +82,6 @@ tests/ds4_server_sc_failure
 /tests/test_dflash_entry
 
 /tests/test_metal_source
+tests/test_dflash_windowed
+tests/test_dflash_selector_confidence
+tests/test_dflash_sdpa

@@ -61253,6 +61253,10 @@ static ds4_dflash_adaptive_config dflash_adaptive_config_read(bool full_block, b
     }
     *valid = dflash_adaptive_entry_configure(&c,
         getenv("DS4_DFLASH_MIN_SERIAL_TOKENS")) && *valid;
+    if (c.windowed) {
+        c.adaptive = c.loss_meter = false;
+        c.early_recovery = c.savings_retry = false;
+    }
     *valid = dflash_adaptive_config_valid(&c) && *valid;
     return c;
 }
@@ -61314,7 +61318,8 @@ void ds4_session_decode_begin(ds4_session *s) {
     if (getenv("DS4_DFLASH_STATS"))
         fprintf(stderr, "ds4: dflash admission policy=%s adaptive=%d "
                 "n_min=%u n_max=%u n_start=%u p_min=%.6f valid=%d retry=%d retry_max=%u retry_tax=%.6f loss_budget=%.6f early_recovery=%d savings_retry=%d min_serial_tokens=%u profile=%s loss_meter=%d\n",
-                s->dflash_full_block ? "full-block" : "confidence-prefix",
+                s->dflash_full_block ? "full-block" :
+                    config.windowed ? "windowed-confidence" : "confidence-prefix",
                 config.adaptive, config.n_min, config.n_max, config.n_start,
                 config.p_min, config_valid, config.retry, config.retry_max, config.retry_tax,
                 config.loss_budget, config.early_recovery, config.savings_retry, config.min_serial_tokens,
@@ -61324,6 +61329,21 @@ void ds4_session_decode_begin(ds4_session *s) {
     dflash_adaptive_charge(&s->dflash_adaptive, ns);
 #else
     (void)s;
+#endif
+}
+
+/* Conservative mode decodes reasoning (<think>) spans serially by default:
+ * drafts are rarely accepted there and every declined proposal is charged.
+ * DS4_DFLASH_REASONING_SERIAL=0 lets the controller propose inside reasoning. */
+void ds4_session_decode_reasoning(ds4_session *s, bool inside_reasoning) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!s || !s->engine || !s->engine->dflash_ready ||
+        s->engine->dflash_mode != DS4_DFLASH_MODE_CONSERVATIVE) return;
+    const char *setting = getenv("DS4_DFLASH_REASONING_SERIAL");
+    dflash_adaptive_reasoning(&s->dflash_adaptive,
+        inside_reasoning && !(setting && !strcmp(setting, "0")));
+#else
+    (void)s; (void)inside_reasoning;
 #endif
 }
 
@@ -61343,7 +61363,7 @@ void ds4_session_decode_ack(ds4_session *s, int consumed, bool done) {
     uint64_t ns = 0;
     (void)dflash_clock_account_ns(account_start, dflash_clock_now_ns(), s->dflash_clock_ns, &ns);
     dflash_adaptive_charge(a, ns);
-    if (getenv("DS4_DFLASH_STATS")) {
+    if (getenv("DS4_DFLASH_STATS") && (done || dflash_stats_detail())) {
         const uint64_t report_start = dflash_clock_now_ns();
         const char *floor_source;
         const double loss_floor = dflash_adaptive_loss_floor(a, &floor_source);
@@ -61372,6 +61392,7 @@ void ds4_session_decode_ack(ds4_session *s, int consumed, bool done) {
                 a->reference_serial_ms, a->reference_verify_ms, a->bootstrap_repriced_ms,
                 (unsigned long long)a->bootstrap_rows, a->bootstrap_step_ms,
                 (unsigned long long)a->serial_consumed, (unsigned long long)a->entry_serial_tokens);
+        if (done) dflash2_proposer_profile_print();
         ns = 0;
         (void)dflash_clock_account_ns(report_start, dflash_clock_now_ns(), s->dflash_clock_ns, &ns);
         dflash_adaptive_charge(a, ns);

@@ -14,7 +14,7 @@ static void step(ds4_dflash_adaptive *a, double ms, ds4_dflash_adaptive_trace t,
 }
 
 int main(void) {
-    ds4_dflash_adaptive_config c = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, false, 0, true};
+    ds4_dflash_adaptive_config c = {1, 7, 3, .75f, false, true, 512, .01f, .03f, true, false, 0, true, false};
     ds4_dflash_adaptive a;
     ds4_dflash_adaptive_trace serial = {.serial_ms = 25};
     ds4_dflash_adaptive_trace zero = {.chosen = 7, .proposed = 7,

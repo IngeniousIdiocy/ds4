@@ -455,7 +455,14 @@ static void print_glm53(FILE *fp, const help_colors *c) {
     title(fp, c, "Kill Switches");
     para(fp, c, "Each turns one default-on change off, for A/B measurement and bisection. Unless the meaning says otherwise a switch is read as set to any non-empty value.");
     opt(fp, c, "DS4_DFLASH_NO_ADAPTIVE", "Legacy fallback when --dflash-mode is omitted: uncapped DFlash experiment with prefill seeding; no 2% slowdown claim.");
-    opt(fp, c, "DS4_DFLASH_P_MIN", "Minimum normalized draft probability for the conservative verified prefix (default 0.75). The first lower probability ends the prefix.");
+    opt(fp, c, "DS4_DFLASH_P_MIN", "Minimum draft confidence for the conservative admitted prefix (default 0.75). The first lower confidence ends the prefix; a prefix shorter than DS4_DFLASH_MIN_DRAFT (default 4) is declined.");
+    opt(fp, c, "DS4_DFLASH_WINDOWED", "=0 replaces the conservative windowed cost-feedback controller (three attempts judged together, 16/32/64/128-token backoff) with the earlier per-attempt savings ledger.");
+    opt(fp, c, "DS4_DFLASH_REASONING_SERIAL", "=0 lets conservative mode propose inside <think> spans; by default reasoning tokens decode serially.");
+    opt(fp, c, "DS4_DFLASH_VERIFY_FULL_BLOCK", "=0 verifies only the confidence-admitted prefix instead of the full eight-row target block.");
+    opt(fp, c, "DS4_DFLASH_SELECTOR_CONFIDENCE", "=0 derives draft confidence from the full-vocabulary logit row instead of the selector's conditional top-K distribution.");
+    opt(fp, c, "DS4_DFLASH_HEAD_PADDED", "=0 keeps the scalar per-row vocabulary head for verification widths below eight instead of padding to the NT4 eight-row shape.");
+    opt(fp, c, "DS4_DFLASH_DRAFT_UNPADDED", "=0 routes block-sized drafter matmuls (<= 8 rows) through the padded 32-row scratch path.");
+    opt(fp, c, "DS4_DFLASH_SDPA_SPLIT", "=0 uses the single-pass simdgroup drafter attention instead of the split-KV (16-partition) kernels.");
     opt(fp, c, "DS4_DFLASH_ADAPTIVE", "=1 enables experimental accepted-count adaptation of the verifier prefix cap; default 0 retains the trained full-block cap.");
     opt(fp, c, "DS4_DFLASH_NO_SELECTOR", "Disables the DFlash2 candidate selector (coherent-chain tracing).");
     opt(fp, c, "DS4_DFLASH_SDPA_SCALAR", "Forces the scalar SDPA drafter kernel instead of the simdgroup one.");

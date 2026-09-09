@@ -167,6 +167,80 @@ kernel void kernel_dflash2_sdpa_sg(
     }
 }
 
+/* Flash-Decoding: partition the KV sequence, then merge the independent
+ * online-softmax states. Masks use the same absolute key bounds as SDPA. */
+kernel void kernel_dflash2_sdpa_split(
+        constant ds4_dflash2_sdpa_args & args [[buffer(0)]],
+        device const float *q [[buffer(1)]],
+        device const float *k_ctx [[buffer(2)]],
+        device const float *v_ctx [[buffer(3)]],
+        device const float *k_prop [[buffer(4)]],
+        device const float *v_prop [[buffer(5)]],
+        device float *scratch [[buffer(6)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg_in_group [[simdgroup_index_in_threadgroup]]) {
+    const uint splits = 16u;
+    const uint job = group.x * 4u + sg_in_group;
+    const uint query = job / splits, split = job % splits;
+    if (query >= args.n_tok * args.n_head) return;
+    const uint t = query / args.n_head, h = query % args.n_head;
+    const uint kv_h = h / (args.n_head / args.n_kv);
+    const uint max_key = args.n_ctx + (args.causal ? t + 1u : args.n_tok);
+    const uint min_key = args.window && max_key > args.window ? max_key - args.window : 0u;
+    const uint chunk = (max_key - min_key + splits - 1u) / splits;
+    const uint begin = min(max_key, min_key + split * chunk);
+    const uint end = min(max_key, begin + chunk);
+    const uint dpl = args.head_dim / 32u;
+    float qv[4], acc[4];
+    for (uint i = 0; i < dpl; ++i) {
+        qv[i] = q[(ulong)query * args.head_dim + i * 32u + lane];
+        acc[i] = 0.0f;
+    }
+    float m = -1e30f, l = 0.0f;
+    const float scale = 1.0f / sqrt((float)args.head_dim);
+    for (uint s = begin; s < end; ++s) {
+        const ulong row = ((ulong)(s < args.n_ctx ? s : s - args.n_ctx) * args.n_kv + kv_h) * args.head_dim;
+        device const float *kh = (s < args.n_ctx ? k_ctx : k_prop) + row;
+        device const float *vh = (s < args.n_ctx ? v_ctx : v_prop) + row;
+        float part = 0.0f;
+        for (uint i = 0; i < dpl; ++i) part += qv[i] * kh[i * 32u + lane];
+        const float score = simd_sum(part) * scale;
+        const float next_m = max(m, score);
+        const float alpha = exp(m - next_m), beta = exp(score - next_m);
+        l = l * alpha + beta;
+        for (uint i = 0; i < dpl; ++i) acc[i] = acc[i] * alpha + beta * vh[i * 32u + lane];
+        m = next_m;
+    }
+    device float *state = scratch + (ulong)job * (args.head_dim + 2u);
+    for (uint i = 0; i < dpl; ++i) state[i * 32u + lane] = acc[i];
+    if (lane == 0) { state[args.head_dim] = m; state[args.head_dim + 1u] = l; }
+}
+
+kernel void kernel_dflash2_sdpa_merge(
+        constant ds4_dflash2_sdpa_args & args [[buffer(0)]],
+        device const float *scratch [[buffer(1)]],
+        device float *out [[buffer(2)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg_in_group [[simdgroup_index_in_threadgroup]]) {
+    const uint query = group.x * 4u + sg_in_group;
+    if (query >= args.n_tok * args.n_head) return;
+    const uint stride = args.head_dim + 2u;
+    device const float *states = scratch + (ulong)query * 16u * stride;
+    float m = -1e30f;
+    for (uint s = 0; s < 16u; ++s) m = max(m, states[s * stride + args.head_dim]);
+    float l = 0.0f, acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint s = 0; s < 16u; ++s) {
+        device const float *state = states + s * stride;
+        const float weight = exp(state[args.head_dim] - m);
+        l += state[args.head_dim + 1u] * weight;
+        for (uint i = 0; i < args.head_dim / 32u; ++i) acc[i] += state[i * 32u + lane] * weight;
+    }
+    const float inv_l = 1.0f / (l > 1e-8f ? l : 1.0f);
+    for (uint i = 0; i < args.head_dim / 32u; ++i) out[(ulong)query * args.head_dim + i * 32u + lane] = acc[i] * inv_l;
+}
+
 struct ds4_qwen_rope_rows_args {
     uint32_t n_head;
     uint32_t head_dim;

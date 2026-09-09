@@ -10,7 +10,7 @@ static void serial(ds4_dflash_adaptive *a, unsigned consumed, bool done) {
     dflash_adaptive_ack(a, consumed, done);
 }
 int main(void) {
-    ds4_dflash_adaptive_config c = {1,7,3,.75f,false,true,512,.01f,.03f,true,true,3, true};
+    ds4_dflash_adaptive_config c = {1,7,3,.75f,false,true,512,.01f,.03f,true,true,3, true, false};
     ds4_dflash_adaptive a;
     assert(dflash_adaptive_entry_configure(&c, "3") && c.min_serial_tokens==3);
     const char *bad[] = {"", "-1", "+3", "65", "3.0", "nan", "99999999999999999"};
@@ -109,7 +109,11 @@ int main(void) {
     dflash_adaptive_begin(&a,c);
     assert(a.active && !a.consumed && !a.drafted && dflash_adaptive_limit(&a)==7);
     c=dflash_adaptive_profile_config(false);
-    assert(c.min_serial_tokens==0 && c.loss_meter && c.savings_retry);
+    assert(c.windowed && c.min_serial_tokens==16 && !c.loss_meter && !c.savings_retry);
     assert(c.retry_tax>.009f && c.retry_tax<.011f);
+    setenv("DS4_DFLASH_WINDOWED","0",1);
+    c=dflash_adaptive_profile_config(false);
+    assert(!c.windowed && c.min_serial_tokens==0 && c.loss_meter && c.savings_retry);
+    unsetenv("DS4_DFLASH_WINDOWED");
     puts("dflash consumed serial entry/public profile tests passed");
 }
