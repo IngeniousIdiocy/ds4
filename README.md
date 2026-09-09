@@ -278,6 +278,25 @@ over workloads or run-to-run variance. See the
 remaining open items. `./ds4 --help glm53` lists the supported controls and kill
 switches.
 
+**Accuracy of the changes.** Every kernel change is classified in
+[bench/FIDELITY.md](bench/FIDELITY.md): Tier 1 changes keep the same arithmetic in
+the same order and are proven bit-identical in a randomized harness (at least 50,000
+poisoned draws, every output word compared, 1,000-run determinism); Tier 2 changes
+alter a summation order, ship behind their own kill switch, and are registered so
+`DS4_GLM_EXACT=1` turns all of them off at once. The
+[exact-mode diagnostic](docs/GLM53_M3ULTRA.md#exact-mode-diagnostic) and
+[bench/EXACT-MODE-PLAN.md](bench/EXACT-MODE-PLAN.md) record the measured
+differences against upstream rather than assuming identity: on three long-context
+cases exact-mode total NLL differed from upstream by 0.000238, 0.004171 and 0.000048.
+The quality receipts are in the evidence index: the focused task screen scored
+[77/77 in both arms](bench/receipts/glm53-m3ultra/taskcheck-quality.json) with 22 of
+23 outputs byte-identical to upstream, while the
+[token-weighted NLL screen](bench/receipts/glm53-m3ultra/e6-quality.json) landed
+0.0019 above upstream against a provisional 0.0005 criterion, which is disclosed as
+unmet, not waived. DFlash2's causal rollback is covered by
+[tests/DFLASH-PREFIX.md](tests/DFLASH-PREFIX.md), and on every fixture in this
+release the DFlash outputs were byte-identical to serial.
+
 ## Logo
 
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
