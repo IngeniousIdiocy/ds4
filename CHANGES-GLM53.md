@@ -178,24 +178,45 @@ machinery retained for testing, and two greedy public profiles. The upstream dra
 for a fixed anchor-plus-seven block. ds4 preserves that geometry, computes normalized
 full-vocabulary confidence for conservative admission, and commits only rows accepted by
 the target verifier. Bare startup is serial and does
-not load draft weights; `--dflash FILE` defaults to conservative confidence-prefix
+not load draft weights; `--dflash FILE` defaults to conservative windowed-confidence
 admission. Explicit modes win over the legacy environment switches regardless of
 argument order.
 
-**Public profiles.** Conservative uses measured width economics and retry backoff with
-a 1% retry-tax setting, a soft request loss meter, and retry funding from savings that
-already-consumed work established. Speculative is the full-block profile: whenever causal
+**Public profiles.** Conservative admits a proposal when the selector's conditional
+confidence holds for at least four positions, verifies the full eight-row block, and runs
+a windowed cost-feedback controller: three complete attempts are judged together against
+the request's measured serial step, a winning window keeps proposing, and a losing window
+backs off 16, 32, 64 and at most 128 consumed serial tokens. Requests begin with 16 serial
+tokens; reasoning spans decode serially (the server's `<think>` parser feeds
+`ds4_session_decode_reasoning`). The earlier per-attempt savings ledger (1% retry tax,
+3% soft loss meter, savings-funded retry, early recovery) is retained behind
+`DS4_DFLASH_WINDOWED=0`. Speculative is the full-block profile: whenever causal
 conditioning and context/response room permit, it drafts and offers all seven positions
-without confidence admission, width economics, retry, backoff, or a loss meter. The target
+without confidence admission, retry, backoff, or a loss meter. The target
 still verifies every offered row; history ownership, exact rollback and the session fault
-latch still apply. Conservative permits an immediate first proposal by default
-(`DS4_DFLASH_MIN_SERIAL_TOKENS=0`); the three-token startup policy remains diagnostic only.
-Its 1% retry setting and 3% soft meter are scheduling inputs, not universal request-downside
-caps. `DS4_DFLASH_BLIND_RESEARCH` is obsolete: speculative now names the full-block policy
-directly, and the withdrawn 5% aggressive confidence profile is no longer public.
-Full-block speculative can be much slower on bad input. Both verified profiles may
+latch still apply. `DS4_DFLASH_BLIND_RESEARCH` is obsolete: speculative now names the
+full-block policy directly, and the withdrawn 5% aggressive confidence profile is no longer
+public. Full-block speculative can be much slower on bad input. Both verified profiles may
 produce a numerically different valid continuation; serial remains the ordinary
 serial-arithmetic path.
+
+**Why the controller changed (2026-09-07/08).** The per-attempt ledger was rejected on
+the real coding-agent workload: on actual code writes its first verification measured one
+draft token, accepted zero, and the extrapolated cost of a seven-token draft was then
+above the serial comparison, so the request stayed effectively serial. The windowed
+controller, the four-position minimum prefix at raw confidence 0.75, full-block
+verification, selector conditional confidence, serial reasoning, the full 2047-row
+drafter history and an operator-quantized Q8_0 drafter were selected together on that
+agent (32 randomized real requests: 39.73 vs 38.09 output tokens/s, +4.3%, every declined
+and failed attempt included; leave-one-request-out stays between +3.2% and +5.6%). Drafter
+kernels added for it: split-KV (Flash-Decoding style) draft attention
+`kernel_dflash2_sdpa_split`/`_merge` with a stable online-softmax merge and pre-dispatch
+fallback, unpadded eight-row draft GEMMs, and vocabulary-head padding for partial-width
+verification. Each path is default-on with an `=0` kill; `docs/DFLASH_GLM53.md` sections
+7 and 9 record the measurement, its limits, and the Q8_0 recipe
+(`gguf-tools/dflash2_quantize_prep.py` + `llama-quantize`). `DS4_DFLASH_STATS=summary`
+prints request totals without per-token output. Tests: `tests/test_dflash_windowed.c`,
+`tests/test_dflash_selector_confidence.c`, `tests/test_dflash_sdpa.c` (GPU).
 
 **Rollback.** Verification advances both KDA conv/recurrent state and the DSA indexer
 tail ring for every offered row. The verifier now captures both state families at each
@@ -283,6 +304,23 @@ timing evidence before any default change.
   error shape instead of a 200 with an empty completion (`json_max_tokens()`).
 - The merge adopted upstream's newer multimodal session handling (a validity predicate
   instead of the fork's unconditional invalidation); see `docs/GLM53_M3ULTRA.md`.
+- **Anthropic content parts are rendered in order** (2026-09-08). A user message can
+  interleave `text` blocks with `tool_result` blocks; agent clients do this for
+  compaction summaries and follow-up instructions. The GLM renderer treated any message
+  carrying a tool result as a sortable tool-only observation block, dropping the text
+  order and rendering literal `<tool_result>` text as a tool response. The JSON parser
+  now records each part's byte span and type, a mixed message is never sorted, and one
+  routine (`append_glm_observation_messages`) renders both full prompts and live
+  continuations. `test_glm_mixed_tool_result_instructions` covers it.
+- **GLM tool-call maps persist in disk checkpoints** (2026-09-08). The checkpoint
+  tool-map writer located tool blocks by the enclosing `tool_calls` tag, which GLM's
+  syntax does not emit, so every GLM tool-call ID was silently dropped when a KV
+  checkpoint was written and a restart or slot displacement lost the cached prefix. The
+  writer now matches the exact bounds the GLM generated-message parser remembers
+  (consecutive `tool_call` elements as one block, including two leading newlines and
+  trailing whitespace), so the replayed prompt is byte-identical. In the live agent this
+  turned a post-compaction re-prefill of a 306k-token transcript into a 1.4 s restore.
+  `test_glm_kv_tool_map_roundtrip_exact_blocks` covers eight variants.
 - **Shutdown cancellation across long prefill.** Commit `be75a99` makes the
   non-streaming long-prefill callback observe the process-wide stop state. Shutdown can
   therefore cancel work before generation begins, while teardown still joins worker

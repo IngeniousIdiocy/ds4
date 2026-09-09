@@ -151,7 +151,7 @@ are deliberately separate.
 | Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | final `538c37c`: 16/16 affected runtime checks, pipelined routed cancellation, connected-client SIGTERM and substantial recovery comparator v3 passed |
 | Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge | **re-validation pending** on a vision prompt |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
-| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to a full-vocabulary confidence-prefix policy over the trained seven-position block; `--dflash-mode speculative` selects the full-block policy. Positive temperature decodes serially. | The `538c37c` runtime suite and `b723dfa` SQL result are historical receipts for the earlier policy. The current confidence-prefix, prompt-seed, prefix-snapshot and fault-latch candidate is under validation; no release performance result is claimed yet. |
+| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to the windowed-confidence policy over the trained seven-position block (four-position minimum prefix, full-block verification, three-attempt cost windows, serial reasoning); `--dflash-mode speculative` selects the full-block policy. Positive temperature decodes serially. | Selected on the real coding agent (+4.3% output throughput over serial on 32 randomized requests with the Q8_0 drafter; `docs/DFLASH_GLM53.md` section 7). Fixture and lifecycle receipts for this branch's final build are in `bench/RELEASE-EVIDENCE.md`. Workload-specific, not a general speedup claim. |
 | CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
 
 **How DFlash2's rollback was completed.** Verification snapshots both the KDA
@@ -168,12 +168,13 @@ promise byte equality between all batched and serial arithmetic. See
 `tests/DFLASH-PREFIX.md` for the test scope and reproduction commands. The historical
 `538c37c` artifact passed its focused 16/16 startup and server runtime suite,
 pipelined routed cancellation, connected-client SIGTERM, Metal-view teardown, and
-the 128-token failure/re-prime comparator v3 checks. Those runs predate and do not
-validate the current confidence-prefix and retry candidate.
+the 128-token failure/re-prime comparator v3 checks. The lifecycle, ignore-EOS and
+drafter-fault drivers were re-run on the final build of this branch with the Q8_0 drafter
+(`bench/RELEASE-EVIDENCE.md`).
 
 Both DFlash modes seed the drafter from prompt tap features through ordinary or
-expert-bank prefill. The default retained tail is 256 rows; this checkpoint
-accepts an explicit `DS4_DFLASH_CTX_CAP` from 1 through 2047. A recoverable
+expert-bank prefill. The default retained tail is the drafter's full 2047-row window;
+this checkpoint accepts an explicit `DS4_DFLASH_CTX_CAP` from 1 through 2047. A recoverable
 cached-drafter failure is drained before serial fallback, invalidates partial
 draft cache state, and latches DFlash off for that allocated session. If the
 drain cannot be established, the request fails rather than resuming on uncertain
@@ -185,11 +186,12 @@ Stated once, so a reader does not have to infer them from the table:
 
 - **DFlash2 speculative decoding is optional and greedy-only.** A bare startup is
   serial and allocates no drafter state. Supplying `--dflash FILE` defaults to the
-  conservative confidence-prefix policy; speculative selects the full-block policy and
-  can regress. Both retain the target model as verifier. The current candidate's retry,
-  throughput and unfavorable-input behavior remain under validation. Personal-use
-  draft recreation instructions are in `docs/DFLASH_GLM53.md`; no draft weights ship.
-  Current experimental controls and accounting are in
+  conservative windowed-confidence policy; speculative selects the full-block policy and
+  can regress. Both retain the target model as verifier. The default controller was
+  selected on the real coding agent and is a modest, workload-specific gain; unfavorable
+  prose can still lose a little. Personal-use draft recreation instructions, the Q8_0
+  drafter recipe and the measurement are in `docs/DFLASH_GLM53.md`; no draft weights
+  ship. The earlier ledger controller's accounting is in
   [`tests/DFLASH-CONFIDENCE.md`](../tests/DFLASH-CONFIDENCE.md).
 - **Unsupported or untested configurations.** The CUDA and ROCm paths carry small
   GLM-5.3 additions (`ds4_cuda.cu`, `rocm/ds4_rocm_glm.cuh`) that are compile-only as far
@@ -269,10 +271,13 @@ opt-in, so they matter only when a drafter is loaded.
 |---|---|---|---|
 | `DS4_ANTHROPIC_DEFAULT_EFFORT` | supported control | Default reasoning effort for Anthropic-protocol requests that carry none (e.g. Claude Code); explicit request fields still win. | `ds4_server.c:3859` |
 | `DS4_DFLASH_ADAPTIVE` | experimental control | `=1` adjusts the conservative verifier-prefix cap from consumed-prefix evidence; default `0`. The drafter still computes its trained seven-position block. | `ds4.c`, DFlash confidence configuration |
-| `DS4_DFLASH_CTX_CAP` | supported control | Retains this many recent prompt/context rows for the drafter; default 256, valid range 1..2047 for this checkpoint. | `ds4_dflash_seed.inc` |
+| `DS4_DFLASH_CTX_CAP` | supported control | Retains this many recent prompt/context rows for the drafter; default 2047 (the full window), valid range 1..2047 for this checkpoint. | `ds4_dflash_seed.inc` |
 | `DS4_DFLASH_DISABLE` | supported control | With no explicit `--dflash-mode`, selects serial startup and avoids loading the drafter. An explicit mode wins. | `ds4.c`, DFlash mode resolver |
-| `DS4_DFLASH_MIN_DRAFT`, `DS4_DFLASH_MAX_DRAFT` | experimental controls | Bound the conservative verifier prefix to 1..7 positions; defaults 1 and 7. They do not shorten the drafter's trained block. | `ds4.c`, DFlash confidence configuration |
-| `DS4_DFLASH_P_MIN` | experimental control | Full-vocabulary normalized top-token probability threshold for each conservative draft position; default 0.75. The first low or invalid value ends the prefix. | `ds4.c`, DFlash confidence configuration |
+| `DS4_DFLASH_MIN_DRAFT`, `DS4_DFLASH_MAX_DRAFT` | supported controls | Bound the conservative admitted prefix to 1..7 positions; defaults 4 and 7 (1 and 7 under `DS4_DFLASH_WINDOWED=0`). They do not shorten the drafter's trained block. | `ds4.c`, DFlash confidence configuration |
+| `DS4_DFLASH_P_MIN` | supported control | Confidence threshold for each conservative draft position (selector conditional confidence by default); default 0.75. The first low or invalid value ends the prefix. | `ds4.c`, DFlash confidence configuration |
+| `DS4_DFLASH_WINDOWED` | kill switch | `=0` replaces the windowed cost-feedback controller with the earlier per-attempt savings ledger. | `ds4_dflash_adaptive.h` |
+| `DS4_DFLASH_REASONING_SERIAL`, `DS4_DFLASH_VERIFY_FULL_BLOCK`, `DS4_DFLASH_SELECTOR_CONFIDENCE` | kill switches | `=0` respectively lets conservative mode propose inside reasoning, verifies only the admitted prefix, or derives confidence from the full-vocabulary logit row. | `ds4.c`, `ds4_dflash_glm.inc`, `ds4_dflash2.inc` |
+| `DS4_DFLASH_SDPA_SPLIT`, `DS4_DFLASH_DRAFT_UNPADDED`, `DS4_DFLASH_HEAD_PADDED` | kill switches | `=0` respectively selects the single-pass simdgroup draft attention, the padded 32-row draft GEMM scratch path, or the scalar per-row vocabulary head for partial-width verification. | `ds4_metal.m`, `ds4_dflash2.inc`, `ds4_dflash_glm.inc` |
 | `DS4_DFLASH_START_DRAFT` | experimental control | Initial verifier-prefix cap when `DS4_DFLASH_ADAPTIVE=1`; default 3 and bounded by min/max. | `ds4.c`, DFlash confidence configuration |
 | `DS4_GLM53_MEMORY_CEILING_GB` | supported control | Clamps the GLM-5.3 memory-guard budget to N GB (used to keep a 512 GB machine's other workloads safe). | `ds4.c:42037` |
 | `DS4_GLM53_PREFILL_CHUNK` | supported control | Upper bound on prefill chunk tokens (default 8192; 4096 and 2048 restore earlier shipped chunks). | `ds4.c:37902` |
@@ -300,7 +305,7 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_SERVER_CHECKPOINT_ON_LENGTH` | supported control | =0 stops recording the thinking checkpoint for turns truncated by max_tokens (default: recorded, so the next turn continues from live KV). | `ds4_server.c:11713` |
 | `DS4_SERVER_CHECKPOINT_WITH_TOOLS` | supported control | =0 stops recording the thinking checkpoint for tool-context turns (default: recorded). | `ds4_server.c:11710` |
 | `DS4_TRACE_MAX_MB` | supported control | Caps the live --trace segment at N MB; the previous segment is kept at <path>.1. | `ds4_server.c:11060` |
-| `DS4_DFLASH_NO_ADAPTIVE` | legacy mode switch | With no explicit `--dflash-mode`, selects the full-block speculative startup policy. It is not the confidence-prefix length control; use `DS4_DFLASH_ADAPTIVE=0` for that. | DFlash mode resolver |
+| `DS4_DFLASH_NO_ADAPTIVE` | legacy mode switch | With no explicit `--dflash-mode`, selects the full-block speculative startup policy. It is not the admitted-prefix length control; use `DS4_DFLASH_ADAPTIVE=0` for that. | DFlash mode resolver |
 | `DS4_DFLASH_NO_WIDE_ROLLBACK` | kill switch | Refuses the speculative cycle on any graph whose speculative state includes the DSA indexer tail (every real GLM-5.3 graph), before any target state is mutated, and decodes serially. Restores this branch's previous behaviour. | `ds4_dflash_glm.inc:88` |
 | `DS4_DFLASH_FORCE_REPLAY` | developer instrumentation (bench-only) | Takes the restore-and-replay rollback even where the per-step snapshot is complete; the correctness oracle for A/B. | `ds4_dflash_glm.inc:89` |
 | `DS4_DFLASH_CONFIDENCE_SCALAR` | developer instrumentation (bench-only) | Forces the scalar full-vocabulary confidence partition instead of the Apple Accelerate path for paired validation. | `ds4_dflash2.inc` |
@@ -593,9 +598,10 @@ prompt identities are recorded in each receipt.
   completion with `finish_reason: length`. Lifecycle test T14 checks it; T7b's
   observational miss in the earlier receipts is this.
 - **DFlash2 is optional.** Bare startup is serial. With local draft weights,
-  conservative confidence-prefix scheduling is the default; full-block speculative
-  mode is explicit and can regress. The current policy is under validation and has no
-  release overhead or speed guarantee. Positive-temperature requests use the serial
+  conservative windowed-confidence scheduling is the default; full-block speculative
+  mode is explicit and can regress. The default policy measured +4.3% output throughput
+  on one real agent workload and has no release overhead or speed guarantee on other
+  input. Positive-temperature requests use the serial
   path; DFlash CLI comparisons must pass `--temp 0`, and server requests must set
   `"temperature": 0`.
 - **Repeat of a long prompt accounted as a cache hit while the whole prompt was

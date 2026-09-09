@@ -1,5 +1,13 @@
 # DFlash conservative confidence and full-block speculative
 
+> **Scope (2026-09-09).** Conservative mode now defaults to the windowed
+> cost-feedback controller described in `docs/DFLASH_GLM53.md` section 7
+> (four-position minimum prefix, full-block verification, three-attempt cost
+> windows with 16/32/64/128-token backoff, serial reasoning). The per-attempt
+> savings ledger described below is what `DS4_DFLASH_WINDOWED=0` selects; its
+> receipt fields still print in both modes, and its retry/economics gates are
+> inactive under the windowed controller.
+
 Conservative mode runs the trained seven-token draft block and selects
 the longest prefix whose normalized draft probabilities meet `p_min`.
 The first low or invalid confidence ends that prefix; later confident

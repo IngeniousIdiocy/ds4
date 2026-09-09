@@ -3,10 +3,14 @@
 `--dflash` is an optional speculative-decoding mode. The upstream checkpoint was
 trained to predict one fixed block: the known target anchor followed by seven
 draft positions. The default conservative profile runs that trained geometry,
-computes a normalized full-vocabulary probability for each position, and offers
-the longest prefix that passes the confidence floor and measured width economics.
-It uses measured retry backoff with a 1% retry-tax setting, a soft request loss
-meter, and retries funded only by savings from already consumed work.
+admits a proposal when the selector's conditional confidence holds for at least
+four positions, verifies the full eight-row block, and lets a windowed
+cost-feedback controller decide whether to keep proposing: three complete
+attempts are judged together against measured serial cost, and a losing window
+backs off for 16, 32, 64 and then 128 serial tokens. Reasoning (`<think>`)
+spans decode serially. This is the configuration that measured faster than
+serial on a real coding-agent workload (section 7); the earlier per-attempt
+savings ledger remains available as `DS4_DFLASH_WINDOWED=0`.
 
 Public speculative is the continuous full-block profile. Whenever causal
 conditioning and context/response room permit, it drafts and offers all seven
@@ -30,11 +34,12 @@ Read the licence before you convert anything. The recipe below produces a
 local file for your own use; it does not grant permission to share the
 result.
 
-**Status of this page.** The conversion/provenance recipe and explicitly
-historical receipts below remain useful, but they do not certify either current
-public profile. Final release measurements are recorded separately from this
-implementation description. DFlash2 is optional, greedy-only and requires a
-locally obtained drafter.
+**Status of this page.** Sections 2-4 are the provenance recipe for the BF16
+drafter; section 9 adds the operator-quantized Q8_0 drafter that the accepted
+configuration used. Section 7 records the real-agent measurement behind the
+default controller and its limits. DFlash2 is optional, greedy-only and requires
+a locally obtained drafter; no drafter file, BF16 or quantized, is
+redistributed.
 
 Both conservative and speculative modes can seed the drafter from completed
 prompt tap features. Ordinary and expert-bank prefill retain the supported
@@ -192,8 +197,8 @@ request intended to exercise DFlash; positive-temperature requests stay serial.
 
 - With neither `--dflash` nor an explicit mode, startup is serial and allocates
   no drafter state.
-- `conservative` uses the confidence/retry policy described in section 7. This
-  is the default when `--dflash FILE` is supplied without an explicit mode.
+- `conservative` uses the windowed confidence policy described in section 7.
+  This is the default when `--dflash FILE` is supplied without an explicit mode.
 - `speculative` continuously drafts and offers the full seven-position block
   whenever causal conditioning and context/response room permit. It does not
   use confidence, width economics, retry, backoff, or a loss meter. It can be
@@ -224,7 +229,8 @@ ds4: DFlash2 draft model loaded: .../GLM-5.3-Flash-DFlash2.gguf (layers=5 block=
 ```
 
 Type `8` is Q8_0. `mask=154856` must match the drafter's config; a `mask=0`
-here means the drafter did not bind its metadata.
+here means the drafter did not bind its metadata. A Q8_0 drafter (section 9)
+loads through the same path; the line then names its quantized matrices.
 
 ### Controls
 
@@ -234,11 +240,11 @@ here means the drafter did not bind its metadata.
 | `DS4_DFLASH_NO_WIDE_ROLLBACK=1` | Kill switch. Refuse the speculative cycle on any graph whose speculative state includes the DSA indexer tail — that is, every real GLM-5.3 graph — before any target state is mutated, and decode serially. This is the behaviour of the branch before the rollback was completed. |
 | `DS4_DFLASH_FORCE_REPLAY=1` | Take the restore-and-replay rollback even where the cheaper per-step snapshot would be sound. An A/B oracle, not a normal setting. |
 | `DS4_DFLASH_NO_ADAPTIVE=1` | With no explicit `--dflash-mode`, select public full-block speculative mode. A mode flag still takes precedence. |
-| `DS4_DFLASH_STATS=1` | Per-call stages, conservative confidence decisions, request begin/consumed-ACK/end markers and public-profile request totals on stderr; also retains verifier and engine diagnostics. |
+| `DS4_DFLASH_STATS=1` | Per-call stages, conservative confidence decisions, request begin/consumed-ACK/end markers and public-profile request totals on stderr; also retains verifier and engine diagnostics. `DS4_DFLASH_STATS=summary` prints only the request totals and proposer stage totals, without per-token output. |
 | `DS4_DFLASH_ZERO_FEATURES=1` | Zero the drafter's input features. It makes a mismatch *likely*, not certain: the drafter still emits a deterministic token per row, and a common one occasionally coincides with the target's own prediction. |
 | `DS4_DFLASH_FORCE_DRAFTS=N` | Diagnostic cap on the offered/verified draft prefix. Conservative mode still runs the trained seven-position proposal; this is not a way to measure a cheaper N-position drafter. It does not force a rejection location. |
 | `DS4_DFLASH_MIN_MARGIN=N` | Optional top1-minus-top2 proposer-margin diagnostic for conservative and legacy/golden calls. Public full-block speculative ignores it and avoids its optional margin scan. |
-| `DS4_DFLASH_CTX_CAP=N` | Retained target-feature/draft-context rows; default 256, validated range 1..2047 for this checkpoint. Invalid values warn and use the default. Larger histories change capture/ingestion cost. |
+| `DS4_DFLASH_CTX_CAP=N` | Retained target-feature/draft-context rows; default 2047 (the drafter's full sliding window), validated range 1..2047 for this checkpoint. Invalid values warn and use the default. Split-KV draft attention keeps the full window cheap; smaller histories reduce capture/ingestion cost. |
 | `DS4_DFLASH_SCRIPT=P:K:N,...` | Deterministic draft supply (test-only): at absolute position P propose N drafts of which the first K are the retained serial continuation, with a known-wrong token at row K. The verifier is untouched and decides for itself. Unnamed positions decode serially, so blocks land exactly where asked. See `tests/dflash_rejection_harness.sh`. |
 | `DS4_DFLASH_SCRIPT_IDS=FILE` | The retained continuation the script proposes from: a base position followed by one token id per line. |
 | `DS4_DFLASH_SCRIPT_SERIAL=1` | Control arm: same binary, same dumps, every position serial. |
@@ -251,18 +257,34 @@ diagnostic. Full-block speculative ignores these controls.
 
 | Variable | Default | Effect of the control |
 | --- | ---: | --- |
-| `DS4_DFLASH_P_MIN` | 0.75 | Finite normalized draft probability in [0,1]; first low/invalid position ends the prefix. `0` retains every finite position before other gates. |
-| `DS4_DFLASH_MIN_DRAFT` / `DS4_DFLASH_MAX_DRAFT` | 1 / 7 | Verifier prefix range, ordered within [1,7]. Neither changes the trained drafter block. |
-| `DS4_DFLASH_ADAPTIVE` | 0 | `1` enables experimental accepted-count verifier-cap adaptation; `0` fixes the cap at max. |
-| `DS4_DFLASH_START_DRAFT` | 3 | Initial adaptive cap, bounded by min/max; ignored with adaptation off. |
-| `DS4_DFLASH_MIN_SERIAL_TOKENS` | 0 | Diagnostic delay before the first proposal, counted only from actually consumed pure-serial tokens, range [0,64]. `3` exercises the withdrawn three-token startup policy; it is not the public default. |
+| `DS4_DFLASH_WINDOWED` | 1 | `0` replaces the windowed cost-feedback controller with the earlier per-attempt savings ledger (loss meter, savings-funded retry, early recovery) and that ledger's defaults (`MIN_DRAFT` 1, `START_DRAFT` 3, `MIN_SERIAL_TOKENS` 0). |
+| `DS4_DFLASH_P_MIN` | 0.75 | Finite draft confidence in [0,1]; the first low/invalid position ends the admitted prefix. `0` retains every finite position before other gates. |
+| `DS4_DFLASH_MIN_DRAFT` / `DS4_DFLASH_MAX_DRAFT` | 4 / 7 | Admitted prefix range, ordered within [1,7]. A confident prefix shorter than `MIN_DRAFT` is declined without verification. Neither changes the trained drafter block. |
+| `DS4_DFLASH_VERIFY_FULL_BLOCK` | 1 | `0` verifies only the confidence-admitted prefix instead of the full eight-row target block. |
+| `DS4_DFLASH_SELECTOR_CONFIDENCE` | 1 | `0` derives confidence from the full-vocabulary normalized logit row instead of the selector's conditional top-K distribution. Both are admission heuristics, not calibrated acceptance probabilities. |
+| `DS4_DFLASH_REASONING_SERIAL` | 1 | `0` lets the controller propose inside `<think>` spans (server requests with thinking enabled). By default reasoning tokens decode serially and leaving reasoning clears any cooldown. |
+| `DS4_DFLASH_MIN_SERIAL_TOKENS` | 16 | Consumed pure-serial tokens before the first proposal of a request, range [0,64]. Conditioning resets retain the request counter; a new request resets it. |
+| `DS4_DFLASH_ADAPTIVE` | 0 | `1` enables experimental accepted-count verifier-cap adaptation (ledger controller only); `0` fixes the cap at max. |
+| `DS4_DFLASH_START_DRAFT` | 7 | Initial adaptive cap, bounded by min/max; ignored with adaptation off. |
 | `DS4_DFLASH_BLIND_RESEARCH` | obsolete | No effect. Full-block behavior is selected directly with `--dflash-mode speculative`. |
-| `DS4_DFLASH_RETRY` | 1 | `0` disables retry, economics, calibration and soft-meter scheduling, reconstructing the continuous confidence-prefix baseline. It does not select serial mode. |
+| `DS4_DFLASH_RETRY` | 1 | `0` disables retry scheduling, reconstructing a continuous confidence-prefix baseline (the windowed controller requires retry and is disabled with it). It does not select serial mode. |
 | `DS4_DFLASH_RETRY_MAX` | 512 | Maximum skipped serial steps, range [1,4096]. |
-| `DS4_DFLASH_RETRY_TAX` | 0.01 | Conservative measured retry cadence tuning fraction, range [0.001,0.1]; not a guaranteed slowdown. |
-| `DS4_DFLASH_LOSS_BUDGET` | 0.03 | Conservative-only soft loss-meter fraction, range [0.001,0.25]; `0` is invalid, not an off switch. |
-| `DS4_DFLASH_EARLY_RECOVERY` | 1 | `0` removes the single early full-width recovery allowance. |
-| `DS4_DFLASH_SAVINGS_RETRY` | 1 | In conservative mode, `0` disables savings-funded wait bypass and the associated non-escalating decline rule, reconstructing the preceding retry policy. |
+| `DS4_DFLASH_RETRY_TAX` | 0.01 | Ledger controller: measured retry cadence tuning fraction, range [0.001,0.1]; not a guaranteed slowdown. |
+| `DS4_DFLASH_LOSS_BUDGET` | 0.03 | Ledger controller: soft loss-meter fraction, range [0.001,0.25]; `0` is invalid, not an off switch. |
+| `DS4_DFLASH_EARLY_RECOVERY` | 1 | Ledger controller: `0` removes the single early full-width recovery allowance. |
+| `DS4_DFLASH_SAVINGS_RETRY` | 1 | Ledger controller: `0` disables savings-funded wait bypass and the associated non-escalating decline rule. |
+
+Drafter kernel paths that the accepted configuration used are on by default
+and each honours `=0` as its kill: `DS4_DFLASH_SDPA_SPLIT` (split-KV draft
+attention, 16 partitions merged by a stable online softmax; pipeline or
+allocation failure falls back to the single-pass simdgroup kernel before
+dispatch), `DS4_DFLASH_DRAFT_UNPADDED` (block-sized draft GEMMs of eight rows or
+fewer run unpadded instead of through the 32-row scratch path) and
+`DS4_DFLASH_HEAD_PADDED` (a partial-width verification pads the vocabulary head
+to the measured eight-row NT4 shape; the padded rows copy a real row and are
+ignored). `tests/test_dflash_sdpa.c` checks the split kernels against the
+single-pass kernel and an independent double-precision CPU softmax over GQA,
+causal, windowed and concurrent-group cases.
 
 Legacy boolean engineering switches in the first table use **presence**, including an
 empty value or `0`; unset them to turn them off. Explicit `--dflash-mode serial`
@@ -321,11 +343,58 @@ require full state recovery or request invalidation.
 ## 7. Conservative admission and full-block speculative
 
 The drafter keeps its trained anchor-plus-seven block. Conservative takes the
-longest prefix whose normalized per-position probability meets `p_min`; it
-stops at the first low or invalid position. Verification uses that prefix plus
-the known anchor. A zero prefix still pays the drafter before one ordinary
-serial evaluation. Normalized confidence is not assumed to be the probability
-that the target will accept a token.
+longest prefix whose per-position confidence meets `p_min`; it stops at the
+first low or invalid position. With the selector active, confidence is the
+normalized maximum of the selector's corrected candidate scores at that
+position, the same conditional distribution upstream DFlash2 walks; with the
+selector off it is the full-vocabulary normalized top probability. A confident
+prefix shorter than `MIN_DRAFT` (four) is declined. An admitted proposal is
+verified as the full eight-row block: the target still checks every proposed
+row, commits the accepted causal prefix and rejects the rest exactly as before,
+so admission never fabricates a token. A zero prefix still pays the drafter
+before one ordinary serial evaluation. Confidence is not assumed to be the
+probability that the target will accept a token.
+
+**Windowed cost feedback (default).** Each complete attempt is priced as its
+actual paid time minus what the consumed rows would have cost serially, using
+the request's measured serial step. Three complete attempts form a window. A
+window that saved time keeps the controller engaged; a window that lost time
+backs off by consumed serial tokens, 16, then 32, 64 and at most 128, before
+the next attempt. There is no earned-savings allowance, no loss meter and no
+savings-funded retry: a cold entry can be repaid by consecutive verification
+and a losing phase is bounded by the backoff, not by a percentage. A partial
+consumer acknowledgement (EOS, stop, cancellation) is not a complete attempt and
+cannot fund a future window. The cumulative request ledger still records every
+failed proposal. Requests begin with 16 consumed serial tokens, and reasoning
+spans (`<think>` in server requests with thinking enabled) decode serially;
+leaving reasoning clears the cooldown for the output phase without changing
+the cumulative accounting.
+
+**Real-agent measurement.** The controller and the Q8_0 drafter of section 9
+were selected on the actual GLM coding agent (Claude Code through `ds4-server`)
+rather than on fixtures, after an earlier per-attempt ledger policy stayed
+effectively serial on real code writes. In the final screen (H8, 2026-09-07)
+32 complete agent requests on the same repository task were assigned at random
+to ordinary serial or to this configuration before any prefill; all 32
+finished with native tool calls. Output tokens, reasoning excluded in both arms:
+
+| arm | requests | output tokens | output seconds | tokens/s |
+| --- | ---: | ---: | ---: | ---: |
+| ordinary serial | 13 | 5,878 | 154.33 | 38.09 |
+| this configuration | 19 | 14,906 | 375.14 | 39.73 |
+
+That is 4.3% more output throughput including every declined proposal, failed
+draft, verification, rollback and delivery. Removing any single request keeps
+the advantage between 3.2% and 5.6%. It is a modest, workload-specific result
+on mixed real history, not a general speedup claim: a matched children's-story
+prompt in the same series was 1.8% slower than serial, structured outputs (SQL,
+JSON) gain far more, and reasoning-heavy requests see no benefit because
+reasoning stays serial. Full-block speculative was not part of that screen.
+
+**Earlier ledger controller (`DS4_DFLASH_WINDOWED=0`).** The remainder of this
+section describes the per-attempt savings ledger that the windowed controller
+replaced. Its accounting terms (retry tax, loss meter, savings-funded retry,
+early recovery) apply only under that switch.
 
 Speculative instead offers all seven positions on every eligible step. It does
 not consult normalized confidence, width economics, the retry schedule, the
@@ -459,7 +528,7 @@ DS4_DFLASH_STATS=1 ./ds4 --model TARGET.gguf --dflash "$DFLASH_DIR/GLM-5.3-Flash
     -p "Write a short paragraph about the sea."
 ```
 
-Expect `dflash admission policy=confidence-prefix` with the resolved controls,
+Expect `dflash admission policy=windowed-confidence` with the resolved controls,
 `dflash adaptive` calls, consumed `adaptive_ack` lines, and a terminal
 `adaptive_totals done=1`. A nonzero `chosen` proves a paid proposer attempt;
 `verified=0` can be the correct confidence/economics decision. It is not
@@ -501,3 +570,44 @@ layout or ordering defect, not drift).
 `DS4_DFLASH_NO_WIDE_ROLLBACK=1` reverts to serial decode with a one-line
 notice; that path is unchanged from before and is the fallback if anything
 here misbehaves.
+
+## 9. Quantized drafter (Q8_0)
+
+The accepted configuration ran an operator-quantized copy of the drafter: the
+35 attention and feed-forward matrices as Q8_0, the selector matrices, the
+`fc` projection and the convolution projections preserved as BF16, and the 32
+F32 norm/convolution vectors unchanged (1,438,198,656 bytes, 81 tensors). No
+training, LoRA or calibration data was involved; it is a numerical
+quantization of the pinned checkpoint, and the licence caution of section 2
+applies to the result exactly as to the BF16 file. ds4 loads either file with
+the same `--dflash` flag.
+
+`llama-quantize` from llama.cpp refuses a GGUF that lacks a few generic keys
+the ds4 converter does not write, so add them first; the tensor payload is
+copied unchanged:
+
+```sh
+python3 gguf-tools/dflash2_quantize_prep.py \
+    "$DFLASH_DIR/GLM-5.3-Flash-DFlash2.gguf" "$DFLASH_DIR/GLM-5.3-Flash-DFlash2.prep.gguf"
+# 2342595392 bytes; sha256 9add20869339c33eb3f4202558838340c9ba5656623be413aae13bbd2677c925
+
+llama-quantize \
+    --tensor-type 'selector_.*=bf16' \
+    --tensor-type 'fc.weight=bf16' \
+    --tensor-type '.*conv_proj.weight=bf16' \
+    "$DFLASH_DIR/GLM-5.3-Flash-DFlash2.prep.gguf" \
+    "$DFLASH_DIR/GLM-5.3-Flash-DFlash2-Q8_0.gguf" Q8_0
+# 1438198656 bytes; sha256 9ea8a7387cb0429c657a4e504fc8779385109c20a8732fdb5cc8068ff3f54c75
+```
+
+The quantizer used was `llama-quantize` 0.1.1-dev (build 10470, commit
+`34af94cd9`); the prep step reproduced the intermediate file byte for byte from
+the pinned BF16 conversion. The `--tensor-type` overrides are what keep the
+selector, `fc` and convolution projections at their trained precision; a
+uniform Q8_0 pass would quantize them too. The quantized file is your own
+local copy for personal, non-commercial use; do not distribute it.
+
+The BF16 drafter works with every control on this page. The Q8_0 drafter is
+what the real-agent result in section 7 was measured with and what the
+fixture receipts in `bench/RELEASE-EVIDENCE.md` name; a BF16 drafter with the
+same controller was not re-measured on the real agent.
