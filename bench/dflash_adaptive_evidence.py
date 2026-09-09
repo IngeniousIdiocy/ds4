@@ -305,7 +305,7 @@ def _validate_policy(item: Dict[str, Any], line_no: int) -> None:
     _require(item, ("policy", "adaptive", "n_min", "n_max", "n_start", "p_min", "valid"), line_no)
     if item["adaptive"] not in (0, 1):
         raise EvidenceError(f"line {line_no}: adaptive must be 0 or 1")
-    if item["policy"] not in {"confidence-prefix", "full-block"}:
+    if item["policy"] not in {"confidence-prefix", "windowed-confidence", "full-block"}:
         raise EvidenceError(f"line {line_no}: unexpected policy {item['policy']!r}")
     if item["valid"] != 1:
         raise EvidenceError(f"line {line_no}: confidence configuration is invalid")
