@@ -547,18 +547,30 @@ identity is not assumed.
 
 ## Results
 
-The final compiled artifact is source `538c37c0455a58df5024bec58be99a4ecfef58a7`
-(`ds4` sha256 `79dd8f58…`). Its curated source-equivalent checkpoint is `26e454f`.
-Repository-contained receipts are linked from `bench/RELEASE-EVIDENCE.md`.
+The final build is release commit `524c8a1` (compiled sources of `247801c`; `ds4`
+sha256 `11fba996…`, `ds4-server` sha256 `511b7a9a…`). Repository-contained receipts
+are linked from `bench/RELEASE-EVIDENCE.md`.
 
-| final measurement | result | scope |
+| final measurement (2026-09-09) | result | scope |
 |---|---:|---|
-| native prefill, 62,174 prompt tokens | **550.27 t/s** | bare guarded policy selected bank + fused command buffer + fixed pipeline8; 42/42 routed layers banked |
-| native serial decode, same prompt | **37.868944385 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 54.081254 s |
+| native prefill, 62,174 prompt tokens | **550.37 t/s** | bare guarded policy: bank + fused command buffer + eight-layer pipeline + untracked views; 42/42 routed layers banked; GPU idle before launch |
+| native serial decode, same prompt | **38.067237857 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 53.799543 s; output byte-identical to the retained controls |
+| native 300,000-token prefill | **473.92 t/s** | five bank groups, zero refusals |
+| native serial decode, 300,000-token prompt | **37.387743210 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 54.77731 s; output byte-identical to the retained block |
+| DFlash2 512-token fixtures, Q8_0 drafter | serial / conservative / speculative: SQL **40.91 / 62.19 / 63.34**, JSON **40.68 / 49.39 / 54.24**; conservative prose 39.90, chat 39.49, mixed 39.97, 24-token restored 300k prefix 36.10 | every DFlash output byte-identical to its serial arm; short fixtures, not a workload average |
+| DFlash2 runtime | lifecycle **7/7**, drafter-fault latch **passed**, ignore-EOS **passed** for both public profiles | `bench/receipts/glm53-m3ultra/dflash-runtime.json` |
+
+The previous public candidate `538c37c` (`ds4` sha256 `79dd8f58…`, curated checkpoint
+`26e454f`) measured, on the same gates:
+
+| `538c37c` measurement | result | scope |
+|---|---:|---|
+| native prefill, 62,174 prompt tokens | **550.27 t/s** | same guarded policy; 42/42 routed layers banked |
+| native serial decode, same prompt | **37.868944385 t/s** | 54.081254 s; same output bytes as the final build |
 | guarded bank boundary, 33,148 native tokens | **556.73 AUTO / 540.64 OFF t/s** | fixed-order same-binary pair, same 77 output bytes; retain 32768 threshold |
 | affected server runtime | **16/16 startup/server, 5/5 routed disconnect and 4/4 connected-client SIGTERM checks passed** | comparator v3 also passed with 128 native tokens in both recovery arms |
 | native 300,000-token prefill | **473.64 t/s** | five groups, 210 routed layers, zero refusals |
-| native serial decode, 300,000-token prompt | **37.187023218 t/s** | `n_generated=2048`, `n_decode_eval=2047`, `stop=predict_limit`; 55.072975 s |
+| native serial decode, 300,000-token prompt | **37.187023218 t/s** | 55.072975 s; same output bytes as the final build |
 
 The following are earlier capability receipts from
 `b723dfa7594dbadc6480cf2872751ae22e551754` (`ds4` sha256 `31139ed7…`) on the same
@@ -656,9 +668,13 @@ prompt identities are recorded in each receipt.
 - [ ] Re-validate a vision prompt after the multimodal session-reuse change.
 - [x] Run the focused DFlash startup/lifecycle, routed pipeline cancellation,
       connected-client SIGTERM and Metal-view teardown checks on historical
-      `538c37c`.
-- [ ] Complete failure, cached-depth, quality and performance validation for the
-      current confidence-prefix, prompt-seed and retry candidate.
+      `538c37c`; DFlash lifecycle, drafter fault and ignore-EOS re-run on the final build.
+- [x] Validate the shipped DFlash2 controller on the final build: fixtures, lifecycle,
+      drafter fault, ignore-EOS (`bench/receipts/glm53-m3ultra/dflash-*.json`); the
+      selection evidence is the real-agent screen in `docs/DFLASH_GLM53.md` section 7.
+- [ ] Re-run the guarded bank-boundary pair, the 16-check affected-runtime suite and
+      comparator v3 on the final build (last run on `538c37c`; the native paths they
+      exercise are unchanged since).
 - [x] Run comparator v3's 64..128-token same-session recovery check.
 - [ ] Decide DFlash2 sampled operation: compute the rejection residual against the
       target's original filtered support instead of masking a logit, or leave the mode

@@ -1,0 +1,332 @@
+{
+  "schema": "ds4.glm53.dflash-fixtures.v1",
+  "completed_utc": "2026-09-09T10:45:03Z",
+  "build": {
+    "release_commit": "524c8a1c22c02af6ed48082bea56942045225284",
+    "compiled_source_commit": "247801c",
+    "ds4_sha256": "11fba9964aca7d11644c3cf272b3a2c626727c10dd8810418cbab3da7258e99c",
+    "ds4_server_sha256": "511b7a9ae0951930ae20e7f76c22bc207e3f1466b58a26b9b20414134ed54ec5"
+  },
+  "draft": {
+    "file": "operator-quantized Q8_0 drafter (docs/DFLASH_GLM53.md section 9)",
+    "bytes": 1438198656,
+    "sha256": "9ea8a7387cb0429c657a4e504fc8779385109c20a8732fdb5cc8068ff3f54c75",
+    "base_bf16_sha256": "a4bbfbd9e5db62ea31c5cde0bab38a4f9be11a8005dfd078f0d455bb630d66a9"
+  },
+  "controller": "conservative = windowed-confidence default (n_min 4, n_start 7, p_min 0.75, 16 serial entry tokens, full-block verify, selector confidence, split-KV draft attention, 2047-row history); speculative = full-block; serial = no drafter",
+  "environment_overrides": "DS4_/MTL_ scrubbed; DS4_GLM_GEN_COUNTERS=1 DS4_DFLASH_STATS=1; conservative tuning passed explicitly equal to the defaults (P_MIN 0.75, MIN_DRAFT 4, MAX_DRAFT 7, START_DRAFT 7, RETRY 1, RETRY_MAX 512, RETRY_TAX 0.01, LOSS_BUDGET 0.03)",
+  "summary": [
+    {
+      "workload": "sql512",
+      "serial_tps": 40.9057851086484,
+      "conservative_tps": 62.1891302631499,
+      "conservative_vs_serial_percent": 52.03,
+      "conservative_output_identical_to_serial": true,
+      "speculative_tps": 63.343680292568614,
+      "speculative_vs_serial_percent": 54.85,
+      "speculative_output_identical_to_serial": true
+    },
+    {
+      "workload": "json512",
+      "serial_tps": 40.6761100387289,
+      "conservative_tps": 49.389594769950605,
+      "conservative_vs_serial_percent": 21.42,
+      "conservative_output_identical_to_serial": true,
+      "speculative_tps": 54.242689420344824,
+      "speculative_vs_serial_percent": 33.35,
+      "speculative_output_identical_to_serial": true
+    },
+    {
+      "workload": "prose512",
+      "serial_tps": 40.694703091605206,
+      "conservative_tps": 39.89845220500511,
+      "conservative_vs_serial_percent": -1.96,
+      "conservative_output_identical_to_serial": true
+    },
+    {
+      "workload": "middle-chat512",
+      "serial_tps": 40.69160792014463,
+      "conservative_tps": 39.49060817696235,
+      "conservative_vs_serial_percent": -2.95,
+      "conservative_output_identical_to_serial": true
+    },
+    {
+      "workload": "mixed-sql512",
+      "serial_tps": 40.705253497928844,
+      "conservative_tps": 39.971904123328315,
+      "conservative_vs_serial_percent": -1.8,
+      "conservative_output_identical_to_serial": true
+    },
+    {
+      "workload": "cached300k24",
+      "serial_tps": 38.15252744597443,
+      "conservative_tps": 36.097010716300055,
+      "conservative_vs_serial_percent": -5.39,
+      "conservative_output_identical_to_serial": true
+    }
+  ],
+  "arms": {
+    "sql512": {
+      "serial": {
+        "valid": true,
+        "complete_generation_tps": 40.9057851086484,
+        "generated": 512,
+        "decode_s": 12.516567,
+        "prompt_len": 114,
+        "stop": "predict_limit",
+        "stdout_sha256": "a87b4bfeca3d1c61139a458a4867f11418282d381b61613804b28abdec506697",
+        "cycles": 0,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": null,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "conservative": {
+        "valid": true,
+        "complete_generation_tps": 62.1891302631499,
+        "generated": 512,
+        "decode_s": 8.23295,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "a87b4bfeca3d1c61139a458a4867f11418282d381b61613804b28abdec506697",
+        "cycles": 62,
+        "verify_cycles": 62,
+        "accepted_draft_tokens": 433,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": -4292.584,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "speculative": {
+        "valid": true,
+        "complete_generation_tps": 63.343680292568614,
+        "generated": 512,
+        "decode_s": 8.08289,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "a87b4bfeca3d1c61139a458a4867f11418282d381b61613804b28abdec506697",
+        "cycles": 64,
+        "verify_cycles": 64,
+        "accepted_draft_tokens": 447,
+        "declines": null,
+        "skips": null,
+        "net_ms": -5059.479,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104427Z"
+      }
+    },
+    "json512": {
+      "serial": {
+        "valid": true,
+        "complete_generation_tps": 40.6761100387289,
+        "generated": 512,
+        "decode_s": 12.587241,
+        "prompt_len": 84,
+        "stop": "predict_limit",
+        "stdout_sha256": "042a3c34cbc43d1cd6247e9cc7c9c693cce93d6f68874586e84575886e299762",
+        "cycles": 0,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": null,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "conservative": {
+        "valid": true,
+        "complete_generation_tps": 49.389594769950605,
+        "generated": 512,
+        "decode_s": 10.366556,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "042a3c34cbc43d1cd6247e9cc7c9c693cce93d6f68874586e84575886e299762",
+        "cycles": 78,
+        "verify_cycles": 54,
+        "accepted_draft_tokens": 317,
+        "declines": 24,
+        "skips": 99,
+        "net_ms": -2184.701,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "speculative": {
+        "valid": true,
+        "complete_generation_tps": 54.242689420344824,
+        "generated": 512,
+        "decode_s": 9.43906,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "042a3c34cbc43d1cd6247e9cc7c9c693cce93d6f68874586e84575886e299762",
+        "cycles": 77,
+        "verify_cycles": 77,
+        "accepted_draft_tokens": 434,
+        "declines": null,
+        "skips": null,
+        "net_ms": -3884.697,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104427Z"
+      }
+    },
+    "prose512": {
+      "serial": {
+        "valid": true,
+        "complete_generation_tps": 40.694703091605206,
+        "generated": 512,
+        "decode_s": 12.58149,
+        "prompt_len": 108,
+        "stop": "predict_limit",
+        "stdout_sha256": "06727125eb0880a69442f82d7e54e6833f0985c736534a26d147f3a80f79724a",
+        "cycles": 0,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": null,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "conservative": {
+        "valid": true,
+        "complete_generation_tps": 39.89845220500511,
+        "generated": 512,
+        "decode_s": 12.832578,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "06727125eb0880a69442f82d7e54e6833f0985c736534a26d147f3a80f79724a",
+        "cycles": 18,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 18,
+        "skips": 476,
+        "net_ms": 242.687,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      }
+    },
+    "middle-chat512": {
+      "serial": {
+        "valid": true,
+        "complete_generation_tps": 40.69160792014463,
+        "generated": 512,
+        "decode_s": 12.582447,
+        "prompt_len": 296,
+        "stop": "predict_limit",
+        "stdout_sha256": "29abed9d48629e1dd269f5632bac0e3e79d72656e2bdf401512d1104e17aed8d",
+        "cycles": 0,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": null,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "conservative": {
+        "valid": true,
+        "complete_generation_tps": 39.49060817696235,
+        "generated": 512,
+        "decode_s": 12.965108,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "29abed9d48629e1dd269f5632bac0e3e79d72656e2bdf401512d1104e17aed8d",
+        "cycles": 18,
+        "verify_cycles": 1,
+        "accepted_draft_tokens": 0,
+        "declines": 17,
+        "skips": 476,
+        "net_ms": 362.16,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      }
+    },
+    "mixed-sql512": {
+      "serial": {
+        "valid": true,
+        "complete_generation_tps": 40.705253497928844,
+        "generated": 512,
+        "decode_s": 12.578229,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "67e6857ada305715c90cf9497c847f3366e4961c10373aa9d8b9539336545c46",
+        "cycles": 0,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": null,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "conservative": {
+        "valid": true,
+        "complete_generation_tps": 39.971904123328315,
+        "generated": 512,
+        "decode_s": 12.808997,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "67e6857ada305715c90cf9497c847f3366e4961c10373aa9d8b9539336545c46",
+        "cycles": 39,
+        "verify_cycles": 11,
+        "accepted_draft_tokens": 51,
+        "declines": 28,
+        "skips": 404,
+        "net_ms": 253.968,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      }
+    },
+    "cached300k24": {
+      "serial": {
+        "valid": true,
+        "complete_generation_tps": 38.15252744597443,
+        "generated": 24,
+        "decode_s": 0.629054,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "086b714be5cf9e0afce93112016bd4ed617e0c279421b190f8fe7122228b1a2d",
+        "cycles": 0,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 0,
+        "skips": 0,
+        "net_ms": null,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      },
+      "conservative": {
+        "valid": true,
+        "complete_generation_tps": 36.097010716300055,
+        "generated": 24,
+        "decode_s": 0.664875,
+        "prompt_len": null,
+        "stop": "limit",
+        "stdout_sha256": "086b714be5cf9e0afce93112016bd4ed617e0c279421b190f8fe7122228b1a2d",
+        "cycles": 3,
+        "verify_cycles": 0,
+        "accepted_draft_tokens": 0,
+        "declines": 3,
+        "skips": 3,
+        "net_ms": 37.653,
+        "idle_gpu": "idle",
+        "staging": "ASTRAL-DFLASH-ADAPTIVE-20260909T104042Z"
+      }
+    }
+  },
+  "scope": "Complete CLI generation intervals at --temp 0 with the fixed token cap of each fixture; outputs compared byte for byte against the serial arm of the same run. Short fixtures; not a workload average. cached300k24 is a 24-token restored-prefix horizon and pays one drafter call with no verification.",
+  "drafter_fault": {
+    "passed": true,
+    "directory": "GLM53-PUBLIC-PORT-20260909/fault2",
+    "report_sha256": "ab7be0c18eab71d7e217d5e63a60e81a2cee9763f49ad0c7b890ea441df95b11",
+    "checks": [
+      "started_utc",
+      "phases",
+      "http_comparison",
+      "finished_utc"
+    ]
+  }
+}

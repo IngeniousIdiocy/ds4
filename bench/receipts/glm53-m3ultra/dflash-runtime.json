@@ -1,0 +1,148 @@
+{
+  "schema": "ds4.glm53.dflash-runtime.v1",
+  "build": {
+    "release_commit": "524c8a1c22c02af6ed48082bea56942045225284",
+    "ds4_server_sha256": "511b7a9ae0951930ae20e7f76c22bc207e3f1466b58a26b9b20414134ed54ec5"
+  },
+  "draft": {
+    "file": "operator-quantized Q8_0 drafter",
+    "sha256": "9ea8a7387cb0429c657a4e504fc8779385109c20a8732fdb5cc8068ff3f54c75"
+  },
+  "lifecycle_conservative": {
+    "passed": true,
+    "checks": {
+      "verified_cancel": "PASS",
+      "same_slot_after_cancel": "PASS",
+      "natural_eos": "PASS",
+      "same_slot_after_eos": "PASS",
+      "same_slot_history_invalidation": "PASS",
+      "positive_temperature_serial_gate": "PASS",
+      "usage_accounting": "PASS"
+    },
+    "staging": "ASTRAL-DFLASH-LIFECYCLE-CONSERVATIVE-20260909T105204Z",
+    "report_sha256": "ff20ecf641ffee6bcc9e072a954f3bc99b2d6ab3360edd0738e5993f2648b68b",
+    "scope": "One owned single-slot server, short prompts; verified cancellation, same-slot reuse after cancel and natural EOS, history invalidation, positive-temperature serial gate, usage accounting."
+  },
+  "drafter_fault": {
+    "passed": true,
+    "phases": {
+      "serial-control": {
+        "mode": "serial",
+        "fault": false,
+        "passed": true,
+        "runtime": null,
+        "server_returncode": 0
+      },
+      "server-conservative": {
+        "mode": "conservative",
+        "fault": true,
+        "passed": true,
+        "runtime": {
+          "requests": 2,
+          "attempts": 1,
+          "failures": 1,
+          "safe": 1,
+          "final_skips": 112,
+          "injected_layer": 0
+        },
+        "server_returncode": 0
+      },
+      "server-speculative": {
+        "mode": "speculative",
+        "fault": true,
+        "passed": true,
+        "runtime": {
+          "requests": 2,
+          "attempts": 1,
+          "failures": 1,
+          "safe": 1,
+          "final_skips": 128,
+          "injected_layer": 0
+        },
+        "server_returncode": 0
+      },
+      "direct-conservative": {
+        "mode": "conservative",
+        "fault": null,
+        "passed": true,
+        "runtime": null,
+        "server_returncode": null
+      },
+      "direct-speculative": {
+        "mode": "speculative",
+        "fault": null,
+        "passed": true,
+        "runtime": null,
+        "server_returncode": null
+      }
+    },
+    "http_comparison": {
+      "conservative": {
+        "faulted_equals_serial": true,
+        "reused_equals_serial": true,
+        "content_bytes": 191,
+        "usage": {
+          "prompt_tokens": 108,
+          "completion_tokens": 64,
+          "total_tokens": 172,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "cache_write_tokens": 108
+          }
+        },
+        "finish_reason": "length"
+      },
+      "speculative": {
+        "faulted_equals_serial": true,
+        "reused_equals_serial": true,
+        "content_bytes": 191,
+        "usage": {
+          "prompt_tokens": 108,
+          "completion_tokens": 64,
+          "total_tokens": 172,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "cache_write_tokens": 108
+          }
+        },
+        "finish_reason": "length"
+      }
+    },
+    "staging": "GLM53-PUBLIC-PORT-20260909/fault2",
+    "report_sha256": "ab7be0c18eab71d7e217d5e63a60e81a2cee9763f49ad0c7b890ea441df95b11",
+    "scope": "Drafter failure injected once (layer 0) in conservative and speculative servers; the faulted request and the same-session reuse must match the serial control byte for byte; the session latches DFlash off after a safe drain."
+  },
+  "ignore_eos": {
+    "passed": true,
+    "modes": {
+      "serial": {
+        "requests": 2,
+        "same_server_reuse": true,
+        "content_sha256": "f20aaed4bfec85b6ca3205756c7019b9b4108eca13922700f881d7abf0485841",
+        "full_cap_without_stop_or_control_return": true,
+        "matches_serial_permitted_token_reference": true,
+        "verified_calls": 0
+      },
+      "conservative": {
+        "requests": 2,
+        "same_server_reuse": true,
+        "content_sha256": "f20aaed4bfec85b6ca3205756c7019b9b4108eca13922700f881d7abf0485841",
+        "full_cap_without_stop_or_control_return": true,
+        "matches_serial_permitted_token_reference": true,
+        "verified_calls": 0
+      },
+      "speculative": {
+        "requests": 2,
+        "same_server_reuse": true,
+        "content_sha256": "f20aaed4bfec85b6ca3205756c7019b9b4108eca13922700f881d7abf0485841",
+        "full_cap_without_stop_or_control_return": true,
+        "matches_serial_permitted_token_reference": true,
+        "verified_calls": 48
+      }
+    },
+    "tokens": 64,
+    "staging": "ASTRAL-DFLASH-IGNORE-EOS-20260909T105458Z",
+    "report_sha256": "df825bfcb04dfd5e6c7c4911dd2a7beffd0d395a5b7d9b3237065b4f4811b131",
+    "scope": "Same-server pairs of 64-token ignore_eos requests per public profile on a short factual prompt; every arm must reach the exact cap without a stop or control return and match the serial permitted-token reference byte for byte. The windowed conservative profile declined every post-EOS proposal here (0 verified calls); speculative verified 48 blocks."
+  }
+}

@@ -238,19 +238,36 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 
 ## GLM-5.3-Flash on the M3 Ultra (this branch)
 
-This branch carries a Metal-side decode/prefill kernel set, server changes and a
-fidelity harness for GLM-5.3-Flash on a 512 GB Mac Studio. Start with
+This branch carries a Metal-side decode/prefill kernel set, server changes, an
+optional DFlash2 speculative decoder and a fidelity harness for GLM-5.3-Flash
+(Q4_K, 185 GB) on a 512 GB M3 Ultra Mac Studio. It is based on upstream `9ab7053`
+and has not been rebased onto later upstream commits. Start with
 [the GLM-5.3 M3 Ultra guide](docs/GLM53_M3ULTRA.md) — tested configuration, the
 measured scope of `DS4_GLM_EXACT=1`, feature status, switch reference and known
-issues — and read
-[CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relative to upstream and why.
-The final `538c37c` artifact records 550.27 prefill tokens/s and 37.868944 native
-serial decode tokens/s for a complete 2,048-token block at a 62,174-token prompt, with
-all output bytes matching the three retained reference controls. At a 300,000-token
-prompt the same final binary records 473.64 prefill tokens/s and 37.187023 decode
-tokens/s for the complete native block. See the
-[release evidence index](bench/RELEASE-EVIDENCE.md) for scope and open gates.
-`./ds4 --help glm53` lists the supported controls and kill switches.
+issues — and read [CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relative
+to upstream and why.
+
+Measured on the final build (`524c8a1`), bare defaults, one cold run each, the GPU
+sampled idle before launch; the upstream column is the same machine and file as
+recorded in [bench/README.md](bench/README.md):
+
+| measurement | upstream of that week | this branch |
+|---|---:|---:|
+| prefill, 62,174-token prompt | ~384 t/s | **550.37 t/s** |
+| serial decode after that prompt, 2,048 tokens | ~23 t/s (50k, serving path) | **38.07 t/s** |
+| serial decode after a 300,000-token prompt, 2,048 tokens | — | **37.39 t/s** (prefill 473.92 t/s) |
+| serial decode, short prompt, 512 tokens | 29.2 t/s | **40.9 t/s** |
+| DFlash2 conservative, SQL / JSON 512-token fixtures | — | **62.2 / 49.4 t/s**, output byte-identical to serial |
+
+The 62k and 300k outputs are byte-identical to the retained reference blocks and to
+the previous public candidate. DFlash2 is optional and needs a locally converted
+drafter (weights are not redistributed); on a real coding-agent workload the default
+conservative profile measured +4.3% output throughput over serial, while unfavorable
+prose fixtures lose 2-3%. These are single cold runs on one machine, not averages
+over workloads or run-to-run variance. See the
+[release evidence index](bench/RELEASE-EVIDENCE.md) for receipts, scope and the
+remaining open items. `./ds4 --help glm53` lists the supported controls and kill
+switches.
 
 ## Logo
 

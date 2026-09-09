@@ -1,13 +1,15 @@
 {
   "schema": "ds4.glm53.native-gate.v1",
   "case": "native-default-300000",
-  "completed_utc": "2026-09-06T21:08:47.576148+00:00",
+  "completed_utc": "2026-09-09T10:40:21.413745+00:00",
   "build": {
-    "compiled_source_commit": "538c37c0455a58df5024bec58be99a4ecfef58a7",
-    "compiled_source_tree": "f4141a9f7aa258e03f3f8f8145e65e052091402c",
-    "run_checkout_commit": "d1838d7f202f5001ff9603d25ebc3a977f339c78",
-    "curated_tree_equivalent_commit": "26e454fbd93ee545eec1a928ab8f2a0d47dc23cd",
-    "ds4_sha256": "79dd8f58f1d74d6f43a6ce3dbd52c60d5eda0119ab821d37d72f52b6a17d027b"
+    "compiled_source_commit": "247801c",
+    "compiled_source_note": "ds4/ds4-server compiled from the tree of 247801c; later commits (9ffa6cb, 5824d38, 524c8a1) change only bench/ scripts and documentation",
+    "run_checkout_commit": "5824d384cb12b8b2762f4f325a0c492014e9ef72",
+    "release_commit": "524c8a1c22c02af6ed48082bea56942045225284",
+    "release_tree": "30498558ff3cbdc18db0c1d0f33c172277889867",
+    "ds4_sha256": "11fba9964aca7d11644c3cf272b3a2c626727c10dd8810418cbab3da7258e99c",
+    "ds4_server_sha256": "511b7a9ae0951930ae20e7f76c22bc207e3f1466b58a26b9b20414134ed54ec5"
   },
   "inputs": {
     "model_bytes": 185299232064,
@@ -16,8 +18,19 @@
     "prompt_sha256": "7a66f69f497d09e7c5c8dbe4295b8956b46e7874d03b7209c48b555bfc7efc9c"
   },
   "command": [
-    "./ds4", "-m", "$MODEL", "--metal", "--nothink", "--temp", "0",
-    "-c", "320000", "-n", "2048", "--prompt-file", "$PROMPT300"
+    "./ds4",
+    "-m",
+    "$MODEL",
+    "--metal",
+    "--nothink",
+    "--temp",
+    "0",
+    "-c",
+    "320000",
+    "-n",
+    "2048",
+    "--prompt-file",
+    "$PROMPT300"
   ],
   "environment_overrides": {
     "DS4_GLM_GEN_COUNTERS": "1",
@@ -34,32 +47,31 @@
     "min_tokens": 32768
   },
   "measured": {
-    "prefill_tokens_per_second": 473.64,
-    "decode_tokens_per_second": 37.18702321783052,
-    "decode_seconds": 55.072975,
+    "prefill_tokens_per_second": 473.92,
+    "decode_tokens_per_second": 37.387743209734104,
+    "decode_seconds": 54.77731,
     "n_generated": 2048,
     "n_decode_eval": 2047,
     "stop": "predict_limit",
     "final_position": 302048,
     "bank_groups": 5,
-    "bank_routed_layers": 210,
-    "bank_expanded_layers": 210,
     "bank_refusals": 0,
     "output_bytes": 9185,
-    "output_sha256": "2c019d7749ac60449bc3fbb6999bad4c1a03be10e7816e6d7403722ab874b1dc"
+    "output_sha256": "2c019d7749ac60449bc3fbb6999bad4c1a03be10e7816e6d7403722ab874b1dc",
+    "idle_gpu_before_launch": "idle"
   },
   "release_gates": {
+    "prefill_at_least_550": null,
     "decode_at_least_37": true
   },
-  "gate_scope": "The 550 t/s prefill gate applies to the 62,174-token case, not this 300,000-token case. The preserved staging driver therefore recorded its generic prefill_gate_met field as false.",
   "comparison": {
-    "references": ["v3+xr8 retained block", "b723dfa retained block"],
+    "reference": "BASE300-v3xr8 block and the 538c37c/7d9567c final receipts",
     "output_byte_identical": true
   },
-  "scope": "One cold native CLI run with a fixed 2048-token horizon. DS4_GLM_IGNORE_EOS changes generated text; visible marker counts are not exact EOS-token counts. This establishes achieved capability, not run-to-run variance.",
+  "scope": "One cold native CLI run with a fixed 2048-token horizon. DS4_GLM_IGNORE_EOS changes generated text; visible marker counts are not exact EOS-token counts. This establishes achieved capability, not run-to-run variance. Serial, no drafter loaded.",
   "preserved_staging_receipts": {
-    "directory_label": "ASTRAL-NATIVE-DEFAULT300-20260906T205716Z",
-    "receipt_json_sha256": "f9f5f601046b816aea4b3ae2e2ac4f0e0f2ef864c180f899ba439daa3adbe165",
-    "command_json_sha256": "0a8654fdb7103556ebbeb33c38482369b0d8648bda3f53512696ac1cdc599d82"
+    "directory_label": "ASTRAL-NATIVE-DEFAULT300-20260909T102824Z",
+    "receipt_json_sha256": "338e6eb4a73a8a0e1dd56e676fd848ded77c6cbb756549af730f6aa819bc3d5a",
+    "command_json_sha256": "5f5799edc33cf261659a0a3d369c90e759612cf38b64c7f256cb78c7101fcb9e"
   }
 }

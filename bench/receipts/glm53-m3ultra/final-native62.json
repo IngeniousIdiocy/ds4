@@ -1,13 +1,15 @@
 {
   "schema": "ds4.glm53.native-gate.v1",
   "case": "native-default-62174",
-  "completed_utc": "2026-09-06T20:56:52.412776+00:00",
+  "completed_utc": "2026-09-09T10:28:02.916963+00:00",
   "build": {
-    "compiled_source_commit": "538c37c0455a58df5024bec58be99a4ecfef58a7",
-    "compiled_source_tree": "f4141a9f7aa258e03f3f8f8145e65e052091402c",
-    "run_checkout_commit": "d1838d7f202f5001ff9603d25ebc3a977f339c78",
-    "curated_tree_equivalent_commit": "26e454fbd93ee545eec1a928ab8f2a0d47dc23cd",
-    "ds4_sha256": "79dd8f58f1d74d6f43a6ce3dbd52c60d5eda0119ab821d37d72f52b6a17d027b"
+    "compiled_source_commit": "247801c",
+    "compiled_source_note": "ds4/ds4-server compiled from the tree of 247801c; later commits (9ffa6cb, 5824d38, 524c8a1) change only bench/ scripts and documentation",
+    "run_checkout_commit": "5824d384cb12b8b2762f4f325a0c492014e9ef72",
+    "release_commit": "524c8a1c22c02af6ed48082bea56942045225284",
+    "release_tree": "30498558ff3cbdc18db0c1d0f33c172277889867",
+    "ds4_sha256": "11fba9964aca7d11644c3cf272b3a2c626727c10dd8810418cbab3da7258e99c",
+    "ds4_server_sha256": "511b7a9ae0951930ae20e7f76c22bc207e3f1466b58a26b9b20414134ed54ec5"
   },
   "inputs": {
     "model_bytes": 185299232064,
@@ -16,8 +18,19 @@
     "prompt_sha256": "e15ce96e009e4684d7006be75e6c24d2f8bfabf0a1ebacf9bc06a850034a6b9b"
   },
   "command": [
-    "./ds4", "-m", "$MODEL", "--metal", "--nothink", "--temp", "0",
-    "-c", "70000", "-n", "2048", "--prompt-file", "$PROMPT62"
+    "./ds4",
+    "-m",
+    "$MODEL",
+    "--metal",
+    "--nothink",
+    "--temp",
+    "0",
+    "-c",
+    "70000",
+    "-n",
+    "2048",
+    "--prompt-file",
+    "$PROMPT62"
   ],
   "environment_overrides": {
     "DS4_GLM_GEN_COUNTERS": "1",
@@ -34,32 +47,39 @@
     "min_tokens": 32768
   },
   "measured": {
-    "prefill_tokens_per_second": 550.27,
-    "decode_tokens_per_second": 37.868944385054384,
-    "decode_seconds": 54.081254,
+    "prefill_tokens_per_second": 550.37,
+    "decode_tokens_per_second": 38.06723785739221,
+    "decode_seconds": 53.799543,
     "n_generated": 2048,
     "n_decode_eval": 2047,
     "stop": "predict_limit",
     "final_position": 64222,
     "bank_routed_layers": 42,
-    "bank_expanded_layers": 42,
     "bank_refusals": 0,
     "output_bytes": 8969,
-    "output_sha256": "1bb479580d47c8863438e01585b5db9d14e532a8da207a635a3d57686eae7df5"
+    "output_sha256": "1bb479580d47c8863438e01585b5db9d14e532a8da207a635a3d57686eae7df5",
+    "idle_gpu_before_launch": "idle"
   },
   "release_gates": {
     "prefill_at_least_550": true,
     "decode_at_least_37": true
   },
-  "gate_scope": "The preserved staging driver also recorded decode_gate_met=false against its older 38 t/s threshold. The release threshold evaluated here is 37 t/s.",
   "comparison": {
-    "reference": "BASE62-v3-20260906T133801Z, all three retained controls",
+    "reference": "BASE62-v3-20260906T133801Z controls and the 538c37c/7d9567c final receipts",
     "output_byte_identical": true
   },
-  "scope": "One cold native CLI run with a fixed 2048-token horizon. DS4_GLM_IGNORE_EOS changes generated text; visible marker counts are not exact EOS-token counts. This establishes achieved capability, not run-to-run variance.",
+  "scope": "One cold native CLI run with a fixed 2048-token horizon. DS4_GLM_IGNORE_EOS changes generated text; visible marker counts are not exact EOS-token counts. This establishes achieved capability, not run-to-run variance. Serial, no drafter loaded.",
+  "preceding_attempt": {
+    "directory_label": "ASTRAL-NATIVE-DEFAULT62-20260909T101953Z",
+    "prefill_tokens_per_second": 549.92,
+    "decode_tokens_per_second": 38.079424084410185,
+    "output_byte_identical": true,
+    "idle_gpu_before_launch": "contended (12% device utilization sampled; WindowServer active)",
+    "note": "Retained, not selected: same binary, prefill 0.08 t/s under the gate with the GPU contended before launch."
+  },
   "preserved_staging_receipts": {
-    "directory_label": "ASTRAL-NATIVE-DEFAULT62-20260906T205402Z",
-    "receipt_json_sha256": "b2276505b79caf6c967678aa64ce992f91570fc6b704780f3233f846a95fd3f5",
-    "command_json_sha256": "efd9c133b20c8a6a4921af635affe147728c4d9e27bb0844b4a523fb82411edf"
+    "directory_label": "ASTRAL-NATIVE-DEFAULT62-20260909T102443Z",
+    "receipt_json_sha256": "19444cceacfe54eafe5627bb8461ebf2d7f31ca6240d22abce72abc9408442ae",
+    "command_json_sha256": "230077f8fc911f03630697cb3f52186ed06a8c3f174bd7d3c3d9b5207d2974ef"
   }
 }
