@@ -236,6 +236,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 
+<a id="glm53_m3ultra"></a>
 ## GLM-5.3-Flash on the M3 Ultra (this branch)
 
 This branch carries a Metal-side decode/prefill kernel set, server changes, an
@@ -261,9 +262,14 @@ recorded in [bench/README.md](bench/README.md):
 
 The 62k and 300k outputs are byte-identical to the retained reference blocks and to
 the previous public candidate. DFlash2 is optional and needs a locally converted
-drafter (weights are not redistributed); on a real coding-agent workload the default
-conservative profile measured +4.3% output throughput over serial, while unfavorable
-prose fixtures lose 2-3%. These are single cold runs on one machine, not averages
+drafter; no drafter weights are redistributed. The
+[DFlash2 guide](docs/DFLASH_GLM53.md) is the complete recipe: the pinned
+`incoai/GLM-5.3-Flash-DFlash2` revision and checksums (section 2), the
+`gguf-tools/dflash2_to_gguf.py` conversion to the BF16 GGUF (section 3), and the
+`llama-quantize` steps for the Q8_0 drafter the numbers above were measured with
+(section 9). On a real coding-agent workload the default conservative profile
+measured +4.3% output throughput over serial, while unfavorable prose fixtures
+lose 2-3%. These are single cold runs on one machine, not averages
 over workloads or run-to-run variance. See the
 [release evidence index](bench/RELEASE-EVIDENCE.md) for receipts, scope and the
 remaining open items. `./ds4 --help glm53` lists the supported controls and kill
