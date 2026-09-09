@@ -249,14 +249,17 @@ issues — and read [CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relati
 to upstream and why.
 
 Measured on the final build (`524c8a1`), bare defaults, one cold run each, the GPU
-sampled idle before launch; the upstream column is the same machine and file as
-recorded in [bench/README.md](bench/README.md):
+sampled idle before launch. The upstream column is unmodified `9ab7053` (plus a
+disclosed 48-line counters patch) on the same machine, file, prompts and 2,048-token
+horizon; see
+[upstream-baseline.json](bench/receipts/glm53-m3ultra/upstream-baseline.json):
 
-| measurement | upstream of that week | this branch |
+| measurement | upstream `9ab7053` | this branch |
 |---|---:|---:|
-| prefill, 62,174-token prompt | ~384 t/s | **550.37 t/s** |
-| serial decode after that prompt, 2,048 tokens | ~23 t/s (50k, serving path) | **38.07 t/s** |
-| serial decode after a 300,000-token prompt, 2,048 tokens | — | **37.39 t/s** (prefill 473.92 t/s) |
+| prefill, 62,174-token prompt | 365.7 t/s | **550.4 t/s** |
+| serial decode after that prompt, 2,048 tokens | 23.75 t/s | **38.07 t/s** |
+| prefill, 300,000-token prompt | 316.8 t/s | **473.9 t/s** |
+| serial decode after that prompt, 2,048 tokens | 21.64 t/s | **37.39 t/s** |
 | serial decode, short prompt, 512 tokens | 29.2 t/s | **40.9 t/s** |
 | DFlash2 conservative, SQL / JSON 512-token fixtures | — | **62.2 / 49.4 t/s**, output byte-identical to serial |
 

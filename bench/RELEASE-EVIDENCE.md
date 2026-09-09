@@ -11,6 +11,7 @@ The earlier `538c37c` and `b723dfa` receipts are retained below as history.
 | input | identity |
 |---|---|
 | upstream base | `9ab705347c1775e7599ede7eb81a6255ec7dccb5` (not rebased; upstream `main` has moved since) |
+| upstream comparator | same commit plus [upstream-bench-patch.diff](receipts/glm53-m3ultra/upstream-bench-patch.diff) (counters and EOS override only); `ds4` sha256 `f0d7d735…`; [upstream-baseline.json](receipts/glm53-m3ultra/upstream-baseline.json): 62k 365.70 prefill / 23.75 decode t/s, 300k 316.77 / 21.64 t/s |
 | release commit | `524c8a1c22c02af6ed48082bea56942045225284`; tree `30498558ff3cbdc18db0c1d0f33c172277889867` |
 | compiled sources | the tree of `247801c`; the later commits change only `bench/` scripts and documentation |
 | final `ds4` | sha256 `11fba9964aca7d11644c3cf272b3a2c626727c10dd8810418cbab3da7258e99c` |

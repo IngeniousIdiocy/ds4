@@ -1,0 +1,52 @@
+{
+  "schema": "ds4.glm53.upstream-baseline.v1",
+  "note": "Upstream antirez/ds4 main 9ab7053 built unmodified except for the disclosed 48-line bench patch (upstream-bench-patch.diff: DS4_GLM_GEN_COUNTERS counters and DS4_GLM_IGNORE_EOS in the native GLM Metal loop, so the fixed 2048-token horizon and counters match the branch). Same machine (M3 Ultra 512 GB), same target GGUF 828f413c\u2026, same prompts, cold native CLI, --metal --nothink --temp 0 -n 2048.",
+  "build": {
+    "source_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "bench_patch": "upstream-bench-patch.diff",
+    "ds4_sha256": "f0d7d735fee78f2406c76fa4c9c24637ac9369e4358f35e0625213c9d8480feb"
+  },
+  "prompt_62174": {
+    "trials": [
+      {
+        "prefill_tps": 365.7,
+        "decode_s": 89.401478
+      },
+      {
+        "prefill_tps": 355.8,
+        "decode_s": 86.467975
+      },
+      {
+        "prefill_tps": 363.93,
+        "decode_s": 86.239311
+      }
+    ],
+    "best_prefill_tps": 365.7,
+    "best_decode_tps": 23.7479,
+    "n_generated": 2048,
+    "n_decode_eval": 2047,
+    "stop": "predict_limit",
+    "ctx": 70000,
+    "output_bytes": 9579,
+    "output_sha256_prefix": "0da2c0e0e349fa3c4d61c762",
+    "staging": "BASE62-public-20260906T121512Z (three UB trials, 2026-09-06 12:15Z)"
+  },
+  "prompt_300000": {
+    "prefill_tps": 316.77,
+    "decode_s": 94.659062,
+    "decode_tps": 21.6355,
+    "ms_per_eval": 46.2428,
+    "n_generated": 2048,
+    "n_decode_eval": 2047,
+    "stop": "predict_limit",
+    "ctx": 320000,
+    "output_bytes": 9266,
+    "output_sha256_prefix": "28fc32ae957c0c0f14a25d20",
+    "staging": "BASE300-v3-20260906T140109Z UB arm (2026-09-06 14:01Z)"
+  },
+  "short_prompt_512": {
+    "decode_tps": 29.2,
+    "source": "bench/README.md CLI single-stream decode, GSM prompt, 512 tokens, greedy, upstream of that week on the custom file"
+  },
+  "scope": "Upstream outputs differ from the branch outputs (different kernels); these are throughput comparators on identical inputs and horizons, not identity references."
+}

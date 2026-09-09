@@ -1,0 +1,48 @@
+diff --git a/ds4.c b/ds4.c
+index 2c6be0b..91f8315 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -53265,6 +53265,10 @@ static int generate_glm_metal_argmax(
+     uint32_t pos = (uint32_t)prompt->len;
+     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+     const double t_decode0 = now_sec();
++    /* BENCH PATCH (disclosed, not upstream): DS4_GLM_IGNORE_EOS keeps decoding to -n;
++     * DS4_GLM_GEN_COUNTERS prints the loop's own counters and stop reason. */
++    const int bench_ignore_eos = getenv("DS4_GLM_IGNORE_EOS") != NULL;
++    const char *bench_stop = "predict_limit_loop"; int bench_decode_eval = 0;
+     for (int i = 0; i < n_predict && pos < g.ctx_size; i++) {
+         if (getenv("DS4_TRACE_TOP") != NULL) {
+             char label[64];
+@@ -53272,11 +53276,11 @@ static int generate_glm_metal_argmax(
+             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
+         }
+         const int token = sample_argmax(logits, DS4_N_VOCAB);
+-        if (vocab_token_is_generation_stop(vocab, token)) break;
++        if (!bench_ignore_eos && vocab_token_is_generation_stop(vocab, token)) { bench_stop = "eos"; break; }
+         if (emit) emit(emit_ud, token);
+         n_generated++;
+ 
+-        if (i == n_predict - 1 || pos + 1u >= g.ctx_size) {
++        if (i == n_predict - 1 || pos + 1u >= g.ctx_size) { bench_stop = (i == n_predict - 1) ? "predict_limit" : "ctx_limit";
+             pos++;
+             break;
+         }
+@@ -53298,6 +53302,7 @@ static int generate_glm_metal_argmax(
+                     (t_eval1 - t_eval0) * 1000.0);
+         }
+         n_decode_eval++;
++        bench_decode_eval++;
+         pos++;
+     }
+     const double t_decode1 = now_sec();
+@@ -53310,6 +53315,10 @@ static int generate_glm_metal_argmax(
+             "ds4: GLM prefill: %.2f t/s, generation: %.2f t/s\n",
+             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
++    if (getenv("DS4_GLM_GEN_COUNTERS") != NULL)
++        fprintf(stderr, "ds4: GLM gen counters: n_generated=%d n_decode_eval=%d prompt_len=%u final_pos=%u ctx=%u n_predict=%d decode_s=%.6f ms_per_eval=%.4f stop=%s\n",
++                n_generated, bench_decode_eval, (uint32_t)prompt->len, pos, g.ctx_size, n_predict, decode_s,
++                bench_decode_eval > 0 ? decode_s * 1000.0 / (double)bench_decode_eval : 0.0, bench_stop);
+ 
+     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
+     free(logits);
