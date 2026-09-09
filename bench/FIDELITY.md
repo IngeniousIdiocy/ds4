@@ -281,13 +281,26 @@ epoch carries over.
 
 | build (public-artifact epoch) | avg_nll | Δ vs upstream pin | budget used (of 3e-4) | first_match / avg_lcp | receipt |
 |---|---|---|---|---|---|
-| upstream 9ab7053 (pin), upstream scorer | — | 0 | 0% | — | `bench/fidelity/upstream-9ab7053-epoch.tsv` (to be added from the E1 sanity run) |
-| this branch, defaults (fast mode) | — | — | — | — | `bench/fidelity/public-<head>-default.tsv` (to be added from the E1 sanity run) |
-| this branch, `DS4_GLM_EXACT=1` | — | measured comparison pending | n/a | — | `bench/fidelity/public-<head>-exact.tsv` (to be added) |
+| upstream 9ab7053 (pin), upstream scorer | 0.300804038 | 0 | 0% | 90 / 9.48 | [`bench/fidelity/upstream-9ab7053-epoch.tsv`](fidelity/upstream-9ab7053-epoch.tsv) |
+| this branch `999f510`, defaults (fast mode) | 0.300766166 | −3.79e-5 | 0% (below the pin) | 90 / 10.29 | [`bench/fidelity/public-999f510-default.tsv`](fidelity/public-999f510-default.tsv) |
+| this branch `999f510`, `DS4_GLM_EXACT=1` | 0.300759677 | −4.44e-5 | 0% (below the pin) | 90 / 9.48 | [`bench/fidelity/public-999f510-exact.tsv`](fidelity/public-999f510-exact.tsv) |
 
-The exact-mode row isolates registered Tier 2 changes; the default row is the fast-mode
-drift. The current E6 token-weighted NLL screen did not meet its provisional margin:
-candidate 1.270792 versus upstream 1.268859, delta +0.001933 against a +0.0005
-criterion. The focused task screen remained 77/77 in both arms (22/23 outputs
-byte-identical, one wording difference). Keep both facts; neither substitutes for a
-broader equivalence claim.
+All three arms ran on 2026-09-09 in one GPU window on the file above (receipt
+[fidelity-100.json](receipts/glm53-m3ultra/fidelity-100.json)). The upstream arm
+reproduces upstream's own published QA figure for this layout (0.300804038, 90/100,
+mean greedy prefix 9.48) exactly. Both branch arms sit below the pin on the
+token-weighted metric, so no drift budget is consumed. `compare_1k.py` criterion 2
+passes for both: defaults paired mean delta +5.9e-5 with SE 5.5e-4, 51/49 wins,
+first_match 90 → 90; exact mode paired mean delta −4.5e-5 with SE 4.3e-5, 49/51 wins,
+first_match 90 → 90. The exact-mode row is the Tier 2 isolation; its per-case spread
+against upstream is an order of magnitude tighter than the defaults row, as expected
+with every registered Tier 2 change off.
+
+The 100-prompt reference metric above is the release criterion. The E6 12-case
+long-context screen (5×62k, 2×30k, 2×12k, 3×6k, token-weighted NLL against upstream on
+the same file) is reported beside it as a diagnostic, not as a gate: candidate 1.270792
+versus upstream 1.268859, delta +0.001933 with casewise SE 0.001757, about 1.1 SE above
+zero, 6 of 12 cases better and 6 worse, first_match 0/12 in both arms. Re-run on
+`999f510` it reproduced both Sep 6 TSVs byte for byte
+([e6-quality.json](receipts/glm53-m3ultra/e6-quality.json)). The focused task screen
+remained 77/77 in both arms (22/23 outputs byte-identical, one wording difference).

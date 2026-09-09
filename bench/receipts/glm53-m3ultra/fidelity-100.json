@@ -1,0 +1,76 @@
+{
+  "schema": "ds4.glm53.fidelity-100.v1",
+  "date_utc": "2026-09-09",
+  "window": "FIDELITY-FINAL-20260909 (supervisor-stopped UAT server; GPU lock held; three arms back to back)",
+  "model": {
+    "path_basename": "GLM-5.3-Flash-Q4_K-9ab7053.gguf",
+    "sha256": "828f413cae8ceee74796606814295e00e04c1c7b151aca9a3c5c75db32cb73e0",
+    "bytes": 185299232064
+  },
+  "manifest": {
+    "path": "gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv",
+    "sha256": "44787787bb836350898b90ea5c470ddf51c930508738daa51159480fe7738eda",
+    "identical_in_upstream_tree": true
+  },
+  "candidate": {
+    "source_commit": "999f51033c016119179f32754b22d3932bb38856",
+    "score_binary_sha256": "5b1250e4ad2bccc2da4f929120de342816fd8ab1f2524716d88c942f206b4e62",
+    "metal_sha256": "3f0a24b9eed556f1c6badd3299187c26df4355cdef2be9b0a98e5512ac679c0b",
+    "ds4_sha256": "11fba9964aca7d11644c3cf272b3a2c626727c10dd8810418cbab3da7258e99c"
+  },
+  "upstream": {
+    "source_commit": "9ab705347c1775e7599ede7eb81a6255ec7dccb5",
+    "score_binary_sha256": "67dfd51cf391fc2485f02b4e95bd2ca64172c04c390364021b66fafdd935df7d",
+    "metal_sha256": "6e833f4a8ced10073c8ecf391078057b05917d6eb6433dd663b01584092cbae3"
+  },
+  "env": "DS4_METAL_MODEL_UNTRACKED=1 DS4_GLM53_MEMORY_CEILING_GB=400; exact arm adds DS4_GLM_EXACT=1; scorer defaults otherwise",
+  "arms": {
+    "upstream_pin": {
+      "tsv": "bench/fidelity/upstream-9ab7053-epoch.tsv",
+      "wall_s": 429,
+      "cases": 100,
+      "token_weighted_avg_nll": 0.3008040376300718,
+      "first_match": 90,
+      "mean_greedy_lcp": 9.48,
+      "tsv_sha256": "b4161ca6ffd9169ef20490cb00c40b6885efa3fd0b8086d7557b97b650be3dba"
+    },
+    "branch_defaults": {
+      "tsv": "bench/fidelity/public-999f510-default.tsv",
+      "wall_s": 320,
+      "cases": 100,
+      "token_weighted_avg_nll": 0.3007661662594515,
+      "first_match": 90,
+      "mean_greedy_lcp": 10.29,
+      "tsv_sha256": "a91016ddcbd6119b74de42aee3817dd4ff5a9ab2b1e17976de080f7c4f1adb2c"
+    },
+    "branch_exact": {
+      "tsv": "bench/fidelity/public-999f510-exact.tsv",
+      "wall_s": 326,
+      "cases": 100,
+      "token_weighted_avg_nll": 0.30075967651025176,
+      "first_match": 90,
+      "mean_greedy_lcp": 9.48,
+      "tsv_sha256": "a937028923b43ded419d5085d2300b40e785681a71f93527f5fef239927eadbc"
+    }
+  },
+  "compare_1k_criterion2": {
+    "defaults_vs_upstream": {
+      "paired_mean_delta": 5.892e-05,
+      "se": 0.0005539,
+      "wins_losses": "51/49",
+      "binomial_p": 0.92,
+      "first_match": "90 -> 90",
+      "verdict": "PASS"
+    },
+    "exact_vs_upstream": {
+      "paired_mean_delta": -4.549e-05,
+      "se": 4.343e-05,
+      "wins_losses": "49/51",
+      "binomial_p": 0.92,
+      "first_match": "90 -> 90",
+      "verdict": "PASS"
+    }
+  },
+  "reference_note": "upstream's QA_BEFORE_RELEASES.md reports 0.300804038 / 90 / 9.48 for this layout on antirez's M3 Ultra; the upstream arm here matches it exactly",
+  "scope": "100 short prompts scored against the FP8 API reference; this is the release criterion. Long-context behaviour is screened separately (e6-quality.json)."
+}

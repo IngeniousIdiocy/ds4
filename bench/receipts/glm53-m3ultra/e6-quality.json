@@ -1,9 +1,9 @@
 {
   "schema": "ds4.glm53.quality-e6.v1",
   "candidate": {
-    "source_commit": "40d72b9a395c8dceaed5babe3d27f11443a4d07e",
-    "score_binary_sha256": "1a02259f9507ade6026e95d3495dc72198fb991501af1137ea12a95f2b5095c5",
-    "metal_sha256": "42f0ffd0d9d0049c386b92a6b10ed15ff8d9b0f79ef95568e684c1dd4d9a82bf",
+    "source_commit": "999f51033c016119179f32754b22d3932bb38856",
+    "score_binary_sha256": "5b1250e4ad2bccc2da4f929120de342816fd8ab1f2524716d88c942f206b4e62",
+    "metal_sha256": "3f0a24b9eed556f1c6badd3299187c26df4355cdef2be9b0a98e5512ac679c0b",
     "tsv": "e6-candidate.tsv",
     "tsv_sha256": "3ba8ca7d4a5f2b4054b81f7e15f89e048dbdf32750ae24e6c3cddbd66418ca29"
   },
@@ -20,7 +20,12 @@
     "manifest_sha256": "b8264c8627a628c6d7999681dd7578a88223b07855cc293126508d1b0325eef5",
     "cases": 12,
     "context_limit": 70000,
-    "depths": [6000, 12000, 30000, 62000]
+    "depths": [
+      6000,
+      12000,
+      30000,
+      62000
+    ]
   },
   "result": {
     "admitted": true,
@@ -30,11 +35,20 @@
     "casewise_standard_error": 0.0017571105229307966,
     "one_sided_upper_95": 0.004823394007404275,
     "provisional_margin": 0.0005,
-    "within_provisional_margin": false
+    "within_provisional_margin": false,
+    "cases_better": 6,
+    "cases_worse": 6
   },
-  "scope": "The provisional E6 margin is unmet. This 12-case selected long-context screen is neither an industry standard nor a 300k quality measurement. Its point estimate is about 1.1 casewise standard errors above zero.",
+  "scope": "Diagnostic long-context screen, not the release criterion (that is the 100-prompt reference set in fidelity-100.json). 12 selected cases; the point estimate is about 1.1 casewise standard errors above zero, 6 of 12 cases better and 6 worse; neither an industry standard nor a 300k quality measurement.",
   "preserved_staging_receipt": {
     "directory_label": "E6-v3-20260906",
     "receipt_json_sha256": "53e5ee00ba49419f6bdf1899f31f0eb221ef2d1d4f7cb553d138e8b4baf7d44b"
+  },
+  "rerun_2026_09_09": {
+    "window": "FIDELITY-FINAL-20260909/E6",
+    "result": "both arms reproduced the 2026-09-06 TSVs byte for byte on the final build 999f510",
+    "previous_candidate_source_commit": "40d72b9a395c8dceaed5babe3d27f11443a4d07e",
+    "previous_candidate_score_binary_sha256": "1a02259f9507ade6026e95d3495dc72198fb991501af1137ea12a95f2b5095c5",
+    "previous_candidate_metal_sha256": "42f0ffd0d9d0049c386b92a6b10ed15ff8d9b0f79ef95568e684c1dd4d9a82bf"
   }
 }

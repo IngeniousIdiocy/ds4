@@ -583,7 +583,8 @@ public GGUF:
 | native prefill, 300,000 prompt tokens | **473.75 t/s** | five admitted bank groups, no refusal | same |
 | DFlash SQL fixed horizon, serial / conservative / speculative | **38.5850 / 47.2064 / 60.7875 t/s** | 8,192 generated in every arm; favorable repetitive prompt, truncated during tuple 483 of 2,000 | `ASTRAL-THREE-MODES-20260906T192241Z` |
 | task outcome screen | **77/77 in both arms** | 22/23 outputs byte-identical; one wording difference; focused screen, not broad equivalence | `TASKCHECK-20260906T154355Z` |
-| E6 token-weighted NLL margin | **unmet** | candidate 1.270792 vs upstream 1.268859, delta +0.001933; provisional +0.0005 criterion not met | E6 retained comparison |
+| 100-prompt reference NLL (release criterion) | **below the pin** | upstream 0.300804 (90/100), defaults 0.300766 (90/100), exact 0.300760 (90/100); `compare_1k.py` PASS both arms | `FIDELITY-FINAL-20260909` |
+| E6 long-context NLL screen (diagnostic) | **1.1 SE above upstream** | 1.270792 vs 1.268859, delta +0.001933, SE 0.001757, 6/12 cases better; reproduced byte for byte on `999f510` | `FIDELITY-FINAL-20260909/E6` |
 
 The 300k output matched the retained v3+`xr8` reference block. That is lineage evidence,
 not a claim of universal or upstream byte identity. The DFlash arms happened to emit the

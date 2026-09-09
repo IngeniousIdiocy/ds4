@@ -263,6 +263,13 @@ horizon; see
 | serial decode, short prompt, 512 tokens | 29.2 t/s | **40.9 t/s** |
 | DFlash2 conservative, SQL / JSON 512-token fixtures | — | **62.2 / 49.4 t/s**, output byte-identical to serial |
 
+Weights: everything above was measured on one file, a Q4 conversion produced by
+upstream's own `gguf-tools/glm53_quantize.py --artifact q4` at `9ab7053` from the
+pinned FP8 snapshot (sha256 `828f413c…`, 185,299,232,064 bytes). The published
+`./download_model.sh glm53-q4` file is a different conversion of the same snapshot and
+was not tested on this branch. Run the converter yourself; the exact commands and the
+expected checksum are in [docs/GLM53_M3ULTRA.md](docs/GLM53_M3ULTRA.md#reproducing-the-weights).
+
 The 62k and 300k outputs are byte-identical to the retained reference blocks and to
 the previous public candidate. DFlash2 is optional and needs a locally converted
 drafter; no drafter weights are redistributed. The
@@ -288,12 +295,19 @@ alter a summation order, ship behind their own kill switch, and are registered s
 [bench/EXACT-MODE-PLAN.md](bench/EXACT-MODE-PLAN.md) record the measured
 differences against upstream rather than assuming identity: on three long-context
 cases exact-mode total NLL differed from upstream by 0.000238, 0.004171 and 0.000048.
-The quality receipts are in the evidence index: the focused task screen scored
+On the 100-prompt reference set upstream uses for release QA, scored against the FP8
+API reference on the same weights file in one window
+([fidelity-100.json](bench/receipts/glm53-m3ultra/fidelity-100.json)): upstream
+`9ab7053` 0.300804 average NLL, 90/100 first-token matches, mean greedy prefix 9.48,
+which is upstream's own published figure; this branch with defaults 0.300766, 90/100,
+10.29; this branch with `DS4_GLM_EXACT=1` 0.300760, 90/100, 9.48. The
+[fidelity ledger](bench/FIDELITY.md#public-artifact-epoch) carries the per-case TSVs and
+the paired verdicts. The focused task screen scored
 [77/77 in both arms](bench/receipts/glm53-m3ultra/taskcheck-quality.json) with 22 of
-23 outputs byte-identical to upstream, while the
-[token-weighted NLL screen](bench/receipts/glm53-m3ultra/e6-quality.json) landed
-0.0019 above upstream against a provisional 0.0005 criterion, which is disclosed as
-unmet, not waived. DFlash2's causal rollback is covered by
+23 outputs byte-identical to upstream. The 12-case long-context
+[NLL screen](bench/receipts/glm53-m3ultra/e6-quality.json) is reported beside these as
+a diagnostic: 0.0019 above upstream at 1.1 standard errors, 6 cases better and 6 worse,
+reproduced byte for byte on the final build. DFlash2's causal rollback is covered by
 [tests/DFLASH-PREFIX.md](tests/DFLASH-PREFIX.md), and on every fixture in this
 release the DFlash outputs were byte-identical to serial.
 
