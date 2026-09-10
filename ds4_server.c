@@ -2109,6 +2109,90 @@ static bool parse_anthropic_image_source(const char **p,
     return true;
 }
 
+/* tool_result content may carry image blocks (an agent's read-file tool returning
+ * a PNG or JPEG).  Flatten text blocks as json_content does and register image
+ * blocks on the caller's list, leaving each marker inline so the image span is
+ * rendered inside the <tool_result>. */
+static bool json_tool_result_content(const char **p, char **out,
+                                     server_image_inputs *images) {
+    json_ws(p);
+    if (**p != '[') return json_content(p, out);
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            (*p)++;
+            json_ws(p);
+            char *type = NULL, *text = NULL;
+            char *source_type = NULL, *media_type = NULL, *data = NULL;
+            bool ok = true;
+            while (ok && **p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) {
+                    ok = false;
+                    break;
+                }
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    ok = false;
+                    break;
+                }
+                (*p)++;
+                if (!strcmp(key, "type"))
+                    ok = json_string_replace(p, &type);
+                else if (!strcmp(key, "text"))
+                    ok = json_string_replace(p, &text);
+                else if (!strcmp(key, "source"))
+                    ok = parse_anthropic_image_source(p, &source_type,
+                                                      &media_type, &data);
+                else
+                    ok = json_skip_value(p);
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (ok && **p == '}') (*p)++;
+            else ok = false;
+            if (ok && type && !strcmp(type, "image")) {
+                char marker[SERVER_IMAGE_MARKER_BYTES];
+                if (!source_type || strcmp(source_type, "base64") ||
+                    !server_image_inputs_push_base64(images, media_type, data, marker))
+                    ok = false;
+                else
+                    buf_puts(&b, marker);
+            } else if (ok && text) {
+                buf_puts(&b, text);
+            }
+            free(type);
+            free(text);
+            free(source_type);
+            free(media_type);
+            free(data);
+            if (!ok) goto fail;
+        } else if (!json_skip_value(p)) {
+            goto fail;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    *out = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
@@ -2128,6 +2212,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *source_type = NULL;
     char *media_type = NULL;
     char *image_data = NULL;
+    server_image_inputs tool_images = {0};
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -2170,10 +2255,13 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            if (!json_content_replace(p, &tool_result)) {
+            char *tmp = NULL;
+            if (!json_tool_result_content(p, &tmp, &tool_images)) {
                 free(key);
                 goto bad;
             }
+            free(tool_result);
+            tool_result = tmp;
         } else if (!strcmp(key, "source")) {
             if (!parse_anthropic_image_source(p, &source_type,
                                                &media_type, &image_data)) {
@@ -2205,6 +2293,15 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
         chat_msg_add_tool_call_id(msg, id);
+        for (size_t i = 0; i < tool_images.len; i++) {
+            if (msg->images.len == msg->images.cap) {
+                size_t cap = msg->images.cap ? msg->images.cap * 2 : 2;
+                msg->images.v = xrealloc(msg->images.v, cap * sizeof(msg->images.v[0]));
+                msg->images.cap = cap;
+            }
+            msg->images.v[msg->images.len++] = tool_images.v[i];
+        }
+        tool_images.len = 0;
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
         buf_puts(&b, "<tool_result>");
@@ -2252,6 +2349,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(source_type);
     free(media_type);
     free(image_data);
+    server_image_inputs_free(&tool_images);
     return true;
 bad:
     free(type);
@@ -2264,6 +2362,7 @@ bad:
     free(source_type);
     free(media_type);
     free(image_data);
+    server_image_inputs_free(&tool_images);
     return false;
 }
 
@@ -21242,6 +21341,31 @@ static void test_anthropic_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_anthropic_tool_result_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"toolu_01\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"before \"},{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+        "\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\" after\"}]}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    const char *open = strstr(msgs.v[0].content, "<tool_result>");
+    const char *close = strstr(msgs.v[0].content, "</tool_result>");
+    const char *marker = strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker);
+    TEST_ASSERT(open && close && marker && open < marker && marker < close);
+    TEST_ASSERT(strstr(msgs.v[0].content, "before ") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, " after") != NULL);
+    TEST_ASSERT(msgs.v[0].parts_len == 1 && msgs.v[0].parts[0].tool_result);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
 static void test_responses_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -21361,6 +21485,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
+    test_anthropic_tool_result_image_content();
     test_responses_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
