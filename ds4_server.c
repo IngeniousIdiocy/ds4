@@ -12652,6 +12652,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const bool live_vision_match =
         ds4_session_vision_state_matches(slot->session,
                                          j->req.images, j->req.image_count);
+    /* An appended image invalidates the text-suffix paths below (they slice
+     * and retokenize), but the exact token-prefix hit keeps the canonical
+     * prompt, so it only needs the checkpoint's images to match as a prefix. */
+    const bool live_vision_prefix_match = live_vision_match ||
+        ds4_session_vision_prefix_state_matches(slot->session,
+                                                j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
@@ -12722,7 +12728,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0 && live_vision_match) {
+    } else if (cached == 0 && live_vision_prefix_match) {
         const int rewind_to = live_prefix_rewind_target(
             ds4_engine_is_glm_dsa(s->engine), old_pos,
             j->req.prompt.len, common);
@@ -12733,9 +12739,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                     rewind_to &&
                 (!multimodal ||
-                 ds4_session_vision_state_matches(slot->session,
-                                                  j->req.images,
-                                                  j->req.image_count));
+                 ds4_session_vision_prefix_state_matches(slot->session,
+                                                         j->req.images,
+                                                         j->req.image_count));
             pthread_mutex_unlock(&s->inference_mu);
             if (rewind_valid) {
                 cached = rewind_to;

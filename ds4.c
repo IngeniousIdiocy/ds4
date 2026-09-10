@@ -71820,6 +71820,14 @@ bool ds4_session_vision_state_matches(
            ds4_session_vision_prefix_matches(s, images, image_count);
 }
 
+bool ds4_session_vision_prefix_state_matches(
+        const ds4_session     *s,
+        const ds4_vision_span *images,
+        size_t                 image_count) {
+    return s && s->checkpoint_valid &&
+           ds4_session_vision_prefix_matches(s, images, image_count);
+}
+
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }

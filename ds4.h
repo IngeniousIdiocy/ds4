@@ -483,6 +483,12 @@ int ds4_session_sync_multimodal(ds4_session *s,
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Weaker form: every checkpoint image matches as above, and any additional
+ * image in the prompt starts at or after the checkpoint, so the live prefix
+ * remains valid when a conversation appends a new image. */
+bool ds4_session_vision_prefix_state_matches(const ds4_session *s,
+                                             const ds4_vision_span *images,
+                                             size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
