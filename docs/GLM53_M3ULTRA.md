@@ -149,7 +149,7 @@ are deliberately separate.
 | MoE block dataflow kernel, hc_pre algebra half B, one-dispatch hc_pre, `xr8` scorer, split8 opt-ins | implemented, **opt-in** (measured slower, or unexplained divergence in the case of `xr8`) | not part of the validated defaults |
 | All-Q8 KDA projection fusion (`DS4_GLM_ENABLE_KDA_PROJ_FUSE`) | implemented, opt-in; the first path written for this file's all-Q8 KDA layout | **not validated**; needs an identity check against the default before it can be recommended |
 | Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | final `538c37c`: 16/16 affected runtime checks, pipelined routed cancellation, connected-client SIGTERM and substantial recovery comparator v3 passed |
-| Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge | **re-validation pending** on a vision prompt |
+| Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge, plus two branch fixes: images nested in Anthropic `tool_result` content are parsed (`a0243fb`), and the live prefix hit survives an appended image (`0d568f8`); see `CHANGES-GLM53.md` §4 | validated 2026-09-10 on the served model: user-message and tool-result images (400×400 PNG and 5712×4284 JPEG) described correctly on the OpenAI and Anthropic paths; appended-image continuation reports the reused prefix. Not part of the release evidence numbers |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
 | DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to the windowed-confidence policy over the trained seven-position block (four-position minimum prefix, full-block verification, three-attempt cost windows, serial reasoning); `--dflash-mode speculative` selects the full-block policy. Positive temperature decodes serially. | Selected on the real coding agent (+4.3% output throughput over serial on 32 randomized requests with the Q8_0 drafter; `docs/DFLASH_GLM53.md` section 7). Fixture and lifecycle receipts for this branch's final build are in `bench/RELEASE-EVIDENCE.md`. Workload-specific, not a general speedup claim. |
 | CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
@@ -197,7 +197,8 @@ Stated once, so a reader does not have to infer them from the table:
   GLM-5.3 additions (`ds4_cuda.cu`, `rocm/ds4_rocm_glm.cuh`) that are compile-only as far
   as this branch goes: no CUDA or ROCm machine built or ran them here; tensor
   parallelism and SSD streaming are upstream's and not exercised; the multimodal
-  (vision) session reuse adopted in the merge has not been re-validated on this branch.
+  (vision) path was exercised on 2026-09-10 (feature table above) but is not part of the
+  release evidence numbers.
   None of these should be assumed to work here beyond what upstream `9ab7053` already
   established.
 - **Cache and recovery cases not validated here.** The lifecycle suite covers a
@@ -646,8 +647,8 @@ prompt identities are recorded in each receipt.
   disk-text`, `cached_tokens 6144`; wall time 13.76 s → 1.93 s (`results.json` T9a/T9b).
   Scope of that evidence: the same-process disk fallback in this sequence (cold prefill,
   one cold snapshot stored, immediate repeat). Restart, session reset, eviction and other
-  state formats are not covered by it and remain open; vision re-validation is still
-  pending.
+  state formats are not covered by it and remain open; the vision path was exercised on
+  2026-09-10 (feature table).
 - **`--help glm53`** (all five tools) lists the supported controls and kill switches,
   and `--help runtime` lists `--dflash`; the experimental opt-ins and the developer
   instrumentation are documented only here.

@@ -84,8 +84,11 @@ Start with the matching language GGUF and `--vision FILE`; see
 
 OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
-Image blocks preserve their order in the request. The limit is 16 images and
-a 64 MiB HTTP body.
+Image blocks preserve their order in the request, including image blocks nested
+in an Anthropic `tool_result` content array (a read-file tool returning a PNG or
+JPEG), which are rendered inside that tool result. The limit is 16 images and
+a 64 MiB HTTP body. GLM-5.3 budgets at most 8,000 image tokens per image, so a
+24 MP photo is resized to about 2874×2156 before encoding.
 
 ## Disk KV cache
 

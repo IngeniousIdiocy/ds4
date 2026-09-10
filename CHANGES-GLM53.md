@@ -321,6 +321,28 @@ timing evidence before any default change.
   trailing whitespace), so the replayed prompt is byte-identical. In the live agent this
   turned a post-compaction re-prefill of a 306k-token transcript into a 1.4 s restore.
   `test_glm_kv_tool_map_roundtrip_exact_blocks` covers eight variants.
+- **Images nested in Anthropic `tool_result` content reach the model** (2026-09-10,
+  `a0243fb`). A tool result whose content array carries an `image` block (an agent's
+  read-file tool returning a PNG or JPEG) was flattened by the generic content parser,
+  which keeps only `text` keys, so the image was dropped and the model saw an empty tool
+  result and guessed. `json_tool_result_content()` now registers nested image blocks on
+  the message and leaves each marker inline, so the image span is rendered inside the
+  `<tool_result>`; images collected while parsing a block are attached only when the
+  block is a `tool_result`. `test_anthropic_tool_result_image_content` covers
+  text/image/text ordering and the part bounds. Verified on the served model: a
+  5712×4284 JPEG returned through a `Read` tool is described correctly.
+- **The live prefix hit survives an appended image** (2026-09-10, `0d568f8`). The exact
+  token-prefix cache hit required the request's image set to equal the checkpoint's, so
+  a multimodal conversation that added an image was accounted as a cold prefill:
+  `cache_read_input_tokens` 0, the prefill rate line dividing the whole prompt by the
+  time spent on the tail (20,000 t/s printed for a 31k prompt whose 645-token tail took
+  1.5 s), and monitors deriving impossible rates, while the engine was already reusing
+  the common prefix. `ds4_session_vision_prefix_state_matches()` accepts a checkpoint
+  whose images match as a prefix when every new image starts at or after the
+  checkpoint; the exact-prefix and rewind paths use it, and the text-suffix paths, which
+  slice and retokenize, keep the strict match. Verified: a tool-result photo after a
+  cached turn reports `cache_read 4,435 / cache_creation 7,938` and the rate line covers
+  the computed tail only.
 - **Shutdown cancellation across long prefill.** Commit `be75a99` makes the
   non-streaming long-prefill callback observe the process-wide stop state. Shutdown can
   therefore cancel work before generation begins, while teardown still joins worker
