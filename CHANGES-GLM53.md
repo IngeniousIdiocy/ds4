@@ -387,11 +387,11 @@ summarized in `bench/README.md` ("Campaign notes").
 ## How this was built
 
 This was a collaborative agent feedback loop. Fable, working through Claude Code,
-implemented the early decode and prefill rounds. Astral, working through Codex,
+implemented the early decode and prefill rounds. Astra, working through Codex,
 independently audited the code and sized the next opportunities through shared written
 notes, then took implementation, integration and GPU-run ownership when Fable reached
-its usage cap. Fable returned as a consulting peer; Astral used Astra and Sol agents for
-bounded implementation and review tasks. The agents worked as peers, with Astral acting
+its usage cap. Fable returned as a consulting peer; Astra used Astra and Sol agents for
+bounded implementation and review tasks. The agents worked as peers, with Astra acting
 as tie breaker only when a disagreement remained unresolved. Mark set the goals and
 constraints and steered priorities.
 
