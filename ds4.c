@@ -41096,9 +41096,6 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_index = ds41_index_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
     const bool batch_publish = ds41_kv_source(il) &&
-#ifdef __APPLE__
-        ratio == 2u &&
-#endif
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
     for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
