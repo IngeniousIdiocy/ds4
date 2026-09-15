@@ -41710,7 +41710,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
-    const bool decoder_suffix = wide && total_count >= 8192u &&
+    /* Layer 20 keeps 1 + (n_layer - 21) * 127 rows and replays the 127 before them. */
+    const uint32_t suffix_rows = 1u + (DS4_N_LAYER - 20u) * 127u;
+    const bool decoder_suffix = wide && total_count >= suffix_rows &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
