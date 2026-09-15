@@ -39,6 +39,64 @@ kernel void kernel_dsv41_bf16_linear(
     }
 }
 
+struct ds4_metal_args_dsv41_router {
+    uint n_expert, top_k, has_bias;
+    float scale;
+};
+
+/* One-token router for up to 1024 experts in one dispatch: the softplus/sqrt
+ * probability transform, the biased top-k through the same bitonic network as
+ * kernel_argsort_f32_i32_desc (padding indices sort last), and the weights
+ * normalised as the generic chain does: gather, SIMD sum over the top_k lanes,
+ * clamp, divide, scale. Threadgroup memory holds nth ints and 2 * nth floats. */
+kernel void kernel_dsv41_router_one(
+        constant ds4_metal_args_dsv41_router &args,
+        device const float *logits,
+        device const float *bias,
+        device float *probs,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup int32_t *shmem_i32 [[threadgroup(0)]],
+        uint col [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    const int width = (int)args.n_expert;
+    threadgroup float *score = (threadgroup float *)(shmem_i32 + ntg);
+    threadgroup float *prob = score + ntg;
+    shmem_i32[col] = (int)col;
+    if ((int)col < width) {
+        const float x = logits[col];
+        const float sp = select(log(1 + exp(x)), x, x > 20);
+        const float p = sqrt(sp);
+        probs[col] = p;
+        prob[col] = p;
+        score[col] = args.has_bias ? p + bias[col] : p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 2; k <= (int)ntg; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            const int ixj = (int)col ^ j;
+            if (ixj > (int)col) {
+                const int a = shmem_i32[col], b = shmem_i32[ixj];
+                const bool swap = ((int)col & k) == 0 ?
+                    (a >= width || (b < width && score[a] < score[b])) :
+                    (b >= width || (a < width && score[a] > score[b]));
+                if (swap) { shmem_i32[col] = b; shmem_i32[ixj] = a; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (col < args.top_k) {
+        const int32_t idx = shmem_i32[col];
+        selected[col] = idx;
+        const float w = prob[idx];
+        const float total = clamp(simd_sum(w), 6.103515625e-5f, INFINITY);
+        /* two stores as in the generic chain: the quotient is rounded before the scale */
+        threadgroup volatile float *quotient = (threadgroup volatile float *)(prob + ntg) + col;
+        *quotient = w / total;
+        weights[col] = *quotient * args.scale;
+    }
+}
+
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];

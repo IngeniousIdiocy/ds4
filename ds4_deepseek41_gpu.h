@@ -21,6 +21,11 @@ typedef enum {
     DS4_V41_FP4_E8M0 = 2,
     DS4_V41_FP4_E4M3 = 3,
 } ds4_v41_activation_format;
+/* One-token router: probabilities, biased top-k and normalised weights in one dispatch. */
+int ds4_gpu_dsv41_router_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                             ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
+                             const void *model_map, uint64_t model_size, uint64_t bias_offset,
+                             uint32_t n_expert, uint32_t top_k, float scale);
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)

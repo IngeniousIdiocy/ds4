@@ -47977,6 +47977,48 @@ int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
     return ds4_gpu_dsv41_rope_stride(x, width, heads, rows, start, 1, compressed, inverse);
 }
 
+int ds4_gpu_dsv41_router_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                             ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
+                             const void *model_map, uint64_t model_size, uint64_t bias_offset,
+                             uint32_t n_expert, uint32_t top_k, float scale) {
+    if (!selected || !weights || !probs || !logits || !n_expert || !top_k || top_k > n_expert ||
+        top_k > 32u) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_router_one");
+        if (!pipeline) return 0;
+        NSUInteger nth = 1;
+        while (nth < n_expert) nth *= 2u;
+        if (nth > pipeline.maxTotalThreadsPerThreadgroup) return 0;
+        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+        if (bias_offset > model_size || bias_bytes > model_size - bias_offset) return 0;
+        uint64_t bias_inner = 0;
+        id<MTLBuffer> biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset,
+                                                          bias_bytes, &bias_inner);
+        if (!biasbuf || ds4_gpu_tensor_bytes(logits) < bias_bytes ||
+            ds4_gpu_tensor_bytes(probs) < bias_bytes ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)top_k * sizeof(int32_t) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)top_k * sizeof(float)) return 0;
+        const struct { uint32_t n_expert, top_k, has_bias; float scale; } args =
+            {n_expert, top_k, 1u, scale};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:biasbuf offset:(NSUInteger)bias_inner atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(probs) offset:ds4_gpu_tensor_offset(probs) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:5];
+        [enc setThreadgroupMemoryLength:((nth * 12u) + 15u + 128u) & ~(NSUInteger)15u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 router");
+    }
+}
+
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format) {
     const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
