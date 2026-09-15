@@ -43556,6 +43556,9 @@ int ds4_gpu_routed_moe_batch_tensor(
          * final work items. Balanced full-model A/B at both 2K and 8K makes
          * it the resident pre-M5 default for large prefill.
          */
+        const bool resident_tile_types =
+            (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4) ||
+            (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K);
         const bool use_pre_m5_mxfp4_mm_id_pair_swiglu_compact_tile_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
@@ -43563,8 +43566,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_SWIGLU_COMPACT_TILE") == NULL;
         const bool use_mxfp4_mm_id_pair_swiglu_compact_tile =
             use_mm_id_pair_swiglu &&
-            gate_type == DS4_METAL_TENSOR_MXFP4 &&
-            down_type == DS4_METAL_TENSOR_MXFP4 &&
+            resident_tile_types &&
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_pair_swiglu_compact_tile_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE) != 0u);
@@ -43579,8 +43581,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_MAP_SCATTER") == NULL;
         const bool use_mxfp4_mm_id_map_scatter =
             use_mxfp4_mm_id_pair_swiglu_compact_tile &&
-            gate_type == DS4_METAL_TENSOR_MXFP4 &&
-            down_type == DS4_METAL_TENSOR_MXFP4 &&
+            resident_tile_types &&
             n_expert == 6 &&
             !g_ssd_streaming_mode &&
             g_tp_split_world == 1 &&
@@ -43600,8 +43601,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_pair_tail_simdgroup_cull =
             use_mm_id_pair_swiglu &&
-            gate_type == DS4_METAL_TENSOR_MXFP4 &&
-            down_type == DS4_METAL_TENSOR_MXFP4 &&
+            resident_tile_types &&
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL) != 0u);
@@ -43613,8 +43613,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_mxfp4_mm_id_down_tail_simdgroup_cull =
             use_mm_id &&
             request_mid_f16 &&
-            gate_type == DS4_METAL_TENSOR_MXFP4 &&
-            down_type == DS4_METAL_TENSOR_MXFP4 &&
+            resident_tile_types &&
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL) != 0u);
@@ -43670,7 +43669,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                     false) :
                 use_mxfp4_mm_id_down_tail_simdgroup_cull ?
                     ds4_gpu_get_mul_mm_id_pipeline(
-                        "kernel_mul_mm_id_mxfp4_f16_tail_cull", false) :
+                        gate_type == DS4_METAL_TENSOR_Q4_K ?
+                            "kernel_mul_mm_id_q4_K_f16_tail_cull" :
+                            "kernel_mul_mm_id_mxfp4_f16_tail_cull", false) :
                 request_mid_f16 ?
                     ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
                     ds4_gpu_routed_mm_pipeline(down_type);
@@ -43768,7 +43769,11 @@ int ds4_gpu_routed_moe_batch_tensor(
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
-                            "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                            (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16_compact_tail_cull" :
+                             use_mxfp4_mm_id_pair_tail_simdgroup_cull ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16_tail_cull" :
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16") :
                         gate_type == DS4_METAL_TENSOR_MXFP4 ?
                             (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
                                 (use_mxfp4_mm_id_pair_half_scale ?
