@@ -84,7 +84,17 @@ int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *blocks,
 int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   const ds4_gpu_tensor *block_mask,
                                   uint32_t width, uint32_t rows,
-                                  uint32_t start, uint32_t ratio);
+                                  uint32_t start, uint32_t ratio,
+                                  uint32_t mask_stride);
+/* Per-row block top-2048 with the causal block count of ratio-1 rows, and
+ * the 0/-inf block masks it selects at mask_stride floats per row. */
+int ds4_gpu_dsv41_candidate_topk_batch(ds4_gpu_tensor *selected,
+                                      const ds4_gpu_tensor *blocks,
+                                      uint32_t width, uint32_t rows, uint32_t start);
+int ds4_gpu_dsv41_candidate_mask_batch(ds4_gpu_tensor *mask,
+                                      const ds4_gpu_tensor *selected,
+                                      uint32_t width, uint32_t rows,
+                                      uint32_t mask_stride);
 /* Causal index scores over ratio-1/2 compressed keys, without an extra cast
  * of the already quantized FP4 queries/keys. Scores have source_rows stride. */
 int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,

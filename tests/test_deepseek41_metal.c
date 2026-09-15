@@ -498,7 +498,7 @@ static int check_candidates(void) {
             CHECK(ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, start, ratio));
             CHECK(ds4_gpu_indexer_topk_tensor(t, b, blocks, rows, top));
             CHECK(ds4_gpu_dsv4_topk_mask_tensor(m, t, blocks, rows, top));
-            CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, ratio));
+            CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, ratio, 0));
             CHECK(ds4_gpu_end_commands());
             CHECK(ds4_gpu_tensor_read(b, 0, maxima, (size_t)blocks * rows * 4));
             CHECK(ds4_gpu_tensor_read(s, 0, got, (size_t)n * rows * 4));
@@ -525,11 +525,69 @@ static int check_candidates(void) {
         }
         CHECK(!ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, UINT32_MAX, 1));
         CHECK(!ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, 0, 0));
-        CHECK(!ds4_gpu_dsv41_candidate_filter(s, m, n, rows + 1, 0, 1));
+        CHECK(!ds4_gpu_dsv41_candidate_filter(s, m, n, rows + 1, 0, 1, 0));
+        CHECK(blocks == 1 || !ds4_gpu_dsv41_candidate_filter(s, m, n, rows, 0, 1, blocks - 1));
         ds4_gpu_tensor_free(s); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(t); ds4_gpu_tensor_free(m);
         free(scores); free(got); free(maxima); free(sorted); free(kept);
     }
     fprintf(stderr, "V4.1 causal candidate blocks and filtering: exact\n");
+    return 1;
+}
+
+/* Batched block top-k, strided masks and filtering against the per-row calls. */
+static int check_candidates_batch(uint32_t n, uint32_t rows, uint32_t start) {
+    const uint32_t blocks = (n + 7) / 8, stride = blocks + 3;
+    float *scores = malloc((size_t)n * rows * 4), *got = malloc((size_t)n * rows * 4);
+    float *mask = malloc((size_t)stride * rows * 4);
+    CHECK(scores && got && mask);
+    for (uint32_t r = 0; r < rows; r++) for (uint32_t i = 0; i < n; i++)
+        scores[(size_t)r * n + i] = (float)((i * 7919u + r * 1009u) % 104729u) - 50000;
+    for (size_t i = 0; i < (size_t)stride * rows; i++) mask[i] = 7.0f;
+    ds4_gpu_tensor *s = upload(scores, (size_t)n * rows * 4);
+    ds4_gpu_tensor *b = upload(NULL, (size_t)blocks * rows * 4);
+    ds4_gpu_tensor *t = upload(NULL, (size_t)2048 * rows * 4);
+    ds4_gpu_tensor *ref = upload(NULL, (size_t)2048 * rows * 4);
+    ds4_gpu_tensor *m = upload(mask, (size_t)stride * rows * 4);
+    CHECK(s && b && t && ref && m);
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, start, 1));
+    for (uint32_t r = 0; r < rows; r++) {
+        uint32_t visible = (start + r + 8) / 8;
+        if (visible > blocks) visible = blocks;
+        ds4_gpu_tensor *br = ds4_gpu_tensor_view(b, (size_t)r * blocks * 4, (size_t)visible * 4);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(ref, (size_t)r * 2048 * 4, 2048 * 4);
+        CHECK(br && out && ds4_gpu_indexer_topk_tensor(out, br, visible, 1, 2048));
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(br);
+    }
+    CHECK(ds4_gpu_dsv41_candidate_topk_batch(t, b, blocks, rows, start));
+    CHECK(ds4_gpu_dsv41_candidate_mask_batch(m, t, blocks, rows, stride));
+    CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, 1, stride));
+    CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+    const int32_t *ids = ds4_gpu_tensor_contents(t), *expected = ds4_gpu_tensor_contents(ref);
+    CHECK(ids && expected && !memcmp(ids, expected, (size_t)2048 * rows * 4));
+    CHECK(ds4_gpu_tensor_read(m, 0, mask, (size_t)stride * rows * 4));
+    CHECK(ds4_gpu_tensor_read(s, 0, got, (size_t)n * rows * 4));
+    for (uint32_t r = 0; r < rows; r++) {
+        uint32_t visible = start + r + 1;
+        if (visible > n) visible = n;
+        for (uint32_t j = 0; j < blocks; j++) {
+            bool kept = false;
+            for (uint32_t k = 0; k < 2048 && !kept; k++) kept = ids[(size_t)r * 2048 + k] == (int32_t)j;
+            CHECK(mask[(size_t)r * stride + j] == (kept ? 0.0f : -INFINITY));
+        }
+        for (uint32_t j = blocks; j < stride; j++) CHECK(mask[(size_t)r * stride + j] == 7.0f);
+        for (uint32_t i = 0; i < n; i++) {
+            const float expect = i < visible && mask[(size_t)r * stride + i / 8] == 0.0f ?
+                scores[(size_t)r * n + i] : -INFINITY;
+            CHECK(got[(size_t)r * n + i] == expect);
+        }
+    }
+    CHECK(!ds4_gpu_dsv41_candidate_topk_batch(t, b, blocks, rows, 16376));
+    CHECK(!ds4_gpu_dsv41_candidate_mask_batch(m, t, blocks, rows, blocks - 1));
+    ds4_gpu_tensor_free(m); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(t);
+    ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(s);
+    free(scores); free(got); free(mask);
+    fprintf(stderr, "V4.1 batched candidates n=%u start=%u: exact\n", n, start);
     return 1;
 }
 
@@ -1312,7 +1370,8 @@ int main(int argc, char **argv) {
     }
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
-             check_candidates() && check_sparse_gather() && check_indexer_batch() &&
+             check_candidates() && check_candidates_batch(16449, 17, 16400) &&
+             check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
