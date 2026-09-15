@@ -526,3 +526,70 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(
         ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model_map, model_size,
             b, 8192u, 5120u, rank * 4096u, 4096u, low, rows);
 }
+
+/* Metal folds these bf16 roundings into the producing kernels; here the
+ * standalone rounding pass follows (or precedes) the unchanged operator. */
+static uint32_t ds4_gpu_dsv41_rows_of(const ds4_gpu_tensor *t, uint32_t width) {
+    const uint64_t bytes = ds4_gpu_tensor_bytes(t);
+    const uint64_t rows = width ? bytes / ((uint64_t)width * sizeof(float)) : 0;
+    return rows ? (uint32_t)rows : 1u;
+}
+
+extern "C" int ds4_gpu_rms_norm_weight_bf16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+    return ds4_gpu_rms_norm_weight_tensor(out, x, model_map, model_size, weight_offset, n, eps) &&
+           ds4_gpu_dsv41_quantize(out, n, 1, DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_bf16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok) &&
+           ds4_gpu_dsv41_quantize(out, (uint32_t)out_dim, (uint32_t)n_tok, DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_bf16io_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_dsv41_quantize(x, (uint32_t)in_dim, (uint32_t)n_tok, DS4_V41_BF16) &&
+           ds4_gpu_matmul_q8_0_bf16_tensor(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok);
+}
+
+extern "C" int ds4_gpu_hc_weighted_sum_bf16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights,
+        uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_hc_weighted_sum_tensor(out, residual_hc, weights, n_embd, n_hc) &&
+           ds4_gpu_dsv41_quantize(out, n_embd, ds4_gpu_dsv41_rows_of(out, n_embd), DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_hc_weighted_sum_split_bf16_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_hc_weighted_sum_split_tensor(out, residual_hc, split, n_embd, n_hc) &&
+           ds4_gpu_dsv41_quantize(out, n_embd, ds4_gpu_dsv41_rows_of(out, n_embd), DS4_V41_BF16);
+}
+
+extern "C" int ds4_gpu_hc_expand_split_bf16_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc, split, n_embd, n_hc) &&
+           ds4_gpu_dsv41_quantize(out_hc, n_hc * n_embd, ds4_gpu_dsv41_rows_of(out_hc, n_hc * n_embd), DS4_V41_BF16);
+}
+
+/* block_out is scratch owned by the caller: the sum lands in it before the expansion. */
+extern "C" int ds4_gpu_hc_expand_split_add_bf16_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    ds4_gpu_tensor *block = (ds4_gpu_tensor *)block_out;
+    const uint32_t rows = ds4_gpu_dsv41_rows_of(block_out, n_embd);
+    return ds4_gpu_add_tensor(block, block_out, block_add, (uint64_t)n_embd * rows) &&
+           ds4_gpu_dsv41_quantize(block, n_embd, rows, DS4_V41_BF16) &&
+           ds4_gpu_hc_expand_split_bf16_tensor(out_hc, block_out, residual_hc, split, n_embd, n_hc);
+}
+
+extern "C" int ds4_gpu_dsv41_rope_bf16(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                       uint32_t rows, uint32_t start, bool compressed, bool inverse) {
+    return ds4_gpu_dsv41_quantize(x, width * heads, rows, DS4_V41_BF16) &&
+           ds4_gpu_dsv41_rope(x, width, heads, rows, start, compressed, inverse);
+}

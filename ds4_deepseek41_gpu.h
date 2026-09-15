@@ -53,6 +53,8 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
+int ds4_gpu_dsv41_rope_bf16(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                            uint32_t rows, uint32_t start, bool compressed, bool inverse);
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
                              bool compressed, bool inverse);
