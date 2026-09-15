@@ -58,8 +58,32 @@ def validate(args):
     config = json.loads((Path(args.hf) / "config.json").read_text())
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
     try:
-        plan = build_plan(db, config, args.quant)
         with open(args.gguf, "rb") as fp:
+            # The file says which layout it holds: a support file, or a model
+            # with or without the DSpark stages.
+            names, arch = set(), None
+            if read_exact(fp, 4, "magic") != b"GGUF" or read_u32(fp, "version") != 3:
+                raise ValueError("expected GGUF v3")
+            count = read_u64(fp, "tensor count")
+            for _ in range(read_u64(fp, "metadata count")):
+                key = read_gguf_string(fp, "metadata key")
+                kind = read_u32(fp, "metadata type")
+                if key == "general.architecture":
+                    arch = read_selected_metadata(fp, kind)
+                else:
+                    skip_gguf_value(fp, kind)
+            for _ in range(count):
+                names.add(read_gguf_string(fp, "tensor name"))
+                for _ in range(read_u32(fp, "tensor rank")):
+                    read_u64(fp, "dimension")
+                read_u32(fp, "tensor type")
+                read_u64(fp, "tensor offset")
+            support = arch == "deepseek41-dspark"
+            embedded = not support and any(name.startswith("mtp.") for name in names)
+            plan, draft = build_plan(db, config, args.quant, "separate" if support else "embed" if embedded else "none")
+            if support:
+                plan = draft
+            fp.seek(0)
             if read_exact(fp, 4, "magic") != b"GGUF" or read_u32(fp, "version") != 3:
                 raise ValueError("expected GGUF v3")
             if read_u64(fp, "tensor count") != len(plan):
@@ -75,7 +99,8 @@ def validate(args):
                     metadata[key] = read_selected_metadata(fp, kind)
                 else:
                     skip_gguf_value(fp, kind)
-            expected = {"general.architecture": "deepseek41", "general.alignment": GGUF_ALIGNMENT,
+            expected = {"general.architecture": "deepseek41-dspark" if support else "deepseek41",
+                        "general.alignment": GGUF_ALIGNMENT,
                         "general.source.revision": args.source_revision,
                         "deepseek41.quantization": QUANTIZATION[args.quant],
                         "deepseek41.calibration": "imatrix" if args.imatrix else "weight-energy bootstrap"}
