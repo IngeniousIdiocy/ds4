@@ -12,6 +12,9 @@ static inline float dsv41_bf16(float x) {
         bits += 0x7fffu + ((bits >> 16u) & 1u);
     return as_type<float>(bits & 0xffff0000u);
 }
+static inline float4 dsv41_bf16(float4 v) {
+    return float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+}
 
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
@@ -57,9 +60,15 @@ kernel void kernel_dsv41_router_one(
         device int32_t *selected,
         device float *weights,
         threadgroup int32_t *shmem_i32 [[threadgroup(0)]],
-        uint col [[thread_position_in_threadgroup]],
-        uint ntg [[threads_per_threadgroup]]) {
+        uint2 tg [[threadgroup_position_in_grid]],
+        uint2 tpos [[thread_position_in_threadgroup]],
+        uint2 tsize [[threads_per_threadgroup]]) {
+    const uint col = tpos.x, ntg = tsize.x;
     const int width = (int)args.n_expert;
+    logits += tg.y * args.n_expert;   /* one threadgroup per row */
+    probs += tg.y * args.n_expert;
+    selected += tg.y * args.top_k;
+    weights += tg.y * args.top_k;
     threadgroup float *score = (threadgroup float *)(shmem_i32 + ntg);
     threadgroup float *prob = score + ntg;
     shmem_i32[col] = (int)col;
@@ -144,6 +153,105 @@ kernel void kernel_dsv41_quantize(
         result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
+}
+
+struct ds4_metal_args_dsv41_rope_quantize {
+    uint width, start, inverse, mode;
+    float frequencies[32];
+};
+
+/* One row's rope, quantization and store into a cache row: the rotation of
+ * the last 64 columns as kernel_dsv41_rope applies it, then the block
+ * quantization of kernel_dsv41_quantize, written to dst. */
+kernel void kernel_dsv41_rope_quantize(
+        constant ds4_metal_args_dsv41_rope_quantize &args,
+        device const float *x,
+        device float *dst,
+        uint group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint block = args.mode == 3u ? 16u : 32u;
+    const uint column = group * block + lane;
+    const bool valid = lane < block && column < args.width;
+    float value = valid ? x[column] : 0.0f;
+    const float other = simd_shuffle_xor(value, 1u);
+    const uint rotary = args.width - 64u;
+    if (valid && column >= rotary) {
+        const float theta = float(args.start) * args.frequencies[(column - rotary) >> 1u];
+        const float c = precise::cos(theta);
+        const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+        const float re = (column & 1u) ? other : value;
+        const float im = (column & 1u) ? value : other;
+        value = (column & 1u) ? dsv41_bf16(re * s + im * c) : dsv41_bf16(re * c - im * s);
+    }
+    value = dsv41_bf16(value);
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (args.mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (args.mode == 2u || args.mode == 3u) {
+        const float scale = args.mode == 3u
+            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    }
+    if (valid) dst[column] = dsv41_bf16(result);
+}
+
+struct ds4_metal_args_dsv41_norm_pair {
+    uint n0, n1, ntg0, ntg1;
+    float eps;
+};
+
+/* Two weighted RMS norms in one dispatch, each row on its own thread count
+ * (ntg0 threads then ntg1), so every reduction matches the single-row kernel. */
+kernel void kernel_dsv41_norm_pair(
+        constant ds4_metal_args_dsv41_norm_pair &args,
+        device const float4 *x0,
+        device const float4 *w0,
+        device float4 *y0,
+        device const float4 *x1,
+        device const float4 *w1,
+        device float4 *y1,
+        threadgroup float *shmem [[threadgroup(0)]],
+        uint2 tg [[threadgroup_position_in_grid]],
+        ushort2 tpos [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const ushort tid = tpos.x;
+    const bool second = tid >= args.ntg0;
+    const uint ntg = second ? args.ntg1 : args.ntg0;
+    const uint t = second ? tid - args.ntg0 : tid;
+    const uint sg = second ? sgitg - args.ntg0 / 32u : sgitg;
+    const int n = int(second ? args.n1 : args.n0);
+    const int ne00_t = n / 4;
+    const uint row = tg.y;   /* grid row = activation row */
+    device const float4 *x = (second ? x1 : x0) + (ulong)row * ne00_t;
+    device const float4 *w = second ? w1 : w0;
+    device float4 *y = (second ? y1 : y0) + (ulong)row * ne00_t;
+    threadgroup float *sh = shmem + (second ? 32u : 0u);
+    if (sg == 0) {
+        sh[tiisg] = 0.0f;
+    }
+    float sumf = 0.0f;
+    for (int i = int(t); i < ne00_t; i += int(ntg)) {
+        sumf += dot(x[i], x[i]);
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sh[sg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = sh[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf/n;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+    for (int i = int(t); i < ne00_t; i += int(ntg)) {
+        float4 v = x[i]*scale;
+        v = v*w[i];
+        y[i] = dsv41_bf16(v);
+    }
 }
 
 struct ds4_metal_args_dsv41_engram {
@@ -372,3 +480,162 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+// DSpark: the draft head reads the mean over the copies of the stream entering
+// each target layer, packed side by side: out[t][out_off + j].
+struct ds4_metal_args_dsv41_hc_mean {
+    uint dim;
+    uint hc;
+    uint out_stride;
+    uint out_off;
+};
+
+kernel void kernel_dsv41_hc_mean(
+        constant ds4_metal_args_dsv41_hc_mean &args,
+        device const float *stream,   // [rows, hc, dim]
+        device float *out,
+        uint2 index [[thread_position_in_grid]]) {
+    if (index.x >= args.dim) return;
+    device const float *row = stream + (ulong)index.y * args.hc * args.dim;
+    float acc = 0.0f;
+    for (uint c = 0; c < args.hc; c++) acc += row[c * args.dim + index.x];
+    out[(ulong)index.y * args.out_stride + args.out_off + index.x] = acc / (float)args.hc;
+}
+
+// The Markov head: position `step`'s logits gain head[v] . embed[token[step]] and its
+// draft is the argmax; the confidence is proj . [x[step], embed[token[step]]].  The
+// chain runs on the device, one part/final pair per position, so no token comes back
+// to the host in between.  Tables are [vocab, rank] rows, F16 or F32.
+struct ds4_metal_args_dsv41_markov {
+    uint vocab;
+    uint rank;
+    uint dim;
+    uint step;
+    uint n_parts;
+    uint f16;
+};
+
+static inline float dsv41_markov_tab(device const void *p, ulong i, uint f16) {
+    return f16 ? (float)((device const half *)p)[i] : ((device const float *)p)[i];
+}
+
+#define DSV41_MARKOV_MAX_PER_LANE 16u   // rank <= 512
+
+// one simdgroup per row stride, lanes over the rank; ties go to the lower index, NaN loses
+kernel void kernel_dsv41_markov_part(
+        constant ds4_metal_args_dsv41_markov &a,
+        device const float *logits,   // [block, vocab]
+        device const void *embed,
+        device const void *head,
+        device const int *tokens,     // [block + 1]
+        device float *part_val,       // [n_parts]
+        device int *part_idx,
+        threadgroup float *e [[threadgroup(0)]],  // [rank]
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    threadgroup float sv[32];
+    threadgroup int si[32];
+    const uint per = a.rank / 32u;
+    if (per == 0u || per > DSV41_MARKOV_MAX_PER_LANE) return;
+    const int prev = tokens[a.step];
+    for (uint r = tid; r < a.rank; r += ntg) e[r] = dsv41_markov_tab(embed, (ulong)prev * a.rank + r, a.f16);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // a lane owns `per` consecutive ranks, so a row is one contiguous load per lane; four
+    // rows go per step so their loads overlap
+    float ev[DSV41_MARKOV_MAX_PER_LANE];
+    for (uint i = 0; i < DSV41_MARKOV_MAX_PER_LANE; i++) ev[i] = i < per ? e[lane * per + i] : 0.0f;
+    device const float *lg = logits + (ulong)a.step * a.vocab;
+    float best = -INFINITY;
+    int bi = -1;
+    const uint stride = a.n_parts * nsg;
+    for (uint v0 = tgpig * nsg + sg; v0 < a.vocab; v0 += 4u * stride) {
+        float p4[4];
+        for (ushort j = 0; j < 4; j++) {
+            const uint v = min(v0 + j * stride, a.vocab - 1u);
+            const ulong base = (ulong)v * a.rank + lane * per;
+            float p = 0.0f;
+            if (a.f16 && per == 8u) {
+                device const half4 *hp = (device const half4 *)((device const half *)head + base);
+                const float4 h0 = float4(hp[0]), h1 = float4(hp[1]);
+                p = dot(h0, float4(ev[0], ev[1], ev[2], ev[3])) + dot(h1, float4(ev[4], ev[5], ev[6], ev[7]));
+            } else {
+                for (uint i = 0; i < DSV41_MARKOV_MAX_PER_LANE; i++) {
+                    if (i < per) p = fma(dsv41_markov_tab(head, base + i, a.f16), ev[i], p);
+                }
+            }
+            p4[j] = p;
+        }
+        for (ushort j = 0; j < 4; j++) {
+            const uint v = v0 + j * stride;
+            if (v >= a.vocab) break;
+            const float p = simd_sum(p4[j]) + lg[v];
+            if (p > best || (p == best && (int)v < bi)) { best = p; bi = (int)v; }
+        }
+    }
+    if (lane == 0) { sv[sg] = best; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < nsg; k++) {
+            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
+        }
+        part_val[tgpig] = best;
+        part_idx[tgpig] = bi;
+    }
+}
+
+kernel void kernel_dsv41_markov_final(
+        constant ds4_metal_args_dsv41_markov &a,
+        device const float *part_val,
+        device const int *part_idx,
+        device int *tokens,           // [block + 1]: tokens[step + 1] is written
+        device const float *x,        // [block, dim], the head's input before its norm
+        device const void *embed,
+        device const float *conf_proj, // [dim + rank]
+        device float *conf,           // [block]
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    threadgroup float sv[32];
+    threadgroup int si[32];
+    float best = -INFINITY;
+    int bi = -1;
+    for (uint p = tid; p < a.n_parts; p += ntg) {
+        const float v = part_val[p];
+        const int i = part_idx[p];
+        if (i >= 0 && (v > best || (v == best && i < bi))) { best = v; bi = i; }
+    }
+    for (uint o = 16; o > 0; o >>= 1) {
+        const float ov = simd_shuffle_down(best, o);
+        const int oi = simd_shuffle_down(bi, o);
+        if (oi >= 0 && (ov > best || (ov == best && oi < bi))) { best = ov; bi = oi; }
+    }
+    if (lane == 0) { sv[sg] = best; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < nsg; k++) {
+            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
+        }
+        tokens[a.step + 1u] = bi < 0 ? 0 : bi;
+    }
+    const int prev = tokens[a.step];
+    float acc = 0.0f;
+    for (uint d = tid; d < a.dim; d += ntg) acc = fma(conf_proj[d], x[(ulong)a.step * a.dim + d], acc);
+    for (uint r = tid; r < a.rank; r += ntg) {
+        acc = fma(conf_proj[a.dim + r], dsv41_markov_tab(embed, (ulong)prev * a.rank + r, a.f16), acc);
+    }
+    acc = simd_sum(acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) sv[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float c = 0.0f;
+        for (uint k = 0; k < nsg; k++) c += sv[k];
+        conf[a.step] = c;
+    }
+}
