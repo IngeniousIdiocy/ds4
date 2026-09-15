@@ -451,7 +451,7 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
                                                 uint32_t start, uint32_t ratio) {
     if ((ratio != 1u && ratio != 2u) || !rows || rows > UINT32_MAX - start ||
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
-        (start + 1u) / ratio < 1024u ||
+        (start + 1u) / ratio <= 512u ||
         !dsv41_has_floats(selected, (uint64_t)rows * 512u) ||
         !dsv41_has_floats(scores, (uint64_t)rows * width)) return 0;
     for (uint32_t row = 0; row < rows; row++) {
@@ -464,6 +464,24 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
         if (!ds4_gpu_indexer_topk_tensor(&dst, &src, visible, 1u, 512u)) return 0;
     }
     return 1;
+}
+
+__global__ static void dsv41_indexer_all_kernel(int32_t *ids, uint32_t rows,
+                                                uint32_t start, uint32_t ratio) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = i / 512u, col = i % 512u;
+    if (row >= rows) return;
+    const uint32_t visible = (start + row + 1u) / ratio;
+    if (col < min(visible, 512u)) ids[i] = (int32_t)col;
+}
+
+extern "C" int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
+                                               uint32_t start, uint32_t ratio) {
+    if (!ratio || !rows || rows > UINT32_MAX - start || (start + rows) / ratio > 512u ||
+        !dsv41_has_floats(selected, (uint64_t)rows * 512u)) return 0;
+    dsv41_indexer_all_kernel<<<(unsigned)(((uint64_t)rows * 512u + 255u) / 256u), 256, 0,
+        cuda_decode_stream()>>>((int32_t *)selected->ptr, rows, start, ratio);
+    return cuda_ok(cudaGetLastError(), "V4.1 indexer select all");
 }
 
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map,

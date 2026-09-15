@@ -1086,7 +1086,7 @@ static int check_general_topk(void) {
 }
 
 static int check_causal_topk(void) {
-    const uint32_t frontiers[] = {1024, 1025, 1535, 2047, 2048, 4095, 16383, 32767, 65535};
+    const uint32_t frontiers[] = {513, 514, 1023, 1024, 1025, 1535, 2047, 2048, 4095, 16383, 32767, 65535};
     const uint32_t counts[] = {1, 2, 31, 32, 33, 127, 128, 129};
     for (uint32_t ratio = 1; ratio <= 2; ratio++) {
     for (size_t fi = 0; fi < sizeof(frontiers) / sizeof(*frontiers); fi++) {
@@ -1139,6 +1139,7 @@ static int check_causal_topk(void) {
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 130, start, ratio));
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, UINT32_MAX, ratio));
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, 0, ratio));
+        CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, 512u * ratio - 1u, ratio));
         CHECK(!ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, 1, start, 0));
         fprintf(stderr, "V4.1 causal top-k ratio=%u visible=%u: exact IDs including ties PASS\n", ratio, frontiers[fi]);
         ds4_gpu_tensor_free(reference); ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(scores);
@@ -1147,6 +1148,31 @@ static int check_causal_topk(void) {
     return 1;
 }
 
+
+/* Rows with at most 512 visible keys select every key; other slots stay. */
+static int check_indexer_all(void) {
+    const uint32_t rows = 129u;
+    ds4_gpu_tensor *selected = upload(NULL, (rows * 512u + 1u) * sizeof(int32_t));
+    CHECK(selected);
+    int32_t *ids = ds4_gpu_tensor_contents(selected);
+    CHECK(ids);
+    for (uint32_t ratio = 1; ratio <= 2; ratio++) for (uint32_t start = 0; start <= 300u; start += 300u) {
+        for (uint32_t i = 0; i <= rows * 512u; i++) ids[i] = -1;
+        CHECK(ds4_gpu_dsv41_indexer_all_batch(selected, rows, start, ratio));
+        CHECK(ds4_gpu_synchronize());
+        for (uint32_t t = 0; t < rows; t++) {
+            const uint32_t visible = (start + t + 1u) / ratio;
+            for (uint32_t i = 0; i < 512u; i++)
+                CHECK(ids[t * 512u + i] == (i < visible ? (int32_t)i : -1));
+        }
+        CHECK(ids[rows * 512u] == -1);
+    }
+    CHECK(!ds4_gpu_dsv41_indexer_all_batch(selected, rows, 512u, 1));
+    CHECK(!ds4_gpu_dsv41_indexer_all_batch(selected, rows, 0, 0));
+    ds4_gpu_tensor_free(selected);
+    fprintf(stderr, "V4.1 indexer select-all rows: exact\n");
+    return 1;
+}
 
 static int check_compact_carry(void) {
     const uint32_t widths[] = {1, 31, 32, 33, 127, 128, 129, 20480};
@@ -1372,7 +1398,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
+             check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

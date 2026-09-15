@@ -118,12 +118,15 @@ int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *scores,
                                       uint32_t source_rows, uint32_t rows,
                                       uint32_t start, uint32_t ratio,
                                       uint32_t packed_rows, uint32_t offset);
-/* Exact row-sort ordering with independent causal widths; at least 1024
+/* Exact row-sort ordering with independent causal widths; more than 512
  * visible keys per row. Output stride is 512 indices. */
 int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected,
                                     const ds4_gpu_tensor *scores,
                                     uint32_t width, uint32_t rows,
                                     uint32_t start, uint32_t ratio);
+/* Rows with at most 512 visible keys select all of them, in key order. */
+int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
+                                   uint32_t start, uint32_t ratio);
 enum { DS4_V41_CARRY_BF16, DS4_V41_CARRY_MASK, DS4_V41_CARRY_F32 };
 /* Lossless storage for already-BF16 activations or 0/-inf candidate masks.
  * Packed rows are padded to whole uint32_t words. Plain rows remain F32. */
