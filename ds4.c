@@ -40670,6 +40670,8 @@ static bool ds41_env_flag(const char *name, int *cached) {
 static bool ds41_expand_fusion_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_EXPAND_FUSION", &c); }
 static bool ds41_hc_block_input_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_HC_BLOCK_INPUT", &c); }
 static bool ds41_rows_attention_on(void) { static int c = -1; return ds41_env_flag("DS4_METAL_ENABLE_V41_ROWS_ATTENTION", &c); }
+static bool ds41_queued_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_QUEUED_HEAD", &c); }
+static bool ds41_short_sweep_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
@@ -41021,13 +41023,16 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_moe_partial(g, m, l, il, token, g->tp_world == 2) && ds41_moe_finish(g, il);
 }
 
+static bool ds41_graph_encode_logits(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
+    return ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+        ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits, m, w, g->norm, 1);
+}
+
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
-              ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
-                                      m, w, g->norm, 1);
+    bool ok = ds41_graph_encode_logits(g, m, w);
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
@@ -41350,13 +41355,16 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_publish = ds41_kv_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
-    for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
+    /* non-source layers have no per-row publication or index work */
+    const bool row_publish = ds41_kv_source(il) && !batch_publish;
+    const bool row_index = ds41_index_source(il) && !batch_index;
+    for (uint32_t t = 0; (row_publish || row_index) && t < count; t++) {
         row.pos = start + t;
 #define DS41_SELECT_ROW(name, width) row.name = g->rows_view[t].name;
         DS41_PREFILL_ROWS(DS41_SELECT_ROW)
 #undef DS41_SELECT_ROW
-        if (!batch_publish && !ds41_attention_publish(&row, m, l, il)) return false;
-        if (!batch_index && !ds41_attention_select_published(&row, m, l, il)) return false;
+        if (row_publish && !ds41_attention_publish(&row, m, l, il)) return false;
+        if (row_index && !ds41_attention_select_published(&row, m, l, il)) return false;
     }
     /* a verify pass keeps its rows' pooling inputs for the rollback */
     if (g->draft && g->draft->verify_rows && ds41_kv_source(il) && ratio == 2u) {
@@ -41935,6 +41943,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const bool queue_layers = !g->imatrix && !layer_resident &&
         !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
                                  : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
+    const bool queued_head = queue_layers && !layer_resident && logits && g->tp_world == 1 && !ds41_queued_head_off();
     if (g->draft) {
         g->draft->mh_pos0 = g->pos;
         g->draft->mh_rows = 1;
@@ -41962,6 +41971,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * the layer 13 drain. Drain before publishing the token to the CPU. */
         const bool drain = !queue_layers || (g->tp_world == 2 && il == 13) ||
             il + 1u == DS4_N_LAYER;
+        /* the head only needs the last layer: encode it before the drain */
+        if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -41985,7 +41996,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, 1);
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     }
-    if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (ok && logits) ok = queued_head ?
+        ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 :
+        ds41_graph_logits(g, m, w, logits);
     if (!ok) {
         g->valid = false;
         return false;
@@ -42078,10 +42091,11 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         !getenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
 #endif
-    if (g->carry_cap && remaining >= 4096u &&
+    if (g->carry_cap && remaining >= (ds41_short_sweep_off() ? 4096u : 3072u) &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
-        return count - count % 2048u;
+        /* a short sweep keeps its final partial tile instead of a second decoder pass */
+        return remaining < 8192u && !ds41_short_sweep_off() ? count : count - count % 2048u;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
     return remaining < tail_cap ? remaining : tail_cap;
@@ -42429,8 +42443,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
             const uint32_t needed = kept + (DS4_N_LAYER - 1u - il) * 127u;
             first = total_count - needed;
-            if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
-                first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
+            /* short sweeps prune whole tiles and warm a complete one, keeping
+             * the partitions the plain schedule would have used */
+            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off();
+            if (short_sweep) first -= first % 2048u;
+            const uint32_t warm = short_sweep ? 128u : 127u;
+            if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
         /* Keep the decoder suffix's established matrix partitions; unlike
          * the encoder, its shrinking tail is not aligned to large tiles. */
