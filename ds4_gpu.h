@@ -154,6 +154,8 @@ int ds4_gpu_add_tensor_tp_flag(
  * the gate's checked flag itself (taken by the attention output K-slice
  * matvec when its output is that slot; otherwise ignored). */
 void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
+/* Bind every routed expert and mask none (the caller splits the list). */
+void ds4_gpu_tp_full_expert_bind(int on);
 
 /* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
  * to run only its q task now and fold the kv task into the KV staging

@@ -10249,6 +10249,11 @@ static int ds4_gpu_tp_world_is_two(void) {
     return g_tp_split_world == 2;
 }
 
+/* Decode balances the routed experts by list position instead of by id
+ * range: every expert is bound and the kernels mask nothing. */
+static int g_tp_full_expert_bind;
+void ds4_gpu_tp_full_expert_bind(int on) { g_tp_full_expert_bind = on; }
+
 /* Return the contiguous routed-expert range backed by this process. Rank 1
  * owns the high range and receives any odd-count remainder. */
 static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
@@ -10256,7 +10261,7 @@ static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
                                     uint32_t *n_expert) {
     *first_expert = 0;
     *n_expert = n_total_expert;
-    if (g_tp_split_world != 2) return;
+    if (g_tp_split_world != 2 || g_tp_full_expert_bind) return;
 
     const uint32_t low_experts = n_total_expert / 2u;
     if (g_tp_split_rank == 1) {
@@ -41049,10 +41054,10 @@ int ds4_gpu_routed_moe_one_tensor(
                                           n_expert, n_expert, n_tokens, down_nr0);
         /* Tensor-parallel expert ownership; non-TP calls keep tp_world at 1. */
         gate_args.tp_rank = g_tp_split_rank;
-        gate_args.tp_world = g_tp_split_world;
+        gate_args.tp_world = g_tp_full_expert_bind ? 1u : g_tp_split_world;
         gate_args.tp_expert_base = tp_expert_base_host;
         down_args.tp_rank = g_tp_split_rank;
-        down_args.tp_world = g_tp_split_world;
+        down_args.tp_world = g_tp_full_expert_bind ? 1u : g_tp_split_world;
         down_args.tp_addend = add_in != NULL;
         down_args.tp_expert_base = tp_expert_base_host;
 
@@ -41226,7 +41231,8 @@ int ds4_gpu_routed_moe_one_tensor(
         }
         const bool direct_down_sum =
             !g_quality_mode &&
-            (n_expert == 6 || (n_expert == 8 && g_tp_split_world == 2)) &&
+            (n_expert == 6 || (n_expert == 8 && g_tp_split_world == 2) ||
+             g_tp_full_expert_bind) &&
             n_tokens == 1 &&
             down_sum6_pipeline != nil;
 
