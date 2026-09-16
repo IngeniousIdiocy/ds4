@@ -245,6 +245,12 @@ tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4
 tests/test_deepseek41_graph: tests/test_deepseek41_graph.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_dsv41_rope_quantize.o: tests/test_dsv41_rope_quantize.c ds4_gpu.h ds4_deepseek41_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dsv41_rope_quantize: tests/test_dsv41_rope_quantize.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1074,7 +1080,7 @@ clean:
 	rm -f tests/test_cuda_tp_repack
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_dsv41_rope_quantize
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

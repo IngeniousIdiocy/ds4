@@ -181,7 +181,8 @@ kernel void kernel_dsv41_rope_quantize(
         const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
         const float re = (column & 1u) ? other : value;
         const float im = (column & 1u) ? value : other;
-        value = (column & 1u) ? dsv41_bf16(re * s + im * c) : dsv41_bf16(re * c - im * s);
+        /* the contraction kernel_dsv41_rope compiles to */
+        value = (column & 1u) ? dsv41_bf16(fma(im, c, re * s)) : dsv41_bf16(fma(re, c, -(im * s)));
     }
     value = dsv41_bf16(value);
     const float amax = simd_max(abs(value));

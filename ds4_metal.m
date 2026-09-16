@@ -48936,7 +48936,9 @@ int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, ui
                                 uint32_t width, uint32_t start, bool compressed,
                                 ds4_v41_activation_format format) {
     const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
-    if (width < 64u || width % block || format < DS4_V41_FP8_E8M0 || format > DS4_V41_FP4_E4M3 ||
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_METAL_DISABLE_V41_ROPE_QUANTIZE") != NULL;
+    if (off || width < 64u || width % block || format < DS4_V41_FP8_E8M0 || format > DS4_V41_FP4_E4M3 ||
         start >= 1048576u || dst_offset % 4u || !dsv41_tensor_has_floats(x, width) ||
         !dst || ds4_gpu_tensor_bytes(dst) < dst_offset + (uint64_t)width * sizeof(float)) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
