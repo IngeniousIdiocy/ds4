@@ -40954,6 +40954,25 @@ static bool ds41_shared_down(ds41_gpu_graph *g, const ds4_model *m,
         ds41_bf16(g->shared_mid, DS4_N_FF_EXP) && ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
 }
 
+static bool ds41_tp_shared_split(void) {
+#ifdef __APPLE__
+    static int c = -1;
+    return !ds41_env_flag("DS4_METAL_DISABLE_V41_TP_SHARED_SPLIT", &c);
+#else
+    return false;
+#endif
+}
+
+/* This rank's half of the shared expert's hidden width: its K slice of the
+ * down projection, summed with the peer's half by the FFN gate. */
+static bool ds41_shared_down_half(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l) {
+    const uint32_t half = DS4_N_FF_EXP / 2u;
+    return ds41_bf16(g->shared_mid, half) &&
+        ds4_gpu_matmul_q8_0_kslice_tensor(g->shared, m->map, m->size, l->ffn_down_shexp->abs_offset,
+            DS4_N_FF_EXP, (uint64_t)g->tp_rank * half, half, DS4_N_EMBD, g->shared_mid, 0) != 0;
+}
+
 /* Without shared_down the shared expert's down projection waits for
  * ds41_graph_after_moe, which folds it into the expand. */
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -40982,7 +41001,12 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
-    const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
+    const bool shared_split = shared_owner && shared_down && ds41_tp_shared_split() &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && (DS4_N_FF_EXP % 64u) == 0u;
+    const bool shared_here = !shared_owner || shared_split || g->tp_rank == (il & 1u);
+    const uint32_t shared_dim = shared_split ? DS4_N_FF_EXP / 2u : DS4_N_FF_EXP;
+    const uint64_t shared_lane = shared_split ? (uint64_t)g->tp_rank * shared_dim * (DS4_N_EMBD / 32u * 34u) : 0u;
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_owner && shared_here &&
@@ -41001,15 +41025,16 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     const bool shared_fused = shared_here && !shared_queued &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         ds4_gpu_dsv41_shared_swiglu(g->shared_mid, g->shared_gate, g->shared_up, m->map, m->size,
-            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP,
-            g->norm, DS4_SWIGLU_CLAMP_EXP, 1u);
+            l->ffn_gate_shexp->abs_offset + shared_lane, l->ffn_up_shexp->abs_offset + shared_lane,
+            DS4_N_EMBD, shared_dim, g->norm, DS4_SWIGLU_CLAMP_EXP, 1u);
     if (shared_here && !shared_queued &&
         ((!shared_fused &&
-          (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
+          (shared_split ||
+           !ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
            !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
            !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                  DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f))) ||
-         (shared_down && !ds41_shared_down(g, m, l)))) return false;
+         (shared_down && !(shared_split ? ds41_shared_down_half(g, m, l) : ds41_shared_down(g, m, l))))) return false;
     bool routed_ok;
     const ds4_gpu_tensor *selected = g->selected, *weights = g->route_weights;
     uint32_t n_used = DS4_N_EXPERT_USED;
@@ -41048,7 +41073,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (!routed_ok) return false;
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
-    if (shared_owner && g->tp_rank == (il & 1u) &&
+    if (shared_owner && (shared_split || g->tp_rank == (il & 1u)) &&
         !ds4_gpu_add_tensor_tp_flag(routed, routed, g->shared, DS4_N_EMBD, il, DS4_TP_GATE_FFN)) return false;
     return true;
 }
