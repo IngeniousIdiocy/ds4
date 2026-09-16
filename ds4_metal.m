@@ -43671,6 +43671,7 @@ int ds4_gpu_routed_moe_batch_tensor(
           g_moe_mul_mv_slots6_mxfp4_sum6_pipeline != nil));
     if (use_single_token_q4_one_tensor || use_single_token_mxfp4_one_tensor) {
         if (mid_is_f16) *mid_is_f16 = false;
+        /* the one-token path binds the owned expert range itself */
         return ds4_gpu_routed_moe_one_tensor(out,
                                              gate,
                                              up,
@@ -43678,9 +43679,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                              experts,
                                              model_map,
                                              model_size,
-                                             gate_offset,
-                                             up_offset,
-                                             down_offset,
+                                             gate_offset - (uint64_t)first_expert * gate_expert_bytes,
+                                             up_offset - (uint64_t)first_expert * gate_expert_bytes,
+                                             down_offset - (uint64_t)first_expert * down_expert_bytes,
                                              gate_type,
                                              down_type,
                                              gate_expert_bytes,
