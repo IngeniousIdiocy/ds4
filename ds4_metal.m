@@ -9665,6 +9665,11 @@ static void ds4_gpu_parallel_ffn_scope_cleanup(BOOL *armed) {
     }
 }
 
+/* DeepSeek V4.1 keeps the shared expert's bf16 boundaries inside the
+ * concurrent encoder: mid rounded by the fused gate/up, bf16 in and out on
+ * the down projection. */
+static BOOL g_parallel_ffn_bf16;
+
 static int ds4_gpu_parallel_ffn_start_range(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -9735,11 +9740,13 @@ static int ds4_gpu_parallel_ffn_start_range(
     if (!gate_wbuf || !up_wbuf || !down_wbuf) return 0;
 
     ds4_gpu_mv_dispatch gate_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
-    const char *gate_fn = "kernel_dsv4_shared_gate_up_swiglu_q8_0";
+    const char *gate_fn = g_parallel_ffn_bf16 ?
+        "kernel_dsv4_shared_mid_swiglu_q8_0_bf16" : "kernel_dsv4_shared_gate_up_swiglu_q8_0";
     id<MTLComputePipelineState> gate_pipeline =
         ds4_gpu_get_mul_mv_pipeline(gate_fn, gate_dispatch.nsg);
     id<MTLComputePipelineState> down_pipeline =
-        ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32", 4);
+        ds4_gpu_get_mul_mv_pipeline(g_parallel_ffn_bf16 ?
+            "kernel_mul_mv_q8_0_f32_bf16io" : "kernel_mul_mv_q8_0_f32", 4);
     if (!gate_pipeline || !down_pipeline ||
         down_pipeline.maxTotalThreadsPerThreadgroup < 128u) {
         return 0;
@@ -9809,6 +9816,29 @@ int ds4_gpu_parallel_ffn_start(
         gate, up, mid, shared_out, model_map, model_size,
         gate_offset, up_offset, down_offset, model_dim, shared_dim,
         0, shared_dim, x, clamp);
+}
+
+int ds4_gpu_parallel_ffn_start_bf16(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp) {
+    g_parallel_ffn_bf16 = YES;
+    const int ok = ds4_gpu_parallel_ffn_start_range(
+        gate, up, mid, shared_out, model_map, model_size,
+        gate_offset, up_offset, down_offset, model_dim, shared_dim,
+        0, shared_dim, x, clamp);
+    g_parallel_ffn_bf16 = NO;
+    return ok;
 }
 
 int ds4_gpu_parallel_ffn_start_sliced(
@@ -41258,15 +41288,24 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_parallel_ffn_mode == 2 &&
                 gate_type == DS4_METAL_TENSOR_MXFP4 &&
                 down_type == DS4_METAL_TENSOR_MXFP4 &&
-                n_tokens == 1 && n_expert == 6 && n_total_expert == 256 &&
-                expert_in_dim == 4096 && expert_mid_dim == 2048 &&
-                out_dim == 4096 && gate_row_bytes == 2176 &&
-                gate_expert_bytes == 4456448 && down_row_bytes == 1088 &&
-                down_expert_bytes == 4456448 &&
-                ((g_tp_split_rank == 0 && first_expert == 0u) ||
-                 (g_tp_split_rank == 1 &&
-                  first_expert + n_bind_expert == n_total_expert)) &&
-                g_tp_split_world == 2 && add_in == NULL &&
+                n_tokens == 1 && n_expert == 6 &&
+                ((n_total_expert == 256 &&
+                  expert_in_dim == 4096 && expert_mid_dim == 2048 &&
+                  out_dim == 4096 && gate_row_bytes == 2176 &&
+                  gate_expert_bytes == 4456448 && down_row_bytes == 1088 &&
+                  down_expert_bytes == 4456448) ||
+                 (n_total_expert == 384 &&
+                  expert_in_dim == 5120 && expert_mid_dim == 2304 &&
+                  out_dim == 5120 && gate_row_bytes == 2720 &&
+                  gate_expert_bytes == 6266880 && down_row_bytes == 1224 &&
+                  down_expert_bytes == 6266880)) &&
+                ((g_tp_split_world == 1 && first_expert == 0u &&
+                  n_bind_expert == n_total_expert) ||
+                 (g_tp_split_world == 2 &&
+                  ((g_tp_split_rank == 0 && first_expert == 0u) ||
+                   (g_tp_split_rank == 1 &&
+                    first_expert + n_bind_expert == n_total_expert)))) &&
+                add_in == NULL &&
                 (force_resident || !g_ssd_streaming_mode) &&
                 !write_clamped_moe && fuse_pair_swiglu && direct_down_sum;
             if (!parallel_iq2_route && !parallel_mxfp4_tp_route) {

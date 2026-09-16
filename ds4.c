@@ -40230,7 +40230,7 @@ typedef struct {
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
-    bool tp_gate_fused;
+    bool tp_gate_fused, shared_done;
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_imatrix_collector *imatrix;
@@ -40981,6 +40981,17 @@ static bool ds41_shared_down(ds41_gpu_graph *g, const ds4_model *m,
         ds41_bf16(g->shared_mid, DS4_N_FF_EXP) && ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
 }
 
+/* The shared expert rides the routed experts' concurrent encoder: its
+ * gate/up beside their pair kernel, its down beside their sum. */
+static bool ds41_concurrent_ffn_on(void) {
+#ifdef __APPLE__
+    static int c = -1;
+    return !ds41_env_flag("DS4_METAL_DISABLE_V41_CONCURRENT_FFN", &c);
+#else
+    return false;
+#endif
+}
+
 static bool ds41_tp_shared_split(void) {
 #ifdef __APPLE__
     static int c = -1;
@@ -41049,6 +41060,17 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         shared_queued = rc > 0;
     }
 #endif
+#ifdef __APPLE__
+    const bool concurrent = shared_here && !shared_down && g->tp_world != 2 && !g->streaming &&
+        !g->quality && ds41_concurrent_ffn_on() &&
+        l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_parallel_ffn_start_bf16(g->shared_gate, g->shared_up, g->shared_mid, g->shared,
+            m->map, m->size, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+            l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP);
+    if (concurrent) shared_queued = true;
+#endif
     const bool shared_fused = shared_here && !shared_queued &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         ds4_gpu_dsv41_shared_swiglu(g->shared_mid, g->shared_gate, g->shared_up, m->map, m->size,
@@ -41096,6 +41118,15 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
+#else
+    if (concurrent) {
+        if (!routed_ok) ds4_gpu_parallel_ffn_abort();
+        else if (!ds4_gpu_parallel_ffn_finish() &&
+                 !(ds4_gpu_dsv41_shared_swiglu(g->shared_mid, g->shared_gate, g->shared_up, m->map, m->size,
+                       l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP,
+                       g->norm, DS4_SWIGLU_CLAMP_EXP, 1u) && ds41_shared_down(g, m, l))) return false;
+        g->shared_done = routed_ok;
+    }
 #endif
     if (!routed_ok) return false;
     /* Keep the shared expert's BF16 boundary, then include it exactly once
@@ -41572,13 +41603,14 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g, const ds4_model *m,
               ds41_expand_partials(g, g->residual, g->after_attn, g->ffn_split, il, DS4_TP_GATE_FFN) :
               ds4_gpu_hc_expand_split_bf16_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC)))
             return false;
-    } else if (!(l && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off() &&
+    } else if (!(l && !g->shared_done && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off() &&
                  ds4_gpu_dsv41_matmul_expand(g->residual, m->map, m->size, l->ffn_down_shexp->abs_offset,
                      l->ffn_down_shexp->dim[0], l->ffn_down_shexp->dim[1], g->shared_mid, g->routed,
                      g->after_attn, g->ffn_split, DS4_N_HC)) &&
-               !((!l || ds41_shared_down(g, m, l)) &&
+               !((!l || g->shared_done || ds41_shared_down(g, m, l)) &&
                  ds4_gpu_hc_expand_split_add_bf16_tensor(g->residual, g->routed, g->shared, g->after_attn, g->ffn_split,
                                                          DS4_N_EMBD, DS4_N_HC))) return false;
+    g->shared_done = false;
     return !carry || ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
