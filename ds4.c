@@ -85178,7 +85178,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         if (k > g->ctx - P1 - 1u - exact) k = g->ctx - P1 - 1u - exact;
         for (uint32_t i = 0; i < k; i++) {
             if (drafts[i] < 0 || drafts[i] >= (int)vocab) { k = i; break; }
-            if (!ignore_eos && drafts[i] == eos_token) { k = i + 1u; break; }
+            if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }   /* never fed; sampled next */
             if (ignore_eos && ds4_token_is_stop_for_think_mode(e, drafts[i], think_mode)) { k = i; break; }
         }
     }
@@ -86378,6 +86378,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* the V4.1 graph keeps no frontier to roll back; a rewind to where it stands is free */
+    if (s->checkpoint_valid && ds4_session_is_ds41(s))
+        state_ok = s->ds41_graph.valid && s->ds41_graph.pos == (uint32_t)pos;
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
