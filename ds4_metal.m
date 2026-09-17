@@ -10245,6 +10245,7 @@ typedef struct {
     uint32_t layer;
     uint32_t gate;
     uint32_t rows;  /* 0 = row gate; >0 = verify-block batch gate */
+    uint32_t batch_slot;    /* slab batch slot of a verify-block gate */
     uint32_t event_arrival;
     uint64_t seq;
     /* Big batch gates (prefill): exchange big_bytes from big_out into
@@ -10696,7 +10697,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             } else if (req.rows > 0) {
                 const double bx0 = profile ? ds4_gpu_now_ms() : 0.0;
                 if (g_tp_batch_exchange_fn)
-                    ok = g_tp_batch_exchange_fn(g_tp_exchange_ud, req.layer,
+                    ok = g_tp_batch_exchange_fn(g_tp_exchange_ud, req.batch_slot,
                                                 req.rows, req.seq);
                 if (profile) {
                     g_tp_stat_batch_gates++;
@@ -11199,6 +11200,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         }
         uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
         g_tp_queue[tail].layer = layer;
+        g_tp_queue[tail].batch_slot = layer;
         g_tp_queue[tail].gate = gate;
         g_tp_queue[tail].rows = 0;
         g_tp_queue[tail].poll = poll_gate ? 1u : 0u;
@@ -11222,15 +11224,17 @@ void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
  * (the FFN flag word and event pair are reused — a decode gate and a batch
  * gate are never in flight together, and seq values stay globally unique),
  * but the service thread runs the multi-row exchange callback. */
-int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+/* A verify-block gate publishes its arrival on the (layer, gate) flag word
+ * and exchanges the rows of slab batch slot `batch_slot`. */
+static int ds4_gpu_tp_batch_gate_encode_slot(uint32_t layer, uint32_t gate,
+                                              uint32_t batch_slot, uint32_t rows) {
     @autoreleasepool {
         if (!g_batch_cb) return 0;
         if (!g_tp_thread_running || rows == 0) return 0;
         const uint64_t seq = ++g_tp_batch_seq;
         const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
         if (!event_arrival) {
-            const uint32_t slot =
-                layer * DS4_GPU_TP_GATES_PER_LAYER + DS4_GPU_TP_GATE_FFN;
+            const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
             const uint32_t value = DS4_TP_BATCH_FLAG_TAG | (uint32_t)seq;
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -11261,7 +11265,8 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
         }
         uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
         g_tp_queue[tail].layer = layer;
-        g_tp_queue[tail].gate = DS4_GPU_TP_GATE_FFN;
+        g_tp_queue[tail].gate = gate;
+        g_tp_queue[tail].batch_slot = batch_slot;
         g_tp_queue[tail].rows = rows;
         g_tp_queue[tail].poll = 0;
         g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
@@ -11274,6 +11279,16 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
         pthread_mutex_unlock(&g_tp_mutex);
         return 1;
     }
+}
+
+int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    return ds4_gpu_tp_batch_gate_encode_slot(layer, DS4_GPU_TP_GATE_FFN, layer, rows);
+}
+
+/* Two gates per layer: slot layer*2+gate of the doubled batch region. */
+int ds4_gpu_tp_batch_gate_encode_kind(uint32_t layer, uint32_t gate, uint32_t rows) {
+    return ds4_gpu_tp_batch_gate_encode_slot(layer, gate,
+        layer * DS4_GPU_TP_GATES_PER_LAYER + gate, rows);
 }
 
 /* Prefill batch gate: the service thread exchanges big_bytes directly
@@ -11302,6 +11317,7 @@ static uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     }
     uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
     g_tp_queue[tail].layer = layer;
+    g_tp_queue[tail].batch_slot = layer;
     g_tp_queue[tail].gate = 1u;
     g_tp_queue[tail].rows = rows;
     g_tp_queue[tail].event_arrival = 1u;
@@ -43634,6 +43650,7 @@ int ds4_gpu_routed_moe_batch_tensor(
     uint32_t n_bind_expert = 0;
     ds4_gpu_tp_expert_range(n_total_expert, &first_expert, &n_bind_expert);
     const int32_t tp_expert_base_host = (int32_t)first_expert;
+    const int32_t tp_world_host = g_tp_full_expert_bind ? 1 : (int32_t)g_tp_split_world;
     gate_offset += (uint64_t)first_expert * gate_expert_bytes;
     up_offset += (uint64_t)first_expert * gate_expert_bytes;
     down_offset += (uint64_t)first_expert * down_expert_bytes;
@@ -43889,14 +43906,14 @@ int ds4_gpu_routed_moe_batch_tensor(
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         gate_args.tp_rank = g_tp_split_rank;
-        gate_args.tp_world = g_tp_split_world;
+        gate_args.tp_world = tp_world_host;
         gate_args.tp_expert_base = tp_expert_base_host;
         ds4_gpu_mul_mv_id_args down_args =
             ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
         down_args.tp_rank = g_tp_split_rank;
-        down_args.tp_world = g_tp_split_world;
+        down_args.tp_world = tp_world_host;
         down_args.tp_expert_base = tp_expert_base_host;
         const bool q4_batch_expert_table_auto =
             gate_type == DS4_METAL_TENSOR_Q4_K &&
@@ -44153,10 +44170,10 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
             gate_mm_args.tp_rank = g_tp_split_rank;
-            gate_mm_args.tp_world = g_tp_split_world;
+            gate_mm_args.tp_world = tp_world_host;
             gate_mm_args.tp_expert_base = tp_expert_base_host;
             down_mm_args.tp_rank = g_tp_split_rank;
-            down_mm_args.tp_world = g_tp_split_world;
+            down_mm_args.tp_world = tp_world_host;
             down_mm_args.tp_expert_base = tp_expert_base_host;
 
             map_pipeline = ds4_gpu_get_pipeline(

@@ -649,7 +649,7 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           (uint64_t)n_layer * 2 * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in, two gates per layer */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -663,9 +663,9 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
-                       (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                       (uint64_t)tp->n_layer * 2 * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                     (uint64_t)tp->n_layer * 2 * DS4_TP_BATCH_MAX_ROWS * vec;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
