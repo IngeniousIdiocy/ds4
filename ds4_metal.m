@@ -19852,6 +19852,16 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
 /* Two to eight rows share one pass over the weights (the rows kernels);
  * each row's arithmetic is the single-row matvec's. round_bf16 as in
  * ds4_gpu_matmul_q8_0_tensor_impl; rounding needs the rows kernel. */
+
+/* The matrix rows kernels round a few outputs differently from the row
+ * kernels, so the exact rows path keeps the row kernels. */
+static int ds4_gpu_v41_rows_mma_off(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_METAL_DISABLE_V41_ROWS_MMA") != NULL ||
+                       getenv("DS4_METAL_ENABLE_V41_ROWS_ATTENTION") != NULL;
+    return off;
+}
+
 static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -19915,8 +19925,7 @@ static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
             round_bf16 == 1 ? "kernel_mul_mv_q8_0_f32_bf16_rows_seq4" : "kernel_mul_mv_q8_0_f32_rows_seq4";
         /* the matrix rows kernel pays off from three rows (four on the
          * widest K); eight simdgroups split a K of 4096 or more */
-        static int mma_off = -1;
-        if (mma_off < 0) mma_off = getenv("DS4_METAL_DISABLE_V41_ROWS_MMA") != NULL;
+        const int mma_off = ds4_gpu_v41_rows_mma_off();
         const int mma = in_dim >= 4096u ? 8 : 4;
         const bool mma_kernel = !mma_off && rows_kernel && n_rows >= (in_dim >= 8192u ? 4u : 3u) &&
             (in_dim % (mma == 8 ? 256u : 128u)) == 0 && (out_dim % 8u) == 0;
@@ -20705,8 +20714,7 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
             (rows > 1u ? "kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows" :
                          "kernel_dsv4_shared_mid_swiglu_q8_0_bf16") :
             "kernel_dsv4_shared_mid_swiglu_q8_0";
-        static int mma_off = -1;
-        if (mma_off < 0) mma_off = getenv("DS4_METAL_DISABLE_V41_ROWS_MMA") != NULL;
+        const int mma_off = ds4_gpu_v41_rows_mma_off();
         const bool mma_kernel = !mma_off && store_gate_up == 2 && rows >= 3u && rows <= 8u &&
             (in_dim % 256u) == 0 && (out_dim % 8u) == 0;
         id<MTLComputePipelineState> pipeline = mma_kernel ?
@@ -27464,8 +27472,7 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
                 .nr0 = 2,
             };
             const NSUInteger groups = rows_kernel ? n_rows : 1u;
-            static int mma_off = -1;
-            if (mma_off < 0) mma_off = getenv("DS4_METAL_DISABLE_V41_ROWS_MMA") != NULL;
+            const int mma_off = ds4_gpu_v41_rows_mma_off();
             const bool mma_kernel = !mma_off && n_rows >= 3u && n_rows <= 8u &&
                 (group_dim % 256u) == 0 && (rank % 8u) == 0;
             if (mma_kernel) { args.nr0 = 8; args.ne12 = (int32_t)n_rows; }
@@ -48951,8 +48958,7 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
         const ds4_gpu_tensor *add_or_x = add ? add : x;
         const NSUInteger split_offset = ds4_gpu_tensor_offset(split);
         if (rows > 1u) { dispatch.nr0 = 4; args.nr0 = 4; }
-        static int mma_off = -1;
-        if (mma_off < 0) mma_off = getenv("DS4_METAL_DISABLE_V41_ROWS_MMA") != NULL;
+        const int mma_off = ds4_gpu_v41_rows_mma_off();
         const int mma = in_dim >= 4096u ? 8 : 4;
         const bool mma_kernel = !mma_off && rows >= (in_dim >= 8192u ? 4u : 3u) &&
             (in_dim % (mma == 8 ? 256u : 128u)) == 0 && (out_dim % 8u) == 0;
