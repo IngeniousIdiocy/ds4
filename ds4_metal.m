@@ -10248,6 +10248,8 @@ typedef struct {
     uint32_t batch_slot;    /* slab batch slot of a verify-block gate */
     uint32_t event_arrival;
     uint64_t seq;
+    const volatile uint32_t *check;   /* batch gate payload behind a checked flag */
+    uint32_t check_words;
     /* Big batch gates (prefill): exchange big_bytes from big_out into
      * big_in directly (CPU-visible bounce buffers), bypassing the slab. */
     const void *big_out;
@@ -10662,15 +10664,16 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         }
         const double t1 = ds4_gpu_now_ms();
         if (profile) g_tp_stat_encode_lead += g_tp_seq - req.seq;
-        if (req.poll && g_tp_check_words && g_tp_slab_cpu && req.rows == 0 &&
+        if (req.poll && g_tp_check_words && g_tp_slab_cpu && (req.rows == 0 || req.check) &&
             req.big_bytes == 0) {
             /* The flag line may land before the payload lines: verify the
              * partial against the checksum the flag kernel published. */
             const uint32_t slot = req.layer * DS4_GPU_TP_GATES_PER_LAYER + req.gate;
-            const uint32_t words = (uint32_t)(g_tp_vec_bytes / 4u);
-            const volatile uint32_t *payload =
+            const uint32_t words = req.rows ? req.check_words : (uint32_t)(g_tp_vec_bytes / 4u);
+            const volatile uint32_t *payload = req.rows ? req.check :
                 (const volatile uint32_t *)(g_tp_slab_cpu + g_tp_out_off + (uint64_t)slot * g_tp_vec_bytes);
-            const uint32_t mix = (uint32_t)req.seq * 0x9E3779B9u;
+            const uint32_t mix = (req.rows ? DS4_TP_BATCH_FLAG_TAG | (uint32_t)req.seq :
+                                  (uint32_t)req.seq) * 0x9E3779B9u;
             uint64_t tries = 0;
             for (;;) {
                 const uint32_t want = __atomic_load_n(&g_tp_check_words[slot], __ATOMIC_ACQUIRE) ^ mix;
@@ -10725,7 +10728,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 0.9 * g_tp_exchange_ewma_us[req.gate] + 0.1 * ex_us;
         }
         /* Release the GPU even on failure so end_commands can drain. */
-        if (req.rows > 0) {
+        if (req.rows > 0 && !req.poll) {
             const double br0 = profile ? ds4_gpu_now_ms() : 0.0;
             g_tp_batch_cpu_event.signaledValue = req.seq;
             if (profile) g_tp_stat_batch_release_ms += ds4_gpu_now_ms() - br0;
@@ -10752,7 +10755,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                             g_tp_poll_prev_slot);
                 g_tp_failed_flag = 1;
             }
-            const uint32_t v = (uint32_t)req.seq;
+            const uint32_t v = req.rows ? DS4_TP_BATCH_FLAG_TAG | (uint32_t)req.seq : (uint32_t)req.seq;
             const double rel_t0 = profile ? ds4_gpu_now_ms() : 0.0;
             volatile uint32_t *region =
                 g_tp_poll_region +
@@ -10772,7 +10775,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         } else {
             g_tp_cpu_event.signaledValue = req.seq;
         }
-        if (req.rows > 0 || !req.poll) g_tp_poll_prev_valid = 0;
+        if (!req.poll) g_tp_poll_prev_valid = 0;
         if (profile) {
             const double gpu_wait_ms = t1 - t0;
             const double exchange_ms = t_ex - t1;
@@ -11227,36 +11230,85 @@ void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
 /* A verify-block gate publishes its arrival on the (layer, gate) flag word
  * and exchanges the rows of slab batch slot `batch_slot`. */
 static int ds4_gpu_tp_batch_gate_encode_slot(uint32_t layer, uint32_t gate,
-                                              uint32_t batch_slot, uint32_t rows) {
+                                              uint32_t batch_slot, uint32_t rows,
+                                              const ds4_gpu_tensor *payload) {
     @autoreleasepool {
         if (!g_batch_cb) return 0;
         if (!g_tp_thread_running || rows == 0) return 0;
         const uint64_t seq = ++g_tp_batch_seq;
         const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
+        const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
+        const uint32_t value = DS4_TP_BATCH_FLAG_TAG | (uint32_t)seq;
+        const uint32_t words = (uint32_t)(rows * g_tp_vec_bytes / 4u);
+        /* With the payload at hand the gate spins like a decode gate: a checked
+         * flag on arrival, kernel_dsv4_tp_poll_release instead of the event wake. */
+        static int poll_off = -1;
+        if (poll_off < 0) poll_off = getenv("DS4_TP_DISABLE_BATCH_POLL_GATES") != NULL;
+        const bool poll_gate = !event_arrival && !poll_off && payload && g_tp_poll_gates &&
+            !g_ssd_streaming_mode && g_tp_check_words != NULL &&
+            slot < DS4_TP_POLL_MAX_SLOTS && words != 0;
         if (!event_arrival) {
-            const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
-            const uint32_t value = DS4_TP_BATCH_FLAG_TAG | (uint32_t)seq;
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
             if (!cb || owned) return 0;
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_set");
+            id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+                poll_gate ? "kernel_dsv4_tp_flag_set_checked" : "kernel_dsv4_tp_flag_set");
             if (!pipeline) return 0;
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:g_tp_slab_buffer
                     offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u)
                    atIndex:0];
-            [enc setBytes:&value length:sizeof(value) atIndex:1];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            if (poll_gate) {
+                [enc setBuffer:g_tp_check_buffer offset:(NSUInteger)slot * 4u atIndex:1];
+                [enc setBytes:&value length:sizeof(value) atIndex:2];
+                [enc setBuffer:ds4_gpu_tensor_buffer((ds4_gpu_tensor *)payload)
+                        offset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)payload) atIndex:3];
+                [enc setBytes:&words length:sizeof(words) atIndex:4];
+                [enc setThreadgroupMemoryLength:8 * sizeof(uint32_t) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc setBytes:&value length:sizeof(value) atIndex:1];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
             ds4_gpu_close_batch_encoder();
         } else {
             ds4_gpu_close_batch_encoder();
             [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
         }
-        [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
+        if (poll_gate) {
+            if (!ds4_gpu_flush_commands()) return 0;
+            if ([g_pending_cbs count] > DS4_TP_POLL_MAX_INFLIGHT) {
+                id<MTLCommandBuffer> old_cb =
+                    g_pending_cbs[[g_pending_cbs count] - 1u - DS4_TP_POLL_MAX_INFLIGHT];
+                [old_cb waitUntilCompleted];
+            }
+            id<MTLComputePipelineState> poll_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release");
+            if (!poll_pipeline) return 0;
+            const uint32_t nlines = DS4_TP_POLL_LINES;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+            [enc setComputePipelineState:poll_pipeline];
+            [enc setBuffer:g_tp_poll_buffer
+                    offset:(NSUInteger)(seq % DS4_TP_POLL_RING) *
+                           DS4_TP_POLL_LINES * DS4_TP_POLL_LINE_BYTES
+                   atIndex:0];
+            [enc setBytes:&value length:sizeof(value) atIndex:1];
+            [enc setBytes:&nlines length:sizeof(nlines) atIndex:2];
+            [enc setBuffer:g_tp_poll_buffer
+                    offset:(NSUInteger)DS4_TP_POLL_LINES * DS4_TP_POLL_LINE_BYTES *
+                               DS4_TP_POLL_RING +
+                           (NSUInteger)slot * 2u * sizeof(uint32_t)
+                   atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+        } else {
+            [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
+        }
         pthread_mutex_lock(&g_tp_mutex);
         if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
             pthread_mutex_unlock(&g_tp_mutex);
@@ -11268,7 +11320,10 @@ static int ds4_gpu_tp_batch_gate_encode_slot(uint32_t layer, uint32_t gate,
         g_tp_queue[tail].gate = gate;
         g_tp_queue[tail].batch_slot = batch_slot;
         g_tp_queue[tail].rows = rows;
-        g_tp_queue[tail].poll = 0;
+        g_tp_queue[tail].poll = poll_gate ? 1u : 0u;
+        g_tp_queue[tail].check = poll_gate ?
+            (const volatile uint32_t *)ds4_gpu_tensor_contents((ds4_gpu_tensor *)payload) : NULL;
+        g_tp_queue[tail].check_words = words;
         g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
         g_tp_queue[tail].seq = seq;
         g_tp_queue[tail].big_out = NULL;
@@ -11282,13 +11337,15 @@ static int ds4_gpu_tp_batch_gate_encode_slot(uint32_t layer, uint32_t gate,
 }
 
 int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    return ds4_gpu_tp_batch_gate_encode_slot(layer, DS4_GPU_TP_GATE_FFN, layer, rows);
+    return ds4_gpu_tp_batch_gate_encode_slot(layer, DS4_GPU_TP_GATE_FFN, layer, rows, NULL);
 }
 
-/* Two gates per layer: slot layer*2+gate of the doubled batch region. */
-int ds4_gpu_tp_batch_gate_encode_kind(uint32_t layer, uint32_t gate, uint32_t rows) {
+/* Two gates per layer: slot layer*2+gate of the doubled batch region, whose
+ * rows `payload` (the slot's out view) holds. */
+int ds4_gpu_tp_batch_gate_encode_kind(uint32_t layer, uint32_t gate, uint32_t rows,
+                                      const ds4_gpu_tensor *payload) {
     return ds4_gpu_tp_batch_gate_encode_slot(layer, gate,
-        layer * DS4_GPU_TP_GATES_PER_LAYER + gate, rows);
+        layer * DS4_GPU_TP_GATES_PER_LAYER + gate, rows, payload);
 }
 
 /* Prefill batch gate: the service thread exchanges big_bytes directly

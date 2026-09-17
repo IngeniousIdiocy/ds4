@@ -40704,7 +40704,7 @@ static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
         const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
         ds4_gpu_tensor *out = g->tp_batch_out[slot], *in = g->tp_batch_in[slot];
         return ds4_gpu_tensor_copy(out, 0, x, 0, (uint64_t)count * DS4_N_EMBD * sizeof(float)) &&
-            ds4_gpu_tp_batch_gate_encode_kind(il, gate, count) &&
+            ds4_gpu_tp_batch_gate_encode_kind(il, gate, count, out) &&
             ds4_gpu_add_tensor(x, g->tp_rank ? in : out, g->tp_rank ? out : in, count * DS4_N_EMBD) != 0;
     }
 #endif
