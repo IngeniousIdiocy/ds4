@@ -42712,6 +42712,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_ROW(name, width) row.name = g->rows_view[t].name;
                 DS41_PREFILL_ROWS(DS41_USE_ROW)
 #undef DS41_USE_ROW
+                row.engram_rows_b = row.engram_rows;   /* the row holds whichever table this layer reads */
                 ok = batch_attention ? ds41_graph_before_attention(&row, m, &w->layer[il], il) :
                     batch_moe ? ds41_graph_before_moe(&row, m, &w->layer[il], il) :
                     ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t]);
