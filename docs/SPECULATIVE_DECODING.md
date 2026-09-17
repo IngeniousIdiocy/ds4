@@ -32,6 +32,14 @@ For Vision Experimental, substitute its matching main model and support file.
 Do not mix the two checkpoints. DSpark is not supported for PRO.
 The same flags work in `ds4-agent` and non-batched `ds4-server` requests.
 
+V4.1 Flash takes the same flags with its own support GGUF, which
+`gguf-tools/deepseek41_quantize.py --dspark-out FILE` writes from the DSpark
+checkpoint. On Metal it also runs across two Macs: give both ranks `--dspark`
+and `--mtp-model`, and the worker verifies each block beside the coordinator.
+`DS4_METAL_ENABLE_V41_ROWS_ATTENTION=1` makes the verify rows attend with the
+one-token decode kernels; greedy output then follows plain decode more closely,
+at some cost in speed.
+
 The support file adds about 5.6 GiB of weights plus runtime state. On Metal,
 the main model can be resident or SSD-streamed. DSpark replaces the legacy
 one-stage MTP drafter for that run; the two are not stacked.

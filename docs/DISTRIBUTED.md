@@ -90,8 +90,8 @@ The coordinator can be `ds4`, `ds4-agent`, `ds4-server`, or `ds4-bench`;
 workers run `ds4`. For models with vision support, pass the same `--vision FILE`
 to both for image input.
 For GLM MTP, enable `--mtp` on both. For DeepSeek DSpark, both need the
-matching support model and DSpark options. V4.1 supports vision but not
-speculative decoding.
+matching support model and DSpark options; V4.1 Flash DSpark runs across two
+Macs on Metal, not over CUDA network TP.
 
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.
