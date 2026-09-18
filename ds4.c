@@ -63343,16 +63343,23 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
     return n;
 }
 
-static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
+static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos, uint32_t draft_rows) {
+    ds41_draft *draft = g->tp_world == 1 ? g->draft : NULL;
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans(g, pos, spans);
     uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
     for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
+    if (draft) {
+        bytes += 5u * sizeof(uint32_t) +
+            (uint64_t)draft_rows * draft->n_target * DS4_N_EMBD * sizeof(float) +
+            ds4_gpu_tensor_bytes(draft->ring);
+    }
     return bytes;
 }
 
 static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_draft *draft = g->tp_world == 1 ? g->draft : NULL;
     if (!s->ds41_graph_ready || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
         !ds4_gpu_synchronize()) {
         payload_set_err(err, errlen, "V4.1 graph has no complete frontier to save");
@@ -63360,10 +63367,19 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
-        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
+        g->ctx, draft ? 2u : 1u, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
         if (payload_write_u32(fp, h[i], err, errlen)) return 1;
+    /* Private UAT format 2 includes the drafter's captured target rows and
+     * attention ring. Target-only restoration would leave stale draft keys. */
+    if (draft) {
+        const ds41_draft *d = draft;
+        const uint32_t dh[] = {d->mh_pos0, d->mh_rows, d->n_stage,
+                               d->n_target, DS41_DRAFT_WINDOW};
+        for (uint32_t i = 0; i < 5; i++)
+            if (payload_write_u32(fp, dh[i], err, errlen)) return 1;
+    }
     for (int i = 0; i < s->checkpoint.len; i++)
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen)) return 1;
     if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, err, errlen)) return 1;
@@ -63374,6 +63390,14 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     for (uint32_t i = 0; i < n && !rc; i++)
         rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    if (draft && !rc) {
+        ds41_draft *d = draft;
+        rc = payload_write_tensor_span(fp, d->mh, 0,
+            (uint64_t)d->mh_rows * d->n_target * DS4_N_EMBD * sizeof(float),
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (!rc) rc = payload_write_tensor_span(fp, d->ring, 0,
+            ds4_gpu_tensor_bytes(d->ring), buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
     free(buf);
     return rc;
 }
@@ -63381,12 +63405,29 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_draft *draft = g->tp_world == 1 ? g->draft : NULL;
     const uint32_t pos = h[7];
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
-        h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
+        h[3] != (draft ? 2u : 1u) || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos)) {
+        h[12] != 0x413431u) {
         payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
+        return 1;
+    }
+    uint32_t dh[5] = {0};
+    const uint64_t body_bytes = remaining;
+    if (draft) {
+        for (uint32_t i = 0; i < 5; i++)
+            if (payload_read_u32(fp, &dh[i], &remaining, err, errlen)) return 1;
+        if (dh[0] > pos || dh[1] > DS41_DRAFT_WINDOW || dh[1] != pos - dh[0] ||
+            dh[2] != draft->n_stage || dh[3] != draft->n_target ||
+            dh[4] != DS41_DRAFT_WINDOW) {
+            payload_set_err(err, errlen, "invalid V4.1 draft snapshot dimensions");
+            return 1;
+        }
+    }
+    if (body_bytes != ds41_payload_body_bytes(g, pos, dh[1])) {
+        payload_set_err(err, errlen, "invalid V4.1 snapshot body size");
         return 1;
     }
     ds4_tokens tokens = {0};
@@ -63411,9 +63452,23 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         for (uint32_t i = 0; i < n && !rc; i++)
             rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+        if (draft && !rc) {
+            ds41_draft *d = draft;
+            rc = payload_read_tensor_span(fp, d->mh, 0,
+                (uint64_t)dh[1] * d->n_target * DS4_N_EMBD * sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (!rc) rc = payload_read_tensor_span(fp, d->ring, 0,
+                ds4_gpu_tensor_bytes(d->ring), buf, DS4_SESSION_IO_CHUNK,
+                &remaining, err, errlen);
+        }
         free(buf);
         if (!rc) {
             ds41_graph_reset(g);
+            if (draft) {
+                draft->mh_pos0 = dh[0];
+                draft->mh_rows = dh[1];
+                draft->verify_rows = 0;
+            }
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
@@ -63452,7 +63507,8 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         if (!s->ds41_graph_ready || !s->ds41_graph.valid ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return 0;
         return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
-               ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
+               ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len,
+                   s->ds41_graph.draft ? s->ds41_graph.draft->mh_rows : 0u);
     }
 #endif
     if (ds4_session_is_cpu(s)) {
@@ -64183,6 +64239,12 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
     if (s->engine && s->engine->tp.active) {
+        /* The private local draft format inserts metadata before tokens.
+         * Do not interpret that metadata as TP checkpoint token history. */
+        if (h[12] == 0x413431u && h[3] == 2u) {
+            payload_set_err(err, errlen, "local V4.1 draft snapshot cannot restore into TP");
+            return 1;
+        }
         /* A local payload cannot restore another rank's caches. Keep the exact
          * saved tokens, consume the payload (leaving trailers readable), and
          * rebuild both ranks through the ordinary mirrored sync protocol. */
