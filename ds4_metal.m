@@ -31295,11 +31295,18 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             top_k == 512u && window == 128u && head_dim == 512u;
         const uint32_t decode_splits = decode_rows ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
+        const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads &&
+            !g_quality_mode && !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() &&
+            !getenv("DS4_METAL_DISABLE_V41_PREFILL_RB16");
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
                 "kernel_dsv4_indexed_mixed_attention_heads8_split") :
+            prefill_rb16 ?
+            ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_PREFILL_LEAN") ?
+                "kernel_dsv4_indexed_mixed_attention_heads8_rb16" :
+                "kernel_dsv4_indexed_mixed_attention_heads8_rb16_lean") :
             decode_one_token ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
@@ -31440,7 +31447,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
+            [enc setThreadgroupMemoryLength:((decode_one_token || prefill_rb16) ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
             [enc dispatchThreadgroups:
