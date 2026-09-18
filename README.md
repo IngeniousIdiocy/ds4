@@ -248,6 +248,15 @@ measured scope of `DS4_GLM_EXACT=1`, feature status, switch reference and known
 issues — and read [CHANGES-GLM53.md](CHANGES-GLM53.md) for what changed relative
 to upstream and why.
 
+[![GLM-5.3-Flash on the M3 Ultra: the explainer film (8:27)](docs/media/glm53-explainer-poster.png)](https://github.com/IngeniousIdiocy/ds4/releases/download/explainer-video/glm53-m3ultra-explainer.mp4)
+
+*Click the frame to play the [explainer film](https://github.com/IngeniousIdiocy/ds4/releases/download/explainer-video/glm53-m3ultra-explainer.mp4)
+(8:27, MP4, 22 MB; also on the [release page](https://github.com/IngeniousIdiocy/ds4/releases/tag/explainer-video)).
+It walks through the roofline, the dispatch ledger, the router fold, the KDA and hyper-connection
+fusions, the bounded radix top-k at 300k, the prefill levers and expert bank, the DFlash2 drafter
+and its controller, the server cache fixes and the fidelity tiers. Every number in it is from the
+receipts linked below.*
+
 Measured on the final build (`524c8a1`), bare defaults, one cold run each, the GPU
 sampled idle before launch. The upstream column is unmodified `9ab7053` (plus a
 disclosed 48-line counters patch) on the same machine, file, prompts and 2,048-token
