@@ -1105,3 +1105,6 @@ tests/test_v41_spec_rewind: tests/test_v41_spec_rewind.c ds4.c $(filter-out ds4.
 
 tests/test_v41_markov_post: tests/test_v41_markov_post.c ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_ds41_dspark_adaptive: tests/test_ds41_dspark_adaptive.c ds4_ds41_dspark_adaptive.h
+	$(CC) -O2 -g -Wall -Wextra -std=c99 -o $@ $< -lm
