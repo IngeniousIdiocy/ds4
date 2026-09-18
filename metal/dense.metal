@@ -383,6 +383,39 @@ void kernel_mul_mv_q8_0_f32_impl(
         args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, (constant ds4_metal_args_mv_rope *)nullptr);
 }
 
+/* Short V4.1 Q8 projections have only five or nine eight-block K tiles.
+ * Map a whole output row to one physical SIMD group while retaining the four
+ * logical accumulators and both reductions of the NSG=4 reference kernel.
+ * All physical groups then execute the last K tile, without a cross-group
+ * barrier. */
+template<short NB, bool ROUND_IN>
+static inline float ds4_q8_short_value(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *weights, device const char *input,
+        uint3 group, ushort lane, ushort simd) {
+    const uint row = group.x * 4u + simd;
+    device const block_q8_0 *w = (device const block_q8_0 *)(weights + row * args.nb01);
+    device const float *x = (device const float *)input;
+    const short ix = lane / 4, il = lane % 4;
+    float partial[4] = {0.f, 0.f, 0.f, 0.f};
+    FOR_UNROLL (short tile = 0; tile < NB / 8; ++tile) {
+        const short ib = tile * 8 + ix;
+        float yl[8];
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            const float v = x[ib * 32 + il * 8 + i];
+            yl[i] = ROUND_IN ? ds4_bf16_round(v) : v;
+        }
+        device const int8_t *q = w[ib].qs + il * 8;
+        float sumq = 0.f;
+        FOR_UNROLL (short i = 0; i < 8; ++i) sumq += q[i] * yl[i];
+        partial[tile % 4] += sumq * w[ib].d;
+    }
+    FOR_UNROLL (short i = 0; i < 4; ++i) partial[i] = simd_sum(partial[i]);
+    const float slot = lane < 4 ? partial[lane] : 0.f;
+    const float value = simd_sum(slot);
+    return ds4_bf16_round(value);
+}
+
 // One simdgroup group per activation row, each running the single-row
 // kernel's walk over the same weight blocks: every row's result matches the
 // one-row kernel, and the rows share the weight loads through the cache.

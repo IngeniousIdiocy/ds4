@@ -45,6 +45,14 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+#ifdef __APPLE__
+/* Metal: the V4.1 decode fast paths, each with one opt-out, DS4_METAL_DISABLE_V41_<NAME>, read once into this mask;
+ * "0" means not set. */
+enum {
+    DS4_GPU_V41_DEFERRED_HC = 1u << 0,
+};
+uint32_t ds4_gpu_v41_off(void);
+#endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -344,8 +352,13 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
     DS4_GPU_TEST_INDEX_SCORE_DIRECT = 1u << 7,
     DS4_GPU_TEST_INDEX_SCORE_WIDE = 1u << 8,
+    DS4_GPU_TEST_COUNT_KERNELS = 1u << 9,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* With DS4_GPU_TEST_COUNT_KERNELS, each V4.1 fast path counts its dispatches by kernel name. */
+uint64_t ds4_gpu_test_kernel_runs(const char *name);
+/* Replaces the DS4_GPU_V41_* opt-out mask read from the environment. */
+void ds4_gpu_test_set_v41_off(uint32_t off);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }

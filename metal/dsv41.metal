@@ -163,12 +163,12 @@ struct ds4_metal_args_dsv41_rope_quantize {
 // One row's rope, quantization and store into a cache row: the rotation of
 // the last 64 columns as kernel_dsv41_rope applies it, then the block
 // quantization of kernel_dsv41_quantize, written to dst.
-kernel void kernel_dsv41_rope_quantize(
+static inline void dsv41_rope_quantize_body(
         constant ds4_metal_args_dsv41_rope_quantize &args,
         device const float *x,
         device float *dst,
-        uint group [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_simdgroup]]) {
+        uint group,
+        uint lane) {
     const uint block = args.mode == 3u ? 16u : 32u;
     const uint column = group * block + lane;
     const bool valid = lane < block && column < args.width;
@@ -197,6 +197,15 @@ kernel void kernel_dsv41_rope_quantize(
         result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
     }
     if (valid) dst[column] = dsv41_bf16(result);
+}
+
+kernel void kernel_dsv41_rope_quantize(
+        constant ds4_metal_args_dsv41_rope_quantize &args,
+        device const float *x,
+        device float *dst,
+        uint group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    dsv41_rope_quantize_body(args, x, dst, group, lane);
 }
 
 struct ds4_metal_args_dsv41_norm_pair {
@@ -530,3 +539,130 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+// Single-Mac decode: the block input's collapse (the weighted sum of the four streams with the previous block's
+// weights) and its norm run first, then the block's own hyper-connection weights run inside the query projection's
+// grid, each with its original reduction order. The query groups read the first collapse's norm; the weights' groups
+// run dsv41_hc_block_input_body whole, including its own copy of the collapse and norm, without which the compiled
+// Sinkhorn split's bits change.
+struct ds4_deferred_hc_args {
+    int32_t n_embd, n_hc, sinkhorn_iters;
+    float hc_eps, norm_eps;
+};
+kernel void kernel_dsv41_deferred_collapse(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device const float *norm_weight,
+        device float *norm_dst, device atomic_uint *counter,
+        threadgroup float *shared [[threadgroup(0)]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+
+    const uint n_embd = (uint)args.n_embd;
+    const uint n4 = n_embd >> 2;
+
+    threadgroup float4 *row = (threadgroup float4 *)shared;
+    threadgroup float  *sum_shmem = shared + n_embd;
+
+    /* kernel_rms_norm_fuse_impl zeroes its 32 accumulator slots from
+     * simdgroup 0 before the parallel sum. */
+    if (sgitg == 0) {
+        sum_shmem[tiisg] = 0.0f;
+    }
+
+    /* --- Collapse with the preceding sublayer's pre weights, then its BF16
+     * boundary, and the weighted RMS partial sum over the rounded values. --- */
+    const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
+    device const float4 *x0 = (device const float4 *)(x + 0u * n_embd);
+    device const float4 *x1 = (device const float4 *)(x + 1u * n_embd);
+    device const float4 *x2 = (device const float4 *)(x + 2u * n_embd);
+    device const float4 *x3 = (device const float4 *)(x + 3u * n_embd);
+    device float4 *collapsed4 = (device float4 *)collapsed;
+
+    float sumf = 0.0f;
+    for (uint i = tid; i < n4; i += ntg) {
+        float4 acc = 0.0f;
+        acc += x0[i] * w0;
+        acc += x1[i] * w1;
+        acc += x2[i] * w2;
+        acc += x3[i] * w3;
+        const float4 v = float4(dsv41_bf16(acc.x), dsv41_bf16(acc.y),
+                                dsv41_bf16(acc.z), dsv41_bf16(acc.w));
+        collapsed4[i] = v;
+        row[i] = v;
+        sumf += dot(v, v);
+    }
+
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        sum_shmem[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = sum_shmem[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf / (float)args.n_embd;
+    const float rscale = 1.0f / sqrt(mean + args.norm_eps);
+
+    device const float4 *w = (device const float4 *)norm_weight;
+    device float4 *y = (device float4 *)norm_dst;
+    for (uint i = tid; i < n4; i += ntg) {
+        const float4 v = (row[i] * rscale) * w[i];
+        y[i] = float4(dsv41_bf16(v.x), dsv41_bf16(v.y),
+                      dsv41_bf16(v.z), dsv41_bf16(v.w));
+    }
+
+    if (tid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
+
+}
+
+kernel void kernel_dsv41_query_deferred_hc(
+        constant ds4_metal_args_hc_norm_mix &hc [[buffer(0)]],
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm &split_args [[buffer(1)]],
+        device const char *residual [[buffer(2)]], device const char *hc_weight [[buffer(3)]],
+        device char *mix [[buffer(4)]], device const float *scale [[buffer(5)]],
+        device const float *base [[buffer(6)]], device char *split [[buffer(7)]],
+        device atomic_uint *completion [[buffer(8)]],
+        constant ds4_metal_args_mul_mv &mv [[buffer(9)]],
+        device const char *weight [[buffer(10)]], device const char *x [[buffer(11)]],
+        device float *q [[buffer(12)]], constant ds4_metal_args_mv_rope &rope [[buffer(13)]],
+        device char *collapsed [[buffer(14)]], device const char *norm_weight [[buffer(15)]],
+        device char *norm [[buffer(16)]], device const float *pre [[buffer(17)]],
+        constant ds4_metal_args_dsv41_rope_quantize &kv_args [[buffer(18)]],
+        device const float *kv [[buffer(19)]], device float *cache [[buffer(20)]],
+        threadgroup char *shmem [[threadgroup(0)]], uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort simd [[simdgroup_index_in_threadgroup]]) {
+    if (group.x < 16u) {
+        dsv41_hc_block_input_body<2>(hc, split_args, residual, hc_weight, mix,
+            scale, base, split, collapsed, norm_weight, norm, pre, completion, shmem,
+            group, lane, simd);
+        return;
+    }
+    if (group.x < 18u) {
+        dsv41_rope_quantize_body(kv_args, kv, cache, (group.x - 16u) * 8u + simd, lane);
+        return;
+    }
+    const uint tile = group.x - 18u;
+    const float value = ds4_q8_short_value<40, false>(mv, weight, x, uint3(tile*2u,0,0), lane, simd);
+    threadgroup float *pairs = (threadgroup float *)shmem;
+    if (lane == 0) pairs[simd] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0 && (simd & 1u) == 0) {
+        const uint row = tile * 8u + simd, col = row % rope.width;
+        const float re = pairs[simd], im = pairs[simd + 1u];
+        if (col >= rope.width - 64u) {
+            const float theta = float(rope.start) * rope.frequencies[(col - (rope.width - 64u)) >> 1u];
+            const float c = precise::cos(theta);
+            const float sn = precise::sin(theta);
+            q[row] = ds4_bf16_round(fma(re, c, -(im * sn)));
+            q[row + 1u] = ds4_bf16_round(fma(im, c, re * sn));
+        } else { q[row] = re; q[row + 1u] = im; }
+    }
+}

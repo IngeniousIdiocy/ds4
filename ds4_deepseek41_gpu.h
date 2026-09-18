@@ -243,6 +243,18 @@ int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
                                    uint32_t raw_start, const ds4_gpu_tensor *comp_cache,
                                    const ds4_gpu_tensor *ids, ds4_gpu_tensor *selected,
                                    uint32_t n_comp, uint32_t attended, uint32_t n_head, uint32_t head_dim);
+/* Single-Mac decode: the block input's collapse and norm now, then its hyper-connection weights inside the query
+ * projection's dispatch, which also ropes and stores the layer's KV row. 0 when DS4_GPU_V41_DEFERRED_HC is off. */
+int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *pre,
+        const void *model_map, uint64_t model_size, uint64_t norm_offset, float eps);
+int ds4_gpu_dsv41_query_deferred_hc(ds4_gpu_tensor *q, ds4_gpu_tensor *mix, ds4_gpu_tensor *split,
+        const ds4_gpu_tensor *qr, const ds4_gpu_tensor *residual,
+        const void *model_map, uint64_t model_size, uint64_t q_offset, uint64_t fn_offset,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t pos, bool compressed,
+        uint32_t iters, float hc_eps, float norm_eps, ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
+        const ds4_gpu_tensor *pre, uint64_t norm_offset,
+        const ds4_gpu_tensor *kv, ds4_gpu_tensor *cache, uint64_t cache_offset);
 /* The Q8_0 q projection of one row with the layer's rope on its outputs. */
 int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,

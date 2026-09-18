@@ -434,6 +434,96 @@ static int check_rope_quantize(void) {
 static int check_rope_quantize(void) { return 1; }
 #endif
 
+#ifdef __APPLE__
+/* Single-Mac decode's deferred hyper-connection weights against the original order, bitwise, on random weights and
+ * fresh inputs per draw. Attention: the collapse, then the weights, query and KV row in one dispatch, against the
+ * block input, the roped query and the KV row's rope and store. FFN: the collapse, then the block input into scratch,
+ * against the block input. With DS4_GPU_V41_DEFERRED_HC off the collapse declines. */
+static int check_deferred_hc(void) {
+    const uint64_t qo = 0, qb = 32768ull * 40 * 34, ho = qo + qb, hb = 24ull * 20480 * 2;
+    const uint64_t so = ho + hb, bo = so + 64, no = bo + 128, wb = no + 5120 * 4;
+    char *model = NULL;
+    CHECK(posix_memalign((void **)&model, getpagesize(), wb) == 0);
+    for (uint64_t i = 0; i < qb / 34; i++) {
+        uint8_t *block = (uint8_t *)model + qo + i * 34;
+        const uint16_t d = (uint16_t)(0x1c00 + (int)(fabsf(random_value()) * 128));
+        memcpy(block, &d, 2);
+        for (int j = 0; j < 32; j++) block[2 + j] = (uint8_t)(int8_t)(random_value() * 31);
+    }
+    uint16_t *fn = (uint16_t *)(model + ho);
+    for (uint64_t i = 0; i < hb / 2; i++)
+        fn[i] = (uint16_t)((random_value() < 0 ? 0x8000 : 0) | (0x2000 + (int)(fabsf(random_value()) * 1536)));
+    float *scale = (float *)(model + so), *base = (float *)(model + bo), *nw = (float *)(model + no);
+    scale[0] = 0.04f; scale[1] = 0.03f; scale[2] = 0.02f;
+    for (int i = 0; i < 24; i++) base[i] = random_value() / 32;
+    for (int i = 0; i < 5120; i++) nw[i] = 1.0f + random_value() / 32;
+    CHECK(ds4_gpu_set_model_map(model, wb));
+    ds4_gpu_tensor *res = upload(NULL, 20480 * 4), *pre = upload(NULL, 16), *qr = upload(NULL, 1280 * 4);
+    ds4_gpu_tensor *kv = upload(NULL, 512 * 4), *scratch = upload(NULL, 5120 * 4);
+    enum { X, NORM, MIX, SPLIT, Q, KV_ROW, OUTS };
+    const uint32_t widths[OUTS] = {5120, 5120, 24, 24, 32768, 512};
+    ds4_gpu_tensor *out[2][OUTS];
+    CHECK(res && pre && qr && kv && scratch);
+    for (int a = 0; a < 2; a++)
+        for (int i = 0; i < OUTS; i++) CHECK((out[a][i] = upload(NULL, widths[i] * 4)) != NULL);
+    float *r = ds4_gpu_tensor_contents(res), *p = ds4_gpu_tensor_contents(pre);
+    float *x = ds4_gpu_tensor_contents(qr), *k = ds4_gpu_tensor_contents(kv);
+    const float eps = 1e-6f;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (uint32_t draw = 0; draw < 6; draw++) {
+        const int ffn = draw & 1;
+        const uint32_t pos = draw * 104729u % 1048576u;
+        const bool compressed = (draw >> 1) & 1;
+        for (int i = 0; i < 20480; i++) r[i] = random_value() * (draw % 3 == 2 ? 16.0f : 1.0f);
+        for (int i = 0; i < 4; i++) p[i] = random_value() / 4;
+        for (int i = 0; i < 1280; i++) x[i] = random_value();
+        for (int i = 0; i < 512; i++) k[i] = random_value();
+        for (int a = 0; a < 2; a++)
+            for (int i = 0; i < OUTS; i++) memset(ds4_gpu_tensor_contents(out[a][i]), 0xff, widths[i] * 4);
+        ds4_gpu_tensor **o = out[0], **d = out[1];
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_hc_block_input_rows(o[MIX], o[X], o[NORM], o[SPLIT], res, pre, model, wb, ho, so, bo, no,
+                                                20480, 24, 5120, 4, 20, eps, eps, 1, 4));
+        if (!ffn) {
+            CHECK(ds4_gpu_dsv41_project_q(o[Q], model, wb, qo, 1280, 32768, qr, pos, compressed));
+            CHECK(ds4_gpu_dsv41_rope_quantize(kv, o[KV_ROW], 0, 512, pos, compressed, DS4_V41_FP8_E8M0));
+        }
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+        const uint64_t collapses = ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse");
+        const uint64_t queries = ds4_gpu_test_kernel_runs("kernel_dsv41_query_deferred_hc");
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_deferred_collapse(d[X], d[NORM], res, pre, model, wb, no, eps));
+        if (ffn) {
+            CHECK(ds4_gpu_dsv41_hc_block_input_rows(d[MIX], d[X], scratch, d[SPLIT], res, pre, model, wb, ho, so, bo,
+                                                    no, 20480, 24, 5120, 4, 20, eps, eps, 1, 4));
+        } else {
+            CHECK(ds4_gpu_dsv41_query_deferred_hc(d[Q], d[MIX], d[SPLIT], qr, res, model, wb, qo, ho, so, bo, pos,
+                                                  compressed, 20, eps, eps, d[X], d[NORM], pre, no, kv, d[KV_ROW], 0));
+        }
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse") == collapses + 1);
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_query_deferred_hc") == queries + !ffn);
+        for (int i = 0; i < (ffn ? Q : OUTS); i++)
+            CHECK(!memcmp(ds4_gpu_tensor_contents(o[i]), ds4_gpu_tensor_contents(d[i]), widths[i] * 4));
+        if (ffn) CHECK(!memcmp(ds4_gpu_tensor_contents(o[NORM]), ds4_gpu_tensor_contents(scratch), 5120 * 4));
+    }
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_DEFERRED_HC);
+    const int declined = !ds4_gpu_dsv41_deferred_collapse(out[1][X], out[1][NORM], res, pre, model, wb, no, eps);
+    ds4_gpu_test_set_v41_off(0);
+    ds4_gpu_test_set_flags(0);
+    CHECK(declined);
+    for (int a = 0; a < 2; a++)
+        for (int i = 0; i < OUTS; i++) ds4_gpu_tensor_free(out[a][i]);
+    ds4_gpu_tensor_free(scratch); ds4_gpu_tensor_free(kv); ds4_gpu_tensor_free(qr);
+    ds4_gpu_tensor_free(pre); ds4_gpu_tensor_free(res);
+    free(model);
+    fprintf(stderr, "V4.1 deferred HC weights (attention and FFN) == original order, bitwise PASS\n");
+    return 1;
+}
+#else
+static int check_deferred_hc(void) { return 1; }
+#endif
+
 static int check_pool(void) {
     enum { D = 512, ROWS = 257, PAIRS = ROWS / 2 };
     float *kv = malloc(ROWS * D * sizeof(float)), *scores = malloc(ROWS * D * sizeof(float));
@@ -1675,6 +1765,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--deferred-hc")) {
+        const int ok = ds4_gpu_init() && check_deferred_hc();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-scores")) {
         const int ok = ds4_gpu_init() && check_indexer_batch();
         ds4_gpu_cleanup();
@@ -1712,7 +1807,7 @@ int main(int argc, char **argv) {
     }
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() &&
-             check_rope_quantize() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
+             check_rope_quantize() && check_deferred_hc() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
              check_index_score_wide() && check_index_candidates() && check_embedding() && check_index_projection() && check_general_topk() &&
              check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() &&
