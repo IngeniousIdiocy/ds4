@@ -40205,6 +40205,9 @@ typedef struct {
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows;       /* the positions the last pass captured */
     uint32_t verify_rows;            /* nonzero while a verify pass runs */
+    double plain_rate, draft_rate;   /* tokens per second of plain and proposing cycles */
+    uint32_t skip_left, skip_len;    /* proposals skipped while drafting loses */
+    uint32_t losing;                 /* consecutive proposing cycles below the plain rate */
     ds4_gpu_tensor *mh;              /* [window][n_target * dim] */
     ds4_gpu_tensor *pending;         /* [n_stage][window][512] */
     ds4_gpu_tensor *ring;            /* [n_stage][window][512] */
@@ -85151,6 +85154,35 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 /* One DSpark cycle for a V4.1 session: a block drafted from first_token, verified in
  * one trunk pass, the accepted prefix kept. */
+static int ds41_draft_adapt_off(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_DSPARK_DISABLE_ADAPTIVE_DRAFTING") != NULL;
+    return off;
+}
+
+/* Prose rarely passes the confidence gate, and a proposal that yields nothing still
+ * costs a third of a decode step.  Compare the token rate of proposing cycles with
+ * plain ones and stop proposing, probing with a growing period, while it loses. */
+static void ds41_draft_adapt(ds41_draft *d, bool proposed, uint32_t k, uint32_t tokens,
+                             double seconds, double propose_seconds) {
+    const double a = 0.25;
+    if (seconds <= 0.0) return;
+    if (proposed && k == 0 && seconds > propose_seconds) {   /* a plain step behind a wasted proposal */
+        const double plain = 1.0 / (seconds - propose_seconds);
+        d->plain_rate = d->plain_rate > 0.0 ? d->plain_rate + a * (plain - d->plain_rate) : plain;
+    }
+    double *r = proposed ? &d->draft_rate : &d->plain_rate;
+    const double rate = (double)tokens / seconds;
+    *r = *r > 0.0 ? *r + a * (rate - *r) : rate;
+    if (!proposed) return;
+    if (d->plain_rate > 0.0 && d->draft_rate < 0.9 * d->plain_rate) d->losing++;   /* a near break-even stretch keeps drafting */
+    else d->losing = d->skip_len = 0;
+    if (d->losing >= 2u) {   /* one poor cycle inside a good stretch does not stop drafting */
+        d->skip_len = d->skip_len ? (d->skip_len < 32u ? 2u * d->skip_len : 32u) : 4u;
+        d->skip_left = d->skip_len;
+    }
+}
+
 static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, int eos_token,
                              bool ignore_eos, ds4_think_mode think_mode, float temperature,
                              int top_k, float top_p, float min_p, uint64_t *rng,
@@ -85160,19 +85192,27 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     ds41_draft *d = g->draft;
     const uint32_t B = d->block, vocab = DS4_N_VOCAB, P1 = (uint32_t)s->checkpoint.len;
     const bool exact = rng && temperature > 0.0f, stats = ds4_dspark_stats_enabled();
-    const double t0 = stats ? now_sec() : 0.0;
+    const double t0 = now_sec();
     int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
     float conf[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t k = 0;
+    double propose_s = 0.0;
     /* the block continues the position whose stream the last pass captured */
-    if (P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 && P1 - 1u < d->mh_pos0 + d->mh_rows &&
-        P1 + B < g->ctx && max_tokens > 1 && accepted_cap > 1) {
-        const double tp = stats ? now_sec() : 0.0;
+    const bool draftable = P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 &&
+        P1 - 1u < d->mh_pos0 + d->mh_rows && P1 + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
+    const bool proposed = draftable && (!d->skip_left || ds41_draft_adapt_off());
+    if (draftable && !proposed) {
+        d->skip_left--;
+        if (stats) s->dspark_stats.scheduler_skips++;
+    }
+    if (proposed) {
+        const double tp = now_sec();
         if (!ds41_draft_propose(g, &e->model, &e->weights, first_token, drafts, conf)) {
             payload_set_err(err, errlen, "DeepSeek V4.1 draft failed");
             return -1;
         }
-        if (stats) s->dspark_stats.propose_ms += (now_sec() - tp) * 1000.0;
+        propose_s = now_sec() - tp;
+        if (stats) s->dspark_stats.propose_ms += propose_s * 1000.0;
         k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
         if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
         if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
@@ -85200,6 +85240,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     if (k == 0) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
+        ds41_draft_adapt(d, proposed, 0, 1, now_sec() - t0, propose_s);
         if (stats) {
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
             s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
@@ -85275,6 +85316,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     if (getenv("DS4_DSPARK_SPEC_LOG"))
         fprintf(stderr, "ds4: DSpark V4.1 cycle pos=%u drafted=%u accepted=%u replacement=%d\n",
                 P1, k, j, replacement);
+    ds41_draft_adapt(d, true, k, 1u + j + (replacement >= 0), now_sec() - t0, propose_s);
     return (int)(1u + j + (replacement >= 0));
 }
 #endif
