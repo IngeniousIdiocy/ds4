@@ -572,6 +572,9 @@ void ds4_session_invalidate(ds4_session *s);
 /* Keep the token prefix, restoring recurrent state where possible. Otherwise
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
+/* Local speculative boundary: true restores both state and next-token logits.
+ * On false, use the ordinary rewind/rebuild path. */
+bool ds4_session_rewind_speculative(ds4_session *s, int pos);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);

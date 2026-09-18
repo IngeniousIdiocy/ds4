@@ -14099,8 +14099,11 @@ decode_again:
             /* Logits after a rewind belong to the discarded suffix. Re-eval
              * the last kept token before sampling under a different mode. */
             int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
-                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+            pthread_mutex_lock(&s->inference_mu);
+            const bool restored = ds4_session_rewind_speculative(slot->session, block_start + kept);
+            pthread_mutex_unlock(&s->inference_mu);
+            if (!restored && (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
+                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0))) {
                 finish = "error";
                 stop_decode = true;
             } else {

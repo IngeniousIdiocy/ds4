@@ -1099,3 +1099,6 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+tests/test_v41_spec_rewind: tests/test_v41_spec_rewind.c ds4.c $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -o $@ $< $(filter-out ds4.o,$(CORE_OBJS)) $(METAL_LDLIBS)
