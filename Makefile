@@ -1105,3 +1105,9 @@ tests/test_v41_q8_short: tests/test_v41_q8_short.c ds4_gpu_args.o $(CORE_OBJS)
 
 tests/test_v41_q8_short_fused: tests/test_v41_q8_short_fused.c ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_v41_deferred_hc: tests/test_v41_deferred_hc.c ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_v41_deferred_ffn_hc: tests/test_v41_deferred_ffn_hc.c ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
