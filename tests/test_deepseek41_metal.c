@@ -1085,6 +1085,66 @@ static int check_general_topk(void) {
     return 1;
 }
 
+/* The radix-select path against the merge ladder: same values by rank, same
+ * ids and order when the selected values are unique, ties by ascending id. */
+static int check_topk_select(void) {
+    const uint32_t widths[] = {16384, 65536, 131072, 262144};
+    const uint32_t counts[] = {1, 512, 2048};
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t width = widths[wi], rows = 2;
+        ds4_gpu_tensor *scores = upload(NULL, (size_t)width * rows * 4);
+        ds4_gpu_tensor *fast = upload(NULL, (size_t)2048 * rows * 4);
+        ds4_gpu_tensor *slow = upload(NULL, (size_t)2048 * rows * 4);
+        topk_entry *reference = malloc((size_t)width * rows * sizeof(*reference));
+        bool *seen = calloc(width, sizeof(*seen));
+        CHECK(scores && fast && slow && reference && seen);
+        float *s = ds4_gpu_tensor_contents(scores);
+        for (uint32_t pattern = 0; pattern < 4; pattern++) {
+            for (uint32_t t = 0; t < rows; t++) {
+                for (uint32_t i = 0; i < width; i++) {
+                    /* 0: coarse random values with many ties; 1: unique; 2: unique
+                     * with seven of eight blocks masked like the candidate filter;
+                     * 3: fewer finite values than 2048, so ties at -inf are selected */
+                    const float unique = (float)((i * 7919u + t * 1009u) % 1048573u) - 500000.0f;
+                    s[(size_t)t * width + i] = pattern == 0 ? random_value() : pattern == 1 ? unique :
+                        pattern == 2 ? (i / 8 % 8 ? -INFINITY : unique) : (i % 1361 ? -INFINITY : unique);
+                    reference[(size_t)t * width + i] = (topk_entry){s[(size_t)t * width + i], i};
+                }
+                qsort(reference + (size_t)t * width, width, sizeof(*reference), compare_topk_entry);
+            }
+            for (size_t ki = 0; ki < sizeof(counts) / sizeof(*counts); ki++) {
+                const uint32_t k = counts[ki];
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
+                CHECK(ds4_gpu_indexer_topk_tensor(fast, scores, width, rows, k));
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_SELECT", "1", 1) == 0);
+                CHECK(ds4_gpu_indexer_topk_tensor(slow, scores, width, rows, k));
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
+                CHECK(ds4_gpu_synchronize());
+                const int32_t *a = ds4_gpu_tensor_contents(fast), *b = ds4_gpu_tensor_contents(slow);
+                for (uint32_t t = 0; t < rows; t++) {
+                    const float *row = s + (size_t)t * width;
+                    const topk_entry *ref = reference + (size_t)t * width;
+                    memset(seen, 0, width * sizeof(*seen));
+                    for (uint32_t i = 0; i < k; i++) {
+                        const int32_t id = a[t * k + i];
+                        CHECK(id >= 0 && (uint32_t)id < width && !seen[id]);
+                        seen[id] = true;
+                        CHECK(row[id] == ref[i].value);
+                        CHECK(row[id] == row[b[t * k + i]]);
+                        if (i && row[id] == row[a[t * k + i - 1]]) CHECK(a[t * k + i - 1] < id);
+                    }
+                    if (pattern == 1 || pattern == 2)
+                        CHECK(!memcmp(a + t * k, b + t * k, k * sizeof(*a)));
+                }
+            }
+        }
+        fprintf(stderr, "V4.1 radix top-k width=%u: values by rank, unique-ID and tie-order oracle PASS\n", width);
+        ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(fast); ds4_gpu_tensor_free(slow);
+        free(reference); free(seen);
+    }
+    return 1;
+}
+
 static int check_causal_topk(void) {
     const uint32_t frontiers[] = {513, 514, 1023, 1024, 1025, 1535, 2047, 2048, 4095, 16383, 32767, 65535};
     const uint32_t counts[] = {1, 2, 31, 32, 33, 127, 128, 129};
@@ -1111,6 +1171,10 @@ static int check_causal_topk(void) {
             }
             for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
                 const uint32_t rows = counts[ci];
+                /* The causal kernels are the ladder's variants and agree with it
+                 * tie for tie; the radix path orders ties by id, so the reference
+                 * stays on the ladder. */
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_SELECT", "1", 1) == 0);
                 CHECK(ds4_gpu_begin_commands());
                 for (uint32_t t = 0; t < rows; t++) {
                     const uint32_t visible = (start + t + 1u) / ratio;
@@ -1120,6 +1184,7 @@ static int check_causal_topk(void) {
                     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(sr);
                 }
                 CHECK(ds4_gpu_end_commands());
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
                 ids[rows * 512u] = 123456;
                 CHECK(ds4_gpu_dsv41_indexer_topk_batch(selected, scores, width, rows, start, ratio));
                 CHECK(ds4_gpu_synchronize());
@@ -1486,6 +1551,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--topk-select")) {
+        const int ok = ds4_gpu_init() && check_topk_select();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--general-topk")) {
         const int ok = ds4_gpu_init() && check_general_topk();
         ds4_gpu_cleanup();
@@ -1500,7 +1570,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
+             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
