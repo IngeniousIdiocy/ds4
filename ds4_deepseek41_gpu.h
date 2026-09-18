@@ -22,6 +22,10 @@ typedef enum {
     DS4_V41_FP4_E4M3 = 3,
 } ds4_v41_activation_format;
 /* One-token router: probabilities, biased top-k and normalised weights in one dispatch. */
+int ds4_gpu_dsv41_indexer_score_masked(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *cache, const ds4_gpu_tensor *mask, uint32_t rows);
+
 int ds4_gpu_dsv41_router_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
                              ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
                              const void *model_map, uint64_t model_size, uint64_t bias_offset,
