@@ -36757,8 +36757,12 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
 
         const bool force_scalar = g_quality_mode;
         const bool use_tiled_f32 = tiled_f32;
-        const bool use_tiled = !force_scalar && n_tokens >= 8u &&
-                               n_head == 32u && head_dim == 128u;
+        /* a verify block's few rows take the tiled kernel too: the scalar one
+         * reduces every head once per key and row */
+        static int verify_tiled = -1;
+        if (verify_tiled < 0) verify_tiled = getenv("DS4_METAL_DISABLE_V41_VERIFY_TILED_INDEX") == NULL;
+        const bool use_tiled = !force_scalar && n_head == 32u && head_dim == 128u &&
+            (n_tokens >= 8u || (n_tokens >= 2u && g_v41_verify_rows && verify_tiled));
         id<MTLComputePipelineState> pipeline =
             use_tiled
                 ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
