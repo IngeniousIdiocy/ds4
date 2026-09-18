@@ -1174,6 +1174,103 @@ static int check_indexer_all(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+static int compare_score_entry(const void *a, const void *b) {
+    const float *x = *(const float *const *)a, *y = *(const float *const *)b;
+    return *x < *y ? 1 : *x > *y ? -1 : 0;
+}
+
+/* The per-key and the wide single-row index scoring kernels on the same random
+ * query and keys: both against a double oracle, then their top-2048 sets, where
+ * any difference must be a near-tie at the 2048th score. */
+static int check_index_score_wide(void) {
+    enum { HEADS = 32, DIM = 128, TOP = 2048, ROUNDS = 8 };
+    const uint32_t counts[] = {4096, 131072};
+    const uint32_t max_keys = counts[1];
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *wt = upload(NULL, (size_t)HEADS * sizeof(float));
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * sizeof(float));
+    ds4_gpu_tensor *sd = upload(NULL, ((size_t)max_keys + 1) * sizeof(float));
+    ds4_gpu_tensor *sw = upload(NULL, ((size_t)max_keys + 1) * sizeof(float));
+    CHECK(qt && wt && kt && sd && sw);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt);
+    float *direct = ds4_gpu_tensor_contents(sd), *wide = ds4_gpu_tensor_contents(sw);
+    const float **order = malloc((size_t)max_keys * sizeof(*order));
+    unsigned char *in_direct = calloc(max_keys, 1), *in_wide = calloc(max_keys, 1);
+    CHECK(q && w && k && direct && wide && order && in_direct && in_wide);
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const uint32_t keys = counts[ci];
+        for (size_t i = 0; i < (size_t)HEADS * DIM; i++)
+            q[i] = ldexpf(random_value(), (int)((i / 32) % 41) - 20);
+        for (size_t i = 0; i < (size_t)keys * DIM; i++)
+            k[i] = ldexpf(random_value(), (int)((i / 32) % 41) - 20);
+        for (size_t i = 0; i < HEADS; i++) w[i] = bf16(random_value());
+        CHECK(ds4_gpu_dsv41_quantize(qt, DIM, HEADS, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_quantize(kt, DIM, keys, DS4_V41_FP4_E8M0));
+        direct[keys] = wide[keys] = 12345;
+        double seconds[2] = {0, 0};
+        for (int mode = 0; mode < 2; mode++) {
+            ds4_gpu_glm_indexer_score_one_force_wide(mode);
+            for (int round = 0; round < ROUNDS; round++) {
+                const double t0 = monotonic_seconds();
+                CHECK(ds4_gpu_glm_indexer_score_one_tensor(mode ? sw : sd, qt, wt, kt,
+                    keys, HEADS, DIM, 1.0f / 64.0f, false));
+                CHECK(ds4_gpu_synchronize());
+                if (round) seconds[mode] += monotonic_seconds() - t0;
+            }
+        }
+        ds4_gpu_glm_indexer_score_one_force_wide(-1);
+        CHECK(direct[keys] == 12345 && wide[keys] == 12345);
+        double worst[2] = {0, 0}, gap = 0;
+        for (uint32_t j = 0; j < keys; j++) {
+            double expected = 0, magnitude = 0;
+            for (uint32_t h = 0; h < HEADS; h++) {
+                double dot = 0;
+                for (uint32_t d = 0; d < DIM; d++)
+                    dot += (double)q[(size_t)h * DIM + d] * k[(size_t)j * DIM + d];
+                const double term = fmax(dot / 64.0, 0) * w[h];
+                expected += term;
+                magnitude += fabs(term);
+            }
+            CHECK(isfinite(direct[j]) && isfinite(wide[j]));
+            worst[0] = fmax(worst[0], fabs(direct[j] - expected) / fmax(magnitude, 1));
+            worst[1] = fmax(worst[1], fabs(wide[j] - expected) / fmax(magnitude, 1));
+            gap = fmax(gap, fabs((double)direct[j] - wide[j]) / fmax(magnitude, 1));
+        }
+        CHECK(worst[0] < 0.00001 && worst[1] < 0.00001);
+        /* top-2048 membership of both kernels */
+        for (uint32_t j = 0; j < keys; j++) order[j] = direct + j;
+        qsort(order, keys, sizeof(*order), compare_score_entry);
+        const float threshold = *order[TOP - 1];
+        memset(in_direct, 0, keys);
+        for (uint32_t i = 0; i < TOP; i++) in_direct[order[i] - direct] = 1;
+        for (uint32_t j = 0; j < keys; j++) order[j] = wide + j;
+        qsort(order, keys, sizeof(*order), compare_score_entry);
+        memset(in_wide, 0, keys);
+        for (uint32_t i = 0; i < TOP; i++) in_wide[order[i] - wide] = 1;
+        uint32_t differing = 0;
+        for (uint32_t j = 0; j < keys; j++) {
+            if (in_direct[j] == in_wide[j]) continue;
+            differing++;
+            CHECK(fabs(direct[j] - threshold) <= 0.00001 * fmax(fabs(threshold), 1));
+        }
+        fprintf(stderr, "V4.1 index score wide keys=%u oracle error direct=%.3g wide=%.3g "
+                "kernel gap=%.3g top-%d symmetric difference=%u (near-ties) "
+                "us per call direct=%.0f wide=%.0f\n",
+                keys, worst[0], worst[1], gap, TOP, differing,
+                seconds[0] / (ROUNDS - 1) * 1e6, seconds[1] / (ROUNDS - 1) * 1e6);
+    }
+    free(in_wide); free(in_direct); free(order);
+    ds4_gpu_tensor_free(sw); ds4_gpu_tensor_free(sd); ds4_gpu_tensor_free(kt);
+    ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(qt);
+    fprintf(stderr, "V4.1 wide index score: double-precision oracle PASS\n");
+    return 1;
+}
+#else
+static int check_index_score_wide(void) { return 1; }
+#endif
+
 static int check_compact_carry(void) {
     const uint32_t widths[] = {1, 31, 32, 33, 127, 128, 129, 20480};
     const uint32_t rows = 129, offset = 2;
@@ -1379,6 +1476,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--index-score-wide")) {
+        const int ok = ds4_gpu_init() && check_index_score_wide();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-topk")) {
         const int ok = ds4_gpu_init() && check_causal_topk();
         ds4_gpu_cleanup();
@@ -1397,7 +1499,7 @@ int main(int argc, char **argv) {
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
-             check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
+             check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();

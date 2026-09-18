@@ -543,6 +543,8 @@ static id<MTLComputePipelineState> g_glm53_expand_pool_selection_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_rope_tail_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_score_one_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_score_one_direct_pipeline;
+static id<MTLComputePipelineState> g_glm_indexer_score_one_wide_pipeline;
+static int g_glm_indexer_score_one_wide_force = -1;   /* tests pick a kernel: 0 direct, 1 wide */
 static id<MTLComputePipelineState> g_glm_indexer_scores_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_f32_pipeline;
@@ -8995,6 +8997,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_indexer_score_one");
         g_glm_indexer_score_one_direct_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_direct");
+        g_glm_indexer_score_one_wide_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_wide");
         g_glm_indexer_scores_batch_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_indexer_scores_batch");
         g_glm_indexer_scores_tiled_pipeline =
@@ -9116,6 +9120,7 @@ int ds4_gpu_init(void) {
             !g_glm_indexer_rope_tail_pipeline ||
             !g_glm_indexer_score_one_pipeline ||
             !g_glm_indexer_score_one_direct_pipeline ||
+            !g_glm_indexer_score_one_wide_pipeline ||
             !g_glm_indexer_scores_batch_pipeline ||
             !g_glm_indexer_scores_tiled_pipeline ||
             !g_glm_indexer_scores_tiled_f32_pipeline ||
@@ -36613,6 +36618,16 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
                                                "GLM indexer RoPE");
 }
 
+static int ds4_gpu_v41_index_score_wide_off(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_METAL_DISABLE_V41_INDEX_SCORE_WIDE") != NULL;
+    return off;
+}
+
+void ds4_gpu_glm_indexer_score_one_force_wide(int mode) {
+    g_glm_indexer_score_one_wide_force = mode;
+}
+
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -36658,7 +36673,13 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         };
 
         if (n_head == 32u && head_dim == 128u) {
-            id<MTLComputePipelineState> direct_pipeline =
+            /* long rows stream one key per thread; short ones keep the per-key kernel */
+            const int force = g_glm_indexer_score_one_wide_force;
+            const bool wide = force >= 0 ? force != 0 :
+                n_rows >= 8192u && !ds4_gpu_v41_index_score_wide_off();
+            id<MTLComputePipelineState> direct_pipeline = wide ?
+                ds4_gpu_hot_pipeline(g_glm_indexer_score_one_wide_pipeline,
+                                     "kernel_glm_indexer_score_one_wide") :
                 ds4_gpu_hot_pipeline(g_glm_indexer_score_one_direct_pipeline,
                                      "kernel_glm_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
@@ -36674,9 +36695,15 @@ int ds4_gpu_glm_indexer_score_one_tensor(
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
             [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            if (wide) {
+                [enc setThreadgroupMemoryLength:(4096u + 32u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_rows + 255u) / 256u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer direct score")) return 0;
