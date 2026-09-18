@@ -48906,7 +48906,10 @@ int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
         top_k > 32u || !rows || rows > 65535u) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_router_one");
+        const bool hier = rows == 1u && n_expert == 384u && top_k == 6u &&
+            !getenv("DS4_METAL_DISABLE_V41_ROUTER_HIER");
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            hier ? "kernel_dsv41_router_hier" : "kernel_dsv41_router_one");
         if (!pipeline) return 0;
         NSUInteger nth = 1;
         while (nth < n_expert) nth *= 2u;
