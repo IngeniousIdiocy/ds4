@@ -40197,6 +40197,9 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
  * stream of the target layers at the trunk positions, and a draft block attends over
  * it plus its own rows.  A pass captures its positions' means; a decode or prefill
  * pass commits them, a verify pass commits the accepted prefix. */
+#include "ds4_ds41_dspark_adaptive.h"
+#include "ds4_dspark_controller.h"
+#include "ds4_ds41_dspark_fault.h"
 #define DS41_DRAFT_WINDOW 128u
 typedef struct {
     const ds4_dspark_weights *w;
@@ -40205,6 +40208,13 @@ typedef struct {
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows;       /* the positions the last pass captured */
     uint32_t verify_rows;            /* nonzero while a verify pass runs */
+    ds41_dspark_adaptive admission;
+    ds41_dspark_fault fault;        /* persists across requests and prefix resets */
+    ds41_ctl_state control;
+    uint64_t control_generation;
+    uint32_t control_end;
+    bool admission_busy;            /* internal serial work belongs to its full cycle */
+    float *confidence_logits;       /* public gate reads post-Markov probabilities */
     /* Local serving may stop inside an accepted block at a sampling/tool
      * boundary. Keep its small draft frontier until the next model step. */
     bool rewind_valid;
@@ -40232,11 +40242,13 @@ static void ds41_draft_free(ds41_draft *d) {
         d->parts, d->logits, d->x, d->xn, d->saved, d->pool_kv, d->pool_score, d->rows_logits, d->rows_x,
         d->rows_tmp, d->rewind_mh, d->rewind_pending, d->rewind_ring, d->rewind_pool};
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(d->confidence_logits);
     free(d);
 }
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
+    uint64_t state_generation;      /* invalidate controller evidence on prefix replacement */
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -40364,6 +40376,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 }
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
+    g->state_generation++;
     g->pos = 0;
     g->valid = true;
     if (g->draft) { g->draft->mh_rows = 0; g->draft->rewind_valid = false; }
@@ -41952,12 +41965,28 @@ static bool ds41_draft_stage(ds41_gpu_graph *g, uint32_t stage, uint32_t count) 
         ds41_moe_expand_batch(b, m, l, count);
 }
 
+static void ds41_dspark_row_confidence(const float *logits_rows, uint32_t block,
+                                       uint32_t vocab, float *out) {
+    for (uint32_t i = 0; i < block; i++) {
+        const float *row = logits_rows + (size_t)i * vocab;
+        float top = -1e30f;
+        for (uint32_t v = 0; v < vocab; v++) if (row[v] > top) top = row[v];
+        const float cut = top - 30.0f;
+        double sum = 0.0;
+        for (uint32_t v = 0; v < vocab; v++)
+            if (row[v] > cut) sum += exp((double)row[v] - (double)top);
+        out[i] = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+    }
+}
+
 /* One draft block from the token the trunk just produced: the stages over
  * [t0, noise x (block - 1)] at the positions after the captured one, then the head,
- * the Markov chain and the confidences.  tokens_out[i] drafts the position two past
- * the captured one plus i, conf_out[i] is the confidence logit that it is right. */
+ * the Markov chain and the confidences. tokens_out[i] drafts the position two past
+ * the captured one plus i. Public admission receives normalized top probability;
+ * other backends retain the trained confidence-head logit. */
 static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                               int t0, int *tokens_out, float *conf_out) {
+                               int t0, int *tokens_out, float *conf_out, bool public_confidence, bool *drained) {
+    *drained = false;
     ds41_draft *d = g->draft;
     const ds4_dspark_stage_weights *last = &d->w->stage[d->n_stage - 1u];
     const uint32_t B = d->block, dim = DS4_N_EMBD, vocab = DS4_N_VOCAB, hc = DS4_N_HC;
@@ -41990,20 +42019,44 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m, const ds4_
         ds4_gpu_rms_norm_weight_rows_tensor(d->xn, d->x, d->m->map, d->m->size,
             last->norm->abs_offset, dim, B, DS4_RMS_EPS) &&
         ds41_output_projection(g, d->logits, m, w, d->xn, B) &&
+#ifdef __APPLE__
+        (public_confidence ?
+         ds4_gpu_dsv41_markov_chain_post(B, vocab, d->rank, dim, d->logits, d->x, d->m->map, d->m->size,
+            last->markov_w1->abs_offset, last->markov_w2->abs_offset,
+            last->markov_w1->type == DS4_TENSOR_F16, d->conf_proj, d->tokens, d->conf, d->parts, 1024u,
+            d->rows_logits) :
+#endif
         ds4_gpu_dsv41_markov_chain(B, vocab, d->rank, dim, d->logits, d->x, d->m->map, d->m->size,
             last->markov_w1->abs_offset, last->markov_w2->abs_offset,
-            last->markov_w1->type == DS4_TENSOR_F16, d->conf_proj, d->tokens, d->conf, d->parts, 1024u);
+            last->markov_w1->type == DS4_TENSOR_F16, d->conf_proj, d->tokens, d->conf, d->parts, 1024u)
+#ifdef __APPLE__
+        )
+#endif
+        ;
     g->batch = whole;
 #define DS41_DRAFT_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_DRAFT_FREE)
 #undef DS41_DRAFT_FREE
-    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    const bool completed = !ds4_gpu_commands_active() || ds4_gpu_end_commands();
+    if (!completed) ok = false;
+    /* Proposal touches draft/scratch tensors, never target KV or its position. */
+    *drained = completed;
     g->tp_world = world;
 #ifdef __APPLE__
     ds4_gpu_tp_full_expert_bind(0);
 #endif
-    return ok && ds4_gpu_tensor_read(d->tokens, sizeof(int32_t), tokens_out, (uint64_t)B * sizeof(int32_t)) &&
-        ds4_gpu_tensor_read(d->conf, 0, conf_out, (uint64_t)B * sizeof(float));
+    if (!ok || !ds4_gpu_tensor_read(d->tokens, sizeof(int32_t), tokens_out, (uint64_t)B * sizeof(int32_t))) return false;
+    if (public_confidence) {
+        /* The trained confidence head is a different statistic. Preserve our
+         * public controller's normalized top probability, including its ordered
+         * double sum, even though the proposal chain now runs on the GPU. The
+         * verify logits buffer is scratch until the subsequent target pass. */
+        if (!d->confidence_logits) d->confidence_logits = xmalloc((size_t)B * vocab * sizeof(float));
+        if (!ds4_gpu_tensor_read(d->rows_logits, 0, d->confidence_logits, (uint64_t)B * vocab * sizeof(float))) return false;
+        ds41_dspark_row_confidence(d->confidence_logits, B, vocab, conf_out);
+        return true;
+    }
+    return ds4_gpu_tensor_read(d->conf, 0, conf_out, (uint64_t)B * sizeof(float));
 }
 
 /* The window slots a verify pass of `rows` positions after `pos` overwrites: saved
@@ -61491,6 +61544,131 @@ static void ds4_session_dspark_scheduler_reset(ds4_session *s) {
     s->dspark_sched_saved_ms = 0.0;
 }
 
+
+/* Keep the public fork's admission algorithm above the selected GPU kernels.
+ * Other backends retain their established controller and synchronization. */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+static bool ds41_public_admission(const ds4_session *s) {
+#ifdef __APPLE__
+    return s && s->ds41_graph_ready && s->ds41_graph.draft &&
+        s->ds41_graph.tp_world == 1 && !s->ds41_graph.streaming &&
+        !getenv("DS4_METAL_DISABLE_V41_PUBLIC_CONTROLLER");
+#else
+    (void)s; return false;
+#endif
+}
+static bool ds41_admission_enabled(const char *name) {
+    const char *v = getenv(name);
+    return !v || strcmp(v, "0") != 0;
+}
+
+static ds41_adapt_config ds41_admission_config(void) {
+    ds41_adapt_config c = {16u, true, true, 0.75f, 3u, true};
+    const char *v = getenv("DS4_DS41_DSPARK_MIN_SERIAL_TOKENS");
+    if (v && *v) {
+        const long n = strtol(v, NULL, 10);
+        if (n >= 0 && n <= DS41_ADAPT_ENTRY_MAX) c.min_serial_tokens = (uint32_t)n;
+    }
+    v = getenv("DS4_DS41_DSPARK_P_MIN");
+    if (v && *v) {
+        const double n = strtod(v, NULL);
+        if (n >= 0.0 && n <= 1.0) c.p_min = (float)n;
+    }
+    v = getenv("DS4_DS41_DSPARK_MIN_DRAFT");
+    if (v && *v) {
+        const long n = strtol(v, NULL, 10);
+        if (n >= 0 && n <= DS4_DSPARK_MAX_BLOCK_SIZE) c.min_draft = (uint32_t)n;
+    }
+    c.enabled = ds41_admission_enabled("DS4_DS41_DSPARK_ADAPTIVE");
+    c.loss_budget = ds41_admission_enabled("DS4_DS41_DSPARK_LOSS_BUDGET");
+    c.reasoning_serial = ds41_admission_enabled("DS4_DS41_DSPARK_REASONING_SERIAL");
+    return c;
+}
+
+static void ds41_admission_token(ds4_engine *e, ds41_ctl_state *c, int token) {
+    if (token == e->vocab.think_start_id) {
+        c->thinking = true; c->tag_len = 0;
+    } else if (token == e->vocab.think_end_id) {
+        c->thinking = false; c->tag_len = 0;
+    } else {
+        size_t len = 0;
+        char *text = ds4_token_text(e, token, &len);
+        ds41_ctl_text(c, text, len);
+        free(text);
+    }
+}
+
+static void ds41_admission_reconstruct(ds4_session *s) {
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_draft *d = g->draft;
+    if (!d->admission.active) ds41_adapt_begin(&d->admission, ds41_admission_config());
+    if (d->control_generation == g->state_generation && d->control_end == g->pos) return;
+    ds41_adapt_reset_evidence(&d->admission);
+    memset(&d->control, 0, sizeof(d->control));
+    /* Parse only the active assistant turn, never a literal tag in user text. */
+    int start = s->checkpoint.len;
+    for (int i = start - 1; i >= 0; i--) {
+        const int token = s->checkpoint.v[i];
+        if (token == s->engine->vocab.user_id || token == s->engine->vocab.system_id ||
+            token == s->engine->vocab.observation_id) break;
+        if (token == s->engine->vocab.assistant_id) { start = i + 1; break; }
+    }
+    for (int i = start; i < s->checkpoint.len; i++)
+        ds41_admission_token(s->engine, &d->control, s->checkpoint.v[i]);
+    ds41_adapt_reasoning(&d->admission, d->control.thinking);
+    d->control_generation = g->state_generation;
+    d->control_end = g->pos;
+}
+
+static void ds41_admission_fault(ds41_draft *d, bool drained) {
+    ds41_fault_latch(&d->fault, drained);
+    fprintf(stderr, "ds4: DSpark V4.1 fault latched disabled=1 safe=%d failures=%llu\n",
+            drained, (unsigned long long)d->fault.failures);
+}
+static void ds41_admission_finish(ds4_session *s,const int *tokens,uint32_t count,
+                                  double seconds,bool proposed,bool declined) {
+    ds41_draft *d = s->ds41_graph.draft;
+    if (declined) ds41_adapt_record_decline(&d->admission, seconds * 1000.0, count);
+    else ds41_adapt_record(&d->admission, seconds * 1000.0, count, proposed);
+    for (uint32_t i = 0; i < count; i++) ds41_admission_token(s->engine, &d->control, tokens[i]);
+    ds41_adapt_reasoning(&d->admission, d->control.thinking);
+    d->control_generation = s->ds41_graph.state_generation;
+    d->control_end = s->ds41_graph.pos;
+}
+#endif
+
+void ds4_session_ds41_dspark_request_begin(ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds41_public_admission(s)) {
+        ds41_draft *d = s->ds41_graph.draft;
+        ds41_fault_begin_request(&d->fault);
+        ds41_adapt_begin(&d->admission, ds41_admission_config());
+        d->control_generation = 0;
+        d->control_end = UINT32_MAX;
+        d->admission_busy = false;
+    }
+#else
+    (void)s;
+#endif
+}
+
+int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[7], double ms[3]) {
+    if (out) memset(out, 0, 7 * sizeof(out[0]));
+    if (ms) memset(ms, 0, 3 * sizeof(ms[0]));
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds41_public_admission(s)) {
+        const ds41_dspark_adaptive *a = &s->ds41_graph.draft->admission;
+        if (out) {
+            out[0] = a->attempts; out[1] = a->serial_steps; out[2] = a->skipped_steps;
+            out[3] = a->windows; out[4] = a->backoffs; out[5] = a->losing_cycles; out[6] = a->declines;
+        }
+        if (ms) { ms[0] = a->serial_ms; ms[1] = a->cycle_ms; ms[2] = a->net_ms; }
+        return 1;
+    }
+#endif
+    (void)s; return 0;
+}
+
 static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     if (!s) return;
     ds4_session_dspark_scheduler_reset(s);
@@ -61683,6 +61861,16 @@ static void ds4_session_dspark_scheduler_note(
         }
     }
     ds4_session_dspark_scheduler_reset(s);
+}
+#endif
+
+#ifdef DS4_NO_GPU
+void ds4_session_ds41_dspark_request_begin(ds4_session *s) { (void)s; }
+int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[7], double ms[3]) {
+    (void)s;
+    if (out) memset(out, 0, 7 * sizeof(out[0]));
+    if (ms) memset(ms, 0, 3 * sizeof(ms[0]));
+    return 0;
 }
 #endif
 
@@ -78605,7 +78793,16 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    const bool note=ds41_public_admission(s)&&!s->ds41_graph.draft->admission_busy;
+    if(note)ds41_admission_reconstruct(s);
+    const double started=note?now_sec():0.0;
+#endif
+    int rc=ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if(note&&!rc)ds41_admission_finish(s,&token,1,now_sec()-started,false,false);
+#endif
+    return rc;
 }
 
 #ifndef DS4_NO_GPU
@@ -85288,6 +85485,12 @@ static void ds41_draft_adapt(ds41_draft *d, bool proposed, uint32_t k, uint32_t 
     }
 }
 
+static int ds41_spec_serial(ds4_session *s,int token,char *err,size_t errlen) {
+    ds41_draft *d=s->ds41_graph.draft;
+    const bool busy=d->admission_busy;d->admission_busy=true;
+    int rc=ds4_session_eval(s,token,err,errlen);d->admission_busy=busy;return rc;
+}
+
 static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, int eos_token,
                              bool ignore_eos, ds4_think_mode think_mode, float temperature,
                              int top_k, float top_p, float min_p, uint64_t *rng,
@@ -85298,27 +85501,65 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     const uint32_t B = d->block, vocab = DS4_N_VOCAB, P1 = (uint32_t)s->checkpoint.len;
     const bool exact = rng && temperature > 0.0f, stats = ds4_dspark_stats_enabled();
     const double t0 = now_sec();
+    const bool public_controller=ds41_public_admission(s);
+    ds41_ctl_state preview={0};
+    if (public_controller) {
+        ds41_admission_reconstruct(s);
+        preview = d->control;
+        ds41_admission_token(e, &preview, first_token);
+        /* first_token has already been selected by the caller. A closing
+         * reasoning tag releases the answer phase before admission is judged. */
+        ds41_adapt_reasoning(&d->admission, preview.thinking);
+        if (d->fault.disabled && !ds41_fault_skip(&d->fault)) {
+            payload_set_err(err, errlen, "DeepSeek V4.1 session state is unsafe after a draft fault");
+            return -1;
+        }
+    }
     int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
     float conf[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t k = 0;
     double propose_s = 0.0;
+    bool proposal_fault = false;
     /* the block continues the position whose stream the last pass captured */
     const bool draftable = P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 &&
         P1 - 1u < d->mh_pos0 + d->mh_rows && P1 + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
-    const bool proposed = draftable && (!d->skip_left || ds41_draft_adapt_off());
+    const bool proposed = draftable && (public_controller ?
+        !d->fault.disabled && ds41_adapt_admit(&d->admission) :
+        (!d->skip_left || ds41_draft_adapt_off()));
     if (draftable && !proposed) {
-        d->skip_left--;
+        if(!public_controller)d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
     }
     if (proposed) {
         const double tp = now_sec();
-        if (!ds41_draft_propose(g, &e->model, &e->weights, first_token, drafts, conf)) {
-            payload_set_err(err, errlen, "DeepSeek V4.1 draft failed");
-            return -1;
+        bool drained = false;
+        if (public_controller) (void)ds41_fault_attempt(&d->fault);
+        bool draft_ok = ds41_draft_propose(g, &e->model, &e->weights, first_token,
+                                         drafts, conf, public_controller, &drained);
+        /* Same diagnostic as the public fork: fail only after a real proposal,
+         * once per process, to exercise the ordinary fault exit. */
+        static bool injected = false;
+        const char *fail = getenv("DS4_DS41_DSPARK_FAIL");
+        if (public_controller && draft_ok &&
+            ds41_fault_inject_once(fail && !strcmp(fail, "drafter_once"), &injected)) draft_ok = false;
+        if (!draft_ok) {
+            if (public_controller) ds41_admission_fault(d, drained);
+            if (!public_controller || !ds41_fault_skip(&d->fault)) {
+                payload_set_err(err, errlen, "DeepSeek V4.1 draft failed");
+                return -1;
+            }
+            proposal_fault = true;
         }
         propose_s = now_sec() - tp;
         if (stats) s->dspark_stats.propose_ms += propose_s * 1000.0;
-        k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
+        if (proposal_fault) {
+            k = 0;
+        } else if (public_controller) {
+            const ds41_adapt_config *c = &d->admission.config;
+            k = (!c->enabled || !c->min_draft || ds41_adapt_prefix(conf, B, c->p_min, c->min_draft)) ? B : 0u;
+        } else {
+            k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
+        }
         if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
         if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
         if (k > g->ctx - P1 - 1u - exact) k = g->ctx - P1 - 1u - exact;
@@ -85343,9 +85584,10 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         fprintf(stderr, "\n");
     }
     if (k == 0) {
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        if (ds41_spec_serial(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
-        ds41_draft_adapt(d, proposed, 0, 1, now_sec() - t0, propose_s);
+        if(public_controller)ds41_admission_finish(s,&first_token,1,now_sec()-t0,false,proposed && !proposal_fault);
+        else ds41_draft_adapt(d, proposed, 0, 1, now_sec() - t0, propose_s);
         if (stats) {
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
             s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
@@ -85370,6 +85612,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         free(rows);
         s->checkpoint_valid = false;
         if (tp_leader) (void)ds4_tp_send_verify_commit(e->tp.ctx, DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
+        if (public_controller) ds41_admission_fault(d, false);
         payload_set_err(err, errlen, "DeepSeek V4.1 verify failed");
         return -1;
     }
@@ -85382,10 +85625,16 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
                 replacement = speculative_point_replacement(s, drafts[j], rng);
                 break;
             }
+            if(public_controller)ds41_admission_token(e,&preview,drafts[j]);
             j++;
+            if(public_controller&&d->admission.config.reasoning_serial&&preview.thinking)break;
         }
     } else {
-        while (j < k && sample_argmax(rows + (size_t)j * vocab, vocab) == drafts[j]) j++;
+        while (j < k && sample_argmax(rows + (size_t)j * vocab, vocab) == drafts[j]) {
+            if(public_controller)ds41_admission_token(e,&preview,drafts[j]);
+            j++;
+            if(public_controller&&d->admission.config.reasoning_serial&&preview.thinking)break;
+        }
     }
     memcpy(s->logits, rows + (size_t)j * vocab, (size_t)vocab * sizeof(float));
     free(rows);
@@ -85403,11 +85652,12 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     ok = ds41_draft_rollback(g, toks, k + 1u, j + 1u, history);
     s->checkpoint_valid = ok;
     if (!ok) {
+        if (public_controller) ds41_admission_fault(d, false);
         payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");
         return -1;
     }
     if (replacement >= 0) {
-        if (ds4_session_eval(s, replacement, err, errlen) != 0) return -1;
+        if (ds41_spec_serial(s, replacement, err, errlen) != 0) return -1;
         accepted[j + 1u] = replacement;
     }
     if (stats) {
@@ -85426,7 +85676,8 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     if (getenv("DS4_DSPARK_SPEC_LOG"))
         fprintf(stderr, "ds4: DSpark V4.1 cycle pos=%u drafted=%u accepted=%u replacement=%d\n",
                 P1, k, j, replacement);
-    ds41_draft_adapt(d, true, k, 1u + j + (replacement >= 0), now_sec() - t0, propose_s);
+    if(public_controller)ds41_admission_finish(s,accepted,1u+j+(replacement>=0),now_sec()-t0,true,false);
+    else ds41_draft_adapt(d, true, k, 1u + j + (replacement >= 0), now_sec() - t0, propose_s);
     return (int)(1u + j + (replacement >= 0));
 }
 #endif

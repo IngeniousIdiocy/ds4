@@ -13767,6 +13767,7 @@ decode_again:
     const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    ds4_session_ds41_dspark_request_begin(slot->session);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
@@ -13831,7 +13832,10 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
+        /* The alternative admission policy keeps reasoning serial. */
         if (!s->batched_mode &&
+            !(thinking.inside &&
+              ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL)) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {

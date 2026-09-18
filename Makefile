@@ -1108,3 +1108,5 @@ tests/test_v41_markov_post: tests/test_v41_markov_post.c ds4_gpu_args.o $(CORE_O
 
 tests/test_ds41_dspark_adaptive: tests/test_ds41_dspark_adaptive.c ds4_ds41_dspark_adaptive.h
 	$(CC) -O2 -g -Wall -Wextra -std=c99 -o $@ $< -lm
+
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_ds41_dspark_adaptive.h ds4_dspark_controller.h ds4_ds41_dspark_fault.h
