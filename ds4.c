@@ -41208,8 +41208,56 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
         (g->tp_world == 2 ? ds41_graph_after_attention(g, m, l, il) : ds41_hc_mix(g, m, l, true, g->attn_split));
 }
 
+/* Diagnostic switches compare public large-prefill folds with the parent.
+ * Keep small-row kernelpool fusions and non-Metal scheduling unchanged. */
+static bool ds41_prefill_fold(uint32_t count, const char *disable) {
+#ifdef __APPLE__
+    return count > DS4_TP_BATCH_MAX_ROWS && ds4_gpu_dsv41_prefill_folds_available() && !getenv(disable);
+#else
+    (void)count; (void)disable;
+    return false;
+#endif
+}
+
+static bool ds41_hc_sum_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const ds4_gpu_tensor *pre, uint32_t count, bool split) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_SUM"))
+        return split ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC) :
+            ds4_gpu_hc_weighted_sum_bf16_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC);
+#endif
+    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC) :
+        ds4_gpu_hc_weighted_sum_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC)) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, count, DS4_V41_BF16);
+}
+
+static bool ds41_hc_expand_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split, uint32_t count) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_EXPAND"))
+        return ds4_gpu_hc_expand_split_bf16_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC);
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+}
+
+static bool ds41_ffn_add_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b, uint32_t count) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_ADD"))
+        return ds4_gpu_dsv41_add_bf16_rows(out, a, b, DS4_N_EMBD, count);
+#endif
+    return ds4_gpu_add_tensor(out, a, b, count * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, count, DS4_V41_BF16);
+}
+
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                             const ds4_model *m, const ds4_tensor *weight, uint32_t count) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_NORM"))
+        return ds4_gpu_dsv41_norm_bf16_rows(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
+#endif
     return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[0], count, DS4_V41_BF16);
@@ -41269,10 +41317,7 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     if (ds41_hc_block_input_rows(b, m, l, false, il ? b->ffn_split : b->pre,
                                  il ? 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC : DS4_N_HC, count)) return true;
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
-    const bool mixed = il ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+    return ds41_hc_sum_batch(b->x, b->residual, il ? b->ffn_split : b->pre, count, il != 0) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
@@ -41290,13 +41335,10 @@ static bool ds41_attention_expand_rows(ds41_prefill_row *b, const ds4_model *m,
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count, bool expanded) {
     return (expanded ||
-            (ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-                 b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-             ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16))) &&
+            ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count)) &&
         (ds41_hc_block_input_rows(b, m, l, true, b->attn_split, 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC, count) ||
          (ds41_hc_mix_batch(b, m, l, true, count) &&
-          ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-          ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+          ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, count, true) &&
           ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count)));
 }
 
@@ -41310,18 +41352,20 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
     if (!(count <= DS4_TP_BATCH_MAX_ROWS &&
           ds4_gpu_dsv41_norm_pair_rows(b->qr, b->qr, l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q,
               b->kv, b->kv, l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, m->map, m->size, DS4_RMS_EPS, count)) &&
-        !(ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
-              l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
-          ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
-          ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
-              l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
-          ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16))) return false;
+        !(ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count) &&
+          ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, count))) return false;
     return ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr, g->tp_rank * q_dim, q_dim, count);
 }
 
 static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool bf16) {
+#ifdef __APPLE__
+    if (weight->type == DS4_TENSOR_F16 && ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_F16_ROWS2"))
+        return ds4_gpu_dsv41_projection_rows2(out, m->map, m->size, weight->abs_offset,
+            (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
+            (!bf16 || ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[1], count, DS4_V41_BF16));
+#endif
     if (weight->type == DS4_TENSOR_F16)
         return ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
@@ -42645,7 +42689,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
             if (!il) {
-#ifndef __APPLE__
+#ifdef __APPLE__
+                if (ok && batch_hc && g->tp_world == 1 && !g->image_count &&
+                    w->token_embd->type == DS4_TENSOR_F16 &&
+                    ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_EMBED")) {
+                    for (uint32_t t = 0; ok && t < count; t++)
+                        ok = tokens[off + t] >= 0 && (uint32_t)tokens[off + t] < DS4_N_VOCAB;
+                    if (ok) ok = ds4_gpu_dsv41_embed_init_rows(active.residual, active.pre, active.x,
+                        g->prefill_tokens, m->map, m->size, w->token_embd->abs_offset,
+                        DS4_N_VOCAB, count, DS4_N_EMBD);
+                } else
+#else
                 if (ok && !g->image_count) {
                     float *pre = calloc((size_t)count * DS4_N_HC, sizeof(float));
                     if (!pre) ok = false;
@@ -42770,11 +42824,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
-                        ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
-                        ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                            active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                    ok = ds41_ffn_add_batch(active.block, active.routed, active.shared, count) &&
+                        ds41_hc_expand_batch(active.residual, active.block, active.after_attn, active.ffn_split, count);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
