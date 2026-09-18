@@ -9761,7 +9761,18 @@ static int ds4_gpu_parallel_ffn_start_range(
         "kernel_dsv4_shared_mid_swiglu_q8_0_bf16" : "kernel_dsv4_shared_gate_up_swiglu_q8_0";
     id<MTLComputePipelineState> gate_pipeline =
         ds4_gpu_get_mul_mv_pipeline(gate_fn, gate_dispatch.nsg);
-    id<MTLComputePipelineState> down_pipeline =
+    /* MXFP4 decode overlaps this shared-down with routed work. Use the same
+     * exact short-K layout here as the standalone path, without changing the
+     * concurrent encoder or the gate/up schedule. Sliced and non-BF16 users
+     * retain their original kernel. */
+    const bool short_down = g_parallel_ffn_bf16 && model_dim == 5120u &&
+        shared_dim == 2304u && shared_lane_offset == 0u && shared_lane_count == shared_dim &&
+        !g_quality_mode && !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() &&
+        getenv("DS4_METAL_DISABLE_V41_Q8_SHORT") == NULL;
+    id<MTLComputePipelineState> down_pipeline = short_down
+        ? ds4_gpu_get_pipeline("kernel_mul_mv_q8_0_short72_bf16io") : nil;
+    const uint32_t down_nr0 = down_pipeline ? 4u : 2u;
+    if (!down_pipeline) down_pipeline =
         ds4_gpu_get_mul_mv_pipeline(g_parallel_ffn_bf16 ?
             "kernel_mul_mv_q8_0_f32_bf16io" : "kernel_mul_mv_q8_0_f32", 4);
     if (!gate_pipeline || !down_pipeline ||
@@ -9806,7 +9817,7 @@ static int ds4_gpu_parallel_ffn_start_range(
         ds4_gpu_make_q8_0_mv_args(shared_dim, model_dim);
     g_parallel_q8_args.ne00 = (int32_t)shared_lane_count;
     g_parallel_q8_args.ne10 = (int32_t)shared_lane_count;
-    g_parallel_q8_args.nr0 = 2;
+    g_parallel_q8_args.nr0 = down_nr0;
 
     g_parallel_ffn_mode = 2;
     g_parallel_ffn_stage = 0;
@@ -10029,9 +10040,11 @@ static void ds4_gpu_encode_parallel_q8_down(
     [enc setBuffer:g_parallel_q8_x offset:g_parallel_q8_x_offset atIndex:2];
     [enc setBuffer:g_parallel_q8_out offset:g_parallel_q8_out_offset atIndex:3];
     }
-    [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+    if (g_parallel_q8_args.nr0 == 2)
+        [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+    const NSUInteger nr0 = (NSUInteger)g_parallel_q8_args.nr0;
     [enc dispatchThreadgroups:MTLSizeMake(
-             ((NSUInteger)g_parallel_q8_args.ne0 + 1u) / 2u, 1, 1)
+             ((NSUInteger)g_parallel_q8_args.ne0 + nr0 - 1u) / nr0, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 }
 
@@ -19610,8 +19623,24 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 mv_fn = round_bf16 == 2 ? "kernel_mul_mv_q8_0_f32_bf16io" : "kernel_mul_mv_q8_0_f32_bf16";
                 if (fused_round) *fused_round = 1;
             }
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_fn, mv_dispatch.nsg);
+            const bool short_rows = round_bf16 && mv_dispatch.nsg == 4 &&
+                mv_dispatch.nr0 == 2 && !g_quality_mode && !g_ssd_streaming_mode &&
+                ((in_dim == 1280u && out_dim == 32768u) ||
+                 (in_dim == 2304u && out_dim == 5120u)) &&
+                getenv("DS4_METAL_DISABLE_V41_Q8_SHORT") == NULL;
+            id<MTLComputePipelineState> pipeline = nil;
+            if (short_rows) {
+                const char *fn = in_dim == 1280u
+                    ? (round_bf16 == 2 ? "kernel_mul_mv_q8_0_short40_bf16io" : "kernel_mul_mv_q8_0_short40_bf16")
+                    : (round_bf16 == 2 ? "kernel_mul_mv_q8_0_short72_bf16io" : "kernel_mul_mv_q8_0_short72_bf16");
+                pipeline = ds4_gpu_get_pipeline(fn);
+                if (pipeline) {
+                    mv_dispatch.nr0 = 4;
+                    mv_dispatch.smem = 0;
+                    mv_args.nr0 = 4;
+                }
+            }
+            if (!pipeline) pipeline = ds4_gpu_get_mul_mv_pipeline(mv_fn, mv_dispatch.nsg);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -19620,7 +19649,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+            if (mv_dispatch.smem) [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                                   1,
                                                   1)
@@ -49031,8 +49060,13 @@ int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t
         if (strcmp(dispatch.function_name, "kernel_mul_mv_q8_0_f32") != 0 || dispatch.nr0 != 2) return 0;
         args.nr0 = dispatch.nr0;
         const ds4_gpu_mv_rope_args rope = ds4_gpu_dsv41_mv_rope_args(512u, pos, compressed, false);
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16_rope", dispatch.nsg);
+        const bool short_rows = in_dim == 1280u && out_dim == 32768u &&
+            dispatch.nsg == 4 && !g_quality_mode && !g_ssd_streaming_mode &&
+            getenv("DS4_METAL_DISABLE_V41_Q8_SHORT") == NULL;
+        id<MTLComputePipelineState> pipeline = short_rows
+            ? ds4_gpu_get_pipeline("kernel_mul_mv_q8_0_short40_bf16_rope") : nil;
+        if (pipeline) { dispatch.nr0 = 4; dispatch.smem = 4u * sizeof(float); args.nr0 = 4; }
+        else pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16_rope", dispatch.nsg);
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -49045,7 +49079,7 @@ int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t
         [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setBytes:&rope length:sizeof(rope) atIndex:4];
         [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) / (NSUInteger)dispatch.nr0, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 q projection with rope");
@@ -49093,6 +49127,14 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
                           "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows") :
             rows > 1u ? "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows_seq4" : "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4",
             dispatch.nsg);
+        const bool short_rows = rows == 1u && in_dim == 2304u && out_dim == 5120u &&
+            dispatch.nsg == 4 && !g_quality_mode && !g_ssd_streaming_mode &&
+            getenv("DS4_METAL_DISABLE_V41_Q8_SHORT") == NULL;
+        if (short_rows) {
+            id<MTLComputePipelineState> short_pipeline =
+                ds4_gpu_get_pipeline("kernel_mul_mv_q8_0_short72_bf16io_hc_expand4");
+            if (short_pipeline) { pipeline = short_pipeline; dispatch.nr0 = 4; args.nr0 = 4; }
+        }
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
