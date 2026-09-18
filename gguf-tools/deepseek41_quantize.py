@@ -57,11 +57,11 @@ def validate_scales(tensors):
             raise ValueError(f"{name}: expected E8M0 scales {expected}")
 
 
-def build_plan(db, config, quant="q2", dspark="embed"):
+def build_plan(db, config, quant="q2", dspark="none"):
     """The main plan, and separately the DSpark stages when dspark is "separate"."""
     if quant not in QUANTIZATION:
         raise ValueError(f"unknown quantization recipe: {quant}")
-    if dspark not in ("embed", "separate", "none"):
+    if dspark not in ("separate", "none"):
         raise ValueError(f"unknown DSpark layout: {dspark}")
     c = config["text_config"]
     if config["quantization_config"]["weight_block_size"] != [32, 32]:
@@ -183,7 +183,7 @@ def build_plan(db, config, quant="q2", dspark="embed"):
         omitted |= {name for name in db.tensors if name.startswith("mtp.")}
     if consumed | omitted != set(db.tensors):
         raise ValueError(f"unclaimed source tensors: {sorted(set(db.tensors) - consumed - omitted)[:10]}")
-    main = plan + (draft if dspark == "embed" else []) + disk
+    main = plan + disk
     for items in (main, draft if dspark == "separate" else []):
         offset = 0
         for item in items:
@@ -367,7 +367,7 @@ def main():
     parser.add_argument("--out", help="the model GGUF; omit to write only --dspark-out")
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
-    parser.add_argument("--dspark-out", help="write the DSpark stages to this support GGUF instead of --out")
+    parser.add_argument("--dspark-out", help="write the DSpark stages to this support GGUF")
     parser.add_argument("--imatrix")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
@@ -381,7 +381,7 @@ def main():
         parser.error("threads must be between 1 and 32")
     if not args.out and not args.dspark_out:
         parser.error("--out or --dspark-out is required")
-    dspark = "separate" if args.dspark_out else "embed"
+    dspark = "separate" if args.dspark_out else "none"
     config, records = metadata(args.hf, args.source_revision)
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
     try:
@@ -390,7 +390,7 @@ def main():
                         kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap")]
         if args.imatrix:
             quantization.append(kv_string("quantize.imatrix.file", os.path.basename(args.imatrix)))
-        records += quantization + (dspark_records(config) if dspark == "embed" else [])
+        records += quantization
         support = [kv_string("general.architecture", "deepseek41-dspark"),
                    kv_string("general.name", "DeepSeek V4.1 Flash DSpark"),
                    kv_string("general.source.revision", args.source_revision),
