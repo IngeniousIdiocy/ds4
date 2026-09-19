@@ -690,6 +690,11 @@ typedef struct {
      * it off at the dispatch site. */
     int hc_pre_algebra_a;
     int decode_ablate;      /* diagnostic: DS4_GLM_DECODE_ABLATE bitmask, live; 0 = env/none */
+    /* C3: the concurrent dispatch group over the DSA decode stages between
+     * the q/kv fold and attention (glm_graph_forward_token).  Default on;
+     * DS4_GLM_DISABLE_DECODE_CONCURRENT turns it off, which restores the
+     * serial encoder -- the byte-identical reference path. */
+    int decode_concurrent;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

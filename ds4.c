@@ -46719,6 +46719,13 @@ static uint32_t glm_decode_ablate_mask(void) {
     return (uint32_t)cached;
 }
 
+/* C3 lever, read live at the dispatch site so a resident server can flip the
+ * DSA decode concurrent group between requests. */
+static bool glm53_graph_decode_concurrent_enabled(void) {
+    glm_levers_init_from_env();
+    return g_glm_levers.decode_concurrent != 0;
+}
+
 static bool glm_graph_encode_shared_swiglu_one(
         ds4_gpu_tensor          *mid,
         ds4_gpu_tensor          *gate,
@@ -55976,6 +55983,7 @@ glm_levers g_glm_levers = {
     .decode_flush_interval = -1, /* -1 = the interval resolved at the call site */
     .hc_pre_algebra_a      = 1,
     .decode_ablate         = 0,
+    .decode_concurrent     = 1,
 };
 static int g_glm_levers_ready;
 
@@ -55990,6 +55998,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_flush_interval", offsetof(glm_levers, decode_flush_interval), "DS4_GLM_DECODE_FLUSH_INTERVAL" },
     { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
     { "decode_ablate",         offsetof(glm_levers, decode_ablate),         "DS4_GLM_DECODE_ABLATE_MASK" },
+    { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56009,6 +56018,10 @@ void glm_levers_init_from_env(void) {
      * default-off half.  DS4_GLM_EXACT still clamps the dispatch off, where it
      * always did, in ds4_gpu_glm53_hc_alg_flag(). */
     g_glm_levers.hc_pre_algebra_a = getenv("DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A") == NULL;
+    /* Same DISABLE_ inversion: the group is default-on and the variable only
+     * ever takes it off. */
+    g_glm_levers.decode_concurrent =
+        getenv("DS4_GLM_DISABLE_DECODE_CONCURRENT") == NULL;
     g_glm_levers_ready = 1;
 }
 
@@ -56054,6 +56067,50 @@ int glm_levers_set(const char *name, int value) {
         }
     }
     return 0;
+}
+
+/* C3.  The DSA decode qk_low (attn_k_b) projection, lifted out of
+ * glm_graph_forward_token so it can be encoded at either of two points: its
+ * historical place, after the indexer selection, or -- when the decode
+ * concurrent group is open -- one dependency level earlier, beside the
+ * indexer score dispatch.  Same arithmetic and the same single dispatch
+ * either way; only the encode position moves. */
+static bool glm53_decode_encode_qk_low(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 pos,
+        bool                     tp_split,
+        ds4_gpu_tensor          *qk_low_out,
+        const ds4_gpu_tensor    *q_in,
+        uint32_t                 head_count) {
+    bool ok = true;
+    uint64_t k_weight_offset = l->attn_k_b->abs_offset;
+    uint64_t k_row_bytes = 0;
+    if (tp_split) {
+        ok = tensor_nbytes(l->attn_k_b->type,
+                           (uint64_t)g->q_nope,
+                           &k_row_bytes);
+        k_weight_offset +=
+            (uint64_t)g->tp_rank * head_count * DS4_N_KV_LORA * k_row_bytes;
+    }
+    if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(qk_low_out,
+                                                     q_in,
+                                                     model->map,
+                                                     model->size,
+                                                     k_weight_offset,
+                                                     l->attn_k_b->type,
+                                                     head_count,
+                                                     DS4_N_KV_LORA,
+                                                     (uint32_t)g->q_nope,
+                                                     DS4_N_KEY_MLA) != 0;
+    if (ok) metal_graph_debug_dump_tensor("glm_decode_qk_low",
+                                          g->qk_low,
+                                          (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA,
+                                          il,
+                                          pos);
+    return ok;
 }
 
 static bool glm_graph_forward_token(
@@ -56496,6 +56553,56 @@ static bool glm_graph_forward_token(
         const bool tp_split_layer_heads =
             tp_split_indexed_heads && il >= DS4_N_LEADING_DENSE &&
             l->attn_q_b->type == DS4_TENSOR_Q8_0;
+        /* C3 -- the concurrent dispatch group over the DSA stages between the
+         * fused q/kv+indexer projection and attention.  Two levels:
+         *
+         *   A = { attn_q_b, indexer pooled key store, indexer_q }
+         *       q_b reads q_rank_norm and attn_q_b, writes g->q;
+         *       the pooled store reads the folded g->indexer_k / g->indexer_gate
+         *       and writes layer_indexer_key_cache[il] + its tails;
+         *       indexer_q reads q_rank_norm and indexer_attn_q_b, writes
+         *       g->indexer_q.  Three disjoint outputs, and no member reads
+         *       anything another member writes.
+         *   B = { qk_low, indexer scores }
+         *       qk_low reads g->q (level A) and writes g->qk_low; the scorer
+         *       reads g->indexer_q and the pooled cache (both level A) plus
+         *       the folded g->indexer_weights, and writes g->indexer_scores.
+         *
+         * The group ends before the top-k chain: ds4_gpu_indexer_topk_fused
+         * encodes a dependent hist/gather/finish/sort/merge sequence that
+         * carries no barriers of its own and is ordered by the serial
+         * encoder alone, so it must not run inside a concurrent group.  A
+         * refused begin leaves today's serial encoder, which orders exactly
+         * the same dispatch sequence; a flush or end_commands landing inside
+         * the group closes it safely, because every one of those entry points
+         * runs ds4_gpu_parallel_ffn_reset_state() and clears the flag. */
+        int dsa_cg = 0;
+        bool qk_low_encoded = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ok && g->glm53 && use_indexed_attention && dsa_indexer_folded &&
+            decode_ablate == 0 && !decode_stage_profile && !g->ssd_streaming &&
+            !tp_split_layer_heads && g->tp_world < 2 &&
+            g->compact_cache_cap != 0 &&
+            glm_graph_layer_uses_full_indexer(il) &&
+            /* the pooled score/top-k chain, not the dense-prefix branch */
+            pos + 1u > glm_graph_dense_compact_attention_limit(g) &&
+            /* with a RoPE tail the q path would own two dependent dispatches
+             * and q_b could not share level A */
+            DS4_N_ROT == 0 && !glm_graph_indexer_qat() &&
+            metal_graph_debug_get_config()->prefix == NULL &&
+            glm53_graph_decode_concurrent_enabled()) {
+            dsa_cg = ds4_gpu_concurrent_group_begin();
+            if (dsa_cg) {
+                static ds4_t2s_slot slot = { "CGRP", 0, 0 };
+                ds4_t2s_hit(&slot,
+                            "glm53 decode DSA concurrent group "
+                            "levelA={attn_q_b,indexer_pool_store,indexer_q} "
+                            "levelB={qk_low,indexer_scores} heads=%u pos=%u",
+                            (unsigned)DS4_N_HEAD, pos);
+            }
+        }
+#endif
+        (void)dsa_cg;
         if (ok && !(decode_ablate & DS4_GLM_ABLATE_QPATH)) {
             DS4_GLM_FT_STAGE("DSA q_b projection");
             uint64_t q_weight_offset = l->attn_q_b->abs_offset;
@@ -56769,6 +56876,27 @@ static bool glm_graph_forward_token(
                                     1) != 0;
                     }
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_weights");
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                    /* C3 level A -> level B.  Either barrier form is a full
+                     * execution barrier for everything encoded earlier in the
+                     * group, so g->q, g->indexer_q and the pooled key cache
+                     * are all complete past this point.  If the barrier is
+                     * refused the group ends here and the encoder boundary
+                     * provides the same ordering. */
+                    if (dsa_cg) {
+                        if (!ds4_gpu_concurrent_group_barrier()) {
+                            (void)ds4_gpu_concurrent_group_end();
+                            dsa_cg = 0;
+                        }
+                        if (ok) {
+                            DS4_GLM_FT_STAGE("DSA qk low-rank projection");
+                            ok = glm53_decode_encode_qk_low(g, model, l, il, pos,
+                                                            false, g->qk_low,
+                                                            g->q, DS4_N_HEAD);
+                            qk_low_encoded = ok;
+                        }
+                    }
+#endif
                     const float indexer_scale =
                         1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                     const uint32_t score_rows = g->glm53 ?
@@ -56796,6 +56924,15 @@ static bool glm_graph_forward_token(
                             indexer_scale,
                             glm_graph_compact_cache_is_f16()) != 0;
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_scores");
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                    /* C3: close before the top-k chain, whose internal
+                     * dispatches depend on each other and rely on the serial
+                     * encoder for their ordering. */
+                    if (dsa_cg) {
+                        (void)ds4_gpu_concurrent_group_end();
+                        dsa_cg = 0;
+                    }
+#endif
                     if (ok && g->glm53) {
                         glm_topk_capture_scores(g->indexer_scores, score_rows,
                                                 il, pos, visible);
@@ -56856,33 +56993,23 @@ static bool glm_graph_forward_token(
                                               g->indexer_selected,
                                               last_indexer_selected_count,
                                               il, pos);
-            if (ok && !(decode_ablate & (DS4_GLM_ABLATE_ATTN_CORE | DS4_GLM_ABLATE_QKLOW))) {
-                uint64_t k_weight_offset = l->attn_k_b->abs_offset;
-                uint64_t k_row_bytes = 0;
-                if (tp_split_layer_heads) {
-                    ok = tensor_nbytes(l->attn_k_b->type,
-                                       (uint64_t)g->q_nope,
-                                       &k_row_bytes);
-                    k_weight_offset +=
-                        (uint64_t)g->tp_rank * tp_head_count *
-                        DS4_N_KV_LORA * k_row_bytes;
-                }
-                if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(
-                                                         tp_split_layer_heads ? tp_qk_low : g->qk_low,
-                                                         tp_split_layer_heads ? tp_q : g->q,
-                                                         model->map,
-                                                         model->size,
-                                                         k_weight_offset,
-                                                         l->attn_k_b->type,
-                                                         tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,
-                                                         DS4_N_KV_LORA,
-                                                         (uint32_t)g->q_nope,
-                                                         DS4_N_KEY_MLA) != 0;
-                if (ok) metal_graph_debug_dump_tensor("glm_decode_qk_low",
-                                                      g->qk_low,
-                                                      (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA,
-                                                      il,
-                                                      pos);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            /* C3: every other way out of the selection block -- an earlier
+             * failure, or a branch the group's admission test did not expect
+             * -- still has to close the group before attention. */
+            if (dsa_cg) {
+                (void)ds4_gpu_concurrent_group_end();
+                dsa_cg = 0;
+            }
+#endif
+            if (ok && !qk_low_encoded &&
+                !(decode_ablate & (DS4_GLM_ABLATE_ATTN_CORE | DS4_GLM_ABLATE_QKLOW))) {
+                ok = glm53_decode_encode_qk_low(
+                        g, model, l, il, pos,
+                        tp_split_layer_heads,
+                        tp_split_layer_heads ? tp_qk_low : g->qk_low,
+                        tp_split_layer_heads ? tp_q : g->q,
+                        tp_split_layer_heads ? tp_head_count : DS4_N_HEAD);
             }
             DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "kv_path");
             DS4_GLM_FT_STAGE("DSA indexed attention");
