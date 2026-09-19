@@ -41568,6 +41568,10 @@ typedef struct ds4_glm_gpu_graph {
      * a command buffer of its own. */
     int chain_split_armed;
 #endif
+    /* decode_ablate: buffers a skipped dispatch would have written are primed
+     * once, so the surviving dispatches keep reading finite values. */
+    uint8_t ablate_scores_primed;
+    uint8_t ablate_selected_primed;
     ds4_gpu_tensor *batch_router_logits;
     ds4_gpu_tensor *batch_router_probs;
     ds4_gpu_tensor *batch_router_selected;
@@ -46732,7 +46736,25 @@ static double glm_graph_streaming_async_profile_ms(void) {
 #define DS4_GLM_ABLATE_ROUTED    (1u << 4)
 #define DS4_GLM_ABLATE_SHARED    (1u << 5)
 #define DS4_GLM_ABLATE_QKLOW     (1u << 6)
-/* bit 7 is reserved; bits 8..12 are defined above glm53_graph_kda_attention */
+/* bit 7 is DS4_GLM_ABLATE_KDA_CORE; bits 8..12 are defined above
+ * glm53_graph_kda_attention.  Bits 13.. are the finer sub-stage bits: each one
+ * skips exactly one dispatch of a family the coarse bits above skip whole. */
+#define DS4_GLM_ABLATE_ATTN_PARTIAL  (1u << 13)  /* == DS4_GPU_ABLATE_* */
+#define DS4_GLM_ABLATE_ATTN_REDUCE   (1u << 14)
+#define DS4_GLM_ABLATE_INDEXER_SCORE (1u << 15)
+#define DS4_GLM_ABLATE_INDEXER_TOPK  (1u << 16)
+#define DS4_GLM_ABLATE_SHARED_UP     (1u << 17)
+#define DS4_GLM_ABLATE_SHARED_DOWN   (1u << 18)
+
+/* The two split8 bits are decided inside the Metal encoder, so the mask is
+ * pushed down every time it is read rather than plumbed through a dozen
+ * signatures.  It is a store of a word on a path that already reads a lever. */
+static inline uint32_t glm_decode_ablate_publish(uint32_t mask) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_ablate_set(mask);
+#endif
+    return mask;
+}
 
 static uint32_t glm_decode_ablate_mask(void) {
     static int cached = -1;
@@ -46740,7 +46762,9 @@ static uint32_t glm_decode_ablate_mask(void) {
      * bitmask wins over the cached environment mask, so the resident bench
      * can ablate families without a restart. */
     glm_levers_init_from_env();
-    if (g_glm_levers.decode_ablate != 0) return (uint32_t)g_glm_levers.decode_ablate;
+    if (g_glm_levers.decode_ablate != 0) {
+        return glm_decode_ablate_publish((uint32_t)g_glm_levers.decode_ablate);
+    }
     if (cached < 0) {
         uint32_t mask = 0;
         const char *env = getenv("DS4_GLM_DECODE_ABLATE");
@@ -46758,13 +46782,19 @@ static uint32_t glm_decode_ablate_mask(void) {
             if (strstr(env, "hc_pre")) mask |= DS4_GLM_ABLATE_HC_PRE;
             if (strstr(env, "head")) mask |= DS4_GLM_ABLATE_HEAD;
             if (strstr(env, "router")) mask |= DS4_GLM_ABLATE_ROUTER;
+            if (strstr(env, "attn_partial")) mask |= DS4_GLM_ABLATE_ATTN_PARTIAL;
+            if (strstr(env, "attn_reduce")) mask |= DS4_GLM_ABLATE_ATTN_REDUCE;
+            if (strstr(env, "indexer_score")) mask |= DS4_GLM_ABLATE_INDEXER_SCORE;
+            if (strstr(env, "indexer_topk")) mask |= DS4_GLM_ABLATE_INDEXER_TOPK;
+            if (strstr(env, "shared_up")) mask |= DS4_GLM_ABLATE_SHARED_UP;
+            if (strstr(env, "shared_down")) mask |= DS4_GLM_ABLATE_SHARED_DOWN;
             if (mask) {
                 fprintf(stderr, "ds4: GLM decode ablation active (mask 0x%x) — output is garbage, timing only\n", mask);
             }
         }
         cached = (int)mask;
     }
-    return (uint32_t)cached;
+    return glm_decode_ablate_publish((uint32_t)cached);
 }
 
 /* C3 lever, read live at the dispatch site so a resident server can flip the
@@ -47407,7 +47437,20 @@ static bool glm_graph_encode_sparse_ffn_one(
          * into its own tensor so that ffn_mid stays the routed experts'. */
         ds4_gpu_tensor *shared_mid = router_shared_folded ?
             g->moe_block_shared_mid : ffn_mid;
-        if (!router_shared_folded) {
+        if (router_shared_folded &&
+            (glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_UP)) {
+            /* The shared up/gate+swiglu is inside the router's single
+             * dispatch here, so there is nothing separate to skip: say so
+             * once rather than let the sweep read a zero as "it is free". */
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "ds4: GLM decode ablation: shared_up is folded "
+                                "into the router dispatch; the bit skips nothing\n");
+            }
+        }
+        if (!router_shared_folded &&
+            !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_UP)) {
             ok = glm_graph_encode_shared_swiglu_one(ffn_mid,
                                                 ffn_gate,
                                                 ffn_up,
@@ -47421,7 +47464,17 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                 stage_profile,
                                                 stage_t0);
         }
-        if (ok && fold_shared_down_hc) {
+        if (ok && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_DOWN)) {
+            /* Ablation: no shared-down dispatch.  In the folded form that one
+             * dispatch also carries the residual add and the HC expand, so
+             * the fold is still reported as done -- otherwise the ablated run
+             * would grow the add3 dispatch the fold replaces and stop being a
+             * clean subtraction. */
+            if (hc_fold && fold_shared_down_hc) {
+                hc_fold->capture_folded = false;
+                hc_fold->folded = true;
+            }
+        } else if (ok && fold_shared_down_hc) {
             bool capture_done = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             if (routed_down_split && hc_fold->capture_out &&
@@ -56073,7 +56126,7 @@ static int g_glm_levers_ready;
  * as given, inside its own range, instead of coercing it to 0/1. */
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
-    if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 8191; return 1; }
+    if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
     return 0;
 }
 
@@ -57028,6 +57081,19 @@ static bool glm_graph_forward_token_sel(
                                 indexer_scale,
                                 il, pos, visible);
                     }
+                    if (decode_ablate & DS4_GLM_ABLATE_INDEXER_SCORE) {
+                        /* Ablation: no scorer dispatch.  The top-k chain below
+                         * runs on whatever is in the score buffer; zero it
+                         * once so the first ablated token has finite scores
+                         * and picks valid rows. */
+                        if (ok && !g->ablate_scores_primed) {
+                            g->ablate_scores_primed = 1;
+                            ok = ds4_gpu_tensor_fill_f32(
+                                    g->indexer_scores, 0.0f,
+                                    ds4_gpu_tensor_bytes(g->indexer_scores) /
+                                        sizeof(float)) != 0;
+                        }
+                    } else {
                     ok = ds4_gpu_glm_indexer_score_one_tensor(
                             g->indexer_scores,
                             g->indexer_q,
@@ -57038,6 +57104,7 @@ static bool glm_graph_forward_token_sel(
                             DS4_N_INDEXER_HEAD_DIM,
                             indexer_scale,
                             glm_graph_compact_cache_is_f16()) != 0;
+                    }
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_scores");
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
                     /* C3: close before the top-k chain, whose internal
@@ -57048,7 +57115,20 @@ static bool glm_graph_forward_token_sel(
                         dsa_cg = 0;
                     }
 #endif
-                    if (ok && g->glm53) {
+                    if (ok && (decode_ablate & DS4_GLM_ABLATE_INDEXER_TOPK)) {
+                        /* Ablation: no hist/gather/finish (and no indirect
+                         * fallback).  g->indexer_selected keeps the previous
+                         * step's ids -- primed once with a contiguous range so
+                         * the first ablated token gathers valid rows -- and
+                         * the host still computes n_selected below. */
+                        if (!g->ablate_selected_primed) {
+                            g->ablate_selected_primed = 1;
+                            ok = ds4_gpu_glm_fill_selected_range_tensor(
+                                    g->indexer_selected,
+                                    g->glm53 ? glm53_graph_indexer_selected_limit()
+                                             : indexer_top_k) != 0;
+                        }
+                    } else if (ok && g->glm53) {
                         glm_topk_capture_scores(g->indexer_scores, score_rows,
                                                 il, pos, visible);
                         const uint32_t selected_pools =
@@ -74728,6 +74808,9 @@ static void ds4_chain_invalidate(ds4_chain *ch) {
     ds4_session *s = ch->s;
     (void)ds4_gpu_chain_stage_abort();
     (void)ds4_gpu_chain_stage_finish();
+    /* Staging is off again, so this is the plain close: never leave the batch
+     * open behind a chain (see ds4_session_chain_end). */
+    (void)glm_graph_end_commands_if_active();
     ch->staged = false;
     ch->inflight_event = 0;
     s->checkpoint_valid = false;
@@ -74968,7 +75051,17 @@ int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen) {
         ds4_chain_err(err, errlen, "chain decode cannot sync with a staged step");
         return 1;
     }
-    return ds4_chain_harvest(ch, ds4_gpu_chain_transient_mark(), err, errlen);
+    if (ds4_chain_harvest(ch, ds4_gpu_chain_transient_mark(), err, errlen) != 0) {
+        return 1;
+    }
+    /* The caller is about to read session state with a quiet GPU, which for
+     * the rest of the engine also means a closed command batch. */
+    if (!glm_graph_end_commands_if_active()) {
+        ds4_chain_err(err, errlen, "chain decode could not close its command batch");
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    return 0;
 }
 
 /* Encode the next step, then wait for the one in flight and return the id it
@@ -75027,6 +75120,21 @@ int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
     (void)ds4_gpu_chain_reap(ds4_gpu_chain_transient_mark(),
                              "glm chain decode end");
     (void)ds4_gpu_chain_stage_finish();
+    /* Leave the engine exactly where the classic decode loop leaves it: with
+     * the command batch CLOSED.  A chain step never ends the batch -- its
+     * logits never come back through the readback that calls
+     * ds4_gpu_end_commands() -- and both ds4_gpu_chain_stage_end() and
+     * _stage_abort() open a fresh empty one behind the step they park.  The
+     * next indexed prefill that has to own a batch (glm_graph_forward_indexed_
+     * tokens calls ds4_gpu_begin_commands() outright, and that returns 0 when
+     * one is already open) would refuse, which is what failed a live-KV
+     * continuation after a chain-decoded turn: "GLM-5.3 prefill failed at
+     * token <first token of the resumed chunk>". */
+    if (!glm_graph_end_commands_if_active()) {
+        ds4_chain_err(err, errlen, "chain decode could not close its command batch");
+        ch->s->checkpoint_valid = false;
+        rc = 1;
+    }
     if (ch->verify && ch->verify_checked) {
         fprintf(stderr, "ds4: glm chain verify: %ld/%ld mismatches\n",
                 ch->verify_mismatch, ch->verify_checked);

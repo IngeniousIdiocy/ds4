@@ -57,6 +57,13 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
+/* Timing-only decode ablation (DS4_GLM_DECODE_ABLATE / lever decode_ablate).
+ * The bits whose dispatch lives inside a Metal encoder are decided here;
+ * ds4.c owns the mask and pushes it down with ds4_gpu_ablate_set(). */
+#define DS4_GPU_ABLATE_ATTN_PARTIAL (1u << 13)
+#define DS4_GPU_ABLATE_ATTN_REDUCE  (1u << 14)
+void     ds4_gpu_ablate_set(uint32_t mask);
+uint32_t ds4_gpu_ablate_mask(void);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,

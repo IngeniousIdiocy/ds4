@@ -10348,6 +10348,11 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     return (uint8_t *)[obj.buffer contents] + obj.offset;
 }
 
+static uint32_t g_ds4_gpu_ablate;
+
+void ds4_gpu_ablate_set(uint32_t mask) { g_ds4_gpu_ablate = mask; }
+uint32_t ds4_gpu_ablate_mask(void) { return g_ds4_gpu_ablate; }
+
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > ds4_gpu_tensor_bytes(tensor) / sizeof(float)) return 0;
     float *p = ds4_gpu_tensor_contents(tensor);
@@ -41200,7 +41205,34 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                 if (strstr(dbl, "reduce")) rep_reduce = 2;
             }
         }
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        /* Timing-only ablation of one half of the split8 pair.  The skipped
+         * dispatch's encoder goes with it -- an empty encoder is not free --
+         * and the buffers the surviving half reads are primed once so it keeps
+         * running on finite numbers: zero partials with a (max,sum) of (1,1),
+         * and zero heads for the case where the reduce itself is the one
+         * skipped. */
+        const uint32_t ablate = g_ds4_gpu_ablate;
+        if (ablate & (DS4_GPU_ABLATE_ATTN_PARTIAL | DS4_GPU_ABLATE_ATTN_REDUCE)) {
+            static int primed;
+            if (!primed) {
+                primed = 1;
+                (void)ds4_gpu_tensor_fill_f32(partial_lora, 0.0f,
+                                              ds4_gpu_tensor_bytes(partial_lora) / sizeof(float));
+                (void)ds4_gpu_tensor_fill_f32(partial_ms, 1.0f,
+                                              ds4_gpu_tensor_bytes(partial_ms) / sizeof(float));
+                (void)ds4_gpu_tensor_fill_f32(heads, 0.0f,
+                                              ds4_gpu_tensor_bytes(heads) / sizeof(float));
+                fprintf(stderr,
+                        "ds4: GLM decode ablation: split8 partial=%s reduce=%s\n",
+                        (ablate & DS4_GPU_ABLATE_ATTN_PARTIAL) ? "skipped" : "on",
+                        (ablate & DS4_GPU_ABLATE_ATTN_REDUCE) ? "skipped" : "on");
+            }
+            if (ablate & DS4_GPU_ABLATE_ATTN_PARTIAL) rep_partial = 0;
+            if (ablate & DS4_GPU_ABLATE_ATTN_REDUCE) rep_reduce = 0;
+        }
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (rep_partial > 0) {
+        enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:partial_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
@@ -41216,7 +41248,9 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
+        }
 
+        if (rep_reduce > 0) {
         const NSUInteger reduce_threads =
             ds4_gpu_glm_indexed_reduce_threads(reduce_pipeline);
         const NSUInteger reduce_scratch_floats =
@@ -41234,6 +41268,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                  threadsPerThreadgroup:MTLSizeMake(reduce_threads, 1, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
+        }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM split grouped indexed attention decode")) return 0;
     }
