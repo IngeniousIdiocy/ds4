@@ -20880,7 +20880,7 @@ static int ds4_gpu_glm_topk_fast_pipelines(void) {
  * resident server with --debug-levers can move it between requests. */
 static int ds4_gpu_glm_topk_fused_lever(void) {
     glm_levers_init_from_env();
-    const int on = g_glm_levers.topk_fused != 0;
+    const int on = g_glm_levers.topk_fused != 0 && !glm53_exact_mode();
     static int last = -1;
     if (on != last) {
         fprintf(stderr, "[T2] topk_fused=%d\n", on);

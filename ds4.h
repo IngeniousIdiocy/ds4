@@ -773,8 +773,10 @@ typedef struct {
      * in threadgroup memory instead of device memory.  Selection semantics are
      * identical - same key mapping, bins, cut arithmetic, cand_cap, reject
      * causes and ctrl codes - and the sort key is a total order, so the output
-     * is byte-identical.  Default off pending its A/B; DS4_GLM_TOPK_FUSED=1
-     * turns it on at startup and /debug/levers moves it live. */
+     * is byte-identical.  Default ON since fused-62k (+0.127 t/s at 62k over
+     * three interleaved reps, identical text); DS4_GLM_DISABLE_TOPK_FUSED is
+     * the kill switch, exact mode clamps it off, and /debug/levers moves it
+     * live. */
     int topk_fused;
 } glm_levers;
 
