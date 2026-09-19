@@ -771,6 +771,20 @@ typedef struct {
      * DS4_GLM_DISABLE_HC_MIX_SPLITK is the historical variable and still
      * forces the single form at the call site whatever the lever says. */
     int hc_pre_single;
+    /* A2: how many heads share one staged window in the DSA decode attention
+     * partial (ds4_metal.m).  Counted 8 / 16 / 32; 8 is the shipped geometry.
+     * 16 and 32 widen the threadgroup to 512 / 1024 threads so each selected
+     * row is gathered once per 16 / 32 heads instead of once per 8.  Tier 1:
+     * bit-identical, the shared window is read-only.  The dispatch site
+     * refuses anything but the certified GLM-5.3 decode tuple and falls back
+     * to 8, logging once.  DS4_GLM_ATTN_GROUP sets it at startup. */
+    int attn_group;
+    /* A2: rows per block of the DSA decode attention split, for the deep
+     * (n_selected > 1024) geometry.  Counted 64 / 128; 128 is shipped.
+     * n_blocks follows it.  Tier 2 -- a different block partition changes the
+     * reduce's summation, so it is NOT bit-identical and DS4_GLM_EXACT and an
+     * explicit DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP both override it. */
+    int attn_block_rows;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

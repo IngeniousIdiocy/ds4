@@ -41021,6 +41021,45 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                 }
             }
         }
+        /* A2: attn_group -- how many heads share one staged window.  The
+         * group8 partial gathers every selected row once per head group, so at
+         * 8 heads per threadgroup each row is read from the compact cache
+         * eight times per layer; 16 and 32 halve and quarter that traffic.
+         * Tier 1 (the staged window is read-only and each simdgroup keeps the
+         * group8 row order, lane mapping and online-softmax update), so the
+         * only thing to police is the shape: this widening is written for the
+         * certified GLM-5.3 decode tuple alone, and anything else falls back
+         * to the shipped group8 dispatch after one log line. */
+        uint32_t attn_group = 8u;
+        {
+            glm_levers_init_from_env();
+            const int want = g_glm_levers.attn_group;
+            if (want == 16 || want == 32) {
+                const uint32_t g = (uint32_t)want;
+                const bool tuple_ok =
+                    !t2s_split8 &&
+                    n_head == 64u && (n_head % g) == 0u &&
+                    kv_lora_dim == 512u && qk_rope == 0u && cache_f16 &&
+                    value_weight_type == DS4_METAL_TENSOR_Q8_0 &&
+                    n_selected <= 2051u;
+                if (tuple_ok) {
+                    attn_group = g;
+                } else {
+                    static int refused;
+                    if (!refused) {
+                        refused = 1;
+                        fprintf(stderr,
+                                "ds4: DSA decode attn_group=%d refused "
+                                "(n_head %u kv_lora %u qk_rope %u f16 %d "
+                                "value_type %u n_selected %u screen %s); "
+                                "using group8\n",
+                                want, n_head, kv_lora_dim, qk_rope,
+                                cache_f16 ? 1 : 0, value_weight_type,
+                                n_selected, t2s_split8 ? t2s_split8 : "off");
+                    }
+                }
+            }
+        }
         id<MTLComputePipelineState> partial_pipeline = nil;
         if (t2s_split8) {
             char fn[96];
@@ -41029,6 +41068,49 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             if (!partial_pipeline) {
                 fprintf(stderr, "ds4: T2SCREEN SPLIT8DBL variant %s unavailable; using production\n", t2s_split8);
                 t2s_split8 = NULL;
+            }
+        }
+        /* A missing or too-narrow widened kernel is a property of the build,
+         * not of the request, so each group remembers its own refusal instead
+         * of retrying (and re-logging) the lookup at every layer. */
+        static int attn_group_unavailable[2];
+        int *attn_group_refused =
+            &attn_group_unavailable[attn_group == 32u ? 1 : 0];
+        if (attn_group != 8u && *attn_group_refused) attn_group = 8u;
+        if (!partial_pipeline && attn_group != 8u) {
+            /* Same variant ladder as group8 below: the widened kernel has a
+             * twin of every instantiation, so the group never weakens the
+             * row/head contract. */
+            char fn[128];
+            snprintf(fn, sizeof(fn),
+                     "kernel_glm_attention_indexed_decode_split_group%u_partial%s",
+                     attn_group,
+                     use_prefix_fullheads ? "_prefix_fullheads" :
+                     use_valid_fullheads ? "_valid_fullheads" : "");
+            partial_pipeline = ds4_gpu_get_pipeline(fn);
+            const NSUInteger want_threads = (NSUInteger)attn_group * 32u;
+            if (partial_pipeline &&
+                partial_pipeline.maxTotalThreadsPerThreadgroup < want_threads) {
+                /* register pressure: the widened threadgroup does not fit */
+                fprintf(stderr,
+                        "ds4: DSA decode %s allows only %lu threads "
+                        "(needs %lu); using group8\n",
+                        fn,
+                        (unsigned long)partial_pipeline.maxTotalThreadsPerThreadgroup,
+                        (unsigned long)want_threads);
+                partial_pipeline = nil;
+            }
+            if (!partial_pipeline) {
+                fprintf(stderr,
+                        "ds4: DSA decode %s unavailable; using group8\n", fn);
+                *attn_group_refused = 1;
+                attn_group = 8u;
+            } else {
+                static uint32_t announced;
+                if (announced != attn_group) {
+                    announced = attn_group;
+                    fprintf(stderr, "ds4: DSA decode attn_group on: %s\n", fn);
+                }
             }
         }
         if (!partial_pipeline && use_prefix_fullheads) {
@@ -41152,10 +41234,12 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         {
             static ds4_t2s_slot slot = { "SPLIT8DBL", 0, 0 };
             ds4_t2s_hit(&slot,
-                        "%s stage_rows=%lu bufs=%lu scratch=%lu B",
+                        "%s group=%u block_rows=%u n_blocks=%u stage_rows=%lu "
+                        "bufs=%lu scratch=%lu B",
                         t2s_split8 ?
                             "kernel_glm_t2s_split_group8_partial" :
-                            "kernel_glm_attention_indexed_decode_split_group8_partial(prod)",
+                            "kernel_glm_attention_indexed_decode_split_group_partial(prod)",
+                        attn_group, block_rows, n_blocks,
                         (unsigned long)stage_rows, (unsigned long)stage_bufs,
                         (unsigned long)partial_scratch_bytes);
         }
@@ -41180,8 +41264,9 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:partial_msbuf offset:ds4_gpu_tensor_offset(partial_ms) atIndex:7];
         [enc setThreadgroupMemoryLength:partial_scratch_bytes atIndex:0];
         for (int rep = 0; rep < rep_partial; rep++) {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / 8u, (NSUInteger)n_blocks, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / attn_group,
+                                                  (NSUInteger)n_blocks, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)attn_group, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
 

@@ -3865,8 +3865,15 @@ kernel void kernel_glm_value_project_q8_0_batch_heads_mma(
  * single final block of at most 3 rows -- pay the per-row bounds test.  A pad
  * row is then masked out of the softmax entirely (score -FLT_MAX/2, no
  * accumulator update), never admitted as a zero-valued member. */
+/* group_heads_t (A2): how many heads share one staged window.  8 is the
+ * shipped geometry; 16 and 32 widen the threadgroup to 512 / 1024 threads so
+ * each selected row is gathered from the compact cache once per 16 / 32 heads
+ * instead of once per 8.  Only the cooperative staging stride changes with it
+ * -- per simdgroup the rows are visited in the same order, with the same lane
+ * mapping, the same simd_sum tree and the same online-softmax update, so every
+ * output word is bit-identical to the group8 kernel. */
 template <bool assume_valid_rows, bool assume_valid_heads,
-          bool prefix_checked = false>
+          bool prefix_checked = false, uint group_heads_t = 8u>
 kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *q,
@@ -3881,7 +3888,8 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         ushort lane_u [[thread_index_in_simdgroup]],
         ushort sg_u [[simdgroup_index_in_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    constexpr uint group_heads = 8u;
+    constexpr uint group_heads = group_heads_t;
+    constexpr uint group_threads = group_heads_t * 32u;
     constexpr uint stage_rows = 16u;
     const uint tid = (uint)tid_u;
     const uint lane = (uint)lane_u;
@@ -3952,7 +3960,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
 
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
-        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+        for (uint off = tid; off < rows * kv_vecs; off += group_threads) {
             const uint rr = off / kv_vecs;
             const uint vv = off - rr * kv_vecs;
             const uint row = selected[base + rr];
@@ -3966,7 +3974,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
                 kv_shared[off] = half4(half(0.0f));
             }
         }
-        for (uint off = tid; off < rows * rope_vecs; off += 256u) {
+        for (uint off = tid; off < rows * rope_vecs; off += group_threads) {
             const uint rr = off / rope_vecs;
             const uint vv = off - rr * rope_vecs;
             const uint r = vv * 4u;
@@ -4074,6 +4082,35 @@ kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true>;
 template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_prefix_fullheads")]]
 kernel glm_attention_indexed_decode_split_group8_partial_t
 kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true>;
+
+/* A2: the same body with 16 heads (512 threads) and 32 heads (1024 threads)
+ * per threadgroup.  The host picks one with the attn_group lever; the grid's x
+ * extent becomes n_head/16 or n_head/32 and the threadgroup becomes
+ * (32, group, 1).  Every variant the group8 path can select has a twin here so
+ * the lever never has to weaken the row/head contract to widen the group. */
+template [[host_name("kernel_glm_attention_indexed_decode_split_group16_partial")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false, false, 16u>;
+
+template [[host_name("kernel_glm_attention_indexed_decode_split_group16_partial_valid_fullheads")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, false, 16u>;
+
+template [[host_name("kernel_glm_attention_indexed_decode_split_group16_partial_prefix_fullheads")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true, 16u>;
+
+template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false, false, 32u>;
+
+template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial_valid_fullheads")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, false, 32u>;
+
+template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial_prefix_fullheads")]]
+kernel glm_attention_indexed_decode_split_group8_partial_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true, 32u>;
 
 template<uint FIXED_BLOCKS, bool Q8_U16>
 static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
