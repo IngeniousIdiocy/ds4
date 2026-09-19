@@ -893,6 +893,47 @@ typedef struct {
      * reduce, or a value_dim below 2.  DS4_GLM_DSA_REDUCE_SPLIT sets it at
      * startup. */
     int dsa_reduce_split;
+    /* Threadgroups per head in the KDA decode glue
+     * (kernel_glm53_kda_decode_glue), 1 or 2.  At 1 the glue runs 64
+     * threadgroups, one per KDA head, so 64 of the machine's 80 cores, and
+     * each core streams its head's whole 128x128 recurrent state plus the
+     * folded low-rank expansion: 11.86 MB a site in 27.70 us, 428 GB/s
+     * against the 564 GB/s 64 cores could reach and 705 GB/s at full
+     * occupancy.  Thirty-four layers, 941.7 us a token (T2-REPORT.md
+     * section 8.2).  At 2 the grid becomes (2, n_heads): both threadgroups
+     * redundantly run the f_b prologue, the conv prep and the q/k/decay/beta
+     * preparation, and each then owns half of the 128 value rows and half of
+     * the 128 conv channels.  Only the g_b half of the prologue is split
+     * rather than replicated, since it feeds the per-channel epilogue alone.
+     *
+     * Tier 1.  Every value row is independent -- both reductions in the
+     * delta-rule loop are simd_sum WITHIN the row, and q4/k4/decay4/beta and
+     * sv[value] are read-only by then -- so moving a row to another
+     * threadgroup changes nothing about its arithmetic; the prep is redundant
+     * recomputation of the same expression in the same order over read-only
+     * inputs.
+     *
+     * The conv history is the one destructive write, and the layout is NOT
+     * changed: the split reads the layer's current conv buffer and writes the
+     * shifted history into its partner, so neither threadgroup reads what the
+     * other wrote, and the host flips the layer's parity afterwards.  At 1 the
+     * two bindings alias and the shift is in place exactly as today.  Every
+     * other conv-state user -- the batched prefill writer, the three other
+     * serial decode paths, the DFlash verify row loop, the speculative save
+     * and restore, the row snapshot restore and session save and load -- goes
+     * through glm53_graph_kda_conv_cur() and writes in place, so none of them
+     * ever flips; restores and session loads pin the layer back to buffer 0.
+     * The glue already refuses outright whenever a KDA snapshot is armed, so
+     * the in-kernel snapshot never meets the split.
+     *
+     * One caveat the measurement has to carry: the head-wide output RMS
+     * cannot run inside half a head, so at 2 the glue always falls back to the
+     * standalone kernel_glm53_kda_decode_out dispatch.  Value 2 therefore
+     * prices the re-grid MINUS one dependent-dispatch boundary, and the
+     * 1-vs-2 delta is also a direct measurement of what that boundary costs
+     * under the corrected model in section 7.12.  DS4_GLM_KDA_GLUE_SPLIT sets
+     * it at startup. */
+    int kda_glue_split;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

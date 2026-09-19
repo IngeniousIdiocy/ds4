@@ -57146,6 +57146,7 @@ typedef struct {
     float norm_eps;
     int32_t snapshot_row;
     uint32_t snapshot_stride;
+    uint32_t split;
     uint32_t lr_in_dim;
     uint32_t lr_q8;
     uint32_t do_prologue;
@@ -57166,6 +57167,14 @@ typedef struct {
 int ds4_gpu_glm53_kda_decode_glue(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
+        /* Lever kda_glue_split: the layer's OTHER conv-history buffer, and an
+         * out-flag set to 1 only when the split form was actually encoded.
+         * The caller flips the layer's parity on that flag alone, never on its
+         * own guess, because this function refuses the split at a dozen
+         * points.  NULL alt (or a caller that passes no flag) means the shift
+         * stays in place on conv_state, which is today's path. */
+        ds4_gpu_tensor       *conv_state_alt,
+        int                  *conv_flip_out,
         ds4_gpu_tensor       *recurrent_state,
         ds4_gpu_tensor       *split_scratch,
         const ds4_gpu_tensor *q,
@@ -57200,6 +57209,7 @@ int ds4_gpu_glm53_kda_decode_glue(
     };
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* the DFlash verify path stays on the fused kernel */
+if (conv_flip_out) *conv_flip_out = 0;
     if (g_glm53_kda_snap_base != NULL) return 0;
     if (!do_prologue && !do_out) return 0;
     /* The prologue is the only consumer of f_b/g_b and of the two low-rank
@@ -57316,6 +57326,44 @@ int ds4_gpu_glm53_kda_decode_glue(
         threads &= ~(NSUInteger)31u;
         if (threads < 128u) return 0;
 
+        /* Lever kda_glue_split (T2-REPORT.md section 8.2).  The glue runs one
+         * threadgroup per head -- 64 of the machine's 80 cores -- and each
+         * core streams its head's whole 128x128 state plus the low-rank
+         * expansion: 11.86 MB a site at 428 GB/s against the 564 GB/s 64 cores
+         * could reach.  At 2 the grid becomes (2, n_heads) and each
+         * threadgroup redundantly runs the prologue and prep and then owns
+         * half the value rows and half the conv channels, putting 128 cores on
+         * the 8.39 MB of state.  Tier 1: identical arithmetic in identical
+         * order, only the threadgroup that runs it changes.
+         *
+         * The conv history is the one destructive write, so the split reads
+         * the layer's current buffer and writes the other one; the caller
+         * flips the parity on conv_flip_out.  The head-wide output RMS cannot
+         * run inside half a head, so the split always takes the standalone
+         * kernel_glm53_kda_decode_out dispatch below -- the arm therefore
+         * prices the re-grid MINUS one dependent-dispatch boundary, and the
+         * 1-vs-2 delta is itself a measurement of that boundary. */
+        uint32_t glue_split = 1u;
+        if (g_glm_levers.kda_glue_split == 2 && n_rows == 1u &&
+            conv_state_alt != NULL && conv_state != NULL &&
+            ds4_gpu_tensor_bytes(conv_state_alt) >=
+                ds4_gpu_tensor_bytes(conv_state) &&
+            ds4_gpu_tensor_buffer(conv_state_alt) != nil &&
+            (n_heads & 1u) == 0u) {
+            glue_split = 2u;
+        }
+        /* The fused epilogue is incompatible with the split; fall back to the
+         * two-dispatch form the host already encodes when do_out is 0. */
+        const int glue_do_out = do_out && glue_split == 1u;
+        {
+            static ds4_t2s_slot slot = { "KDAGLUESPLIT", 0, 0 };
+            ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) heads=%u rows=%u "
+                               "fused_out=%d",
+                        glue_split,
+                        glue_split > 1u ? glue_split : (unsigned)n_rows,
+                        n_heads, n_heads, n_rows, glue_do_out);
+        }
+
         glm53_gpu_kda_glue_args args = {
             .n_heads = n_heads,
             .n_rows = n_rows,
@@ -57323,10 +57371,11 @@ int ds4_gpu_glm53_kda_decode_glue(
             .norm_eps = norm_eps,
             .snapshot_row = -1,
             .snapshot_stride = 0,
+            .split = glue_split,
             .lr_in_dim = lr_in_dim,
             .lr_q8 = lr_q8 ? 1u : 0u,
             .do_prologue = do_prologue ? 1u : 0u,
-            .do_out = do_out ? 1u : 0u,
+            .do_out = glue_do_out ? 1u : 0u,
         };
         glm53_gpu_kda_args out_args = {
             .n_heads = n_heads,
@@ -57389,11 +57438,20 @@ int ds4_gpu_glm53_kda_decode_glue(
         [enc setBuffer:output_norm offset:(NSUInteger)norm_inner atIndex:19];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:20];
+        {
+            /* At split 1 this aliases conv_state and the shift is in place,
+             * value for value as before. */
+            ds4_gpu_tensor *conv_write =
+                glue_split > 1u ? conv_state_alt : conv_state;
+            [enc setBuffer:ds4_gpu_tensor_buffer(conv_write)
+                    offset:ds4_gpu_tensor_offset(conv_write) atIndex:21];
+        }
         [enc setThreadgroupMemoryLength:532u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_heads, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(glue_split > 1u ? glue_split : n_rows,
+                                              n_heads, 1)
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 
-        if (!do_out) {
+        if (!glue_do_out) {
             if (needs_barrier) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
@@ -57411,8 +57469,15 @@ int ds4_gpu_glm53_kda_decode_glue(
         }
 
         ds4_gpu_end_compute_encoder(cb, enc);
-        return ds4_gpu_finish_command_buffer(
-            cb, owned, "GLM-5.3 glued KDA decode");
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                           "GLM-5.3 glued KDA decode")) {
+            return 0;
+        }
+        /* Encoded, so the parity advances -- and only now.  Encode order is
+         * execution order on the serial encoder and across the decode chain's
+         * command buffers, so the host's parity matches the GPU's. */
+        if (glue_split > 1u && conv_flip_out) *conv_flip_out = 1;
+        return 1;
     }
 }
 

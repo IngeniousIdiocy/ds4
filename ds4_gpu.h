@@ -3936,6 +3936,14 @@ int ds4_gpu_glm53_kda_decode_split2(
 int ds4_gpu_glm53_kda_decode_glue(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
+        /* Lever kda_glue_split: the layer's OTHER conv-history buffer, and an
+         * out-flag set to 1 only when the split form was actually encoded.
+         * The caller flips the layer's parity on that flag alone, never on its
+         * own guess, because this function refuses the split at a dozen
+         * points.  NULL alt (or a caller that passes no flag) means the shift
+         * stays in place on conv_state, which is today's path. */
+        ds4_gpu_tensor       *conv_state_alt,
+        int                  *conv_flip_out,
         ds4_gpu_tensor       *recurrent_state,
         ds4_gpu_tensor       *split_scratch,
         const ds4_gpu_tensor *q,
