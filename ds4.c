@@ -56117,8 +56117,8 @@ glm_levers g_glm_levers = {
     .hc_pre_algebra_a      = 1,
     .decode_ablate         = 0,
     .decode_concurrent     = 1,
-    .chain_decode          = 0,  /* off until the C2 gates adopt it */
-    .chain_commit_ahead    = 0,  /* off until the commit-ahead arm is measured */
+    .chain_decode          = 1,  /* on: +0.61 t/s at 62k, +0.72 at 8k */
+    .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
 };
 static int g_glm_levers_ready;
 
@@ -56135,8 +56135,8 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
     { "decode_ablate",         offsetof(glm_levers, decode_ablate),         "DS4_GLM_DECODE_ABLATE_MASK" },
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
-    { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_CHAIN_DECODE" },
-    { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_CHAIN_COMMIT_AHEAD" },
+    { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_DISABLE_CHAIN" },
+    { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56160,12 +56160,19 @@ void glm_levers_init_from_env(void) {
      * ever takes it off. */
     g_glm_levers.decode_concurrent =
         getenv("DS4_GLM_DISABLE_DECODE_CONCURRENT") == NULL;
-    /* Chain decode is default-off; the kill switch wins over the enable. */
-    g_glm_levers.chain_decode =
-        getenv("DS4_GLM_CHAIN_DECODE") != NULL &&
-        getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
+    /* Chain decode ships ON (decode-2 campaign, +0.61 t/s at 62k / +0.72 at
+     * 8k, both shapes byte-identical).  Same DISABLE_ inversion as the group
+     * above: the variable is the only way to take it off at startup, and
+     * ds4_session_chain_supported() tests it again at the gate, so a session
+     * cannot be talked back into the chain by setting the lever afterwards.
+     * The old DS4_GLM_CHAIN_DECODE / DS4_GLM_CHAIN_COMMIT_AHEAD enables are
+     * gone: they now name the default. */
+    g_glm_levers.chain_decode = getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
+    /* Commit-ahead only exists inside a chain step, so either switch takes
+     * it. */
     g_glm_levers.chain_commit_ahead =
-        getenv("DS4_GLM_CHAIN_COMMIT_AHEAD") != NULL;
+        getenv("DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD") == NULL &&
+        getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
     g_glm_levers_ready = 1;
 }
 

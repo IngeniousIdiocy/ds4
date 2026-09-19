@@ -321,6 +321,9 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_GLM_DISABLE_EXPERT_BANK` | kill switch | `=1` strongly disables expert-bank admission; `=0` is a no-op. | expert-bank admission |
 | `DS4_GLM_DISABLE_SUPERCHUNK` | kill switch | `=1` strongly disables the bank superchunk schedule; `=0` is a no-op. | expert-bank scheduler |
 | `DS4_GLM_DISABLE_BF16_LOWRANK_SPLITK` | kill switch | Ordinary mm kernel for the BF16 low-rank prefill matmuls instead of split-K (registry entry 2). | `ds4_metal.m:52173` |
+| `DS4_GLM_DISABLE_CHAIN` | kill switch | `=1` declines chain decode everywhere and takes the classic per-token loop (default on: the GPU selector picks the next id inside the step that produced the logits, so the next step is encoded before the current one finishes). Also takes commit-ahead with it. | `ds4.c:74750` |
+| `DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD` | kill switch | `=1` keeps chain decode but commits the whole step after the host confirms the token, instead of handing the step's non-mutating prologue to the GPU at encode time. | `ds4.c:56173` |
+| `DS4_GLM_DISABLE_DECODE_CONCURRENT` | kill switch | `=1` encodes the DSA decode levels serially instead of in one concurrent dispatch group. | `ds4.c:56161` |
 | `DS4_GLM_DISABLE_DENSE_HALF_COPY` | kill switch | Disables the dense-layer half-copy path and its ring (prefill lever 24). | `ds4_metal.m:21155` |
 | `DS4_GLM_DISABLE_DENSE_HALF_RING` | kill switch | Disables the half-copy ring alone. | `ds4_metal.m:21299` |
 | `DS4_GLM_DISABLE_DSA_BATCH_HOIST` | kill switch | Batched DSA prefill attention: no hoisting of the shared loads. | `ds4_metal.m:40884` |

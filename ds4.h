@@ -757,15 +757,15 @@ typedef struct {
     int decode_concurrent;
     /* C2 chain decode: pick the next id on the GPU and encode the following
      * step before the current one finishes.  Default off until adopted;
-     * DS4_GLM_CHAIN_DECODE turns it on at startup and DS4_GLM_DISABLE_CHAIN
-     * is the kill switch that declines it wherever it is asked for. */
+     * Default ON since the decode-2 campaign; DS4_GLM_DISABLE_CHAIN is the
+     * kill switch and declines it wherever it is asked for. */
     int chain_decode;
     /* C2 commit-ahead: 1 cuts each chain step in two at the first
      * state-mutating dispatch and hands the prologue to the GPU while the
      * previous step is still running, so the queue is never empty at the
      * token boundary.  The remainder still waits for the host's confirm, so
-     * a stop still has nothing to roll back.  DS4_GLM_CHAIN_COMMIT_AHEAD
-     * turns it on at startup. */
+     * a stop still has nothing to roll back.  Default ON with the chain;
+     * DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD is the kill switch. */
     int chain_commit_ahead;
 } glm_levers;
 

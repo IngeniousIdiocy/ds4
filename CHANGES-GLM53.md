@@ -384,6 +384,55 @@ dependency; and this file. The campaign's working notes (prefill plan, decode ba
 exact-reference procedure) are kept outside the public tree; their technical content is
 summarized in `bench/README.md` ("Campaign notes").
 
+## 7. Decode-2 campaign (2026-09-19)
+
+A second decode round on the serial path, because trench disables speculation while the
+model is reasoning: those tokens run the plain per-token loop, so a win there is a win
+on the traffic that matters. Two changes, both Tier 1 (byte-identical output), both
+default on, measured together on one resident server with interleaved arms and three
+repetitions: **+0.61 t/s at 62k (26.39 -> 25.97 ms/token) and +0.72 t/s at 8k**.
+
+**Chain decode** (`DS4_GLM_DISABLE_CHAIN`). A GPU selector kernel picks the next token
+inside the same command buffer that produced the logits, writing the id into the device
+tensor the next step embeds from (a two-slot host-visible ring plus `prefill_tokens`),
+so the host no longer has to read 605 KiB of logits and run an argmax between tokens,
+and the next step can be encoded while the current one is still running. The selector
+reproduces the host tie rules exactly -- `argmax_f32_excluding_unrolled8`'s seeded
+accumulator for greedy, Gumbel-max with the request's own RNG draw for sampling -- and
+a harness of 20,000 random logits vectors with planted ties, NaNs and -inf, plus a
+50-vector x 200,000-draw G-test on the sampler, gates it away from the GPU. A chain step
+is one command buffer; the step's non-mutating prologue (embedding, `hc_pre`, the first
+layer's projections) is cut off and committed while the previous step still runs, so the
+queue is never empty at the token boundary, while everything that mutates session state
+stays behind a host confirm. A stop token therefore drops an uncommitted step and leaves
+the session exactly where a classic run would: there is nothing to roll back.
+`DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD` keeps the chain but restores the whole-step commit.
+
+**Concurrent DSA decode levels** (`DS4_GLM_DISABLE_DECODE_CONCURRENT`): the decode
+attention's independent levels are encoded into one concurrent dispatch group instead of
+serially, with explicit barriers at the level boundaries.
+
+Gates: byte-identical text and token ids against the classic loop at both shapes; a
+per-token GPU-vs-host verify run (`DS4_GLM_CHAIN_VERIFY=1`, 0/511 mismatches); 3x
+determinism; and a two-turn gate that generates with the chain, stops, and then prefills
+a continuation that extends the KV the chain just decoded. That last one found the only
+real bug of the round: a chain step never ends the command batch (its logits never come
+back through the readback that does), and both the stage-end and abort paths open a
+fresh empty buffer behind the step they park, so the chain left `g_batch_cb` non-nil --
+and the indexed prefill owns its batch outright, so the first chunk of a live
+continuation refused. Every earlier gate prefilled after a synchronize and could not see
+it. The chain now closes the batch on end, abort-invalidate and sync.
+
+Two further levers were built, measured and deleted rather than left default-off: the
+`hc_pre` kernel-A threadgroup width (bit-identical at any width, but the shipped
+16-slices-at-nsg-8 pairing is already the knee: 38.58 -> 38.52 at nsg 4 and 38.47 at
+nsg 16), and a wide-group DSA decode partial that stages each selected row once per 32
+heads instead of 8 (flat on a quiet machine, 38.61 against a 38.64 control -- the
+duplicate row gathers were already cache-served). The stage-ablation switch grew the
+sub-bits that produced those verdicts (`attn_partial`, `attn_reduce`, `indexer_score`,
+`indexer_topk`, `shared_up`, `shared_down`), each skipping exactly one dispatch with the
+buffers the survivors read primed once so the run stays finite.
+
 ## How this was built
 
 This was a collaborative agent feedback loop. Fable, working through Claude Code,
