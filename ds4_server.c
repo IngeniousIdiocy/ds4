@@ -305,6 +305,19 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+/* Lever values are signed: -1 means "the call site's own default" for a
+ * counted lever, which json_int()'s non-negative clamp would silently turn
+ * into 0 (= flushes disabled).  NaN folds to 0; the rest is clamped to int. */
+static bool json_int_signed(const char **p, int *out) {
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (v != v) v = 0;
+    if (v > INT_MAX) v = INT_MAX;
+    if (v < INT_MIN) v = INT_MIN;
+    *out = (int)v;
+    return true;
+}
+
 /* max_tokens / max_completion_tokens / max_output_tokens.  Unlike json_int(),
  * which clamps so the other numeric knobs stay lenient, a negative, NaN,
  * infinite or fractional value is a request error: the client gets a 4xx
@@ -14764,7 +14777,7 @@ static void *client_main(void *arg) {
                                 json_ws(&p);
                                 int lv = 0;
                                 bool lb = false;
-                                if (json_int(&p, &lv)) { /* numeric */ }
+                                if (json_int_signed(&p, &lv)) { /* numeric */ }
                                 else if (json_bool(&p, &lb)) { lv = lb ? 1 : 0; }
                                 else { free(lk); break; }
                                 /* A rejected lever must refuse the request, not
@@ -14843,7 +14856,7 @@ static void *client_main(void *arg) {
                     json_ws(&p);
                     int v = 0;
                     bool b = false;
-                    if (json_int(&p, &v)) {
+                    if (json_int_signed(&p, &v)) {
                         /* numeric */
                     } else if (json_bool(&p, &b)) {
                         v = b ? 1 : 0;
