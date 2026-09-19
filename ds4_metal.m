@@ -57209,6 +57209,8 @@ typedef struct {
     int32_t snapshot_row;
     uint32_t snapshot_stride;
     uint32_t split;
+    /* Lever kda_glue_lanes; mirrors lanes in glm53_kda_glue_args. */
+    uint32_t lanes;
     uint32_t lr_in_dim;
     uint32_t lr_q8;
     uint32_t do_prologue;
@@ -57405,6 +57407,35 @@ if (conv_flip_out) *conv_flip_out = 0;
          * kernel_glm53_kda_decode_out dispatch below -- the arm therefore
          * prices the re-grid MINUS one dependent-dispatch boundary, and the
          * 1-vs-2 delta is itself a measurement of that boundary. */
+        /* Lever kda_glue_lanes (T2-REPORT.md section 8.8).  The phase-3 state
+         * loop is already coalesced and lane-split -- 32 lanes cover one
+         * contiguous 512-byte state row as float4 on both the load and the
+         * write-back -- which is why the glue reaches 6.7 GB/s per core
+         * against the reduce's 4.3.  What caps it is loads in flight: the body
+         * is load -> simd_sum -> fma -> store -> simd_sum and the first
+         * reduction consumes the load at once, so a simdgroup never has more
+         * than one row outstanding.  1 keeps two rows in flight, 2 keeps four;
+         * both are Tier 1, since the rows are independent and each row's own
+         * arithmetic is untouched.  There is deliberately no Tier 2 arm here:
+         * the lane split that value 2 means elsewhere is already the shipped
+         * form, and narrowing the reduction to 16 lanes would halve the
+         * coalescing width, which is a downgrade rather than an arm. */
+        uint32_t glue_lanes = 0u;
+        if (g_glm_levers.kda_glue_lanes == 1 ||
+            g_glm_levers.kda_glue_lanes == 2) {
+            glue_lanes = (uint32_t)g_glm_levers.kda_glue_lanes;
+        }
+        {
+            static int announced_glue_lanes = -1;
+            if (announced_glue_lanes != (int)glue_lanes) {
+                announced_glue_lanes = (int)glue_lanes;
+                fprintf(stderr,
+                        "ds4: KDAGLUELANES lever=%d -> lanes=%u "
+                        "(rows in flight per simdgroup: %u)\n",
+                        g_glm_levers.kda_glue_lanes, glue_lanes,
+                        glue_lanes == 2u ? 4u : (glue_lanes == 1u ? 2u : 1u));
+            }
+        }
         const int glue_mode = g_glm_levers.kda_glue_split;
         uint32_t glue_split = 1u;
         if (glue_mode == 2 && n_rows == 1u &&
@@ -57462,6 +57493,7 @@ if (conv_flip_out) *conv_flip_out = 0;
             .snapshot_row = -1,
             .snapshot_stride = 0,
             .split = glue_split,
+            .lanes = glue_lanes,
             .lr_in_dim = lr_in_dim,
             .lr_q8 = lr_q8 ? 1u : 0u,
             .do_prologue = do_prologue ? 1u : 0u,

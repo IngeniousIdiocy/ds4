@@ -989,6 +989,32 @@ typedef struct {
      * and 2 is registered so DS4_GLM_EXACT=1 clamps it back to 0.
      * DS4_GLM_DSA_REDUCE_LANES sets it at startup. */
     int dsa_reduce_lanes;
+    /* Rows of the KDA glue's phase-3 state loop a simdgroup keeps in flight:
+     * 0 one (today), 1 two, 2 four.
+     *
+     * That loop is already coalesced and lane-split -- 32 lanes cover one
+     * contiguous 512-byte state row as float4 on both the load and the
+     * write-back, and both reductions are simd_sum within the row -- which is
+     * why the glue reaches 6.7 GB/s per core against the reduce projection's
+     * 4.3.  What caps it is loads in flight: the body is load -> simd_sum ->
+     * fma -> store -> simd_sum, and the first reduction consumes the load
+     * immediately, so a simdgroup can never have more than one row
+     * outstanding.  Unrolling the loop issues NR rows' loads before the first
+     * reduction and holds NR * 512 bytes.
+     *
+     * Tier 1 at both values.  The rows are independent -- distinct state
+     * addresses, distinct so[] slots, and sv, k4, q4, decay4 and beta all
+     * read-only by then -- and each row keeps its own multiply by decay4, its
+     * own dot, its own 32-lane simd_sum, its own fma and its own store.  Only
+     * the interleaving of two or four independent rows changes.
+     *
+     * There is no Tier 2 arm: the lane split that value 2 means for
+     * dsa_reduce_lanes is already this loop's shipped form, and narrowing the
+     * reduction to 16 lanes would halve the coalescing width.  At the
+     * demonstrated 8.8 GB/s per core the floor is 185 KB / 8.8 GB/s, about
+     * 21 us a site against 27.7 today: 6.7 us x 34 sites, 0.23 ms.
+     * DS4_GLM_KDA_GLUE_LANES sets it at startup. */
+    int kda_glue_lanes;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

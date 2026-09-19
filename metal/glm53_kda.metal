@@ -704,6 +704,9 @@ struct glm53_kda_glue_args {
      * section 8.2.  This field exists ONLY in glm53_kda_glue_args; the other
      * KDA kernels use glm53_kda_args and are untouched. */
     uint split;
+    /* Lever kda_glue_lanes: rows of the phase-3 state loop a simdgroup keeps
+     * in flight.  0 one (today), 1 two, 2 four.  Threadgroup-uniform. */
+    uint lanes;
     uint lr_in_dim;
     /* 0: f_b/g_b are BF16 (the fork's custom layout); 1: Q8_0 (the
      * upstream-recipe layout). Uniform across the threadgroup. */
@@ -711,6 +714,60 @@ struct glm53_kda_glue_args {
     uint do_prologue;
     uint do_out;
 };
+
+/* One batch of NR independent phase-3 state rows.  NR == 1 is today's loop
+ * body verbatim.  The point of NR > 1 is the load schedule: all NR state rows
+ * are loaded BEFORE the first simd_sum, so a simdgroup holds NR * 512 bytes in
+ * flight instead of 512.  Today the body is load -> simd_sum -> fma -> store ->
+ * simd_sum, and the first reduction consumes the load immediately, so a
+ * simdgroup can never have more than one row outstanding; that ceiling is the
+ * gap between the glue's 6.7 GB/s per core and the 8.8 GB/s the full-grid
+ * mul_mv kernels reach (T2-REPORT.md section 8.8).
+ *
+ * Tier 1.  The rows are independent -- distinct state addresses, distinct
+ * so[] slots, sv/k4/q4/decay4/beta all read-only -- and each row's own
+ * arithmetic is untouched: same multiply by decay4, same dot, same simd_sum
+ * over the same 32 lanes, same fma, same store.  Only the order in which two
+ * independent rows' instructions interleave changes, which no output element
+ * can observe. */
+template <ushort NR>
+static __attribute__((always_inline)) inline void glm53_kda_state_rows(
+        device float             *state_head_ptr,
+        uint                      k0,
+        float4                    decay4,
+        float4                    k4,
+        float4                    q4,
+        float                     beta,
+        threadgroup const float  *sv,
+        device float             *so,
+        thread const uint        *v,
+        ushort                    lane) {
+    constexpr uint D = 128u;
+    device float4 *p[NR];
+    float4 h[NR];
+    FOR_UNROLL (ushort i = 0; i < NR; i++) {
+        p[i] = (device float4 *)(state_head_ptr + (ulong)v[i] * D + k0);
+    }
+    FOR_UNROLL (ushort i = 0; i < NR; i++) {
+        h[i] = *p[i];
+    }
+    FOR_UNROLL (ushort i = 0; i < NR; i++) {
+        h[i] = h[i] * decay4;
+    }
+    float hk[NR];
+    FOR_UNROLL (ushort i = 0; i < NR; i++) {
+        hk[i] = simd_sum(dot(h[i], k4));
+    }
+    FOR_UNROLL (ushort i = 0; i < NR; i++) {
+        const float delta_v = (sv[v[i]] - hk[i]) * beta;
+        h[i] = fma(k4, float4(delta_v), h[i]);
+        *p[i] = h[i];
+        const float hq = simd_sum(dot(h[i], q4));
+        if (lane == 0u) {
+            so[v[i]] = hq;
+        }
+    }
+}
 
 kernel void kernel_glm53_kda_decode_glue(
         constant glm53_kda_glue_args &args,
@@ -902,17 +959,29 @@ kernel void kernel_glm53_kda_decode_glue(
     const ulong state_head =
         ((ulong)row * args.n_heads + head) * D * D;
 
-    for (uint value = half_lo + sg; value < half_hi; value += n_sg) {
-        device float4 *hptr =
-            (device float4 *)(state + state_head + (ulong)value * D + k0);
-        float4 h = *hptr * decay4;
-        float hk = dot(h, k4);
-        hk = simd_sum(hk);
-        const float delta_v = (sv[value] - hk) * beta;
-        h = fma(k4, float4(delta_v), h);
-        *hptr = h;
-        float hq = simd_sum(dot(h, q4));
-        if (lane == 0u) so[value] = hq;
+    device float *state_head_ptr = state + state_head;
+    const ushort unroll_rows =
+        args.lanes == 2u ? 4 : (args.lanes == 1u ? 2 : 1);
+    uint value = half_lo + sg;
+    if (unroll_rows == 4) {
+        for (; value + 3u * n_sg < half_hi; value += 4u * n_sg) {
+            const uint v[4] = { value, value + n_sg,
+                                value + 2u * n_sg, value + 3u * n_sg };
+            glm53_kda_state_rows<4>(state_head_ptr, k0, decay4, k4, q4, beta,
+                                    sv, so, v, lane);
+        }
+    }
+    if (unroll_rows >= 2) {
+        for (; value + n_sg < half_hi; value += 2u * n_sg) {
+            const uint v[2] = { value, value + n_sg };
+            glm53_kda_state_rows<2>(state_head_ptr, k0, decay4, k4, q4, beta,
+                                    sv, so, v, lane);
+        }
+    }
+    for (; value < half_hi; value += n_sg) {
+        const uint v[1] = { value };
+        glm53_kda_state_rows<1>(state_head_ptr, k0, decay4, k4, q4, beta,
+                                sv, so, v, lane);
     }
 
     /* epilogue: kernel_glm53_kda_decode_out's body on simdgroups 0..3.  It

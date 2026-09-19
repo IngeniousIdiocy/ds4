@@ -56278,6 +56278,7 @@ glm_levers g_glm_levers = {
     .dsa_reduce_split      = 1,  /* one reduce threadgroup per head, as shipped */
     .kda_glue_split        = 1,  /* one glue threadgroup per head, as shipped */
     .dsa_reduce_lanes      = 0,  /* one thread per value row, as shipped */
+    .kda_glue_lanes        = 0,  /* one state row in flight, as shipped */
 };
 static int g_glm_levers_ready;
 
@@ -56294,6 +56295,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "dsa_reduce_split")) { *lo = 1; *hi = 2; return 1; }
     if (!strcmp(name, "kda_glue_split")) { *lo = 1; *hi = 3; return 1; }
     if (!strcmp(name, "dsa_reduce_lanes")) { *lo = 0; *hi = 2; return 1; }
+    if (!strcmp(name, "kda_glue_lanes")) { *lo = 0; *hi = 2; return 1; }
     return 0;
 }
 
@@ -56358,6 +56360,12 @@ static int glm_lever_counted_member(const char *name, int value) {
          * is registered for exact mode. */
         return value >= 0 && value <= 2;
     }
+    if (!strcmp(name, "kda_glue_lanes")) {
+        /* Rows of the glue's state loop in flight per simdgroup: 0 one as
+         * shipped, 1 two, 2 four.  Both non-zero values are Tier 1 -- see
+         * ds4.h -- so this one is meant to ship if it measures. */
+        return value >= 0 && value <= 2;
+    }
     return 1;
 }
 
@@ -56377,6 +56385,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "dsa_reduce_split",      offsetof(glm_levers, dsa_reduce_split),      "DS4_GLM_DSA_REDUCE_SPLIT" },
     { "kda_glue_split",        offsetof(glm_levers, kda_glue_split),        "DS4_GLM_KDA_GLUE_SPLIT" },
     { "dsa_reduce_lanes",      offsetof(glm_levers, dsa_reduce_lanes),      "DS4_GLM_DSA_REDUCE_LANES" },
+    { "kda_glue_lanes",        offsetof(glm_levers, kda_glue_lanes),        "DS4_GLM_KDA_GLUE_LANES" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56494,6 +56503,16 @@ void glm_levers_init_from_env(void) {
             const int n = atoi(v);
             if (glm_lever_counted_member("dsa_reduce_lanes", n)) {
                 g_glm_levers.dsa_reduce_lanes = n;
+            }
+        }
+    }
+    /* Counted 0..2, default 0; a value outside the set leaves one state row
+     * in flight per simdgroup. */
+    {   const char *v = getenv("DS4_GLM_KDA_GLUE_LANES");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("kda_glue_lanes", n)) {
+                g_glm_levers.kda_glue_lanes = n;
             }
         }
     }
