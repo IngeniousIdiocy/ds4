@@ -41142,6 +41142,14 @@ static int sample_top_p_min_p(
 }
 
 #ifdef DS4_TEST_HOOKS
+/* The exact host rule the C2 GPU selector has to reproduce, seeded
+ * accumulator and NaN quirk included. */
+int ds4_test_argmax_excluding(const float *logits, uint32_t n_vocab,
+                              int excluded_id) {
+    if (!logits || n_vocab == 0) return -1;
+    return argmax_f32_excluding_unrolled8(logits, n_vocab, excluded_id);
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -74445,7 +74453,6 @@ struct ds4_chain {
     bool             staged;
     uint64_t         staged_event;
     int              staged_slot;
-    int              staged_token;     /* -1 = the GPU picked it */
     uint32_t         staged_pos;
     bool             staged_dense;
     int              committed;        /* steps the GPU has been given */
@@ -74505,7 +74512,6 @@ ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
     }
     ch->s = s;
     ch->p = *p;
-    ch->staged_token = -1;
     ch->verify = getenv("DS4_GLM_CHAIN_VERIFY") != NULL;
     ch->violations = ds4_gpu_chain_violations();
     return ch;
@@ -74586,7 +74592,6 @@ static int ds4_chain_encode_step(ds4_chain *ch, int token,
     }
     ch->staged = true;
     ch->staged_slot = sel.params.ring_slot;
-    ch->staged_token = token;
     ch->staged_pos = pos;
     ch->staged_dense = dense;
     ch->steps++;

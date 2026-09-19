@@ -66,9 +66,9 @@ static inline ds4_glm53_select_part ds4_glm53_select_reduce_tg(
         uint                           tid) {
     shared[tid] = mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint half = DS4_GLM53_SELECT_TG / 2u; half > 0u; half >>= 1u) {
-        if (tid < half) {
-            shared[tid] = ds4_glm53_select_merge(shared[tid], shared[tid + half]);
+    for (uint span = DS4_GLM53_SELECT_TG / 2u; span > 0u; span >>= 1u) {
+        if (tid < span) {
+            shared[tid] = ds4_glm53_select_merge(shared[tid], shared[tid + span]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -85,7 +85,7 @@ static inline float ds4_glm53_select_uniform(uint64_t seed, uint32_t index) {
     x = x ^ (x >> 31);
     const uint32_t bits = (uint32_t)(x >> 32);
     // (bits + 0.5) / 2^32 -- open interval, so -log(-log(u)) stays finite.
-    return fma((float)bits, 0x1.0p-32f, 0x1.0p-33f);
+    return fma((float)bits, 2.3283064365386963e-10f, 1.1641532182693481e-10f);
 }
 
 // ---------------------------------------------------------------------------
