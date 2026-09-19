@@ -211,6 +211,13 @@ int ds4_gpu_chain_last_step_cbs(void);
 double ds4_gpu_chain_last_cb_gpu_end_ms(void);
 double ds4_gpu_chain_last_cb_gpu_span_ms(void);
 void ds4_gpu_chain_trace_reset(void);
+/* Wait for the last committed step.  spin_us > 0 polls the shared event's
+ * signaledValue first; the blocking fallback is the classic path's
+ * [cb waitUntilCompleted]. */
+int ds4_gpu_chain_wait_step(uint64_t event_value, uint32_t spin_us,
+                            const char *label);
+/* Compile the selector pipelines outside the decode loop. */
+int ds4_gpu_glm53_select_warm(void);
 #endif
 
 #ifdef __APPLE__

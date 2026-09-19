@@ -754,6 +754,11 @@ typedef struct {
      * DS4_GLM_CHAIN_DECODE turns it on at startup and DS4_GLM_DISABLE_CHAIN
      * is the kill switch that declines it wherever it is asked for. */
     int chain_decode;
+    /* C2 chain decode: microseconds to spin on the selector event's
+     * signaledValue before falling back to the blocking command-buffer wait.
+     * 0 (default) blocks straight away.  DS4_GLM_CHAIN_SPIN_US sets it at
+     * startup. */
+    int chain_spin_us;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

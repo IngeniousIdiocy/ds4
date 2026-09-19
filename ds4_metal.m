@@ -10662,6 +10662,44 @@ int ds4_gpu_chain_reap(unsigned long mark, const char *label) {
     return ok;
 }
 
+/* Wait for the step that was committed last.
+ *
+ * The blocking primitive is [cb waitUntilCompleted] -- the same one the
+ * classic decode path uses for every command buffer -- and NOT
+ * MTLSharedEvent's waitUntilSignaledValue:, whose wake travels through a
+ * notification path that has been seen to arrive hundreds of milliseconds
+ * late on a loaded machine.  With chain_spin_us > 0 the host first polls the
+ * event's signaledValue, which is a plain read of shared memory and involves
+ * no wake at all; the command-buffer join afterwards then returns immediately.
+ */
+int ds4_gpu_chain_wait_step(uint64_t event_value, uint32_t spin_us,
+                            const char *label) {
+    if (!g_chain_last_cb) return 0;
+    if (spin_us != 0 && event_value != 0 && g_selected_readback_event) {
+        const double deadline = ds4_gpu_clock_ms() + (double)spin_us / 1000.0;
+        for (;;) {
+            if (g_selected_readback_event.signaledValue >= event_value) break;
+            if (ds4_gpu_clock_ms() >= deadline) break;
+#if defined(__arm64__) || defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#endif
+        }
+    }
+    return ds4_gpu_wait_command_buffer(g_chain_last_cb,
+                                       label ? label : "glm chain step");
+}
+
+/* Build the selector pipelines before the decode loop instead of inside its
+ * first step: newComputePipelineStateWithFunction compiles, and the first
+ * chain step was paying ~260 ms of it. */
+int ds4_gpu_glm53_select_warm(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_get_pipeline("kernel_glm53_select_scan_max") != nil &&
+           ds4_gpu_get_pipeline("kernel_glm53_select_final_max") != nil &&
+           ds4_gpu_get_pipeline("kernel_glm53_select_scan_gumbel") != nil &&
+           ds4_gpu_get_pipeline("kernel_glm53_select_final_gumbel") != nil;
+}
+
 int ds4_gpu_chain_stage_finish(void) {
     g_chain_staging = NO;
     return ds4_gpu_chain_discard_staged();

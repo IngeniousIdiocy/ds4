@@ -56027,19 +56027,23 @@ glm_levers g_glm_levers = {
     .decode_flush_interval = -1, /* -1 = the interval resolved at the call site */
     .hc_pre_algebra_a      = 1,
     .chain_decode          = 0,  /* off until the C2 gates adopt it */
+    .chain_spin_us         = 0,  /* block on the command buffer straight away */
 };
 static int g_glm_levers_ready;
 
 /* A counted lever carries a quantity, not a switch, so /debug/levers stores it
- * as given (inside its own range) instead of coercing it to 0/1. */
-static int glm_lever_counted(const char *name) {
-    return !strcmp(name, "decode_flush_interval");
+ * as given, inside its own range, instead of coercing it to 0/1. */
+static int glm_lever_range(const char *name, int *lo, int *hi) {
+    if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
+    if (!strcmp(name, "chain_spin_us")) { *lo = 0; *hi = 100000; return 1; }
+    return 0;
 }
 
 static const struct { const char *name; size_t off; const char *env; } g_glm_lever_map[] = {
     { "decode_flush_interval", offsetof(glm_levers, decode_flush_interval), "DS4_GLM_DECODE_FLUSH_INTERVAL" },
     { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_CHAIN_DECODE" },
+    { "chain_spin_us",         offsetof(glm_levers, chain_spin_us),         "DS4_GLM_CHAIN_SPIN_US" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56063,6 +56067,15 @@ void glm_levers_init_from_env(void) {
     g_glm_levers.chain_decode =
         getenv("DS4_GLM_CHAIN_DECODE") != NULL &&
         getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
+    {   const char *v = getenv("DS4_GLM_CHAIN_SPIN_US");
+        if (v && v[0]) {
+            int lo = 0, hi = 0, n = atoi(v);
+            (void)glm_lever_range("chain_spin_us", &lo, &hi);
+            if (n < lo) n = lo;
+            if (n > hi) n = hi;
+            g_glm_levers.chain_spin_us = n;
+        }
+    }
     g_glm_levers_ready = 1;
 }
 
@@ -56093,11 +56106,13 @@ int glm_levers_set(const char *name, int value) {
     glm_levers_init_from_env();
     for (size_t i = 0; i < glm_levers_count(); i++) {
         if (!strcmp(name, g_glm_lever_map[i].name)) {
-            if (glm_lever_counted(name)) {
+            int lo = 0, hi = 0;
+            if (glm_lever_range(name, &lo, &hi)) {
                 /* decode_flush_interval: -1 restores the call site's own
                  * default, 0 disables the flushes, and the graph clamps
-                 * anything above the layer count. */
-                if (value < -1 || value > 256) return 0;
+                 * anything above the layer count.  chain_spin_us is a
+                 * microsecond budget. */
+                if (value < lo || value > hi) return 0;
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value;
             } else {
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value ? 1 : 0;
@@ -74531,6 +74546,18 @@ ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
     ch->trace = getenv("DS4_GLM_CHAIN_TRACE") != NULL;
     ch->violations = ds4_gpu_chain_violations();
     ds4_gpu_chain_trace_reset();
+    /* Compile the selector pipelines here rather than inside the first step,
+     * where they cost ~260 ms of encode on a fresh process. */
+    const double warm0 = ch->trace ? now_sec() : 0.0;
+    if (!ds4_gpu_glm53_select_warm()) {
+        free(ch);
+        ds4_chain_err(err, errlen, "chain decode could not build the selector pipelines");
+        return NULL;
+    }
+    if (ch->trace) {
+        fprintf(stderr, "ds4: glm chain trace: selector pipelines ready in %.1f ms\n",
+                (now_sec() - warm0) * 1000.0);
+    }
     return ch;
 }
 
@@ -74688,16 +74715,34 @@ static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
     ds4_session *s = ch->s;
     ds4_glm_gpu_graph *g = &s->glm_graph;
     if (ch->inflight_event == 0) return 0;
-    const double t_wait0 = ch->trace ? now_sec() : 0.0;
-    if (!ds4_gpu_wait_selected_readback_ready(ch->inflight_event,
-                                              "glm chain decode")) {
-        ds4_chain_err(err, errlen, "chain decode timed out waiting for the GPU");
+    const double t_wait0 = now_sec();
+    glm_levers_init_from_env();
+    const int spin_us = g_glm_levers.chain_spin_us;
+    if (!ds4_gpu_chain_wait_step(ch->inflight_event,
+                                 spin_us > 0 ? (uint32_t)spin_us : 0u,
+                                 "glm chain decode")) {
+        ds4_chain_err(err, errlen, "chain decode failed waiting for the GPU");
         ds4_chain_invalidate(ch);
         return 1;
     }
+    /* A step's wait is the GPU's own time plus one wake.  Anything this side
+     * of a second is a scheduling or driver pathology, not decode, and it has
+     * to be visible without a trace run to reproduce it. */
+    const double wait_ms = (now_sec() - t_wait0) * 1000.0;
+    if (wait_ms > 100.0) {
+        /* gpu_span is the step's own time on the GPU.  If it is small while
+         * the wait is large, the GPU finished long before the host was told:
+         * the stall is in the wake, not in the decode. */
+        fprintf(stderr,
+                "ds4: glm chain slow wait %.1f ms at step %d pos %u "
+                "(gpu_span %.1f ms, cbs %d, spin %d us)\n",
+                wait_ms, ch->steps, (uint32_t)s->checkpoint.len,
+                ds4_gpu_chain_last_cb_gpu_span_ms(),
+                ds4_gpu_chain_last_step_cbs(), spin_us);
+    }
     const double t_read0 = ch->trace ? now_sec() : 0.0;
     if (ch->trace) {
-        ch->t_wait = (t_read0 - t_wait0) * 1000.0;
+        ch->t_wait = wait_ms;
         ch->t_gpu = ds4_gpu_chain_last_cb_gpu_span_ms();
     }
     (void)ds4_gpu_chain_reap(mark, "glm chain decode");
@@ -74780,8 +74825,8 @@ int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
     int rc = 0;
     (void)ds4_session_chain_abort(ch);
     if (ch->inflight_event != 0) {
-        if (!ds4_gpu_wait_selected_readback_ready(ch->inflight_event,
-                                                  "glm chain decode end")) {
+        if (!ds4_gpu_chain_wait_step(ch->inflight_event, 0u,
+                                     "glm chain decode end")) {
             ds4_chain_err(err, errlen, "chain decode timed out draining the GPU");
             ch->s->checkpoint_valid = false;
             rc = 1;

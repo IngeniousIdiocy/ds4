@@ -14793,6 +14793,15 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
                 token = ds4_session_argmax_excluding(f->session, eos);
                 if (token >= 0) {
                     rc = ds4_session_chain_eval(chain, token, serr, sizeof(serr));
+                    /* The classic loop's first token contains its own GPU
+                     * step, and gen_first_ms is excluded from the steady
+                     * window.  Without this the chain would push the first
+                     * step's execution -- and every first-use cost it carries
+                     * -- into the second token, i.e. into the steady number
+                     * the arms are compared on. */
+                    if (rc == 0) {
+                        rc = ds4_session_chain_sync(chain, serr, sizeof(serr));
+                    }
                 }
             } else {
                 token = ds4_session_chain_next(chain, serr, sizeof(serr));
