@@ -7715,6 +7715,9 @@ typedef struct {
     /* Lever dsa_reduce_lanes; mirrors value_lanes in
      * ds4_metal_args_glm_attention_indexed_decode_split. */
     uint32_t value_lanes;
+    /* Lever dsa_reduce_blend; mirrors blend_layout in
+     * ds4_metal_args_glm_attention_indexed_decode_split. */
+    uint32_t blend_layout;
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -41307,6 +41310,51 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                 }
             }
         }
+        /* Lever dsa_reduce_blend (T2-REPORT.md section 8.9).  partial_lora is
+         * written block-major by the partial and read head-major by the
+         * reduce, so for one head the n_blocks reads are n_head * kv_lora_dim
+         * * 4 bytes apart -- 131,072 at this shape -- with no row-buffer reuse
+         * and no TLB locality, and with nth equal to kv_lora_dim each thread
+         * handles exactly one j so nothing hides the latency.  1 planes the
+         * array by head instead, which makes the reduce's run contiguous and
+         * the partial's stores eight 2 KB chunks at n_blocks * 2 KB stride --
+         * independent stores that do not stall.  2 adds the reduction fix:
+         * the two block reductions sweep all nth leaves to combine n_blocks
+         * values, and the kernel's identity-leaf argument shows the five
+         * simdgroup-wide steps are the only ones that do anything.
+         *
+         * Both values are Tier 1.  Both are refused when either T2 screen
+         * variant of this pair is selected, because the screen kernels in
+         * metal/t2screen.metal carry their own copies of the two loops and
+         * would keep the old layout: producer and consumer must never
+         * disagree.  Every other reader and writer of partial_lora is one of
+         * the six production partial instantiations or the six production
+         * reduce instantiations, which share this args struct; the buffer is
+         * per-dispatch scratch that is never serialised, snapshotted or read
+         * by any DFlash path. */
+        uint32_t blend_layout = 0u;
+        if ((g_glm_levers.dsa_reduce_blend == 1 ||
+             g_glm_levers.dsa_reduce_blend == 2) &&
+            !t2s_split8 && !t2s_vplane && n_blocks > 0u) {
+            blend_layout = (uint32_t)g_glm_levers.dsa_reduce_blend;
+        }
+        {
+            static int announced_blend = -1;
+            static int announced_blend_lever = -2;
+            if (announced_blend != (int)blend_layout ||
+                announced_blend_lever != g_glm_levers.dsa_reduce_blend) {
+                announced_blend = (int)blend_layout;
+                announced_blend_lever = g_glm_levers.dsa_reduce_blend;
+                fprintf(stderr,
+                        "ds4: DSAREDBLEND lever=%d -> blend_layout=%u "
+                        "(n_blocks=%u n_head=%u kv_lora=%u screen split8=%s "
+                        "vplane=%d)\n",
+                        g_glm_levers.dsa_reduce_blend, blend_layout,
+                        (unsigned)n_blocks, (unsigned)n_head,
+                        (unsigned)kv_lora_dim,
+                        t2s_split8 ? t2s_split8 : "off", t2s_vplane);
+            }
+        }
         /* Lever dsa_reduce_lanes (T2-REPORT.md section 8.8).  The reduce's
          * value projection streams 139 KB of Q8_0 weight per head at 4.3 GB/s
          * per core, against the 8.8 GB/s the full-grid mul_mv kernels reach,
@@ -41398,6 +41446,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
             .value_lanes = reduce_lanes,
+            .blend_layout = blend_layout,
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;

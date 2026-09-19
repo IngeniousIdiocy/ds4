@@ -1015,6 +1015,45 @@ typedef struct {
      * 21 us a site against 27.7 today: 6.7 us x 34 sites, 0.23 ms.
      * DS4_GLM_KDA_GLUE_LANES sets it at startup. */
     int kda_glue_lanes;
+    /* How the DSA attention reduce gets its block partials: 0 today, 1 the
+     * head-planed partial_lora layout, 2 that plus the shrunken block
+     * reductions.
+     *
+     * Sections 8.8 and 8.9 excluded the value projection by measurement --
+     * the lane-split arm made the loads fully contiguous, shortened the chain
+     * from 512 FMAs to 16 and used all 512 threads, and came back flat -- so
+     * the reduce's 32.33 us is in the blend half, and the code shows two
+     * reasons.  partial_lora is written block-major by the partial as
+     * (block * n_head + head) * kv_lora_dim and read head-major by the
+     * reduce, so for a fixed head consecutive blocks are n_head * kv_lora_dim
+     * * 4 bytes apart -- 131,072 at this shape -- and with nth equal to
+     * kv_lora_dim each thread handles exactly one j, so there is no other work
+     * in the threadgroup to hide that latency behind.  And both block
+     * reductions sweep all nth leaves, about forty 512-thread barriers, to
+     * combine seventeen values.
+     *
+     * 1 planes the array by head, (head * n_blocks + block) * kv_lora_dim.
+     * Same values written by the same lane in the same order and summed over b
+     * in the same order; only the addresses move.  The reduce's run becomes
+     * one contiguous 34 KB read and the partial's write becomes eight 2 KB
+     * chunks at n_blocks * 2 KB stride -- the strided side moves from the
+     * consumer, which stalls on it, to the producer, whose stores are
+     * independent.  Tier 1.
+     *
+     * 2 adds the reduction fix: the five simdgroup-wide steps are the only
+     * ones that do anything, because leaves past n_blocks hold the max and sum
+     * identities, which is this kernel's own identity-leaf comment read
+     * backwards.  max is order-independent and exact; for the sum, xor masks
+     * in descending order make the same pairing the Hillis-Steele down-sweep
+     * makes, so lane 0 gets the same tree.  Guarded on n_blocks <= 32, which
+     * is 17 at 62k.  Tier 1.
+     *
+     * Both are refused when either T2 screen variant of this pair is selected
+     * (DS4_GLM_ENABLE_SPLIT8_DBLBUF, DS4_GLM_ENABLE_SPLIT8_VPLANE), because
+     * those kernels carry their own copies of the loops and would keep the old
+     * layout; producer and consumer must never disagree.
+     * DS4_GLM_DSA_REDUCE_BLEND sets it at startup. */
+    int dsa_reduce_blend;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

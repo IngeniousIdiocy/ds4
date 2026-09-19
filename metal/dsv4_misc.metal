@@ -368,6 +368,13 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
      * projection: 0 today's one-thread-per-row dot, 1 the Tier 1 batched-load
      * form, 2 the Tier 2 lane split.  Threadgroup-uniform. */
     uint32_t value_lanes;
+    /* Lever dsa_reduce_blend.  0 partial_lora is planed by block, as shipped;
+     * >= 1 it is planed by head, so the reduce's n_blocks reads for one head
+     * are one contiguous run instead of n_blocks chunks a whole block-plane
+     * apart; >= 2 additionally shrinks the two block reductions from nth
+     * leaves to one simdgroup.  Read by BOTH the partial and the reduce, which
+     * share this struct, so producer and consumer can never disagree. */
+    uint32_t blend_layout;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -4118,10 +4125,18 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     }
 
     if (valid_head) {
+        /* Lever dsa_reduce_blend >= 1: plane by head instead of by block.  The
+         * same 512 floats are written by the same lane in the same order; only
+         * the plane's base moves, so this threadgroup's eight heads become
+         * eight 2 KB chunks at n_blocks * 2 KB stride instead of eight
+         * contiguous ones -- independent stores that do not stall -- and the
+         * reduce's side becomes contiguous. */
+        const uint64_t plane = args.blend_layout != 0u
+            ? ((uint64_t)head * args.n_blocks + block)
+            : ((uint64_t)block * args.n_head + head);
         device float4 *out4 =
             (device float4 *)(partial_lora +
-                ((uint64_t)block * args.n_head + head) *
-                    args.kv_lora_dim * sizeof(float));
+                plane * args.kv_lora_dim * sizeof(float));
         out4[lane + 0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -4233,12 +4248,40 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
                 ((uint64_t)tid * args.n_head + head) * 2u * sizeof(float));
         local_m = ms[1] > 0.0f ? ms[0] : -FLT_MAX / 2.0f;
     }
-    red[tid] = local_m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint step = nth >> 1; step > 0; step >>= 1) {
-        if (tid < step) red[tid] = max(red[tid], red[tid + step]);
+    /* Lever dsa_reduce_blend >= 2: reduce the n_blocks leaves inside ONE
+     * simdgroup instead of sweeping all nth of them.
+     *
+     * Bit-identity is this kernel's own identity-leaf argument read backwards.
+     * Leaves at tid >= n_blocks hold the identities (-FLT_MAX/2 for the max,
+     * 0.0f for the sum), so in the nth-wide sweep every step whose stride is
+     * at least 32 pairs a real leaf with an identity and is a no-op for the
+     * lanes that matter; only the steps 16, 8, 4, 2, 1 do anything.  Running
+     * exactly those five steps as simd_shuffle_xor with masks 16..1 reproduces
+     * the same binary tree lane 0 would have got -- for the max because max is
+     * order-independent and exact, and for the sum because xor masks in
+     * descending order pair (0,16) then (0..15 with 8..23) and so on, which is
+     * the pairing the Hillis-Steele down-sweep makes.  Guarded on
+     * n_blocks <= 32 so the leaves fit one simdgroup; 17 at 62k. */
+    const bool blend_simd = args.blend_layout >= 2u && n_blocks <= 32u;
+    if (blend_simd) {
+        if (tid < 32u) {
+            float v = local_m;
+            v = max(v, simd_shuffle_xor(v, (ushort)16));
+            v = max(v, simd_shuffle_xor(v, (ushort)8));
+            v = max(v, simd_shuffle_xor(v, (ushort)4));
+            v = max(v, simd_shuffle_xor(v, (ushort)2));
+            v = max(v, simd_shuffle_xor(v, (ushort)1));
+            if (tid == 0u) red[0] = v;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        red[tid] = local_m;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint step = nth >> 1; step > 0; step >>= 1) {
+            if (tid < step) red[tid] = max(red[tid], red[tid + step]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
     const float max_m = red[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4253,22 +4296,44 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         block_scale[tid] = e;
         local_denom = s * e;
     }
-    red[tid] = local_denom;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint step = nth >> 1; step > 0; step >>= 1) {
-        if (tid < step) red[tid] += red[tid + step];
+    if (blend_simd) {
+        if (tid < 32u) {
+            float v = local_denom;
+            v += simd_shuffle_xor(v, (ushort)16);
+            v += simd_shuffle_xor(v, (ushort)8);
+            v += simd_shuffle_xor(v, (ushort)4);
+            v += simd_shuffle_xor(v, (ushort)2);
+            v += simd_shuffle_xor(v, (ushort)1);
+            if (tid == 0u) red[0] = v;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        red[tid] = local_denom;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint step = nth >> 1; step > 0; step >>= 1) {
+            if (tid < step) red[tid] += red[tid + step];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
     const float denom = max(red[0], 1.0e-20f);
 
     for (uint j = tid; j < args.kv_lora_dim; j += nth) {
         float acc = 0.0f;
         for (uint b = 0u; b < n_blocks; b++) {
+            /* Same addends in the same order over b; only the address moves.
+             * At blend_layout 0 consecutive b are n_head * kv_lora_dim * 4
+             * bytes apart -- 128 KB at this shape -- and with nth equal to
+             * kv_lora_dim each thread handles exactly one j, so there is no
+             * other work in the threadgroup to hide that latency behind.  At
+             * >= 1 they are kv_lora_dim * 4 bytes apart and the whole run is
+             * contiguous. */
+            const uint64_t plane = args.blend_layout != 0u
+                ? ((uint64_t)head * n_blocks + b)
+                : ((uint64_t)b * args.n_head + head);
             device const float *src =
                 (device const float *)(partial_lora +
-                    ((uint64_t)b * args.n_head + head) *
-                        args.kv_lora_dim * sizeof(float));
+                    plane * args.kv_lora_dim * sizeof(float));
             acc += src[j] * block_scale[b];
         }
         lora_sum[j] = acc / denom;
