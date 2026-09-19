@@ -56213,6 +56213,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
     if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
     if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
+    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 3; return 1; }
     return 0;
 }
 
@@ -56232,6 +56233,10 @@ static int glm_lever_counted_member(const char *name, int value) {
         /* 4 and 8 were measured flat by the t2 screen and are not offered
          * here; only the shipped 2 and the untried 1. */
         return value == 1 || value == 2;
+    }
+    if (!strcmp(name, "sdn_fold")) {
+        /* 0 pair, 1 fold, 2 publication-only ablation, 3 slot-major fold. */
+        return value >= 0 && value <= 3;
     }
     return 1;
 }
@@ -56318,8 +56323,15 @@ void glm_levers_init_from_env(void) {
             }
         }
     }
-    /* Also default-off, same resolution as sdn_ptail. */
-    g_glm_levers.sdn_fold = getenv("DS4_GLM_SDN_FOLD") != NULL;
+    /* Counted 0..3, default 0; a value outside the set leaves the pair. */
+    {   const char *v = getenv("DS4_GLM_SDN_FOLD");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("sdn_fold", n)) {
+                g_glm_levers.sdn_fold = n;
+            }
+        }
+    }
     g_glm_levers_ready = 1;
 }
 

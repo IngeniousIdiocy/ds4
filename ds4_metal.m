@@ -43926,18 +43926,33 @@ static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_split_pipeline(void) 
 
 /* C1 (lever sdn_fold): the same split body with coherent partial stores, a
  * per-row-pair last-arrival ticket and the shared-down + slot-sum + HC-expand
- * consumer as its tail.  See metal/dsv4_hc.metal. */
-static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_sdn_fold_pipeline(void) {
-    static id<MTLComputePipelineState> cached = nil;
-    static int tried = 0;
-    if (!tried) {
-        tried = 1;
-        cached = ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_split_sdn_fold_f32");
-        if (!cached) {
-            fprintf(stderr, "ds4: SDNFOLD pipeline unavailable; using the pair\n");
+ * consumer as its tail.  See metal/dsv4_hc.metal.  Mode 1 is the form measured
+ * at -0.86 t/s; 2 is the publication-only ablation (no tail, the host still
+ * dispatches the consumer); 3 is the full fold with the slot as the
+ * fastest-varying grid axis. */
+static const char *ds4_gpu_glm_routed_down_sdn_fold_kernel(int mode) {
+    switch (mode) {
+    case 1: return "kernel_glm_q4_K_down_simd_split_sdn_fold_f32";
+    case 2: return "kernel_glm_q4_K_down_simd_split_sdn_pub_f32";
+    case 3: return "kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32";
+    default: return NULL;
+    }
+}
+
+static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_sdn_fold_pipeline(int mode) {
+    static id<MTLComputePipelineState> cached[4];
+    static int tried[4];
+    if (mode < 1 || mode > 3) return nil;
+    if (!tried[mode]) {
+        tried[mode] = 1;
+        cached[mode] =
+            ds4_gpu_get_pipeline(ds4_gpu_glm_routed_down_sdn_fold_kernel(mode));
+        if (!cached[mode]) {
+            fprintf(stderr, "ds4: SDNFOLD pipeline %s unavailable; using the pair\n",
+                    ds4_gpu_glm_routed_down_sdn_fold_kernel(mode));
         }
     }
-    return cached;
+    return cached[mode];
 }
 
 
@@ -44453,6 +44468,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
          * threadgroup.  Everything the pair needs is validated here, and any
          * miss leaves fold_pipeline nil so the pair runs unchanged. */
         id<MTLComputePipelineState> fold_pipeline = nil;
+        int fold_mode = 0;
         id<MTLBuffer> fold_wbuf = nil, fold_midbuf = nil, fold_sharedbuf = nil;
         id<MTLBuffer> fold_resbuf = nil, fold_splitbuf = nil, fold_outbuf = nil;
         id<MTLBuffer> fold_ticketbuf = nil;
@@ -44476,8 +44492,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 2ull * sdn_fold->n_hc + (uint64_t)sdn_fold->n_hc * sdn_fold->n_hc;
             const uint64_t ticket_bytes =
                 ((uint64_t)out_dim / 2u) * sizeof(uint32_t);
+            fold_mode = g_glm_levers.sdn_fold;
             const bool shape_ok =
-                g_glm_levers.sdn_fold != 0 && g_glm_levers.sdn_ptail == 0 &&
+                fold_mode >= 1 && fold_mode <= 3 && g_glm_levers.sdn_ptail == 0 &&
                 sdn_d.nsg == 4 && sdn_d.nr0 == 2 &&
                 g_tp_split_world != 2 &&
                 (out_dim & 1u) == 0u && out_dim == sdn_fold->out_dim &&
@@ -44513,7 +44530,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                                          &fold_winner);
                 }
                 if (fold_wbuf) {
-                    fold_pipeline = ds4_gpu_glm_routed_down_sdn_fold_pipeline();
+                    fold_pipeline = ds4_gpu_glm_routed_down_sdn_fold_pipeline(fold_mode);
                 }
             }
             if (fold_pipeline) {
@@ -44545,10 +44562,11 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             }
             {
                 static ds4_t2s_slot slot = { "SDNFOLD", 0, 0 };
-                ds4_t2s_hit(&slot, "%s nsg=%d nr0=%d tickets=%llu slots=%u",
+                ds4_t2s_hit(&slot, "%s mode=%d nsg=%d nr0=%d tickets=%llu slots=%u",
                             fold_pipeline ?
-                                "kernel_glm_q4_K_down_simd_split_sdn_fold_f32" :
+                                ds4_gpu_glm_routed_down_sdn_fold_kernel(fold_mode) :
                                 "kernel_glm_q4_K_down_simd_split_f32(pair)",
+                            fold_pipeline ? fold_mode : 0,
                             (int)sdn_d.nsg, (int)sdn_d.nr0,
                             (unsigned long long)(out_dim / 2u), n_expert);
             }
@@ -44869,7 +44887,16 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (down_threadgroup_bytes != 0u && !split_pipeline) {
             [enc setThreadgroupMemoryLength:down_threadgroup_bytes atIndex:0];
         }
-        if (split_pipeline) {
+        if (fold_pipeline && fold_mode == 3) {
+            /* Same threadgroups, slot as the FASTEST-varying axis: a row
+             * pair's n_expert arrivals are then adjacent in time, so tails are
+             * elected throughout the dispatch instead of all in the last
+             * z-wave.  The kernel maps slot = x and row pair = y. */
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_expert,
+                                                  ((NSUInteger)out_dim + 1u) / 2u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else if (split_pipeline) {
             /* NSG = 2 simdgroups of 32 threads, one output row each, one
              * expert slot per threadgroup: out_dim/2 in x, n_expert in z. */
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u,
@@ -44886,7 +44913,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (!ok) return 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) return 0;
         if (split_pipeline && used_split) *used_split = 1;
-        if (fold_pipeline && sdn_fold) sdn_fold->folded = 1;
+        /* Mode 2 is the publication-only ablation: the consumer dispatch must
+         * still run, so the fold is deliberately NOT reported as done. */
+        if (fold_pipeline && fold_mode != 2 && sdn_fold) sdn_fold->folded = 1;
 #undef DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE
     }
 

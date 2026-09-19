@@ -4322,16 +4322,45 @@ DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
 //
 // The dependency is the most LOCAL one in the decode graph: consumer
 // threadgroup x owns rows 2x and 2x+1, and those two rows' partials come from
-// exactly the n_expert_used producer threadgroups (x, 0, slot).  Fan-in 8,
-// fan-out 1.  So one ticket per row pair elects the eighth arrival to run the
+// exactly the n_expert_used producer threadgroups for that pair.  Fan-in 8,
+// fan-out 1.  So one ticket per row pair elects the last arrival to run the
 // consumer's work for its own two rows -- work that one threadgroup was always
 // going to do -- and 2048 of those tails run concurrently.  That is the
 // opposite of hc_pre's one-dispatch form, where a single global reduction put
 // ~19 us of serial tail on one threadgroup and lost 1.05 t/s.
 //
-// PUBLICATION.  The tail reads partials written by other threadgroups of the
-// same dispatch on a two-die part, so this copies the router+shared fold's
-// pattern (metal/glm53_moe_block.metal), which is the one that was qualified
+// MEASURED, first form (RUN_TAIL, slot in z): -0.86 t/s at 62k, three
+// interleaved reps, text identical.  That is about +24 us per MoE layer where
+// the boundary is worth -10, and there are two candidate mechanisms:
+//   (a) Dispatch ORDER.  With the grid (2048, 1, n_slots) Metal walks x
+//       fastest, so every threadgroup of slot 0 runs before any of slot 7 and
+//       every ticket completes in the LAST z-wave.  All 2048 tails are then
+//       elected at the end, so the shared-down stream runs after the routed
+//       stream instead of inside it, at 64 threads instead of the consumer's
+//       128, with nothing left to overlap.
+//   (b) PUBLICATION.  16,384 threadgroups each pay a device barrier, a
+//       seq_cst device fence and an atomic before retiring, where the router
+//       fold pays that on 144.
+// The two template flags below price them separately, and the host exposes
+// them as lever values so the arms differ only in this kernel:
+//   RUN_TAIL=1 SLOT_MAJOR=0  lever 1: the first form, as measured.
+//   RUN_TAIL=0 SLOT_MAJOR=0  lever 2: publication and ticket only -- every
+//                            threadgroup still pays the barriers, the fence,
+//                            the fetch_add and the self-rearm, then returns,
+//                            and the host dispatches the consumer exactly as
+//                            at lever 0.  Its delta against 0 is (b) alone.
+//   RUN_TAIL=1 SLOT_MAJOR=1  lever 3: the full fold with the SLOT as the
+//                            fastest-varying grid dimension, dispatched
+//                            (n_slots, 2048, 1) with slot = tgpig.x and the
+//                            row pair = tgpig.y.  A row pair's 8 arrivals are
+//                            then adjacent in time, so tails are elected
+//                            throughout the dispatch and overlap the weight
+//                            stream.  Everything else is identical to lever 1,
+//                            so the difference is (a) alone.
+//
+// PUBLICATION PATTERN.  The tail reads partials written by other threadgroups
+// of the same dispatch on a two-die part, so this copies the router+shared
+// fold's pattern (metal/glm53_moe_block.metal), which is the one qualified
 // against the Phase 1 stale-row finding: coherent (relaxed atomic) stores for
 // the partials, a threadgroup barrier and a device barrier and a seq_cst
 // thread_scope_device fence before the ticket, and another seq_cst
@@ -4343,12 +4372,14 @@ DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
 // assumption and no forward-progress requirement.
 //
 // The ticket buffer holds one counter per row pair and is self-rearming -- the
-// last arrival resets its own counter before doing the tail -- so all 42 layers
-// reuse it.  hc_pre dispatches and these are strictly ordered by the encoder,
-// so a counter is always 0 when the next layer's dispatch starts.
+// last arrival resets its own counter before doing the tail, and it does so at
+// RUN_TAIL=0 as well, so the ablation leaves the buffer in the same state the
+// next layer expects.  All 42 layers reuse it; the dispatches are strictly
+// ordered by the encoder.
 //
-// TIER 1.  Every arithmetic operation, its order and its rounding points are
-// the consumer's; only the threadgroup that executes them changes.
+// TIER 1 at every value.  Every arithmetic operation, its order and its
+// rounding points are the consumer's; only the threadgroup that executes them
+// changes, and SLOT_MAJOR changes only which grid index carries the slot.
 //   * The producer half is glm_q4_K_down_simd_split_impl<2,1> with COHERENT
 //     stores -- the same float bits at the same addresses.
 //   * The consumer runs its matvec on FOUR simdgroups striding
@@ -4366,12 +4397,13 @@ DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
 //     reused), so it is the consumer's loop over the consumer's values.
 //   * The residual/post/comb epilogue is copied statement for statement.
 //
-// The host refuses this kernel and runs the pair whenever the split refuses,
+// The host refuses every value and runs the pair whenever the split refuses,
 // and additionally on capture_out, exact mode, sdn_ptail, TP world 2, an odd
 // out_dim, or an SDN dispatch whose nsg is not 4 or nr0 not 2 -- because the
 // virtual-simdgroup emulation above is written for the (4, 2) shape alone.
 // ===========================================================================
-kernel void kernel_glm_q4_K_down_simd_split_sdn_fold_f32(
+template <bool RUN_TAIL, bool SLOT_MAJOR>
+static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
         constant ds4_metal_glm_routed_moe_args  & args,
         device  const char    * down,
         device  const int32_t * selected,
@@ -4388,10 +4420,10 @@ kernel void kernel_glm_q4_K_down_simd_split_sdn_fold_f32(
         device  const char    * post,
         device  const char    * comb,
         device        char    * dst,
-        threadgroup   char    * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        threadgroup   char    * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     // Uniform gate: every thread of every threadgroup takes the same branch,
     // so a refusal here refuses the whole dispatch rather than stranding a
     // ticket.  The host checks all of it too; this is belt and braces.
@@ -4403,9 +4435,15 @@ kernel void kernel_glm_q4_K_down_simd_split_sdn_fold_f32(
         return;
     }
 
+    /* SLOT_MAJOR only renames the grid axes: the producer body still sees
+       (row pair, token, slot) in (x, y, z) and computes the same rows from the
+       same slot, so nothing about the arithmetic moves. */
+    const uint pair = SLOT_MAJOR ? tgpig.y : tgpig.x;
+    const uint3 ptg = SLOT_MAJOR ? uint3(tgpig.y, 0u, tgpig.x) : tgpig;
+
     // ---- Producer: the shipped split body, coherent stores ----------------
     glm_q4_K_down_simd_split_impl<2, 1, true>(
-        args, down, selected, mid, partials, tgpig, tiisg, sgitg);
+        args, down, selected, mid, partials, ptg, tiisg, sgitg);
 
     // ---- Publish, then ticket (the router fold's pattern) -----------------
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4418,28 +4456,31 @@ kernel void kernel_glm_q4_K_down_simd_split_sdn_fold_f32(
     const ushort tid = (ushort)(sgitg * 32u + tiisg);
     if (tid == 0u) {
         const uint prev =
-            atomic_fetch_add_explicit(&ticket[tgpig.x], 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&ticket[pair], 1u, memory_order_relaxed);
         const bool last = (prev + 1u) >= args.n_expert_used;
         if (last) {
             // Rearm for the next layer's dispatch, which cannot start before
-            // this one retires.
-            atomic_store_explicit(&ticket[tgpig.x], 0u, memory_order_relaxed);
+            // this one retires.  Done at RUN_TAIL = 0 too, so the ablation
+            // leaves the counter where the next layer expects it.
+            atomic_store_explicit(&ticket[pair], 0u, memory_order_relaxed);
         }
         elected[0] = last ? 1u : 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    /* Publication-only ablation: everything above has been paid. */
+    if (!RUN_TAIL) return;
     if (elected[0] == 0u) return;
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                         thread_scope_device);
 
-    // ---- Tail: kernel_dsv4_shared_down_hc_expand4_slots_q8_0, rows 2x/2x+1 -
+    // ---- Tail: kernel_dsv4_shared_down_hc_expand4_slots_q8_0, rows 2p/2p+1 -
     constexpr short NW  = N_SIMDWIDTH;
     constexpr short NQ  = 8;
     constexpr short NR0 = N_R0_Q8_0;
     constexpr short CONS_NSG = 4;   // the consumer's simdgroup count
 
     const int nb   = mv.ne00 / QK8_0;
-    const int row0 = (int)tgpig.x * NR0;
+    const int row0 = (int)pair * NR0;
 
     const short ix = tiisg / (NW / NQ);
     const short il = tiisg % (NW / NQ);
@@ -4535,3 +4576,40 @@ kernel void kernel_glm_q4_K_down_simd_split_sdn_fold_f32(
         }
     }
 }
+
+#define DS4_GLM_SDN_FOLD_KERNEL(NAME, RUN_TAIL_V, SLOT_MAJOR_V)               \
+kernel void NAME(                                                             \
+        constant ds4_metal_glm_routed_moe_args  & args,                       \
+        device  const char    * down,                                         \
+        device  const int32_t * selected,                                     \
+        device  const float   * mid,                                          \
+        device        float   * partials,                                     \
+        device        atomic_uint * ticket,                                   \
+        constant ds4_metal_args_mul_mv          & mv,                         \
+        constant ds4_metal_args_dsv4_hc_expand  & hc,                         \
+        device  const char    * weight,                                       \
+        device  const char    * shared_mid,                                   \
+        device        char    * shared_out,                                   \
+        constant ds4_metal_args_dsv4_routed_slots & slots,                    \
+        device  const char    * residual,                                     \
+        device  const char    * post,                                         \
+        device  const char    * comb,                                         \
+        device        char    * dst,                                          \
+        threadgroup   char    * shmem [[threadgroup(0)]],                     \
+        uint3  tgpig [[threadgroup_position_in_grid]],                        \
+        ushort tiisg [[thread_index_in_simdgroup]],                           \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {                    \
+    glm_q4_K_down_sdn_fold_body<RUN_TAIL_V, SLOT_MAJOR_V>(                     \
+        args, down, selected, mid, partials, ticket, mv, hc, weight,          \
+        shared_mid, shared_out, slots, residual, post, comb, dst, shmem,      \
+        tgpig, tiisg, sgitg);                                                 \
+}
+
+/* Lever 1: the measured form -- tail on, slot in z. */
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_f32,       true,  false)
+/* Lever 2: publication and ticket only, the host still dispatches the pair's
+ * consumer.  Prices the publication pattern at 16,384 threadgroups. */
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_f32,        false, false)
+/* Lever 3: the full fold with the slot as the fastest-varying grid axis.
+ * Prices the dispatch order. */
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32, true,  true)

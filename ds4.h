@@ -812,8 +812,17 @@ typedef struct {
      * one-dispatch form, which put a global reduction on one threadgroup and
      * lost 1.05 t/s.  Tier 1: same operations, same order, same rounding
      * points; only the threadgroup that runs them changes.  Default off.
-     * DS4_GLM_SDN_FOLD turns it on at startup; DS4_GLM_EXACT, sdn_ptail and
-     * every condition the split itself refuses on fall back to the pair. */
+     * DS4_GLM_SDN_FOLD sets it at startup; DS4_GLM_EXACT, sdn_ptail and every
+     * condition the split itself refuses on fall back to the pair.
+     *
+     * Counted 0..3 after the first measurement (-0.862 t/s at 62k, three
+     * interleaved reps, text identical, so the tail is correct and the cost is
+     * structural): 0 = the pair; 1 = the measured fold, slot on the z axis;
+     * 2 = publication and ticket only, no tail, the consumer still dispatched
+     * -- its delta against 0 is the cost of the publication pattern at 16,384
+     * threadgroups; 3 = the full fold with the slot as the fastest-varying
+     * grid axis, which elects tails throughout the dispatch instead of all in
+     * the last z-wave -- its delta against 1 is the cost of the order. */
     int sdn_fold;
 } glm_levers;
 
