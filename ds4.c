@@ -45297,11 +45297,6 @@ static bool glm53_graph_hc_pre(
      * the cost of a second dispatch and a different summation order. Because
      * the order changes, it stays off unless asked for, and it takes the
      * unfused ladder so the split-K matvec is the mix step. */
-    /* Campaign lever hc_pre_a_nsg: kernel A's threadgroup width, read live at
-     * the call site so a resident server can sweep it between requests. */
-    glm_levers_init_from_env();
-    ds4_gpu_hc_pre_nsg_set((uint32_t)(g_glm_levers.hc_pre_a_nsg > 0
-                                          ? g_glm_levers.hc_pre_a_nsg : 0));
     const bool splitk_mix = hc_mix_bf16 &&
         g->hc_mix_partials != NULL &&
         getenv("DS4_GLM_DISABLE_HC_MIX_SPLITK") == NULL;
@@ -56124,7 +56119,6 @@ glm_levers g_glm_levers = {
     .decode_concurrent     = 1,
     .chain_decode          = 0,  /* off until the C2 gates adopt it */
     .chain_commit_ahead    = 0,  /* off until the commit-ahead arm is measured */
-    .hc_pre_a_nsg          = 0,  /* 0 = the slice/width pairing's own choice */
 };
 static int g_glm_levers_ready;
 
@@ -56133,7 +56127,6 @@ static int g_glm_levers_ready;
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
-    if (!strcmp(name, "hc_pre_a_nsg")) { *lo = 0; *hi = 32; return 1; }
     return 0;
 }
 
@@ -56144,7 +56137,6 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_CHAIN_DECODE" },
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_CHAIN_COMMIT_AHEAD" },
-    { "hc_pre_a_nsg",          offsetof(glm_levers, hc_pre_a_nsg),          "DS4_GLM_HC_PRE_NSG" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56174,16 +56166,6 @@ void glm_levers_init_from_env(void) {
         getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
     g_glm_levers.chain_commit_ahead =
         getenv("DS4_GLM_CHAIN_COMMIT_AHEAD") != NULL;
-    /* The width selector's historical variable takes the same four values the
-     * lever does; anything else leaves the shipped pairing alone. */
-    {   const char *v = getenv("DS4_GLM_HC_PRE_NSG");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (n == 4 || n == 8 || n == 16 || n == 32) {
-                g_glm_levers.hc_pre_a_nsg = n;
-            }
-        }
-    }
     g_glm_levers_ready = 1;
 }
 

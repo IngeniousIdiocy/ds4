@@ -767,14 +767,6 @@ typedef struct {
      * a stop still has nothing to roll back.  DS4_GLM_CHAIN_COMMIT_AHEAD
      * turns it on at startup. */
     int chain_commit_ahead;
-    /* hc_pre kernel A: threadgroup width in simdgroups (4, 8, 16 or 32).
-     * 0 (default) leaves the shape the slice/width pairing picks -- 8 with
-     * the algebra half A on, 32 without it.  Only the grid and the thread
-     * count move: the split-K (out_row, slice) mapping is tgpig.x*nsg + sg,
-     * so every partial, every lane stride and every reduction is unchanged.
-     * DS4_GLM_HC_PRE_NSG sets it at startup; the width is pinned whenever
-     * DS4_GLM_DISABLE_HC_PRE_WIDE or DS4_GLM_EXACT is set. */
-    int hc_pre_a_nsg;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

@@ -54296,16 +54296,9 @@ static int ds4_gpu_glm53_hc_alg_active(int half);
 #define DS4_GLM53_HC_ALG_SLICES_DEFAULT 16u
 #define DS4_GLM53_HC_ALG_NSG_DEFAULT     8u
 
-/* Live lever hc_pre_a_nsg: the kernel-A width, pushed down by ds4.c.  The
- * width is free -- see the two tables above -- so this only moves the grid. */
-static uint32_t g_hc_pre_nsg_lever;
-
-void ds4_gpu_hc_pre_nsg_set(uint32_t nsg) { g_hc_pre_nsg_lever = nsg; }
-
 static void ds4_gpu_glm53_hc_pre_shape(uint32_t *slices_out, uint32_t *nsg_out) {
-    static uint32_t c_slices = 0u, c_nsg = 0u, c_lever = 0xffffffffu;
-    const uint32_t lever = g_hc_pre_nsg_lever;
-    if (c_slices == 0u || lever != c_lever) {
+    static uint32_t c_slices = 0u, c_nsg = 0u;
+    if (c_slices == 0u) {
         const int alg = ds4_gpu_glm53_hc_alg_active(0);
         uint32_t sl = alg ? DS4_GLM53_HC_ALG_SLICES_DEFAULT
                           : DS4_GLM53_HC_PRE_SLICES_DEFAULT;
@@ -54332,15 +54325,6 @@ static void ds4_gpu_glm53_hc_pre_shape(uint32_t *slices_out, uint32_t *nsg_out) 
                 nsg = (uint32_t)n;
             }
         }
-        /* The lever wins over the environment, under the same two rules and
-         * the same kill switches. */
-        if ((lever == 4u || lever == 8u || lever == 16u || lever == 32u) &&
-            ((24u * sl) % lever) == 0u &&
-            getenv("DS4_GLM_DISABLE_HC_PRE_WIDE") == NULL &&
-            !glm53_exact_mode()) {
-            nsg = lever;
-        }
-        c_lever = lever;
         c_nsg = nsg;
         c_slices = sl;
     }
