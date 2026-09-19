@@ -183,6 +183,44 @@ int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
 #ifdef __APPLE__
+/* Chain decode (C2, GLM-5.3): stage a whole decode step's command buffers
+ * without committing them, so the step can be encoded while the previous one
+ * is still running and then either committed (the token that feeds it was
+ * confirmed) or dropped (it never ran, the session state is exact). */
+int ds4_gpu_chain_stage_begin(void);
+int ds4_gpu_chain_staging_active(void);
+int ds4_gpu_chain_stage_end(uint64_t *event_value);
+int ds4_gpu_chain_stage_abort(void);
+int ds4_gpu_chain_commit_staged(void);
+int ds4_gpu_chain_discard_staged(void);
+int ds4_gpu_chain_stage_finish(void);
+unsigned long ds4_gpu_chain_transient_mark(void);
+/* Retire completed command buffers and the transients of finished steps
+ * without ending the batch. */
+int ds4_gpu_chain_reap(unsigned long mark, const char *label);
+/* Sticky count of end_commands()/synchronize() calls that happened while a
+ * step was staged; non-zero means the confirmation gate was bypassed. */
+int ds4_gpu_chain_violations(void);
+/* DS4_GLM_CHAIN_TRACE: how many command buffers a step holds, and the GPU
+ * span / end time of the last committed step's final command buffer.  The
+ * times are in the ds4_gpu_clock_ms() domain, which is the one
+ * MTLCommandBuffer.GPUStartTime / GPUEndTime use. */
+double ds4_gpu_clock_ms(void);
+int ds4_gpu_chain_staged_count(void);
+int ds4_gpu_chain_last_step_cbs(void);
+double ds4_gpu_chain_last_cb_gpu_end_ms(void);
+double ds4_gpu_chain_last_cb_gpu_span_ms(void);
+void ds4_gpu_chain_trace_reset(void);
+/* Wait for the last committed step.  spin_us > 0 polls the shared event's
+ * signaledValue first; the blocking fallback is the classic path's
+ * [cb waitUntilCompleted]. */
+int ds4_gpu_chain_wait_step(uint64_t event_value, uint32_t spin_us,
+                            const char *label);
+/* Compile the selector pipelines outside the decode loop. */
+int ds4_gpu_glm53_select_warm(void);
+#endif
+
+#ifdef __APPLE__
 /* Diagnostic-only census window.  Requires DS4_KERNEL_LEDGER=1; begin drops
  * all earlier counts and dump writes the current counters to `path`. */
 int ds4_gpu_kernel_ledger_window_begin(void);
@@ -644,6 +682,37 @@ int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab);
+
+#ifdef __APPLE__
+/* GLM-5.3 chain decode selector: picks the next id from the logits inside the
+ * same command buffer that produced them and writes it to the embedding input
+ * tensor of the following step plus a host-visible ring slot. */
+#define DS4_GPU_GLM53_SELECT_TG    256u
+#define DS4_GPU_GLM53_SELECT_PARTS 256u
+
+typedef enum {
+    DS4_GPU_SELECT_ARGMAX = 0,
+    DS4_GPU_SELECT_SAMPLE = 1,
+} ds4_gpu_select_mode;
+
+typedef struct {
+    ds4_gpu_select_mode mode;
+    int                 excluded_id;  /* argmax only; -1 = none */
+    int                 ring_slot;    /* 0 or 1 */
+    float               temperature;  /* sample only, > 0 */
+    float               min_p;        /* sample only */
+    uint64_t            seed;         /* sample only: this step's RNG draw */
+} ds4_gpu_select_params;
+
+uint64_t ds4_gpu_glm53_select_scratch_bytes(void);
+int ds4_gpu_glm53_select_tensor(
+        ds4_gpu_tensor              *token_slot,
+        ds4_gpu_tensor              *ring,
+        ds4_gpu_tensor              *parts,
+        const ds4_gpu_tensor        *logits,
+        uint32_t                     n_vocab,
+        const ds4_gpu_select_params *p);
+#endif
 
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,

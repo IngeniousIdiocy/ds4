@@ -5640,6 +5640,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_GLM53_SELECT_SOURCE", @"metal/glm53_select.metal"],
         /* campaign-t2-screen duplicated kernels; concatenated LAST so every
          * production helper above is already in scope.  Nothing in it runs
          * unless a DS4_GLM_ENABLE_* switch selects it. */
@@ -10533,6 +10534,182 @@ int ds4_gpu_flush_encoder(void) {
     return 1;
 }
 
+/* Chain decode (C2): while a step is being encoded ahead of its confirmation,
+ * every flush parks its command buffer here instead of committing it.  The
+ * caller commits the whole step once the token that feeds it is confirmed, or
+ * drops it -- an uncommitted command buffer never runs, so the session state
+ * stays exact at the previous token.  Command buffers are never enqueued
+ * before they are committed, so commit order is execution order. */
+static BOOL g_chain_staging;
+static NSMutableArray<id<MTLCommandBuffer>> *g_chain_staged_cbs;
+static int g_chain_violations;
+/* Trace support: the last command buffer of the most recently committed step,
+ * kept so the host can read its GPU span and ask how long the GPU was idle
+ * between it and the next commit. */
+static id<MTLCommandBuffer> g_chain_last_cb;
+static int g_chain_last_cb_count;
+
+/* The clock MTLCommandBuffer.GPUStartTime / GPUEndTime are expressed in. */
+double ds4_gpu_clock_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
+int ds4_gpu_chain_staged_count(void) {
+    return g_chain_staged_cbs ? (int)[g_chain_staged_cbs count] : 0;
+}
+
+int ds4_gpu_chain_last_step_cbs(void) {
+    return g_chain_last_cb_count;
+}
+
+double ds4_gpu_chain_last_cb_gpu_end_ms(void) {
+    if (!g_chain_last_cb) return 0.0;
+    const double t = g_chain_last_cb.GPUEndTime;
+    return t > 0.0 ? t * 1000.0 : 0.0;
+}
+
+double ds4_gpu_chain_last_cb_gpu_span_ms(void) {
+    if (!g_chain_last_cb) return 0.0;
+    const double s0 = g_chain_last_cb.GPUStartTime, e0 = g_chain_last_cb.GPUEndTime;
+    return e0 > s0 ? (e0 - s0) * 1000.0 : 0.0;
+}
+
+int ds4_gpu_chain_stage_begin(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_chain_staged_cbs) g_chain_staged_cbs = [NSMutableArray array];
+    if (!g_chain_staged_cbs) return 0;
+    g_chain_staging = YES;
+    return 1;
+}
+
+int ds4_gpu_chain_staging_active(void) {
+    return g_chain_staging ? 1 : 0;
+}
+
+int ds4_gpu_chain_violations(void) {
+    return g_chain_violations;
+}
+
+unsigned long ds4_gpu_chain_transient_mark(void) {
+    return (unsigned long)[g_transient_buffers count];
+}
+
+int ds4_gpu_chain_commit_staged(void) {
+    if (!g_chain_staged_cbs) return 1;
+    g_chain_last_cb_count = (int)[g_chain_staged_cbs count];
+    g_chain_last_cb = [g_chain_staged_cbs lastObject];
+    for (id<MTLCommandBuffer> cb in g_chain_staged_cbs) {
+        [cb commit];
+        [g_pending_cbs addObject:cb];
+        ds4_gpu_stream_expert_cache_note_batch_committed();
+    }
+    [g_chain_staged_cbs removeAllObjects];
+    return 1;
+}
+
+int ds4_gpu_chain_discard_staged(void) {
+    if (!g_chain_staged_cbs) return 1;
+    /* Nothing in here was committed, so releasing the buffers is the whole
+     * rollback: the GPU never saw the step. */
+    [g_chain_staged_cbs removeAllObjects];
+    return 1;
+}
+
+/* Close the step being encoded: signal the step's shared-event value from its
+ * last command buffer and park that buffer with the rest of the step. */
+int ds4_gpu_chain_stage_end(uint64_t *event_value) {
+    if (!g_chain_staging || !g_chain_staged_cbs) return 0;
+    if (!ds4_gpu_signal_selected_readback_ready(event_value)) return 0;
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    [g_chain_staged_cbs addObject:cb];
+    g_batch_cb = ds4_gpu_new_command_buffer();
+    g_batch_has_work = NO;
+    if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+    ds4_gpu_timeline_attach(g_batch_cb);
+    return g_batch_cb != nil;
+}
+
+int ds4_gpu_chain_stage_abort(void) {
+    if (!g_chain_staging) return 1;
+    ds4_gpu_close_batch_encoder();
+    if (g_batch_cb) {
+        g_batch_cb = nil;
+        g_batch_has_work = NO;
+        g_batch_cb = ds4_gpu_new_command_buffer();
+        if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+        ds4_gpu_timeline_attach(g_batch_cb);
+    }
+    return ds4_gpu_chain_discard_staged();
+}
+
+/* Retire everything the GPU has already finished without ending the batch:
+ * the caller has just waited on the step's shared event, so every pending
+ * command buffer is complete and every transient buffer allocated before
+ * `mark` (i.e. before the step now being encoded) is free. */
+int ds4_gpu_chain_reap(unsigned long mark, const char *label) {
+    if (!g_initialized) return 0;
+    const int ok = ds4_gpu_wait_pending_command_buffers(label ? label : "chain reap");
+    const unsigned long have = (unsigned long)[g_transient_buffers count];
+    const unsigned long drop = mark < have ? mark : have;
+    if (drop != 0) {
+        [g_transient_buffers removeObjectsInRange:NSMakeRange(0, (NSUInteger)drop)];
+    }
+    return ok;
+}
+
+/* Wait for the step that was committed last.
+ *
+ * The blocking primitive is [cb waitUntilCompleted] -- the same one the
+ * classic decode path uses for every command buffer -- and NOT
+ * MTLSharedEvent's waitUntilSignaledValue:, whose wake travels through a
+ * notification path that has been seen to arrive hundreds of milliseconds
+ * late on a loaded machine.  With chain_spin_us > 0 the host first polls the
+ * event's signaledValue, which is a plain read of shared memory and involves
+ * no wake at all; the command-buffer join afterwards then returns immediately.
+ */
+int ds4_gpu_chain_wait_step(uint64_t event_value, uint32_t spin_us,
+                            const char *label) {
+    if (!g_chain_last_cb) return 0;
+    if (spin_us != 0 && event_value != 0 && g_selected_readback_event) {
+        const double deadline = ds4_gpu_clock_ms() + (double)spin_us / 1000.0;
+        for (;;) {
+            if (g_selected_readback_event.signaledValue >= event_value) break;
+            if (ds4_gpu_clock_ms() >= deadline) break;
+#if defined(__arm64__) || defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#endif
+        }
+    }
+    return ds4_gpu_wait_command_buffer(g_chain_last_cb,
+                                       label ? label : "glm chain step");
+}
+
+/* Build the selector pipelines before the decode loop instead of inside its
+ * first step: newComputePipelineStateWithFunction compiles, and the first
+ * chain step was paying ~260 ms of it. */
+int ds4_gpu_glm53_select_warm(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_get_pipeline("kernel_glm53_select_scan_max") != nil &&
+           ds4_gpu_get_pipeline("kernel_glm53_select_final_max") != nil &&
+           ds4_gpu_get_pipeline("kernel_glm53_select_scan_gumbel") != nil &&
+           ds4_gpu_get_pipeline("kernel_glm53_select_final_gumbel") != nil;
+}
+
+int ds4_gpu_chain_stage_finish(void) {
+    g_chain_staging = NO;
+    return ds4_gpu_chain_discard_staged();
+}
+
+void ds4_gpu_chain_trace_reset(void) {
+    g_chain_last_cb = nil;
+    g_chain_last_cb_count = 0;
+}
+
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
@@ -10542,9 +10719,13 @@ int ds4_gpu_flush_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
-    [cb commit];
-    [g_pending_cbs addObject:cb];
-    ds4_gpu_stream_expert_cache_note_batch_committed();
+    if (g_chain_staging) {
+        [g_chain_staged_cbs addObject:cb];
+    } else {
+        [cb commit];
+        [g_pending_cbs addObject:cb];
+        ds4_gpu_stream_expert_cache_note_batch_committed();
+    }
 
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
@@ -12537,6 +12718,14 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 }
 
 int ds4_gpu_end_commands(void) {
+    /* A chain step is encoded ahead of its confirmation; ending the batch
+     * underneath it would run that step unconfirmed.  Commit what is staged so
+     * ordering survives and record the violation: the chain turns it into a
+     * hard error rather than a silently advanced session. */
+    if (g_chain_staging) {
+        g_chain_violations++;
+        (void)ds4_gpu_chain_commit_staged();
+    }
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
@@ -12609,6 +12798,10 @@ static int ds4_gpu_flash_attn_stage_profile_boundary(
 
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_chain_staging) {
+        g_chain_violations++;
+        (void)ds4_gpu_chain_commit_staged();
+    }
     if (g_batch_cb) return ds4_gpu_end_commands();
     ds4_gpu_parallel_ffn_reset_state(YES);
     if ([g_pending_cbs count] != 0) {
@@ -21164,6 +21357,177 @@ int ds4_gpu_argmax_tensor(
     }
 
     return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * GLM-5.3 chain decode selector (metal/glm53_select.metal).
+ *
+ * Writes the chosen id into the embedding input tensor the next decode step
+ * reads (g->prefill_tokens) and into a host-visible ring slot, inside the same
+ * command buffer that produced the logits.  Both stages go into their own
+ * compute encoder so the second one observes the first one's writes whatever
+ * dispatch type the batch encoder happens to be using.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    int32_t  n_vocab;
+    int32_t  n_parts;
+    int32_t  excluded_id;
+    int32_t  seed_index;
+    int32_t  seed_from_logits;
+    int32_t  ring_slot;
+    int32_t  write_token;
+    int32_t  pad0;
+    float    temperature;
+    float    min_p;
+    uint32_t seed_lo;
+    uint32_t seed_hi;
+} ds4_gpu_glm53_select_args;
+
+uint64_t ds4_gpu_glm53_select_scratch_bytes(void) {
+    return (uint64_t)(2u * DS4_GPU_GLM53_SELECT_PARTS + 1u) * 8ull;
+}
+
+static int ds4_gpu_encode_glm53_select_stage(
+        id<MTLCommandBuffer>             cb,
+        id<MTLComputePipelineState>      pso,
+        const ds4_gpu_glm53_select_args *args,
+        id<MTLBuffer>                    logits,
+        NSUInteger                       logits_offset,
+        id<MTLBuffer>                    parts,
+        NSUInteger                       parts_offset,
+        id<MTLBuffer>                    token_slot,
+        NSUInteger                       token_slot_offset,
+        id<MTLBuffer>                    ring,
+        NSUInteger                       ring_offset,
+        NSUInteger                       threadgroups) {
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:pso];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    NSUInteger index = 1;
+    if (logits) [enc setBuffer:logits offset:logits_offset atIndex:index++];
+    [enc setBuffer:parts offset:parts_offset atIndex:index++];
+    if (token_slot) {
+        [enc setBuffer:token_slot offset:token_slot_offset atIndex:index++];
+        [enc setBuffer:ring offset:ring_offset atIndex:index++];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(DS4_GPU_GLM53_SELECT_TG, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    /* Force a fresh encoder for the next stage: dispatches in one encoder are
+     * only ordered when it is a serial one. */
+    ds4_gpu_close_batch_encoder();
+    return 1;
+}
+
+int ds4_gpu_glm53_select_tensor(
+        ds4_gpu_tensor                 *token_slot,
+        ds4_gpu_tensor                 *ring,
+        ds4_gpu_tensor                 *parts,
+        const ds4_gpu_tensor           *logits,
+        uint32_t                        n_vocab,
+        const ds4_gpu_select_params    *p) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!token_slot || !ring || !parts || !logits || !p || n_vocab == 0) return 0;
+    if (p->ring_slot < 0 || p->ring_slot > 1) return 0;
+    if (p->mode == DS4_GPU_SELECT_SAMPLE &&
+        !(p->temperature > 0.0f) ) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> logitsbuf = ds4_gpu_tensor_buffer(logits);
+        id<MTLBuffer> partsbuf = ds4_gpu_tensor_buffer(parts);
+        id<MTLBuffer> tokenbuf = ds4_gpu_tensor_buffer(token_slot);
+        id<MTLBuffer> ringbuf = ds4_gpu_tensor_buffer(ring);
+        if (!logitsbuf || !partsbuf || !tokenbuf || !ringbuf ||
+            ds4_gpu_tensor_bytes(logits) < (uint64_t)n_vocab * sizeof(float) ||
+            ds4_gpu_tensor_bytes(parts) < ds4_gpu_glm53_select_scratch_bytes() ||
+            ds4_gpu_tensor_bytes(token_slot) < sizeof(int32_t) ||
+            ds4_gpu_tensor_bytes(ring) < 2u * sizeof(int32_t)) {
+            fprintf(stderr, "ds4: GLM-5.3 selector received undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> scan_max =
+            ds4_gpu_get_pipeline("kernel_glm53_select_scan_max");
+        id<MTLComputePipelineState> final_max =
+            ds4_gpu_get_pipeline("kernel_glm53_select_final_max");
+        if (!scan_max || !final_max) return 0;
+        id<MTLComputePipelineState> scan_gumbel = nil;
+        id<MTLComputePipelineState> final_gumbel = nil;
+        if (p->mode == DS4_GPU_SELECT_SAMPLE) {
+            scan_gumbel = ds4_gpu_get_pipeline("kernel_glm53_select_scan_gumbel");
+            final_gumbel = ds4_gpu_get_pipeline("kernel_glm53_select_final_gumbel");
+            if (!scan_gumbel || !final_gumbel) return 0;
+        }
+        if (scan_max.maxTotalThreadsPerThreadgroup < DS4_GPU_GLM53_SELECT_TG ||
+            final_max.maxTotalThreadsPerThreadgroup < DS4_GPU_GLM53_SELECT_TG) {
+            fprintf(stderr, "ds4: GLM-5.3 selector needs %u threads per threadgroup\n",
+                    (unsigned)DS4_GPU_GLM53_SELECT_TG);
+            return 0;
+        }
+
+        const int greedy = p->mode == DS4_GPU_SELECT_ARGMAX;
+        ds4_gpu_glm53_select_args args = {
+            .n_vocab = (int32_t)n_vocab,
+            .n_parts = (int32_t)DS4_GPU_GLM53_SELECT_PARTS,
+            /* The max pass of the sampler mirrors sample_argmax(): no
+             * exclusion and a -inf seed.  The greedy selector mirrors
+             * argmax_f32_excluding_unrolled8(): the seed is the lowest
+             * non-excluded index and its logit. */
+            .excluded_id = greedy ? p->excluded_id : -1,
+            .seed_index = greedy && p->excluded_id == 0 ? 1 : 0,
+            .seed_from_logits = greedy ? 1 : 0,
+            .ring_slot = p->ring_slot,
+            .write_token = greedy ? 1 : 0,
+            .pad0 = 0,
+            .temperature = p->temperature,
+            .min_p = p->min_p,
+            .seed_lo = (uint32_t)(p->seed & 0xffffffffull),
+            .seed_hi = (uint32_t)(p->seed >> 32),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        int ok = ds4_gpu_encode_glm53_select_stage(
+                cb, scan_max, &args,
+                logitsbuf, ds4_gpu_tensor_offset(logits),
+                partsbuf, ds4_gpu_tensor_offset(parts),
+                nil, 0, nil, 0,
+                DS4_GPU_GLM53_SELECT_PARTS);
+        if (ok) {
+            ok = ds4_gpu_encode_glm53_select_stage(
+                    cb, final_max, &args,
+                    nil, 0,
+                    partsbuf, ds4_gpu_tensor_offset(parts),
+                    tokenbuf, ds4_gpu_tensor_offset(token_slot),
+                    ringbuf, ds4_gpu_tensor_offset(ring),
+                    1);
+        }
+        if (ok && p->mode == DS4_GPU_SELECT_SAMPLE) {
+            ok = ds4_gpu_encode_glm53_select_stage(
+                    cb, scan_gumbel, &args,
+                    logitsbuf, ds4_gpu_tensor_offset(logits),
+                    partsbuf, ds4_gpu_tensor_offset(parts),
+                    nil, 0, nil, 0,
+                    DS4_GPU_GLM53_SELECT_PARTS);
+            if (ok) {
+                ok = ds4_gpu_encode_glm53_select_stage(
+                        cb, final_gumbel, &args,
+                        nil, 0,
+                        partsbuf, ds4_gpu_tensor_offset(parts),
+                        tokenbuf, ds4_gpu_tensor_offset(token_slot),
+                        ringbuf, ds4_gpu_tensor_offset(ring),
+                        1);
+            }
+        }
+        if (!ok) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "glm53 select")) return 0;
+    }
+
+    return 1;
 }
 
 int ds4_gpu_dsv4_topk_mask_tensor(

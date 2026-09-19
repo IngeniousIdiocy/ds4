@@ -41142,6 +41142,14 @@ static int sample_top_p_min_p(
 }
 
 #ifdef DS4_TEST_HOOKS
+/* The exact host rule the C2 GPU selector has to reproduce, seeded
+ * accumulator and NaN quirk included. */
+int ds4_test_argmax_excluding(const float *logits, uint32_t n_vocab,
+                              int excluded_id) {
+    if (!logits || n_vocab == 0) return -1;
+    return argmax_f32_excluding_unrolled8(logits, n_vocab, excluded_id);
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -41549,6 +41557,13 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *moe_block_counters;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Chain decode (C2): the GPU selector's host-visible 2-slot readback ring
+     * and its reduction scratch.  The selected id also goes straight into
+     * prefill_tokens, which is what the next step embeds from. */
+    ds4_gpu_tensor *select_ring;
+    ds4_gpu_tensor *select_parts;
+#endif
     ds4_gpu_tensor *batch_router_logits;
     ds4_gpu_tensor *batch_router_probs;
     ds4_gpu_tensor *batch_router_selected;
@@ -43589,6 +43604,10 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_value_cache[il]);
         ds4_gpu_tensor_free(g->layer_key_cache[il]);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_tensor_free(g->select_parts);
+    ds4_gpu_tensor_free(g->select_ring);
+#endif
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->batch_router_weights);
     ds4_gpu_tensor_free(g->prefill_seed_router_selected);
@@ -44377,6 +44396,11 @@ static bool glm_graph_alloc_slice(
     }
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->output_norm, emb_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->logits, logits_bytes);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    DS4_GLM_GRAPH_ALLOC_TENSOR(g->select_ring, 2u * sizeof(int32_t));
+    DS4_GLM_GRAPH_ALLOC_TENSOR(g->select_parts,
+                               ds4_gpu_glm53_select_scratch_bytes());
+#endif
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefill_seed_router_selected,
                                (uint64_t)DS4_N_LAYER *
                                DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
@@ -50220,7 +50244,35 @@ static bool glm_graph_mtp_step(
     return true;
 }
 
-static bool glm_graph_forward_token(
+/* Chain decode (C2): ask the step to pick the next id on the GPU instead of
+ * reading 605 KiB of logits back and letting the host choose.  `params` is the
+ * selector configuration, `token_from_device` says the id this step consumes is
+ * already in g->prefill_tokens (the previous step's selector put it there), and
+ * `event_out` receives the shared-event value the step's last command buffer
+ * signals.  The step's command buffers are staged, not committed. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+typedef struct {
+    ds4_gpu_select_params params;
+    bool                  token_from_device;
+    uint64_t             *event_out;
+} glm_chain_select;
+#else
+typedef struct { int unused; } glm_chain_select;
+#endif
+
+static bool glm_graph_forward_token_sel(
+        ds4_glm_gpu_graph      *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        int                     token,
+        const float            *input_hc,
+        uint32_t                pos,
+        float                  *output_hc,
+        float                  *logits_out,
+        bool                    defer_completion,
+        const glm_chain_select *sel);
+
+static inline bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -50229,7 +50281,11 @@ static bool glm_graph_forward_token(
         uint32_t           pos,
         float             *output_hc,
         float             *logits_out,
-        bool               defer_completion);
+        bool               defer_completion) {
+    return glm_graph_forward_token_sel(g, model, weights, token, input_hc, pos,
+                                       output_hc, logits_out, defer_completion,
+                                       NULL);
+}
 
 
 /* Decode-style verify pass for tiny row counts (MTP): the indexed batch
@@ -55984,14 +56040,18 @@ glm_levers g_glm_levers = {
     .hc_pre_algebra_a      = 1,
     .decode_ablate         = 0,
     .decode_concurrent     = 1,
+    .chain_decode          = 0,  /* off until the C2 gates adopt it */
+    .chain_spin_us         = 0,  /* block on the command buffer straight away */
 };
 static int g_glm_levers_ready;
 
 /* A counted lever carries a quantity, not a switch, so /debug/levers stores it
- * as given (inside its own range) instead of coercing it to 0/1. */
-static int glm_lever_counted(const char *name) {
-    return !strcmp(name, "decode_flush_interval") ||
-           !strcmp(name, "decode_ablate");
+ * as given, inside its own range, instead of coercing it to 0/1. */
+static int glm_lever_range(const char *name, int *lo, int *hi) {
+    if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
+    if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 8191; return 1; }
+    if (!strcmp(name, "chain_spin_us")) { *lo = 0; *hi = 100000; return 1; }
+    return 0;
 }
 
 static const struct { const char *name; size_t off; const char *env; } g_glm_lever_map[] = {
@@ -55999,6 +56059,8 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
     { "decode_ablate",         offsetof(glm_levers, decode_ablate),         "DS4_GLM_DECODE_ABLATE_MASK" },
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
+    { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_CHAIN_DECODE" },
+    { "chain_spin_us",         offsetof(glm_levers, chain_spin_us),         "DS4_GLM_CHAIN_SPIN_US" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56022,6 +56084,19 @@ void glm_levers_init_from_env(void) {
      * ever takes it off. */
     g_glm_levers.decode_concurrent =
         getenv("DS4_GLM_DISABLE_DECODE_CONCURRENT") == NULL;
+    /* Chain decode is default-off; the kill switch wins over the enable. */
+    g_glm_levers.chain_decode =
+        getenv("DS4_GLM_CHAIN_DECODE") != NULL &&
+        getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
+    {   const char *v = getenv("DS4_GLM_CHAIN_SPIN_US");
+        if (v && v[0]) {
+            int lo = 0, hi = 0, n = atoi(v);
+            (void)glm_lever_range("chain_spin_us", &lo, &hi);
+            if (n < lo) n = lo;
+            if (n > hi) n = hi;
+            g_glm_levers.chain_spin_us = n;
+        }
+    }
     g_glm_levers_ready = 1;
 }
 
@@ -56052,13 +56127,13 @@ int glm_levers_set(const char *name, int value) {
     glm_levers_init_from_env();
     for (size_t i = 0; i < glm_levers_count(); i++) {
         if (!strcmp(name, g_glm_lever_map[i].name)) {
-            if (glm_lever_counted(name)) {
+            int lo = 0, hi = 0;
+            if (glm_lever_range(name, &lo, &hi)) {
                 /* decode_flush_interval: -1 restores the call site's own
                  * default, 0 disables the flushes, and the graph clamps
-                 * anything above the layer count. */
-                if (!strcmp(name, "decode_ablate")) {
-                    if (value < 0 || value > 8191) return 0;
-                } else if (value < -1 || value > 256) return 0;
+                 * anything above the layer count.  decode_ablate is a
+                 * bitmask and chain_spin_us a microsecond budget. */
+                if (value < lo || value > hi) return 0;
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value;
             } else {
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value ? 1 : 0;
@@ -56113,16 +56188,20 @@ static bool glm53_decode_encode_qk_low(
     return ok;
 }
 
-static bool glm_graph_forward_token(
-        ds4_glm_gpu_graph *g,
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        int                token,
-        const float       *input_hc,
-        uint32_t           pos,
-        float             *output_hc,
-        float             *logits_out,
-        bool               defer_completion) {
+static bool glm_graph_forward_token_sel(
+        ds4_glm_gpu_graph      *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        int                     token,
+        const float            *input_hc,
+        uint32_t                pos,
+        float                  *output_hc,
+        float                  *logits_out,
+        bool                    defer_completion,
+        const glm_chain_select *sel) {
+#if !defined(__APPLE__) || defined(DS4_NO_GPU)
+    (void)sel;
+#endif
 #define DS4_GLM_FT_FAIL(why) do { \
         if (getenv("DS4_GLM_TP_DEBUG")) \
             fprintf(stderr, "ds4: glm forward_token fail pos=%u: %s\n", pos, why); \
@@ -56144,6 +56223,16 @@ static bool glm_graph_forward_token(
     if (logits_out != NULL) {
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
         decode_layer_flush_interval = use_indexed_attention ? 4u : 32u;
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Chain decode: the mid-step flushes exist so the GPU can start this
+         * step before the host has finished encoding it.  A chain step may not
+         * start until the caller confirms the token that feeds it, and by then
+         * it is fully encoded, so splitting it costs a command-buffer
+         * allocation, a commit, an encoder close and a GPU command-buffer
+         * launch every four layers and buys nothing.  One buffer per step.
+         * The lever still overrides, so the split is one A/B away. */
+        if (sel) decode_layer_flush_interval = 0;
 #endif
         /* Campaign lever: the interval used to be resolved from the
          * environment on every decode step.  glm_levers_init_from_env() reads
@@ -56223,11 +56312,21 @@ static bool glm_graph_forward_token(
         glm_graph_streaming_decode_sync_each_layer();
     bool ok = true;
     if (!input_hc && g->glm53) {
-        const int32_t token_id = (int32_t)token;
-        ok = ds4_gpu_tensor_write(g->prefill_tokens,
-                                  0,
-                                  &token_id,
-                                  sizeof(token_id)) != 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Chain decode: the previous step's selector already wrote the id the
+         * embedding reads, which is what lets this step be encoded before that
+         * one has finished. */
+        const bool token_from_device = sel && sel->token_from_device;
+#else
+        const bool token_from_device = false;
+#endif
+        if (!token_from_device) {
+            const int32_t token_id = (int32_t)token;
+            ok = ds4_gpu_tensor_write(g->prefill_tokens,
+                                      0,
+                                      &token_id,
+                                      sizeof(token_id)) != 0;
+        }
     }
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->glm53 ? g->hc_cur : g->cur,
@@ -57457,6 +57556,38 @@ glm53_attention_done:
             else (void)ds4_gpu_synchronize();
         }
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (sel) {
+        /* The id is chosen inside this step's own command buffers and written
+         * to g->prefill_tokens (the next step's embedding input) and to the
+         * host-visible ring.  Nothing is read back and the batch is not ended:
+         * the step is staged until the caller confirms the token that feeds
+         * it. */
+        if (ok && !merge_indexed_output &&
+            !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_HEAD)) {
+            ok = glm_graph_encode_output_head(g, model, weights);
+        }
+        if (ok) {
+            ok = ds4_gpu_glm53_select_tensor(g->prefill_tokens,
+                                             g->select_ring,
+                                             g->select_parts,
+                                             g->logits,
+                                             DS4_N_VOCAB,
+                                             &sel->params) != 0;
+        }
+        if (ok) ok = ds4_gpu_chain_stage_end(sel->event_out) != 0;
+        else (void)ds4_gpu_synchronize();
+        if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+            fprintf(stderr,
+                    "ds4: glm chain forward_token fail pos=%u around layer %u (%s)\n",
+                    pos, glm_ft_fail_il, glm_ft_fail_stage);
+        }
+        ds4_gpu_tensor_free(tp_heads);
+        ds4_gpu_tensor_free(tp_qk_low);
+        ds4_gpu_tensor_free(tp_q);
+        return ok;
+    }
+#endif
     if (!g->ssd_streaming && !defer_completion) {
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
@@ -74448,6 +74579,531 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
 #endif
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
 }
+
+/* ---------------------------------------------------------------------------
+ * Chain decode (C2).
+ *
+ * The classic loop pays ~0.48 ms per token outside the command buffers: it
+ * waits for the step's last command buffer, reads 605 KiB of logits back,
+ * argmaxes them on the host, writes the id into g->prefill_tokens and then
+ * encodes the next step from scratch while the GPU sits idle.  GLM-5.3 embeds
+ * from that device tensor, so the step can choose its own successor: a selector
+ * kernel in the same command buffer writes the id where the next step's
+ * embedding will read it.
+ *
+ * The chain keeps the session state exact at a stop token by encoding the next
+ * step ahead of time but committing it only after the caller has confirmed the
+ * token that feeds it.  Encoding is the expensive host half and it overlaps the
+ * running step; the commit is a handful of microseconds.  An uncommitted
+ * command buffer never runs, so an abort leaves the session exactly where the
+ * classic loop would have left it.
+ *
+ * Nothing here touches the speculative (DFlash/MTP) path: the chain drives the
+ * serial decode only, and ds4_session_chain_supported() declines otherwise.
+ * ------------------------------------------------------------------------ */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+
+struct ds4_chain {
+    ds4_session     *s;
+    ds4_chain_params p;
+    uint64_t         inflight_event;   /* 0 = no step in flight */
+    int              inflight_slot;
+    int              steps;            /* steps encoded so far */
+    /* The staged (encoded, uncommitted) step, if any. */
+    bool             staged;
+    uint64_t         staged_event;
+    int              staged_slot;
+    uint32_t         staged_pos;
+    bool             staged_dense;
+    int              committed;        /* steps the GPU has been given */
+    /* An id harvested from a finished step but not yet handed to the caller:
+     * ds4_session_chain_sync() leaves one behind so the host can read session
+     * state with a quiet GPU. */
+    bool             have_id;
+    int              pending_id;
+    int              violations;
+    bool             verify;
+    long             verify_checked;
+    long             verify_mismatch;
+    /* DS4_GLM_CHAIN_TRACE: the host timeline of one token. */
+    bool             trace;
+    double           t_encode, t_wait, t_read, t_commit, t_gap, t_gpu;
+    double           sum_encode, sum_wait, sum_read, sum_commit, sum_gap, sum_gpu;
+    long             traced;
+};
+
+static void ds4_chain_err(char *err, size_t errlen, const char *what) {
+    if (err && errlen) snprintf(err, errlen, "%s", what);
+}
+
+int ds4_session_chain_supported(ds4_session *s, const ds4_chain_params *p) {
+    if (!s || !p || !s->checkpoint_valid || s->distributed) return 0;
+    if (getenv("DS4_GLM_DISABLE_CHAIN")) return 0;
+    if (ds4_session_is_cpu(s) || !ds4_session_is_glm(s) || !s->glm_graph_ready) return 0;
+    if (s->engine && s->engine->tp.active) return 0;
+    if (g_expert_profile.active) return 0;
+    if (getenv("DS4_GLM_MTP_PROBE")) return 0;
+    if (glm_debug_hidden_dump_layer() >= 0) return 0;
+    if (glm_decode_ablate_mask() & DS4_GLM_ABLATE_HEAD) return 0;
+    const ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!g->glm53 || g->ssd_streaming || g->placement) return 0;
+    if (!g->has_token_embd || !g->has_output_head) return 0;
+    if (!g->select_ring || !g->select_parts || !g->prefill_tokens) return 0;
+    if ((uint32_t)s->checkpoint.len >= g->ctx_size) return 0;
+    if (p->mode == DS4_CHAIN_SAMPLE) {
+        /* The Gumbel-max selector is exact for the full-vocabulary nucleus
+         * sample_top_p_min_p() draws at top_p 1 / top_k 0 and nothing else. */
+        if (!(p->temperature > 0.0f)) return 0;
+        if (p->top_k > 0) return 0;
+        if (!(p->top_p >= 1.0f)) return 0;
+        if (p->min_p < 0.0f || p->min_p > 1.0f) return 0;
+        if (!p->rng) return 0;
+    } else if (p->mode != DS4_CHAIN_GREEDY) {
+        return 0;
+    }
+    return 1;
+}
+
+ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
+                                   char *err, size_t errlen) {
+    if (!ds4_session_chain_supported(s, p)) {
+        ds4_chain_err(err, errlen, "chain decode is not available for this session");
+        return NULL;
+    }
+    ds4_chain *ch = calloc(1, sizeof(*ch));
+    if (!ch) {
+        ds4_chain_err(err, errlen, "oom");
+        return NULL;
+    }
+    ch->s = s;
+    ch->p = *p;
+    ch->verify = getenv("DS4_GLM_CHAIN_VERIFY") != NULL;
+    ch->trace = getenv("DS4_GLM_CHAIN_TRACE") != NULL;
+    ch->violations = ds4_gpu_chain_violations();
+    ds4_gpu_chain_trace_reset();
+    /* Compile the selector pipelines here rather than inside the first step,
+     * where they cost ~260 ms of encode on a fresh process. */
+    const double warm0 = ch->trace ? now_sec() : 0.0;
+    if (!ds4_gpu_glm53_select_warm()) {
+        free(ch);
+        ds4_chain_err(err, errlen, "chain decode could not build the selector pipelines");
+        return NULL;
+    }
+    if (ch->trace) {
+        fprintf(stderr, "ds4: glm chain trace: selector pipelines ready in %.1f ms\n",
+                (now_sec() - warm0) * 1000.0);
+    }
+    return ch;
+}
+
+static void ds4_chain_invalidate(ds4_chain *ch) {
+    ds4_session *s = ch->s;
+    (void)ds4_gpu_chain_stage_abort();
+    (void)ds4_gpu_chain_stage_finish();
+    ch->staged = false;
+    ch->inflight_event = 0;
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    ds4_session_glm_cap_dense_cache(s);
+}
+
+/* Encode one step, leaving its command buffers staged.  `token` is the id the
+ * step consumes; pass -1 when the previous step's selector already wrote it
+ * into g->prefill_tokens. */
+static int ds4_chain_encode_step(ds4_chain *ch, int token,
+                                 char *err, size_t errlen) {
+    ds4_session *s = ch->s;
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+
+    if (pos >= g->ctx_size) {
+        if (errlen) snprintf(err, errlen, "GLM Metal context reached (%u)", g->ctx_size);
+        return 1;
+    }
+    if (!s->glm_spec_inside) {
+        s->glm_mtp_rollback_valid = false;
+        s->glm_mtp_have = 0;
+    }
+
+    glm_chain_select sel = {0};
+    sel.token_from_device = token < 0;
+    sel.event_out = &ch->staged_event;
+    sel.params.ring_slot = ch->steps & 1;
+    if (ch->p.mode == DS4_CHAIN_SAMPLE) {
+        sel.params.mode = DS4_GPU_SELECT_SAMPLE;
+        sel.params.excluded_id = -1;
+        sel.params.temperature = ch->p.temperature;
+        sel.params.min_p = ch->p.min_p;
+        /* One draw from the request's RNG per token, exactly as
+         * sample_top_p_min_p() consumes one. */
+        sel.params.seed = sample_rng_next(ch->p.rng);
+    } else {
+        sel.params.mode = DS4_GPU_SELECT_ARGMAX;
+        sel.params.excluded_id = ch->p.excluded_id;
+        sel.params.temperature = 0.0f;
+        sel.params.min_p = 0.0f;
+        sel.params.seed = 0;
+    }
+
+    const bool dense = glm_graph_decode_updates_dense_cache(g, pos, s->logits);
+    /* Staging is open only from here to the commit or the abort, i.e. inside
+     * whatever lock the caller holds around one chain step.  It is a process
+     * global, so leaving it on across an unlocked window would park another
+     * thread's command buffers in this chain's staging list. */
+    if (!ds4_gpu_chain_stage_begin()) {
+        ds4_chain_err(err, errlen, "chain decode could not stage its step");
+        return 1;
+    }
+    const double t_encode0 = ch->trace ? now_sec() : 0.0;
+    if (!glm_graph_forward_token_sel(g, &e->model, &e->weights,
+                                     token < 0 ? 0 : token,
+                                     NULL, pos, NULL, s->logits, false, &sel)) {
+        if (errlen) snprintf(err, errlen, "%s GLM chain decode failed",
+                             ds4_backend_name(e->backend));
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    if (ds4_gpu_chain_violations() != ch->violations) {
+        if (errlen) snprintf(err, errlen,
+                             "GLM chain decode lost its confirmation gate");
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    if (ch->trace) ch->t_encode = (now_sec() - t_encode0) * 1000.0;
+    ch->staged = true;
+    ch->staged_slot = sel.params.ring_slot;
+    ch->staged_pos = pos;
+    ch->staged_dense = dense;
+    ch->steps++;
+    return 0;
+}
+
+/* Commit the staged step and apply exactly the host-side updates
+ * ds4_session_eval() applies for the token it consumes. */
+static int ds4_chain_commit_step(ds4_chain *ch, int token,
+                                 char *err, size_t errlen) {
+    ds4_session *s = ch->s;
+    if (!ch->staged) {
+        ds4_chain_err(err, errlen, "chain decode has no staged step to commit");
+        return 1;
+    }
+    double t_commit0 = 0.0;
+    if (ch->trace) {
+        /* From the moment the previous step's last command buffer left the GPU
+         * to the moment this step is handed to the queue: the boundary the
+         * chain exists to shrink. */
+        const double gpu_end = ds4_gpu_chain_last_cb_gpu_end_ms();
+        ch->t_gap = gpu_end > 0.0 ? ds4_gpu_clock_ms() - gpu_end : 0.0;
+        t_commit0 = now_sec();
+    }
+    const int staged_cbs = ds4_gpu_chain_staged_count();
+    if (!ds4_gpu_chain_commit_staged()) {
+        ds4_chain_err(err, errlen, "chain decode could not commit its step");
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    if (ch->trace) {
+        ch->t_commit = (now_sec() - t_commit0) * 1000.0;
+        ch->sum_encode += ch->t_encode;
+        ch->sum_wait += ch->t_wait;
+        ch->sum_read += ch->t_read;
+        ch->sum_commit += ch->t_commit;
+        ch->sum_gap += ch->t_gap;
+        ch->sum_gpu += ch->t_gpu;
+        ch->traced++;
+        fprintf(stderr,
+                "ds4: glm chain trace step %d pos %u: encode %.3f wait %.3f "
+                "read %.3f commit %.3f gap %.3f gpu_last_cb %.3f cbs %d\n",
+                ch->steps, ch->staged_pos, ch->t_encode, ch->t_wait, ch->t_read,
+                ch->t_commit, ch->t_gap, ch->t_gpu, staged_cbs);
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    if (ch->staged_dense) ds4_session_glm_note_dense_cache(s, ch->staged_pos, 1);
+    ch->inflight_event = ch->staged_event;
+    ch->inflight_slot = ch->staged_slot;
+    ch->staged = false;
+    ch->committed++;
+    (void)ds4_gpu_chain_stage_finish();
+    return 0;
+}
+
+int ds4_session_chain_eval(ds4_chain *ch, int token, char *err, size_t errlen) {
+    if (!ch || token < 0 || token >= (int)DS4_N_VOCAB) {
+        ds4_chain_err(err, errlen, "chain decode received an invalid token");
+        return 1;
+    }
+    if (ch->inflight_event != 0 || ch->staged) {
+        ds4_chain_err(err, errlen, "chain decode already has a step in flight");
+        return 1;
+    }
+    if (ds4_chain_encode_step(ch, token, err, errlen) != 0) return 1;
+    return ds4_chain_commit_step(ch, token, err, errlen);
+}
+
+/* Wait for the step in flight and take the id it chose.  `mark` bounds the
+ * transient buffers that belong to steps that are now finished. */
+static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
+                             char *err, size_t errlen) {
+    ds4_session *s = ch->s;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (ch->inflight_event == 0) return 0;
+    const double t_wait0 = now_sec();
+    glm_levers_init_from_env();
+    const int spin_us = g_glm_levers.chain_spin_us;
+    if (!ds4_gpu_chain_wait_step(ch->inflight_event,
+                                 spin_us > 0 ? (uint32_t)spin_us : 0u,
+                                 "glm chain decode")) {
+        ds4_chain_err(err, errlen, "chain decode failed waiting for the GPU");
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    /* A step's wait is the GPU's own time plus one wake.  Anything this side
+     * of a second is a scheduling or driver pathology, not decode, and it has
+     * to be visible without a trace run to reproduce it. */
+    const double wait_ms = (now_sec() - t_wait0) * 1000.0;
+    if (wait_ms > 100.0) {
+        /* gpu_span is the step's own time on the GPU.  If it is small while
+         * the wait is large, the GPU finished long before the host was told:
+         * the stall is in the wake, not in the decode. */
+        fprintf(stderr,
+                "ds4: glm chain slow wait %.1f ms at step %d pos %u "
+                "(gpu_span %.1f ms, cbs %d, spin %d us)\n",
+                wait_ms, ch->steps, (uint32_t)s->checkpoint.len,
+                ds4_gpu_chain_last_cb_gpu_span_ms(),
+                ds4_gpu_chain_last_step_cbs(), spin_us);
+    }
+    const double t_read0 = ch->trace ? now_sec() : 0.0;
+    if (ch->trace) {
+        ch->t_wait = wait_ms;
+        ch->t_gpu = ds4_gpu_chain_last_cb_gpu_span_ms();
+    }
+    (void)ds4_gpu_chain_reap(mark, "glm chain decode");
+    ch->inflight_event = 0;
+
+    int32_t id = -1;
+    if (!ds4_gpu_tensor_read(g->select_ring,
+                             (uint64_t)ch->inflight_slot * sizeof(int32_t),
+                             &id, sizeof(id))) {
+        ds4_chain_err(err, errlen, "chain decode could not read the selected id");
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    if (id < 0 || id >= (int32_t)DS4_N_VOCAB) {
+        if (errlen) snprintf(err, errlen, "chain decode selected an invalid id %d", id);
+        ds4_chain_invalidate(ch);
+        return 1;
+    }
+    if (ch->verify && ch->p.mode == DS4_CHAIN_GREEDY && s->logits) {
+        if (ds4_gpu_tensor_read(g->logits, 0, s->logits,
+                                (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+            const int host = argmax_f32_excluding_unrolled8(
+                    s->logits, DS4_N_VOCAB, ch->p.excluded_id);
+            ch->verify_checked++;
+            if (host != (int)id) {
+                ch->verify_mismatch++;
+                fprintf(stderr,
+                        "ds4: glm chain verify mismatch at pos %u: gpu %d host %d\n",
+                        (uint32_t)s->checkpoint.len, (int)id, host);
+            }
+        }
+    }
+    if (ch->trace) ch->t_read = (now_sec() - t_read0) * 1000.0;
+    ch->have_id = true;
+    ch->pending_id = (int)id;
+    return 0;
+}
+
+/* Quiesce the GPU without giving up the chain: the caller wants to read or
+ * serialize session state (a disk-cache waypoint) between two tokens. */
+int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen) {
+    if (!ch || ch->staged) {
+        ds4_chain_err(err, errlen, "chain decode cannot sync with a staged step");
+        return 1;
+    }
+    return ds4_chain_harvest(ch, ds4_gpu_chain_transient_mark(), err, errlen);
+}
+
+/* Encode the next step, then wait for the one in flight and return the id it
+ * chose.  The next step is not committed: the caller decides. */
+int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
+    if (!ch || ch->staged || (ch->inflight_event == 0 && !ch->have_id)) {
+        ds4_chain_err(err, errlen, "chain decode has no step in flight");
+        return -1;
+    }
+    const unsigned long mark = ds4_gpu_chain_transient_mark();
+    if (ds4_chain_encode_step(ch, -1, err, errlen) != 0) return -1;
+    if (ds4_chain_harvest(ch, mark, err, errlen) != 0) return -1;
+    ch->have_id = false;
+    return ch->pending_id;
+}
+
+int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen) {
+    if (!ch) return 1;
+    return ds4_chain_commit_step(ch, token, err, errlen);
+}
+
+int ds4_session_chain_abort(ds4_chain *ch) {
+    if (!ch) return 1;
+    if (ch->staged) {
+        (void)ds4_gpu_chain_stage_abort();
+        ch->staged = false;
+    }
+    (void)ds4_gpu_chain_stage_finish();
+    return 0;
+}
+
+int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
+    if (!ch) return 0;
+    int rc = 0;
+    (void)ds4_session_chain_abort(ch);
+    if (ch->inflight_event != 0) {
+        if (!ds4_gpu_chain_wait_step(ch->inflight_event, 0u,
+                                     "glm chain decode end")) {
+            ds4_chain_err(err, errlen, "chain decode timed out draining the GPU");
+            ch->s->checkpoint_valid = false;
+            rc = 1;
+        }
+        ch->inflight_event = 0;
+    }
+    if (rc == 0 && ch->committed > 0 && ch->s->logits && ch->s->checkpoint_valid) {
+        /* Leave the session exactly as the classic loop would: the logits of
+         * the last committed token.  One 605 KiB read per generation instead
+         * of one per token, and it keeps snapshots, continuations and logprob
+         * callers honest. */
+        (void)ds4_gpu_tensor_read(ch->s->glm_graph.logits, 0, ch->s->logits,
+                                  (uint64_t)DS4_N_VOCAB * sizeof(float));
+    }
+    (void)ds4_gpu_chain_reap(ds4_gpu_chain_transient_mark(),
+                             "glm chain decode end");
+    (void)ds4_gpu_chain_stage_finish();
+    if (ch->verify && ch->verify_checked) {
+        fprintf(stderr, "ds4: glm chain verify: %ld/%ld mismatches\n",
+                ch->verify_mismatch, ch->verify_checked);
+    }
+    if (ch->trace && ch->traced > 0) {
+        const double n = (double)ch->traced;
+        fprintf(stderr,
+                "ds4: glm chain trace mean over %ld tokens: encode %.3f "
+                "wait %.3f read %.3f commit %.3f gap %.3f gpu_last_cb %.3f "
+                "cbs/step %d\n",
+                ch->traced, ch->sum_encode / n, ch->sum_wait / n,
+                ch->sum_read / n, ch->sum_commit / n, ch->sum_gap / n,
+                ch->sum_gpu / n, ds4_gpu_chain_last_step_cbs());
+    }
+    free(ch);
+    return rc;
+}
+
+int ds4_session_chain_steps(const ds4_chain *ch) {
+    return ch ? ch->steps : 0;
+}
+
+int ds4_session_decode_chain(ds4_session *s, int n_max,
+                             const ds4_chain_params *p,
+                             int (*on_token)(void *ctx, int token, int index),
+                             void *ctx,
+                             char *err, size_t errlen) {
+    if (!s || !p || !on_token || n_max <= 0) {
+        ds4_chain_err(err, errlen, "chain decode received invalid arguments");
+        return -1;
+    }
+    ds4_chain *ch = ds4_session_chain_begin(s, p, err, errlen);
+    if (!ch) return -1;
+
+    int produced = 0;
+    int rc = 0;
+    for (int i = 0; i < n_max; i++) {
+        int token;
+        if (i == 0) {
+            /* The first id comes from the logits the session already holds,
+             * exactly as the classic loop's first iteration does. */
+            token = p->mode == DS4_CHAIN_SAMPLE
+                ? ds4_session_sample(s, p->temperature, p->top_k, p->top_p,
+                                     p->min_p, p->rng)
+                : ds4_session_argmax_excluding(s, p->excluded_id);
+        } else {
+            token = ds4_session_chain_next(ch, err, errlen);
+        }
+        if (token < 0) { rc = -1; break; }
+        if (on_token(ctx, token, i) != 0) {
+            /* A stop: the step that would consume this token is still
+             * uncommitted, so dropping it leaves the session exactly where the
+             * classic loop's pre-eval stop check leaves it. */
+            (void)ds4_session_chain_abort(ch);
+            break;
+        }
+        produced++;
+        const int crc = i == 0 ? ds4_session_chain_eval(ch, token, err, errlen)
+                               : ds4_session_chain_confirm(ch, token, err, errlen);
+        if (crc != 0) { rc = -1; break; }
+    }
+    if (ds4_session_chain_end(ch, err, errlen) != 0 && rc == 0) rc = -1;
+    return rc == 0 ? produced : -1;
+}
+
+#else  /* chain decode is Metal-only */
+
+int ds4_session_chain_supported(ds4_session *s, const ds4_chain_params *p) {
+    (void)s; (void)p;
+    return 0;
+}
+
+ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
+                                   char *err, size_t errlen) {
+    (void)s; (void)p;
+    if (err && errlen) snprintf(err, errlen, "chain decode requires Metal");
+    return NULL;
+}
+
+int ds4_session_chain_eval(ds4_chain *ch, int token, char *err, size_t errlen) {
+    (void)ch; (void)token; (void)err; (void)errlen;
+    return 1;
+}
+
+int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
+    (void)ch; (void)err; (void)errlen;
+    return -1;
+}
+
+int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen) {
+    (void)ch; (void)err; (void)errlen;
+    return 1;
+}
+
+int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen) {
+    (void)ch; (void)token; (void)err; (void)errlen;
+    return 1;
+}
+
+int ds4_session_chain_abort(ds4_chain *ch) {
+    (void)ch;
+    return 1;
+}
+
+int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
+    (void)ch; (void)err; (void)errlen;
+    return 1;
+}
+
+int ds4_session_chain_steps(const ds4_chain *ch) {
+    (void)ch;
+    return 0;
+}
+
+int ds4_session_decode_chain(ds4_session *s, int n_max,
+                             const ds4_chain_params *p,
+                             int (*on_token)(void *ctx, int token, int index),
+                             void *ctx,
+                             char *err, size_t errlen) {
+    (void)s; (void)n_max; (void)p; (void)on_token; (void)ctx;
+    if (err && errlen) snprintf(err, errlen, "chain decode requires Metal");
+    return -1;
+}
+
+#endif
 
 #ifndef DS4_NO_GPU
 static bool glm53_graph_native_session_batch_supported(

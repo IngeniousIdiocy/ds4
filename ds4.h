@@ -544,6 +544,66 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 
+/* ---------------------------------------------------------------------------
+ * Chain decode (C2, GLM-5.3 on Metal).
+ *
+ * The step picks its own successor on the GPU and writes it into the tensor the
+ * next step embeds from, so the next step is encoded while this one runs and
+ * committed only once the caller has confirmed the token that feeds it.  A stop
+ * token therefore costs nothing: the staged step is dropped and the session
+ * state is exactly what the classic sample/eval loop would have left.
+ *
+ * `s->logits` is NOT populated per token in chain mode -- only once, at
+ * ds4_session_chain_end(), where it is refilled with the logits of the last
+ * committed token so the session ends exactly where the classic loop ends.
+ * Callers that need logits or logprobs for every token must use
+ * ds4_session_eval().
+ * ------------------------------------------------------------------------ */
+typedef enum {
+    DS4_CHAIN_GREEDY = 0,   /* argmax, optionally excluding one id */
+    DS4_CHAIN_SAMPLE = 1,   /* temperature + min_p, top_p 1.0 / top_k 0 only */
+} ds4_chain_mode;
+
+typedef struct {
+    ds4_chain_mode mode;
+    int            excluded_id;  /* greedy: id the selector may not pick, -1 none */
+    float          temperature;
+    int            top_k;        /* must be 0 */
+    float          top_p;        /* must be 1.0 */
+    float          min_p;
+    uint64_t      *rng;          /* sampling: one draw per token */
+} ds4_chain_params;
+
+typedef struct ds4_chain ds4_chain;
+
+/* Every decline (speculative decoding, TP, streaming weights, CPU sessions,
+ * top_k/top_p, profiling and dump switches, DS4_GLM_DISABLE_CHAIN) is decided
+ * here; callers fall back to the classic loop when it returns 0. */
+int ds4_session_chain_supported(ds4_session *s, const ds4_chain_params *p);
+
+/* Pull-style driver.  begin -> eval(first host-chosen token) ->
+ * { next -> confirm | next -> abort } * -> end. */
+ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
+                                   char *err, size_t errlen);
+int ds4_session_chain_eval(ds4_chain *ch, int token, char *err, size_t errlen);
+int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen);
+/* Wait for the step in flight without ending the chain: everything that reads
+ * or serializes session state between two tokens (a disk-cache waypoint) needs
+ * a quiet GPU first. */
+int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen);
+int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen);
+int ds4_session_chain_abort(ds4_chain *ch);
+int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen);
+int ds4_session_chain_steps(const ds4_chain *ch);
+
+/* Callback form: on_token returns non-zero to stop before the token is
+ * consumed.  Returns the number of tokens produced, or -1 on error. */
+int ds4_session_decode_chain(ds4_session *s, int n_max,
+                             const ds4_chain_params *p,
+                             int (*on_token)(void *ctx, int token, int index),
+                             void *ctx,
+                             char *err, size_t errlen);
+
 typedef struct {
     ds4_session *session;
     int token;
@@ -695,6 +755,16 @@ typedef struct {
      * DS4_GLM_DISABLE_DECODE_CONCURRENT turns it off, which restores the
      * serial encoder -- the byte-identical reference path. */
     int decode_concurrent;
+    /* C2 chain decode: pick the next id on the GPU and encode the following
+     * step before the current one finishes.  Default off until adopted;
+     * DS4_GLM_CHAIN_DECODE turns it on at startup and DS4_GLM_DISABLE_CHAIN
+     * is the kill switch that declines it wherever it is asked for. */
+    int chain_decode;
+    /* C2 chain decode: microseconds to spin on the selector event's
+     * signaledValue before falling back to the blocking command-buffer wait.
+     * 0 (default) blocks straight away.  DS4_GLM_CHAIN_SPIN_US sets it at
+     * startup. */
+    int chain_spin_us;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
