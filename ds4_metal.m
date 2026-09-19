@@ -41265,6 +41265,49 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                                  use_reduce_u16 ?
                                      "kernel_glm_attention_indexed_decode_split_group8_reduce_u16" :
                                      "kernel_glm_attention_indexed_decode_split_group8_reduce");
+        /* Lever dsa_reduce_split (T2-REPORT.md section 8.3).  The reduce runs one
+         * threadgroup per head, 64 of the machine's 80 cores, and streams
+         * 11.2 MB of value weights and block partials at 346 GB/s against the
+         * 564 GB/s that 64 cores could reach and the 705 GB/s the ledger shows
+         * at large grids.  Halving the output rows over two threadgroups per
+         * head replicates only the 2.23 MB blend and puts 128 cores on the
+         * weights.  Tier 1: the blend is redundant recomputation of the same
+         * reduction tree over read-only inputs, and each output row keeps its
+         * own arithmetic because a row is one thread's serial dot (Q8_0) or a
+         * fixed lane split reduced by simd_sum (Q4_K) whichever threadgroup
+         * runs it.  Refused back to one threadgroup per head when the shape has
+         * no twin: the VPLANE screen kernel, or a value_dim the split cannot
+         * halve. */
+        uint32_t reduce_split = 1u;
+        if (!t2s_vplane && g_glm_levers.dsa_reduce_split == 2 &&
+            value_dim >= 2u) {
+            const char *split_name =
+                use_reduce16 ?
+                    "kernel_glm_attention_indexed_decode_split_group8_reduce16_split2" :
+                use_reduce_u16 ?
+                    "kernel_glm_attention_indexed_decode_split_group8_reduce_u16_split2" :
+                    "kernel_glm_attention_indexed_decode_split_group8_reduce_split2";
+            id<MTLComputePipelineState> split_pipeline =
+                ds4_gpu_get_pipeline(split_name);
+            if (split_pipeline) {
+                reduce_pipeline = split_pipeline;
+                reduce_split = 2u;
+            } else {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    fprintf(stderr,
+                            "ds4: DSAREDSPLIT pipeline %s unavailable; "
+                            "using one threadgroup per head\n", split_name);
+                }
+            }
+        }
+        {
+            static ds4_t2s_slot slot = { "DSAREDSPLIT", 0, 0 };
+            ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) value_dim=%u",
+                        reduce_split, n_head, reduce_split, value_dim);
+        }
+
         if (!partial_pipeline || !reduce_pipeline) return 0;
 
         int owned = 0;
@@ -41382,7 +41425,8 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:4];
         [enc setThreadgroupMemoryLength:reduce_scratch_floats * sizeof(float) atIndex:0];
         for (int rep = 0; rep < rep_reduce; rep++) {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
+                                                  (NSUInteger)reduce_split, 1)
                  threadsPerThreadgroup:MTLSizeMake(reduce_threads, 1, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);

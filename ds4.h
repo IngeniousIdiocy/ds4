@@ -870,6 +870,29 @@ typedef struct {
      * and a binary one: an identical run says this fixture never tripped a
      * reject, not that a reject cannot happen. */
     int topk_fallback_encode;
+    /* Threadgroups per head in the DSA attention reduce
+     * (kernel_glm_attention_indexed_decode_split_group8_reduce*), 1 or 2.
+     * At 1 the reduce runs 64 threadgroups -- 64 of the machine's 80 cores --
+     * and streams 8.91 MB of Q8_0 value weights plus 2.23 MB of block
+     * partials at 346 GB/s, against the 564 GB/s that 64 cores could reach
+     * and the 705 GB/s the 62k ledger shows at large grids; measured 32.33 us
+     * a site, 11 sites, 355.6 us a token (T2-REPORT.md section 8.3).  At 2 the
+     * grid becomes (n_head, 2), each threadgroup recomputes the whole
+     * 17-partial online-softmax blend and then projects only its contiguous
+     * half of value_dim, which replicates 2.23 MB to put 128 cores on the
+     * 8.91 MB of weights: floor 19.1 us a site, about 145 us a token.
+     *
+     * Tier 1.  The blend is redundant recomputation of the same reduction
+     * tree at the same nth over read-only inputs, so both replicas hold a
+     * bit-identical lora_sum; each output row keeps its own arithmetic
+     * because a row is one thread's serial dot in the Q8_0 path and a fixed
+     * lane split reduced by simd_sum in the Q4_K path, neither of which
+     * depends on which threadgroup runs it; and out[d] is the kernel's only
+     * device write, so no head-wide value needs a designated owner.  The host
+     * refuses back to 1 on any shape with no split twin -- the VPLANE screen
+     * reduce, or a value_dim below 2.  DS4_GLM_DSA_REDUCE_SPLIT sets it at
+     * startup. */
+    int dsa_reduce_split;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

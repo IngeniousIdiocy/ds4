@@ -56203,6 +56203,7 @@ glm_levers g_glm_levers = {
     .hcx_nr0               = 2,  /* rows per threadgroup, as shipped */
     .sdn_fold              = 0,  /* off: routed-down and shared-down as a pair */
     .topk_fallback_encode  = 1,  /* on: the legacy argsort chain is encoded */
+    .dsa_reduce_split      = 1,  /* one reduce threadgroup per head, as shipped */
 };
 static int g_glm_levers_ready;
 
@@ -56216,6 +56217,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
     if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 6; return 1; }
     if (!strcmp(name, "topk_fallback_encode")) { *lo = 0; *hi = 1; return 1; }
+    if (!strcmp(name, "dsa_reduce_split")) { *lo = 1; *hi = 2; return 1; }
     return 0;
 }
 
@@ -56257,6 +56259,13 @@ static int glm_lever_counted_member(const char *name, int value) {
          * the accepted fast path leaves in the command buffer. */
         return value == 0 || value == 1;
     }
+    if (!strcmp(name, "dsa_reduce_split")) {
+        /* Threadgroups per head in the DSA attention reduce.  1 is the shipped
+         * grid; 2 halves the value projection's output rows across two
+         * threadgroups that each recompute the blend.  Tier 1 either way -- see
+         * ds4.h -- so this one is meant to ship if it measures. */
+        return value == 1 || value == 2;
+    }
     return 1;
 }
 
@@ -56273,6 +56282,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "hcx_nr0",               offsetof(glm_levers, hcx_nr0),               "DS4_GLM_HCX_NR0" },
     { "sdn_fold",              offsetof(glm_levers, sdn_fold),              "DS4_GLM_SDN_FOLD" },
     { "topk_fallback_encode",  offsetof(glm_levers, topk_fallback_encode),  "DS4_GLM_TOPK_FALLBACK_ENCODE" },
+    { "dsa_reduce_split",      offsetof(glm_levers, dsa_reduce_split),      "DS4_GLM_DSA_REDUCE_SPLIT" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56359,6 +56369,16 @@ void glm_levers_init_from_env(void) {
             const int n = atoi(v);
             if (glm_lever_counted_member("topk_fallback_encode", n)) {
                 g_glm_levers.topk_fallback_encode = n;
+            }
+        }
+    }
+    /* Counted 1..2, default 1; a value outside the set leaves the shipped
+     * one-threadgroup-per-head grid. */
+    {   const char *v = getenv("DS4_GLM_DSA_REDUCE_SPLIT");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("dsa_reduce_split", n)) {
+                g_glm_levers.dsa_reduce_split = n;
             }
         }
     }

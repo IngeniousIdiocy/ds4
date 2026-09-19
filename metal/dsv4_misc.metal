@@ -1516,7 +1516,7 @@ kernel void kernel_glm_attention_full(
         const float denom = red[0];
         device float *out = (device float *)(heads +
             ((uint64_t)token * args.n_head + head) * args.value_dim * sizeof(float));
-        for (uint d = tid; d < args.value_dim; d += nth) {
+        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             float acc = 0.0f;
             for (uint s = 0; s < visible; s++) {
                 const uint64_t vbase = ((uint64_t)s * args.n_head + head) * args.value_dim;
@@ -1559,7 +1559,7 @@ kernel void kernel_glm_attention_full(
         const float denom = red[0];
         device float *out = (device float *)(heads +
             ((uint64_t)token * args.n_head + head) * args.value_dim * sizeof(float));
-        for (uint d = tid; d < args.value_dim; d += nth) {
+        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             float acc = 0.0f;
             for (uint s = 0; s < visible; s++) {
                 const uint64_t vbase = ((uint64_t)s * args.n_head + head) * args.value_dim;
@@ -4101,7 +4101,20 @@ template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial_
 kernel glm_attention_indexed_decode_split_group8_partial_t
 kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true, 32u>;
 
-template<uint FIXED_BLOCKS, bool Q8_U16>
+/* SPLIT (host lever dsa_reduce_split) divides the value projection's output
+ * rows between SPLIT threadgroups per head, grid (n_head, SPLIT).  Each of
+ * them recomputes the whole 17-partial online-softmax blend -- same nth, same
+ * reduction trees, same block_scale, read-only inputs -- so every replica
+ * holds a bit-identical lora_sum, and then walks only its contiguous half of
+ * value_dim with the SAME lane and simdgroup assignment it would have used
+ * inside that half.  Each output row's arithmetic is therefore untouched: in
+ * the Q8_0 path a row is one thread's serial dot whichever thread runs it, and
+ * in the Q4_K path a row is a fixed lane split reduced by simd_sum whichever
+ * simdgroup runs it.  T2-REPORT.md section 8.3 prices it; the redundant blend
+ * is the section 3.3 redundant-recomputation argument, and the only device
+ * write in this kernel is out[d], so no head-wide value needs an owner.
+ * SPLIT == 1 is today's path byte for byte. */
+template<uint FIXED_BLOCKS, bool Q8_U16, uint SPLIT = 1u>
 static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *partial_lora,
@@ -4119,9 +4132,19 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         args.kv_lora_dim != 512u ||
         n_blocks == 0u ||
         n_blocks > 64u ||
-        (FIXED_BLOCKS != 0u && args.n_blocks != FIXED_BLOCKS)) {
+        (FIXED_BLOCKS != 0u && args.n_blocks != FIXED_BLOCKS) ||
+        (SPLIT > 1u && (args.value_dim < SPLIT || tgpig.y >= SPLIT))) {
         return;
     }
+
+    /* Contiguous half (or SPLIT-th) of the output rows this threadgroup owns.
+     * With SPLIT == 1 these collapse to the full range and every loop below is
+     * textually today's loop. */
+    const uint vd_chunk =
+        SPLIT > 1u ? (args.value_dim + SPLIT - 1u) / SPLIT : args.value_dim;
+    const uint vd_lo = SPLIT > 1u ? (uint)tgpig.y * vd_chunk : 0u;
+    const uint vd_hi = SPLIT > 1u ? min(vd_lo + vd_chunk, args.value_dim)
+                                  : args.value_dim;
 
     const uint nth = ntg_u.x;
     /* Scratch is laid out relative to nth so the host can widen the
@@ -4192,7 +4215,7 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         const uint vp_sg = tid >> 5u;
         const uint vp_lane = tid & 31u;
         const uint vp_nsg = nth >> 5u;
-        for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
+        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
@@ -4204,7 +4227,7 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
             }
         }
     } else {
-        for (uint d = tid; d < args.value_dim; d += nth) {
+        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             /* Q8_U16 reads the same row as ushort pairs in the same order. */
@@ -4261,6 +4284,56 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_reduce16(
         ushort3 ntg_u [[threads_per_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
     kernel_glm_attention_indexed_decode_split_group8_reduce_impl<16, false>(
+            args, partial_lora, partial_ms, value_weight, heads, scratch,
+            tid, ntg_u, tgpig);
+}
+
+/* dsa_reduce_split = 2: the three production reduce shapes above with the
+ * output rows halved over two threadgroups per head, grid (n_head, 2).  Every
+ * other argument, binding and threadgroup-memory size is unchanged; the host
+ * refuses back to one threadgroup per head on any shape without a twin here
+ * (the VPLANE screen kernel in metal/t2screen.metal has none). */
+kernel void kernel_glm_attention_indexed_decode_split_group8_reduce_split2(
+        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
+        device const char *partial_lora,
+        device const char *partial_ms,
+        device const char *value_weight,
+        device char *heads,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0, false, 2u>(
+            args, partial_lora, partial_ms, value_weight, heads, scratch,
+            tid, ntg_u, tgpig);
+}
+
+kernel void kernel_glm_attention_indexed_decode_split_group8_reduce_u16_split2(
+        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
+        device const char *partial_lora,
+        device const char *partial_ms,
+        device const char *value_weight,
+        device char *heads,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0, true, 2u>(
+            args, partial_lora, partial_ms, value_weight, heads, scratch,
+            tid, ntg_u, tgpig);
+}
+
+kernel void kernel_glm_attention_indexed_decode_split_group8_reduce16_split2(
+        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
+        device const char *partial_lora,
+        device const char *partial_ms,
+        device const char *value_weight,
+        device char *heads,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<16, false, 2u>(
             args, partial_lora, partial_ms, value_weight, heads, scratch,
             tid, ntg_u, tgpig);
 }
@@ -4404,7 +4477,7 @@ kernel void kernel_glm_attention_indexed_decode(
 
         device float *out =
             (device float *)(heads + (uint64_t)head * args.value_dim * sizeof(float));
-        for (uint d = tid; d < args.value_dim; d += nth) {
+        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);
@@ -4510,7 +4583,7 @@ kernel void kernel_glm_attention_indexed_decode(
         const uint vp_sg = tid >> 5u;
         const uint vp_lane = tid & 31u;
         const uint vp_nsg = nth >> 5u;
-        for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
+        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
@@ -4522,7 +4595,7 @@ kernel void kernel_glm_attention_indexed_decode(
             }
         }
     } else {
-        for (uint d = tid; d < args.value_dim; d += nth) {
+        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);
@@ -4664,7 +4737,7 @@ kernel void kernel_glm_attention_indexed_batch(
         const uint vp_sg = tid >> 5u;
         const uint vp_lane = tid & 31u;
         const uint vp_nsg = nth >> 5u;
-        for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
+        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
@@ -4676,7 +4749,7 @@ kernel void kernel_glm_attention_indexed_batch(
             }
         }
     } else {
-        for (uint d = tid; d < args.value_dim; d += nth) {
+        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);
