@@ -822,7 +822,17 @@ typedef struct {
      * -- its delta against 0 is the cost of the publication pattern at 16,384
      * threadgroups; 3 = the full fold with the slot as the fastest-varying
      * grid axis, which elects tails throughout the dispatch instead of all in
-     * the last z-wave -- its delta against 1 is the cost of the order. */
+     * the last z-wave -- its delta against 1 is the cost of the order.
+     *
+     * Measured at 62k, three interleaved reps, all texts identical: 0 = 38.414,
+     * 2 = 37.668, 1 = 37.669, 3 = 37.305.  Publication alone is the whole loss,
+     * the elected tail costs exactly what the consumer dispatch cost, and
+     * slot-fastest order is worse still.  4 and 5 repeat 2 and 1 with both
+     * seq_cst device fences removed, to find which part of the publication is
+     * expensive.  4 and 5 are DIAGNOSTICS ONLY: without the fences a partial
+     * can be invisible or stale across the two dies, and a stale partial is the
+     * previous layer's value, so it reaches the generated text.  Neither may
+     * ship whatever it measures. */
     int sdn_fold;
 } glm_levers;
 

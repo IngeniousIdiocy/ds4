@@ -56213,7 +56213,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
     if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
     if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
-    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 3; return 1; }
+    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 5; return 1; }
     return 0;
 }
 
@@ -56235,8 +56235,11 @@ static int glm_lever_counted_member(const char *name, int value) {
         return value == 1 || value == 2;
     }
     if (!strcmp(name, "sdn_fold")) {
-        /* 0 pair, 1 fold, 2 publication-only ablation, 3 slot-major fold. */
-        return value >= 0 && value <= 3;
+        /* 0 pair, 1 fold, 2 publication-only, 3 slot-fastest fold,
+         * 4 publication-only without the device fences, 5 fold without them.
+         * 4 and 5 are diagnostics: they are not memory-safe across the two
+         * dies and must never ship. */
+        return value >= 0 && value <= 5;
     }
     return 1;
 }
