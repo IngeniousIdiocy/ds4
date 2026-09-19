@@ -41279,6 +41279,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
          * no twin: the VPLANE screen kernel, or a value_dim the split cannot
          * halve. */
         uint32_t reduce_split = 1u;
+        const char *reduce_split_name = "production(1 TG/head)";
         if (!t2s_vplane && g_glm_levers.dsa_reduce_split == 2 &&
             value_dim >= 2u) {
             const char *split_name =
@@ -41292,6 +41293,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             if (split_pipeline) {
                 reduce_pipeline = split_pipeline;
                 reduce_split = 2u;
+                reduce_split_name = split_name;
             } else {
                 static int warned;
                 if (!warned) {
@@ -41306,6 +41308,25 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             static ds4_t2s_slot slot = { "DSAREDSPLIT", 0, 0 };
             ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) value_dim=%u",
                         reduce_split, n_head, reduce_split, value_dim);
+            /* Announce on every VALUE CHANGE as well as on the first dispatch.
+             * These are live levers, moved through /debug/levers on a resident
+             * server, so the first-dispatch line only records whichever arm
+             * ran first and says nothing about take-up afterwards.  The line
+             * carries the lever's value AND the kernel actually selected, so a
+             * silent refusal is distinguishable from a lever that never
+             * moved. */
+            static uint32_t announced_split = 0xffffffffu;
+            static int announced_lever = -1;
+            if (announced_split != reduce_split ||
+                announced_lever != g_glm_levers.dsa_reduce_split) {
+                announced_split = reduce_split;
+                announced_lever = g_glm_levers.dsa_reduce_split;
+                fprintf(stderr,
+                        "ds4: DSAREDSPLIT lever=%d -> split=%u grid=(%u,%u) "
+                        "value_dim=%u kernel=%s\n",
+                        g_glm_levers.dsa_reduce_split, reduce_split,
+                        n_head, reduce_split, value_dim, reduce_split_name);
+            }
         }
 
         if (!partial_pipeline || !reduce_pipeline) return 0;
@@ -57343,8 +57364,9 @@ if (conv_flip_out) *conv_flip_out = 0;
          * kernel_glm53_kda_decode_out dispatch below -- the arm therefore
          * prices the re-grid MINUS one dependent-dispatch boundary, and the
          * 1-vs-2 delta is itself a measurement of that boundary. */
+        const int glue_mode = g_glm_levers.kda_glue_split;
         uint32_t glue_split = 1u;
-        if (g_glm_levers.kda_glue_split == 2 && n_rows == 1u &&
+        if (glue_mode == 2 && n_rows == 1u &&
             conv_state_alt != NULL && conv_state != NULL &&
             ds4_gpu_tensor_bytes(conv_state_alt) >=
                 ds4_gpu_tensor_bytes(conv_state) &&
@@ -57352,9 +57374,16 @@ if (conv_flip_out) *conv_flip_out = 0;
             (n_heads & 1u) == 0u) {
             glue_split = 2u;
         }
-        /* The fused epilogue is incompatible with the split; fall back to the
-         * two-dispatch form the host already encodes when do_out is 0. */
-        const int glue_do_out = do_out && glue_split == 1u;
+        /* Mode 3 prices the epilogue's dispatch boundary ALONE: today's
+         * unsplit glue on today's grid with the in-place conv shift, but with
+         * the output RMS moved out to the standalone
+         * kernel_glm53_kda_decode_out dispatch.  Nothing else changes, so
+         * (mode 2) - (mode 3) is the re-grid's own contribution with the
+         * boundary it had to pay already subtracted.  The fused epilogue is
+         * also incompatible with the split itself, so mode 2 takes the same
+         * two-dispatch form. */
+        const int glue_do_out =
+            do_out && glue_split == 1u && glue_mode != 3;
         {
             static ds4_t2s_slot slot = { "KDAGLUESPLIT", 0, 0 };
             ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) heads=%u rows=%u "
@@ -57362,6 +57391,26 @@ if (conv_flip_out) *conv_flip_out = 0;
                         glue_split,
                         glue_split > 1u ? glue_split : (unsigned)n_rows,
                         n_heads, n_heads, n_rows, glue_do_out);
+            /* Value-change announcement, for the same reason as DSAREDSPLIT:
+             * a live lever's take-up is otherwise invisible after the first
+             * dispatch of the process. */
+            static int announced_mode = -1;
+            static uint32_t announced_split = 0xffffffffu;
+            static int announced_out = -1;
+            if (announced_mode != glue_mode ||
+                announced_split != glue_split ||
+                announced_out != glue_do_out) {
+                announced_mode = glue_mode;
+                announced_split = glue_split;
+                announced_out = glue_do_out;
+                fprintf(stderr,
+                        "ds4: KDAGLUESPLIT lever=%d -> split=%u grid=(%u,%u) "
+                        "fused_out=%d (standalone decode_out %s)\n",
+                        glue_mode, glue_split,
+                        glue_split > 1u ? glue_split : (unsigned)n_rows,
+                        n_heads, glue_do_out,
+                        glue_do_out ? "off" : "on");
+            }
         }
 
         glm53_gpu_kda_glue_args args = {

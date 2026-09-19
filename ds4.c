@@ -56291,7 +56291,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 6; return 1; }
     if (!strcmp(name, "topk_fallback_encode")) { *lo = 0; *hi = 1; return 1; }
     if (!strcmp(name, "dsa_reduce_split")) { *lo = 1; *hi = 2; return 1; }
-    if (!strcmp(name, "kda_glue_split")) { *lo = 1; *hi = 2; return 1; }
+    if (!strcmp(name, "kda_glue_split")) { *lo = 1; *hi = 3; return 1; }
     return 0;
 }
 
@@ -56341,12 +56341,13 @@ static int glm_lever_counted_member(const char *name, int value) {
         return value == 1 || value == 2;
     }
     if (!strcmp(name, "kda_glue_split")) {
-        /* Threadgroups per head in the KDA decode glue.  1 is the shipped
-         * grid and the in-place conv shift; 2 halves the value rows and the
-         * conv channels across two threadgroups per head and ping-pongs the
-         * conv buffer.  Tier 1 either way -- see ds4.h -- so this one is meant
-         * to ship if it measures. */
-        return value == 1 || value == 2;
+        /* 1 the shipped grid and the in-place conv shift; 2 halves the value
+         * rows and the conv channels across two threadgroups per head and
+         * ping-pongs the conv buffer; 3 is 1 with the output RMS moved to the
+         * standalone kda_decode_out dispatch, which prices the boundary 2 has
+         * to pay so that (2) - (3) isolates the re-grid.  All Tier 1 -- see
+         * ds4.h.  3 is a measurement arm, not a shipping candidate. */
+        return value >= 1 && value <= 3;
     }
     return 1;
 }

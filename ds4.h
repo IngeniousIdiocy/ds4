@@ -890,8 +890,19 @@ typedef struct {
      * depends on which threadgroup runs it; and out[d] is the kernel's only
      * device write, so no head-wide value needs a designated owner.  The host
      * refuses back to 1 on any shape with no split twin -- the VPLANE screen
-     * reduce, or a value_dim below 2.  DS4_GLM_DSA_REDUCE_SPLIT sets it at
-     * startup. */
+     * reduce, or a value_dim below 2.
+     *
+     * Measured at 62k, three interleaved reps, all texts identical: 1 =
+     * 38.237 mean, 2 = 38.231, flat to within 0.014 t/s in every rep pair.
+     * T2-REPORT.md section 8.7 says why.  The makespan of a dispatch of G
+     * equal threadgroups is ceil(G / 80) x one threadgroup's duration, so
+     * taking 64 heads to 128 threadgroups doubles the wave count while halving
+     * the duration and is neutral by construction; 2, 3 and 4 threadgroups per
+     * head are all exactly neutral and nothing below 5 can win.  The same
+     * measurement says the 2.23 MB blend is nearly free and the 8.91 MB value
+     * projection is essentially the whole 32.33 us.  Kept as the receipt for
+     * that rule rather than as a shipping candidate.
+     * DS4_GLM_DSA_REDUCE_SPLIT sets it at startup. */
     int dsa_reduce_split;
     /* Threadgroups per head in the KDA decode glue
      * (kernel_glm53_kda_decode_glue), 1 or 2.  At 1 the glue runs 64
@@ -929,10 +940,20 @@ typedef struct {
      * One caveat the measurement has to carry: the head-wide output RMS
      * cannot run inside half a head, so at 2 the glue always falls back to the
      * standalone kernel_glm53_kda_decode_out dispatch.  Value 2 therefore
-     * prices the re-grid MINUS one dependent-dispatch boundary, and the
-     * 1-vs-2 delta is also a direct measurement of what that boundary costs
-     * under the corrected model in section 7.12.  DS4_GLM_KDA_GLUE_SPLIT sets
-     * it at startup. */
+     * prices the re-grid MINUS one dependent-dispatch boundary.
+     *
+     * Value 3 is that boundary on its own: today's unsplit glue on today's
+     * grid with the in-place conv shift, but do_out forced to 0 so the output
+     * RMS runs in the standalone dispatch.  Nothing else about the kernel or
+     * the grid changes, so (3) - (1) measures one dependent-dispatch drain and
+     * ramp per KDA layer directly -- the quantity the corrected model in
+     * T2-REPORT.md section 7.12 now turns on -- and (2) - (3) is the re-grid's
+     * own contribution with that boundary subtracted.  3 is a measurement arm,
+     * never a shipping candidate.
+     *
+     * Measured at 62k, three interleaved reps, all texts identical: 1 =
+     * 38.237 mean, 2 = 37.809, i.e. -0.43.  DS4_GLM_KDA_GLUE_SPLIT sets it at
+     * startup. */
     int kda_glue_split;
 } glm_levers;
 
