@@ -54048,6 +54048,21 @@ static uint32_t ds4_gpu_glm53_hc_repl_tail_tgs(void) {
 #define DS4_GLM53_HC_SLICED_TAIL       "kernel_glm53_hc_tail_sliced"
 #define DS4_GLM53_HC_SLICED_TAIL_ALG   "kernel_glm53_hc_tail_sliced_alg"
 
+/* H1: half A's PAIR as one dispatch with the replicated wide tail.
+ *
+ * P = out_dim*n_slices/32 producer threadgroups run kernel A's per-simdgroup
+ * slice dots grouped 32 to a threadgroup (the same dots in the same order, so
+ * the same bits), publish the partials and the per-slice sums of squares with
+ * relaxed device atomics and increment an arrival counter; the same dispatch
+ * also carries the replicated wide tail's 1 + (N-1) threadgroups, which
+ * prefetch their residual float4s, wait on that counter behind a seq_cst
+ * device fence, and then run kernel_glm53_hc_reduce_wsum_repl_alg's reduce,
+ * gates, Sinkhorn, collapse and stores unchanged.  What goes away is the
+ * dependent-dispatch boundary between the two, the tail's launch ramp, and
+ * the 64 KB residual read that used to start only after the mixer retired.
+ * See metal/dsv4_hc.metal for the bit-exactness argument and the watchdog. */
+#define DS4_GLM53_HC_ONEPASS_KERNEL    "kernel_glm53_hc_pre_onepass_alg"
+
 /* Compile-time defaults. */
 #ifndef DS4_GLM53_HC_ALG_A_DEFAULT_ON
 #define DS4_GLM53_HC_ALG_A_DEFAULT_ON 1
@@ -54116,6 +54131,17 @@ static int ds4_gpu_glm53_hc_alg_flag(int half) {
         cached = on;
     }
     return cached;
+}
+
+/* H1's one-dispatch hc_pre.  Like half A it is a campaign lever (glm_levers,
+ * ds4.h) read live here, so a resident server with --debug-levers can flip it
+ * between requests; the eligibility conditions it also needs (half A on, half
+ * B off, the replicated wide tail, a serial encoder, the pipeline and the
+ * counter tensor) are checked at the dispatch site.  Exact mode needs no
+ * clamp of its own: it already clamps half A off, and this path requires it. */
+static int ds4_gpu_glm53_hc_onepass_flag(void) {
+    glm_levers_init_from_env();
+    return g_glm_levers.hc_pre_onepass != 0;
 }
 
 /* The two halves as they are actually dispatched.  Both need the replicated
@@ -54367,6 +54393,48 @@ static int ds4_gpu_glm53_hc_pre_splitk_impl(
                 alg_threads = n4 / c;
             }
         }
+
+        /* H1: the half-A pair as ONE dispatch with the wide waiting tail.
+         * Eligible only where the pair it replaces is exactly what would
+         * otherwise be encoded -- half A on, half B off, the replicated wide
+         * tail, and a serial encoder, because the arrival counter assumes one
+         * hc_pre dispatch at a time (the watchdog would make a concurrent
+         * group slow rather than wrong, but there is no reason to pay for
+         * it).  Default ON; kill switch DS4_GLM_DISABLE_HC_PRE_ONEPASS. */
+        int onepass = alg_a && !alg_b && !ticket &&
+                      !g_batch_encoder_concurrent &&
+                      ds4_gpu_glm53_hc_refuse_tail_is_repl() &&
+                      ds4_gpu_glm53_hc_onepass_flag();
+        uint32_t op_producers = 0u, op_tail_tgs = 0u;
+        NSUInteger op_shared_bytes = 0;
+        id<MTLComputePipelineState> pipe_op = nil;
+        if (onepass) {
+            const uint32_t op_nsg =
+                (uint32_t)DS4_HC_PRE_DECODE_FUSED_THREADS / 32u;
+            pipe_op = ds4_gpu_get_pipeline(DS4_GLM53_HC_ONEPASS_KERNEL);
+            op_tail_tgs = ds4_gpu_glm53_hc_repl_tail_tgs();
+            op_producers = (mix_dim * slices) / op_nsg;
+            /* The replicated tail's layout plus the threadgroup mirror of the
+             * partials array the tail reduces over. */
+            op_shared_bytes =
+                (DS4_HC_PRE_DECODE_FUSED_HEAD_FLOATS + (NSUInteger)n_embd +
+                 DS4_HC_PRE_DECODE_FUSED_TAIL_FLOATS +
+                 (NSUInteger)mix_dim * slices +
+                 DS4_GLM53_HC_PRE_SUMSQ_SLOTS) * sizeof(float);
+            const NSUInteger op_max_shared = [g_device maxThreadgroupMemoryLength];
+            id<MTLBuffer> op_counters = tail_counters
+                ? ds4_gpu_tensor_buffer(tail_counters) : nil;
+            if (!pipe_op || !op_counters ||
+                ds4_gpu_tensor_bytes(tail_counters) < 512u ||
+                pipe_op.maxTotalThreadsPerThreadgroup <
+                    DS4_HC_PRE_DECODE_FUSED_THREADS ||
+                ((mix_dim * slices) % op_nsg) != 0u || op_producers == 0u ||
+                op_tail_tgs < 2u ||
+                (n_embd >> 2) != DS4_HC_PRE_DECODE_FUSED_THREADS ||
+                (op_max_shared != 0 && op_shared_bytes > op_max_shared)) {
+                onepass = 0;
+            }
+        }
         const char *tail_name =
             alg_b ? (alg_a ? DS4_GLM53_HC_SLICED_TAIL_ALG
                            : DS4_GLM53_HC_SLICED_TAIL)
@@ -54455,6 +54523,43 @@ static int ds4_gpu_glm53_hc_pre_splitk_impl(
             [enc dispatchThreadgroups:MTLSizeMake(
                         (mix_dim * slices + snsg - 1u) / snsg, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(32u * snsg, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "split-K HC-pre") ? 1 : 0;
+        }
+        if (onepass) {
+            /* One dispatch: P producer threadgroups of 32 simdgroups running
+             * kernel A's slice dots, then the replicated wide tail's
+             * 1 + (N-1) threadgroups waiting on the arrival counter. */
+            {   static ds4_t2s_slot slot = { "HCP1PASS", 0, 0 };
+                ds4_t2s_hit(&slot,
+                            "%s producers=%u tail_tgs=%u slices=%u smem=%lu",
+                            DS4_GLM53_HC_ONEPASS_KERNEL,
+                            (unsigned)op_producers, (unsigned)op_tail_tgs,
+                            (unsigned)slices, (unsigned long)op_shared_bytes);
+            }
+            const uint32_t op_spin_cap = ds4_gpu_glm53_hc_alg_spin_cap();
+            [enc setComputePipelineState:pipe_op];
+            [enc setBytes:&mix_args length:sizeof(mix_args) atIndex:0];
+            [enc setBytes:&splitk length:sizeof(splitk) atIndex:1];
+            [enc setBytes:&split_args length:sizeof(split_args) atIndex:2];
+            [enc setBytes:&op_spin_cap length:sizeof(op_spin_cap) atIndex:3];
+            [enc setBuffer:mix_weight offset:(NSUInteger)mix_weight_inner atIndex:4];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:5];
+            [enc setBuffer:parbuf offset:ds4_gpu_tensor_offset(partials) atIndex:6];
+            [enc setBuffer:ds4_gpu_tensor_buffer(tail_counters)
+                    offset:ds4_gpu_tensor_offset(tail_counters) atIndex:7];
+            [enc setBuffer:mixbuf offset:ds4_gpu_tensor_offset(mix) atIndex:8];
+            [enc setBuffer:scalebuf offset:(NSUInteger)scale_inner atIndex:9];
+            [enc setBuffer:basebuf offset:(NSUInteger)base_inner atIndex:10];
+            [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) atIndex:11];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:12];
+            [enc setBuffer:norm_weight offset:(NSUInteger)norm_inner atIndex:13];
+            [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:14];
+            [enc setThreadgroupMemoryLength:op_shared_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(
+                        op_producers + op_tail_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(
+                        DS4_HC_PRE_DECODE_FUSED_THREADS, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "split-K HC-pre") ? 1 : 0;
         }

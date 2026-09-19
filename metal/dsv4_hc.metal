@@ -4036,6 +4036,562 @@ kernel void kernel_glm53_hc_reduce_wsum_repl_alg(
 }
 
 
+
+// Retirement of one threadgroup of the one-pass grid.  counters[1] counts the
+// WHOLE grid -- producers and tail threadgroups alike -- and the last one to
+// retire re-arms both counters for the next dispatch, which is strictly
+// ordered after this one in the serial encoder.  Counting the whole grid, and
+// not just the tail, is what keeps the re-arm safe when a tail threadgroup's
+// watchdog fires and it retires before a producer has arrived.  Call from
+// thread 0 only.
+static __attribute__((always_inline)) inline void glm53_hc_onepass_retire(
+        device atomic_uint *counters,
+        uint n_tgs) {
+    const uint prev = atomic_fetch_add_explicit(&counters[1], 1u,
+                                                memory_order_relaxed);
+    if (prev + 1u >= n_tgs) {
+        atomic_store_explicit(&counters[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&counters[1], 0u, memory_order_relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H1: the half-A decode HC-pre pair as ONE dispatch with the WIDE tail.
+//
+// kernel_glm53_hc_rms_splitk_alg and kernel_glm53_hc_reduce_wsum_repl_alg are
+// two DEPENDENT dispatches in the serial encoder, 90 times per decoded token.
+// The pair costs 20.1 us/site for 70 MB of weights and the cold microbench of
+// the pair is ~13 us, so most of it is the dependent-dispatch boundary, the
+// tail's launch ramp, and the fact that the tail's 64 KB residual read cannot
+// start until the mixer has retired.
+//
+// kernel_glm53_hc_pre_splitk_single above already fuses the pair into one
+// dispatch, but its tail runs in the ONE last-arriving threadgroup, which is
+// single-core bandwidth bound (see the replicated-tail comment) and measured
+// slower.  This kernel keeps the 13-threadgroup wide tail: the grid is
+//
+//     P producer threadgroups  +  T tail threadgroups,   P = out_dim*n_slices/NSG
+//
+// all of them 1024 threads.  Producer threadgroup p runs kernel A's body for
+// simdgroup-flat indices [p*32, p*32+32): the SAME per-simdgroup slice dot in
+// the SAME lane stride and the same eight-way order kernel A runs at nsg 8,
+// only grouped 32 to a threadgroup, which is exactly what
+// glm53_hc_pre_splitk_single_body already does and is bit-identical by
+// construction (a partial depends only on its lane and its slice bounds).
+// Tail threadgroup k == 0 is the comb threadgroup and k == 1..T-1 are the
+// collapse threadgroups of kernel_glm53_hc_reduce_wsum_repl_alg.
+//
+// What the fusion buys, and why the tail can wait:
+//   * one dispatch instead of two, so the dependent-dispatch floor (~2.6 us,
+//     measured) is paid once;
+//   * the tail threadgroups are launched WITH the producers, so their launch
+//     ramp overlaps the mixer instead of following it;
+//   * every collapse threadgroup loads its four residual float4s into
+//     registers BEFORE it waits, so the 64 KB stream read is in flight while
+//     the mixer runs instead of starting after it.
+//
+// Cross-threadgroup publication.  Everything a tail threadgroup reads from a
+// producer -- the 24*n_slices split-K partials and the n_slices sums of
+// squares -- is published with a relaxed device atomic store of its bit
+// pattern and read back with a relaxed device atomic load, with an
+// atomic_thread_fence(mem_device, seq_cst, thread_scope_device) on BOTH sides
+// of the arrival counter (Phase 1's finding that a threadgroup_barrier is not
+// a release, and the router fold's finding that a plain store is not visible
+// across the two dies even with fences on both sides).  The atomics carry no
+// arithmetic: the same bit patterns go in and come out.
+//
+// Bit-exactness against the pair:
+//   * Producers are kernel_glm53_hc_rms_splitk_alg's body with the two plain
+//     stores replaced by atomic stores of the same bits.
+//   * The tail reads the published words into a threadgroup mirror of the
+//     partials array laid out exactly like the device one, and then runs
+//     glm53_hc_alg_mix_reduce<true>'s block over that mirror: the same ss
+//     load first, the same float4-grouped addends in the same order, the same
+//     simd_sum, the same 1/sqrt(mean + eps) scale.  (It reads the mirror and
+//     not the device array so that the fast path and the watchdog path below
+//     share one reduce and agree by construction.)
+//   * The gate block, the Sinkhorn call, the collapse accumulation order, the
+//     1024-thread sumsq tree, the rsqrt and the slice store loop are
+//     kernel_glm53_hc_reduce_wsum_repl_alg's, character for character; only
+//     the collapse's four x loads come from registers prefetched before the
+//     wait instead of being issued inside the loop, which changes when they
+//     are issued and not what they are.
+//
+// Watchdog.  If the arrival wait exceeds its spin cap the tail threadgroup
+// does NOT give up: it recomputes all out_dim*n_slices partials and all
+// n_slices sums of squares itself, one simdgroup per (out_row, slice) in P
+// rounds of 32 -- the same per-slice lane stride and the same eight-way order
+// the producers use -- into the same threadgroup mirror, and the reduce
+// proceeds unchanged.  The recovered values are bit-identical to the fast
+// path's, so a watchdog firing costs time and nothing else.  Slow, never
+// wrong.  DS4_GLM_HC_TAIL_SPIN_CAP=0 forces it for testing.
+//
+// Counters (hc_tail_counters, the same 512-byte tensor half B uses; the host
+// refuses this path whenever half B is active or the encoder is concurrent,
+// so the two never share a dispatch).  counters[0] is the producer arrival
+// count and counters[1] the retirement count of the WHOLE grid.  The last of
+// the P+T threadgroups to retire zeroes both.  Counting retirements over the
+// whole grid rather than over the tail alone is what makes the re-arm safe on
+// the watchdog path: a tail threadgroup that gives up on the wait can reach
+// its retirement before a producer has incremented counters[0], and a re-arm
+// keyed on the tail alone would then zero the counter with producer
+// increments still to come and leave the NEXT dispatch's tail believing the
+// producers had already arrived.
+//
+// Threadgroup memory: the replicated tail's layout (the host's 17776-byte
+// formula) plus MIX_SLOTS*n_slices + DS4_GLM53_HC_PRE_SUMSQ_SLOTS floats for
+// the partials mirror.  The host extends its size formula for this kernel
+// only.  The tail borrows the unused phase-A slot (norm_shmem[0]) as the
+// watchdog control word.
+// ---------------------------------------------------------------------------
+kernel void kernel_glm53_hc_pre_onepass_alg(
+        constant ds4_metal_args_hc_norm_mix & norm_args,
+        constant glm53_bf16_splitk_args     & args,
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
+        constant uint      & spin_cap,
+        device const ushort * weights,
+        device const float  * x,
+        device atomic_uint  * partials,
+        device atomic_uint  * counters,
+        device       char   * mixes,
+        device const float  * hc_scale,
+        device const float  * hc_base,
+        device       char   * split,
+        device       char   * collapse_dst,
+        device const char   * norm_weight,
+        device       char   * norm_dst,
+        threadgroup  char   * shmem [[threadgroup(0)]],
+        uint   tgx   [[threadgroup_position_in_grid]],
+        uint   n_tgs [[threadgroups_per_grid]],
+        ushort tid   [[thread_position_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    constexpr short NW        = DS4_HC_PRE_FUSED_NW;
+    constexpr short NSG       = DS4_HC_PRE_FUSED_NSG;
+    constexpr short NCLUSTER  = DS4_HC_PRE_FUSED_NCLUSTER;
+    constexpr short NR0       = DS4_HC_PRE_FUSED_NR0;
+    constexpr short MIX_SLOTS = DS4_HC_PRE_FUSED_MIX;
+
+    const uint n_embd = uint(split_args.n_embd);
+    const uint n4 = n_embd >> 2;
+    const uint P  = (args.out_dim * args.n_slices) / (uint)NSG;
+
+    // Uniform gates: every thread of every threadgroup takes the same branch,
+    // so a refusal refuses the whole dispatch rather than stranding the
+    // counters.  ntg is pinned to the shipped tail's 1024 so the replicated
+    // sumsq tree is the shipped tree, and n4 == ntg so every collapse thread
+    // owns exactly one float4 and can prefetch it before the wait.
+    if (norm_args.n != (int32_t)args.in_dim || args.in_dim != 16384u ||
+        args.out_dim != (uint)MIX_SLOTS || args.n_rows != 1u ||
+        args.n_slices == 0u || args.n_slices > 32u ||
+        (args.out_dim * args.n_slices) % (uint)NSG != 0u ||
+        ntg != (ushort)(NSG*NW) || nsg != (ushort)NSG ||
+        split_args.n_rows != 1 || split_args.n_hc != 4 ||
+        (split_args.n_embd & 3) != 0 ||
+        n4 != (uint)ntg || n_tgs < P + 2u) {
+        return;
+    }
+
+    // ---- Producer threadgroups: kernel_glm53_hc_rms_splitk_alg's body -----
+    // Kernel A's `out_row >= out_dim || token >= n_rows` guard is absent
+    // because the gate above pins the grid: P*NSG == out_dim*n_slices, so
+    // flat < out_dim*n_slices for every simdgroup and n_rows is 1.  Its
+    // k0 >= in_dim guard becomes an if/else rather than a return, because the
+    // threadgroup barrier below has to be reached by every thread.
+    if (tgx < P) {
+        const uint flat = tgx * (uint)nsg + sgitg;
+        const uint out_row = flat / args.n_slices;
+        const uint slice = flat - out_row * args.n_slices;
+        const ulong slot = (ulong)out_row * args.n_slices + slice;
+        const uint per = (args.in_dim + args.n_slices - 1u) / args.n_slices;
+        const uint k0 = slice * per;
+        // The simdgroup that owns this slice's sum of squares: exactly one per
+        // slice, spread over out_rows so the extra pass does not land in one
+        // threadgroup.
+        const bool own_ss = (out_row == (slice % args.out_dim));
+        device atomic_uint *sumsq = partials + glm53_hc_alg_sumsq_base(args);
+        if (k0 >= args.in_dim) {
+            if (tiisg == 0u) {
+                atomic_store_explicit(&partials[slot], as_type<uint>(0.0f),
+                                      memory_order_relaxed);
+                if (own_ss) {
+                    atomic_store_explicit(&sumsq[slice], as_type<uint>(0.0f),
+                                          memory_order_relaxed);
+                }
+            }
+        } else {
+            const uint kend = min(k0 + per, args.in_dim);
+            device const ushort *w = weights + (ulong)out_row * args.in_dim;
+            device const float *xr = x;
+            float sum = 0.0f;
+            uint k = k0 + tiisg;
+            for (; k + 224u < kend; k += 256u) {
+                const ushort w0 = w[k];
+                const ushort w1 = w[k + 32u];
+                const ushort w2 = w[k + 64u];
+                const ushort w3 = w[k + 96u];
+                const ushort w4 = w[k + 128u];
+                const ushort w5 = w[k + 160u];
+                const ushort w6 = w[k + 192u];
+                const ushort w7 = w[k + 224u];
+                const float x0 = xr[k];
+                const float x1 = xr[k + 32u];
+                const float x2 = xr[k + 64u];
+                const float x3 = xr[k + 96u];
+                const float x4v = xr[k + 128u];
+                const float x5 = xr[k + 160u];
+                const float x6 = xr[k + 192u];
+                const float x7 = xr[k + 224u];
+                sum = fma(glm53_bf16_to_f32(w0), x0, sum);
+                sum = fma(glm53_bf16_to_f32(w1), x1, sum);
+                sum = fma(glm53_bf16_to_f32(w2), x2, sum);
+                sum = fma(glm53_bf16_to_f32(w3), x3, sum);
+                sum = fma(glm53_bf16_to_f32(w4), x4v, sum);
+                sum = fma(glm53_bf16_to_f32(w5), x5, sum);
+                sum = fma(glm53_bf16_to_f32(w6), x6, sum);
+                sum = fma(glm53_bf16_to_f32(w7), x7, sum);
+            }
+            for (; k < kend; k += 32u) {
+                sum = fma(glm53_bf16_to_f32(w[k]), xr[k], sum);
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0u) {
+                atomic_store_explicit(&partials[slot], as_type<uint>(sum),
+                                      memory_order_relaxed);
+            }
+
+            // Sum of squares over this slice, in the same lane stride and the
+            // same eight-way order as the dot above.
+            if (own_ss) {
+                float ss = 0.0f;
+                uint j = k0 + tiisg;
+                for (; j + 224u < kend; j += 256u) {
+                    const float x0 = xr[j];
+                    const float x1 = xr[j + 32u];
+                    const float x2 = xr[j + 64u];
+                    const float x3 = xr[j + 96u];
+                    const float x4v = xr[j + 128u];
+                    const float x5 = xr[j + 160u];
+                    const float x6 = xr[j + 192u];
+                    const float x7 = xr[j + 224u];
+                    ss = fma(x0, x0, ss);
+                    ss = fma(x1, x1, ss);
+                    ss = fma(x2, x2, ss);
+                    ss = fma(x3, x3, ss);
+                    ss = fma(x4v, x4v, ss);
+                    ss = fma(x5, x5, ss);
+                    ss = fma(x6, x6, ss);
+                    ss = fma(x7, x7, ss);
+                }
+                for (; j < kend; j += 32u) {
+                    ss = fma(xr[j], xr[j], ss);
+                }
+                ss = simd_sum(ss);
+                if (tiisg == 0u) {
+                    atomic_store_explicit(&sumsq[slice], as_type<uint>(ss),
+                                          memory_order_relaxed);
+                }
+            }
+        }
+
+        // Writer side of the handoff: retire this threadgroup's partial
+        // stores before its arrival becomes visible.
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                            thread_scope_device);
+        if (tid == 0u) {
+            atomic_fetch_add_explicit(&counters[0], 1u, memory_order_relaxed);
+            // Orders this threadgroup's arrival before its retirement, so the
+            // grid's last retirement really does follow every arrival.
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                                thread_scope_device);
+            glm53_hc_onepass_retire(counters, n_tgs);
+        }
+        return;
+    }
+
+    // ---- Tail threadgroups: kernel_glm53_hc_reduce_wsum_repl_alg ----------
+    const uint k = tgx - P;              // 0 = comb threadgroup, 1..T-1 collapse
+    const uint T = n_tgs - P;
+
+    threadgroup float  *mix_shmem  = (threadgroup float *)shmem;
+    threadgroup float  *norm_shmem = mix_shmem  + MIX_SLOTS;
+    threadgroup float  *mv_shmem   = norm_shmem + NW;
+    threadgroup float4 *row_shmem  =
+        (threadgroup float4 *)(mv_shmem + NCLUSTER*NR0*NW);
+    threadgroup float  *pre_shmem  =
+        (threadgroup float *)row_shmem + split_args.n_embd;
+    threadgroup float  *sum_shmem  = pre_shmem + 4;
+    // norm_shmem is phase A's partial array and no tail has a phase A, so its
+    // first slot is free for the watchdog control word.
+    threadgroup float  *ctrl       = norm_shmem;
+    // The threadgroup mirror of the device partials array, laid out exactly
+    // like it: MIX_SLOTS*n_slices partials then the per-slice sums of squares.
+    threadgroup float  *fb         = sum_shmem + NW;
+
+    device const char  *xc = (device const char *)x;
+    device const float4 *x0 = (device const float4 *)(xc + 0 * split_args.nb_x1);
+    device const float4 *x1 = (device const float4 *)(xc + 1 * split_args.nb_x1);
+    device const float4 *x2 = (device const float4 *)(xc + 2 * split_args.nb_x1);
+    device const float4 *x3 = (device const float4 *)(xc + 3 * split_args.nb_x1);
+
+    // Prefetch while the producers are still running: n4 == ntg, so this
+    // thread's single float4 of each of the four HC streams.  The comb
+    // threadgroup takes no collapse slice and needs none of them.
+    float4 r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+    if (k != 0u) {
+        r0 = x0[tid];
+        r1 = x1[tid];
+        r2 = x2[tid];
+        r3 = x3[tid];
+    }
+
+    // ---- Wait for the producers ------------------------------------------
+    if (tid == 0u) {
+        ctrl[0] = 0.0f;
+        // The cap is tested BEFORE the counter is read, so spin_cap == 0 puts
+        // every tail threadgroup on the recovery path unconditionally, which
+        // is what makes the recovery path testable at all.
+        uint spins = 0u;
+        for (;;) {
+            if (spins >= spin_cap) {
+                ctrl[0] = 1.0f;
+                break;
+            }
+            if (atomic_load_explicit(&counters[0],
+                                     memory_order_relaxed) >= P) {
+                break;
+            }
+            ++spins;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+    // Reader side of the handoff.
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                        thread_scope_device);
+
+    const uint ss_base = glm53_hc_alg_sumsq_base(args);
+    if (ctrl[0] == 0.0f) {
+        // Pull the published words through the coherent path into the mirror,
+        // bit pattern for bit pattern.
+        for (uint idx = tid; idx < ss_base + args.n_slices; idx += ntg) {
+            fb[idx] = as_type<float>(
+                atomic_load_explicit(&partials[idx], memory_order_relaxed));
+        }
+    } else {
+        // Watchdog recovery: recompute every partial and every slice sum of
+        // squares in this threadgroup, one simdgroup per (out_row, slice) in
+        // P rounds of 32, in the same per-slice lane stride and the same
+        // eight-way order the producers use, so the mirror is bit-identical
+        // to what the fast path would have read.  Slow, never wrong.
+        for (uint r = 0; r < P; ++r) {
+            const uint flat = r * (uint)nsg + sgitg;
+            const uint out_row = flat / args.n_slices;
+            const uint slice = flat - out_row * args.n_slices;
+            const uint slot = out_row * args.n_slices + slice;
+            const uint per = (args.in_dim + args.n_slices - 1u) / args.n_slices;
+            const uint k0 = slice * per;
+            const bool own_ss = (out_row == (slice % args.out_dim));
+            if (k0 >= args.in_dim) {
+                if (tiisg == 0u) {
+                    fb[slot] = 0.0f;
+                    if (own_ss) fb[ss_base + slice] = 0.0f;
+                }
+                continue;
+            }
+            const uint kend = min(k0 + per, args.in_dim);
+            device const ushort *w = weights + (ulong)out_row * args.in_dim;
+            device const float *xr = x;
+            float sum = 0.0f;
+            uint kk = k0 + tiisg;
+            for (; kk + 224u < kend; kk += 256u) {
+                const ushort w0 = w[kk];
+                const ushort w1 = w[kk + 32u];
+                const ushort w2 = w[kk + 64u];
+                const ushort w3 = w[kk + 96u];
+                const ushort w4 = w[kk + 128u];
+                const ushort w5 = w[kk + 160u];
+                const ushort w6 = w[kk + 192u];
+                const ushort w7 = w[kk + 224u];
+                const float a0 = xr[kk];
+                const float a1 = xr[kk + 32u];
+                const float a2 = xr[kk + 64u];
+                const float a3 = xr[kk + 96u];
+                const float a4 = xr[kk + 128u];
+                const float a5 = xr[kk + 160u];
+                const float a6 = xr[kk + 192u];
+                const float a7 = xr[kk + 224u];
+                sum = fma(glm53_bf16_to_f32(w0), a0, sum);
+                sum = fma(glm53_bf16_to_f32(w1), a1, sum);
+                sum = fma(glm53_bf16_to_f32(w2), a2, sum);
+                sum = fma(glm53_bf16_to_f32(w3), a3, sum);
+                sum = fma(glm53_bf16_to_f32(w4), a4, sum);
+                sum = fma(glm53_bf16_to_f32(w5), a5, sum);
+                sum = fma(glm53_bf16_to_f32(w6), a6, sum);
+                sum = fma(glm53_bf16_to_f32(w7), a7, sum);
+            }
+            for (; kk < kend; kk += 32u) {
+                sum = fma(glm53_bf16_to_f32(w[kk]), xr[kk], sum);
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0u) fb[slot] = sum;
+
+            if (own_ss) {
+                float ss = 0.0f;
+                uint j = k0 + tiisg;
+                for (; j + 224u < kend; j += 256u) {
+                    const float a0 = xr[j];
+                    const float a1 = xr[j + 32u];
+                    const float a2 = xr[j + 64u];
+                    const float a3 = xr[j + 96u];
+                    const float a4 = xr[j + 128u];
+                    const float a5 = xr[j + 160u];
+                    const float a6 = xr[j + 192u];
+                    const float a7 = xr[j + 224u];
+                    ss = fma(a0, a0, ss);
+                    ss = fma(a1, a1, ss);
+                    ss = fma(a2, a2, ss);
+                    ss = fma(a3, a3, ss);
+                    ss = fma(a4, a4, ss);
+                    ss = fma(a5, a5, ss);
+                    ss = fma(a6, a6, ss);
+                    ss = fma(a7, a7, ss);
+                }
+                for (; j < kend; j += 32u) {
+                    ss = fma(xr[j], xr[j], ss);
+                }
+                ss = simd_sum(ss);
+                if (tiisg == 0u) fb[ss_base + slice] = ss;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // glm53_hc_alg_mix_reduce<true> over the mirror: the same ss load issued
+    // first, the same float4-grouped addends in the same order, the same
+    // simd_sum and the same 1/sqrt(mean + eps).
+    if (sgitg == 0) {
+        float ss = 0.0f;
+        {
+            threadgroup const float *ssp = fb + ss_base;
+            ss = (tiisg < (ushort)args.n_slices) ? ssp[tiisg] : 0.0f;
+        }
+
+        float sum = 0.0f;
+        const bool live = tid < (ushort)(args.out_dim * args.n_rows);
+        if (live) {
+            threadgroup const float *p = fb + (uint)tid * args.n_slices;
+            const uint ns4 = args.n_slices >> 2;
+            threadgroup const float4 *p4 = (threadgroup const float4 *)p;
+            for (uint s = 0; s < ns4; s++) {
+                const float4 v = p4[s];
+                sum += v.x; sum += v.y; sum += v.z; sum += v.w;
+            }
+            for (uint s = ns4 << 2; s < args.n_slices; s++) sum += p[s];
+        }
+
+        // Fixed slice order: lane i holds slice i.
+        ss = simd_sum(ss);
+        const float mean = ss / (float)args.in_dim;
+        sum = sum * (1.0f/sqrt(mean + norm_args.eps));
+
+        if (live) {
+            mix_shmem[tid] = sum;
+            if (k == 0u) ((device float *)mixes)[tid] = sum;
+        }
+        sum_shmem[tiisg] = 0.0f;
+    }
+
+    // Publishes the mix values; mem_device covers the comb threadgroup's own
+    // hc_mix row store, which ds4_hc_comb_weights4_exact reads back below.
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    device float *out = (device float *)split;
+
+    if (tid == 0) {
+        const float epsv       = split_args.eps;
+        const float pre_scale  = hc_scale[0];
+        const float4 base_pre  = *((device const float4 *)hc_base);
+
+        const float4 pre_z =
+            *((threadgroup const float4 *)mix_shmem) * pre_scale + base_pre;
+        const float4 pre = 1.0f / (1.0f + exp(-pre_z)) + epsv;
+        pre_shmem[0] = pre.x;
+        pre_shmem[1] = pre.y;
+        pre_shmem[2] = pre.z;
+        pre_shmem[3] = pre.w;
+
+        if (k == 0u) {
+            const float post_scale = hc_scale[1];
+            const float4 base_post = *((device const float4 *)(hc_base + 4));
+            *((device float4 *)out) = pre;
+            const float4 post_z =
+                *((threadgroup const float4 *)(mix_shmem + 4)) * post_scale +
+                base_post;
+            *((device float4 *)(out + 4)) = 2.0f / (1.0f + exp(-post_z));
+        }
+    }
+
+    if (k == 0u) {
+        if (tid == 0) {
+            ds4_hc_comb_weights4_exact(
+                split_args, (device volatile const float *)mixes,
+                hc_scale, hc_base, out);
+            glm53_hc_onepass_retire(counters, n_tgs);
+        }
+        return;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Replicated collapse and replicated RMS reduction: the shipped tail's
+    // expression order, over the residual float4s prefetched above.
+    float sumf = 0.0f;
+    {
+        // Preserve the standalone HC collapse's explicit accumulation order.
+        float4 v = 0.0f;
+        v += r0 * pre_shmem[0];
+        v += r1 * pre_shmem[1];
+        v += r2 * pre_shmem[2];
+        v += r3 * pre_shmem[3];
+        row_shmem[tid] = v;
+        sumf += dot(v, v);
+    }
+
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sum_shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = sum_shmem[tiisg];
+    sumf = simd_sum(sumf);
+    const float norm_arg = sumf / float(n_embd) + split_args.norm_eps;
+    const float norm_scale = split_args.n_rows > 1 ? 1.0f / sqrt(norm_arg)
+                                                   : rsqrt(norm_arg);
+
+    const uint ncol = T - 1u;
+    const uint kc   = k - 1u;
+    const uint per  = (n4 + ncol - 1u) / ncol;
+    const uint i0   = kc * per;
+    const uint i1   = min(i0 + per, n4);
+
+    device float4 *dst4 = (device float4 *)collapse_dst;
+    device const float4 *w4 = (device const float4 *)norm_weight;
+    device float4 *norm4 = (device float4 *)norm_dst;
+    for (uint i = i0 + tid; i < i1; i += ntg) {
+        const float4 v = row_shmem[i];
+        dst4[i] = v;
+        norm4[i] = (v * norm_scale) * w4[i];
+    }
+
+    if (tid == 0) glm53_hc_onepass_retire(counters, n_tgs);
+}
+
+
 // ---------------------------------------------------------------------------
 // Half B: the sliced decode HC-pre tail.
 //

@@ -55970,6 +55970,7 @@ static bool glm_graph_streaming_decode_sync_each_layer(void) {
 glm_levers g_glm_levers = {
     .decode_flush_interval = -1, /* -1 = the interval resolved at the call site */
     .hc_pre_algebra_a      = 1,
+    .hc_pre_onepass        = 1,
 };
 static int g_glm_levers_ready;
 
@@ -55982,6 +55983,7 @@ static int glm_lever_counted(const char *name) {
 static const struct { const char *name; size_t off; const char *env; } g_glm_lever_map[] = {
     { "decode_flush_interval", offsetof(glm_levers, decode_flush_interval), "DS4_GLM_DECODE_FLUSH_INTERVAL" },
     { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
+    { "hc_pre_onepass",        offsetof(glm_levers, hc_pre_onepass),        "DS4_GLM_DISABLE_HC_PRE_ONEPASS" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56001,6 +56003,9 @@ void glm_levers_init_from_env(void) {
      * default-off half.  DS4_GLM_EXACT still clamps the dispatch off, where it
      * always did, in ds4_gpu_glm53_hc_alg_flag(). */
     g_glm_levers.hc_pre_algebra_a = getenv("DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A") == NULL;
+    /* H1's one-dispatch hc_pre is compiled in default-on as well, so its
+     * resolution is the same "the DISABLE_ variable is unset". */
+    g_glm_levers.hc_pre_onepass = getenv("DS4_GLM_DISABLE_HC_PRE_ONEPASS") == NULL;
     g_glm_levers_ready = 1;
 }
 
