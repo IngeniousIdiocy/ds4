@@ -43284,37 +43284,7 @@ int ds4_gpu_glm_router_shared_gateup_fold_tensor(
                                                        sh_bytes, &up_inner);
         if (!wbuf || !biasbuf || !gatebuf || !upbuf) return 0;
 
-        /* T2 proposal 3, lever shg_split.  The shipped fold packs TWO virtual
-         * NSG-4 cohorts into each 256-thread threadgroup, so the shared half
-         * contributes n_ff_exp/4 threadgroups of four rows and the whole grid
-         * is 656 threadgroups -- about eight per core, one wave, in which the
-         * heterogeneity between a short F32 router threadgroup and a long Q8
-         * shared one is fully exposed because there is no later wave to absorb
-         * it.  One NSG-8 cohort per threadgroup halves the rows per
-         * threadgroup and doubles the shared threadgroup count, taking the grid
-         * to 1168.  The arrival-ordered ticket is unchanged (still counted over
-         * the same n_router_groups router threadgroups, still electing the last
-         * arrival), so the elected threadgroup's work and the router outputs
-         * are untouched; what changes is the shared rows' summation order, and
-         * that alone makes it Tier 2.  Read live; the exact umbrella clamps it
-         * back to the shipped packing. */
-        int shg_split = 0;
-        {
-            glm_levers_init_from_env();
-            shg_split = g_glm_levers.shg_split != 0 && !glm53_exact_mode() &&
-                        nsg == 8u && (n_ff_exp % 2u) == 0u;
-        }
-        id<MTLComputePipelineState> pipeline = nil;
-        if (shg_split) {
-            pipeline = ds4_gpu_get_mul_mv_pipeline(
-                "kernel_glm_t2s_router_shared_gateup_fold_nsg8", (int16_t)nsg);
-            if (!pipeline) {
-                fprintf(stderr, "ds4: SHGSPLIT pipeline unavailable; using production\n");
-                shg_split = 0;
-            }
-        }
-        if (!pipeline)
-        pipeline = ds4_gpu_get_mul_mv_pipeline(
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
             "kernel_glm_router_shared_gateup_fold", (int16_t)nsg);
         if (!pipeline) DS4_RSF_REFUSE(13);
 
@@ -43331,15 +43301,14 @@ int ds4_gpu_glm_router_shared_gateup_fold_tensor(
             .pad0 = 0,
         };
         const uint32_t n_router_groups = (n_expert + 1u) / 2u;
-        const uint32_t n_cohorts = shg_split ? 1u : 2u;
-        const uint32_t n_shared_groups = n_ff_exp / (2u * n_cohorts);
-        /* The router tail reuses the matvec's threadgroup scratch and each
-         * shared cohort wants a slice; the allocation is the max of the three,
-         * exactly as the two dispatchers compute it today. */
+        const uint32_t n_shared_groups = n_ff_exp / 4u;
+        /* The router tail reuses the matvec's threadgroup scratch and the two
+         * shared cohorts want a slice each; the allocation is the max of the
+         * three, exactly as the two dispatchers compute it today. */
         const NSUInteger select_scratch =
             (NSUInteger)n_expert * sizeof(float) +
             (NSUInteger)nsg * n_expert_used * (sizeof(float) + sizeof(int32_t));
-        const NSUInteger cohort_scratch = n_cohorts * (2u * q8_dispatch.smem);
+        const NSUInteger cohort_scratch = 2u * (2u * q8_dispatch.smem);
         NSUInteger scratch = select_scratch > cohort_scratch ?
             select_scratch : cohort_scratch;
         if (scratch < mv_dispatch.smem) scratch = mv_dispatch.smem;
@@ -43373,15 +43342,6 @@ int ds4_gpu_glm_router_shared_gateup_fold_tensor(
         [enc setBytes:&swiglu_clamp length:sizeof(swiglu_clamp) atIndex:18];
         [enc setThreadgroupMemoryLength:scratch atIndex:0];
         [enc setThreadgroupMemoryLength:sizeof(uint32_t) atIndex:1];
-        {
-            static ds4_t2s_slot slot = { "SHGSPLIT", 0, 0 };
-            ds4_t2s_hit(&slot, "%s cohorts=%u tgs=%llu",
-                        shg_split ?
-                            "kernel_glm_t2s_router_shared_gateup_fold_nsg8" :
-                            "kernel_glm_router_shared_gateup_fold(prod)",
-                        n_cohorts,
-                        (unsigned long long)(n_router_groups + n_shared_groups));
-        }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_router_groups +
                                               (NSUInteger)n_shared_groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];

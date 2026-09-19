@@ -56136,7 +56136,6 @@ glm_levers g_glm_levers = {
     .attn_block_rows       = 128,/* deep split geometry, as shipped */
     .sdn_ptail             = 0,  /* off: today's single-lane SDN epilogue */
     .hcx_nr0               = 2,  /* rows per threadgroup, as shipped */
-    .shg_split             = 0,  /* off: two NSG-4 cohorts per threadgroup */
 };
 static int g_glm_levers_ready;
 
@@ -56182,7 +56181,6 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "attn_block_rows",       offsetof(glm_levers, attn_block_rows),       "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP" },
     { "sdn_ptail",             offsetof(glm_levers, sdn_ptail),             "DS4_GLM_SDN_PTAIL" },
     { "hcx_nr0",               offsetof(glm_levers, hcx_nr0),               "DS4_GLM_HCX_NR0" },
-    { "shg_split",             offsetof(glm_levers, shg_split),             "DS4_GLM_SHG_SPLIT" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56253,7 +56251,6 @@ void glm_levers_init_from_env(void) {
             }
         }
     }
-    g_glm_levers.shg_split = getenv("DS4_GLM_SHG_SPLIT") != NULL;
     g_glm_levers_ready = 1;
 }
 

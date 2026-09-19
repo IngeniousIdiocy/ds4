@@ -803,16 +803,6 @@ typedef struct {
      * screen.  Costs one extra read of the activation vector per row.
      * DS4_GLM_HCX_NR0 sets it at startup. */
     int hcx_nr0;
-    /* T2 proposal 3: the router + shared gate/up fold's shared half as ONE
-     * NSG-8 cohort per 256-thread threadgroup instead of two NSG-4 cohorts
-     * (ds4_metal.m, metal/glm53_moe_block.metal), which takes the fold's grid
-     * from 656 threadgroups to 1168 and halves the rows per threadgroup.
-     * Default off.  TIER 2, deliberately: the arrival-ordered ticket, the
-     * elected threadgroup's work and every router output are unchanged, but
-     * NSG sets each lane's K-block stride, so the shared rows' dot products
-     * are summed in a different order.  DS4_GLM_EXACT clamps it off.
-     * DS4_GLM_SHG_SPLIT turns it on at startup. */
-    int shg_split;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
