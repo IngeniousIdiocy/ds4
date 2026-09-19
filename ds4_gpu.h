@@ -210,12 +210,17 @@ int ds4_gpu_chain_staged_count(void);
 int ds4_gpu_chain_last_step_cbs(void);
 double ds4_gpu_chain_last_cb_gpu_end_ms(void);
 double ds4_gpu_chain_last_cb_gpu_span_ms(void);
+/* GPUStartTime of the step's last command buffer, same clock as
+ * ds4_gpu_clock_ms(): how long it sat in the queue before it ran. */
+double ds4_gpu_chain_last_cb_gpu_start_ms(void);
 void ds4_gpu_chain_trace_reset(void);
-/* Wait for the last committed step.  spin_us > 0 polls the shared event's
- * signaledValue first; the blocking fallback is the classic path's
+/* Commit the first n staged command buffers, leaving the rest staged. */
+int ds4_gpu_chain_commit_staged_prefix(int n);
+/* Drop the transient buffers below `mark` without joining the queue. */
+void ds4_gpu_chain_release_transients(unsigned long mark);
+/* Wait for the last committed step, with the classic path's primitive:
  * [cb waitUntilCompleted]. */
-int ds4_gpu_chain_wait_step(uint64_t event_value, uint32_t spin_us,
-                            const char *label);
+int ds4_gpu_chain_wait_step(const char *label);
 /* Compile the selector pipelines outside the decode loop. */
 int ds4_gpu_glm53_select_warm(void);
 #endif

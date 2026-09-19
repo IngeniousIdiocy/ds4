@@ -41563,6 +41563,10 @@ typedef struct ds4_glm_gpu_graph {
      * prefill_tokens, which is what the next step embeds from. */
     ds4_gpu_tensor *select_ring;
     ds4_gpu_tensor *select_parts;
+    /* Commit-ahead: armed by the chain for the step it is encoding, cleared by
+     * the first KDA layer, which flushes there so the step's prologue becomes
+     * a command buffer of its own. */
+    int chain_split_armed;
 #endif
     ds4_gpu_tensor *batch_router_logits;
     ds4_gpu_tensor *batch_router_probs;
@@ -45289,13 +45293,8 @@ static bool glm53_graph_hc_pre(
      * the cost of a second dispatch and a different summation order. Because
      * the order changes, it stays off unless asked for, and it takes the
      * unfused ladder so the split-K matvec is the mix step. */
-    /* Campaign lever hc_pre_single: 1 takes the split-K mixer out, which hands
-     * the stage to the one-dispatch compound producer below.  The historical
-     * kill switch is unchanged and still wins on its own. */
-    glm_levers_init_from_env();
     const bool splitk_mix = hc_mix_bf16 &&
         g->hc_mix_partials != NULL &&
-        !g_glm_levers.hc_pre_single &&
         getenv("DS4_GLM_DISABLE_HC_MIX_SPLITK") == NULL;
     const bool fuse_single = fuse_norm && !splitk_mix &&
         (fn->type == DS4_TENSOR_F16 || hc_mix_bf16) &&
@@ -45345,9 +45344,9 @@ static bool glm53_graph_hc_pre(
     (void)hc_mix_bf16;
     (void)splitk_mix;
     (void)fuse_refuse;
-    /* Logged on the first call and again whenever the selection changes: with
-     * hc_pre_single live, a server that ran both arms would otherwise report
-     * only the first one's path. */
+    /* Logged on the first call and again whenever the selection changes: a
+     * server whose kill switches differ between runs would otherwise report
+     * only the first path it took. */
     const int fusion_state =
         (int)fuse_norm_mix | ((int)fuse_norm << 1) | ((int)fuse_single << 2) |
         ((int)splitk_mix << 3) | ((int)fuse_refuse << 4) |
@@ -45934,6 +45933,19 @@ static bool glm53_graph_kda_attention(
             g->kda_output_gate, model, l->kda_g_b,
             DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
     bool kda_split_done = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* C2 commit-ahead cut.  Everything encoded up to here -- the embedding,
+     * the hc_pre stage, this layer's norm and its projections -- writes only
+     * per-step scratch; the dispatches below are the first that mutate state
+     * the host would have to disown if it stopped at the previous token (the
+     * conv shift and the recurrent update, both in place).  Cutting the
+     * command buffer here lets the chain commit the prologue before it has
+     * confirmed the previous token, with nothing to roll back. */
+    if (ok && g->chain_split_armed) {
+        g->chain_split_armed = 0;
+        ok = ds4_gpu_flush_commands() != 0;
+    }
+#endif
 #if defined(__APPLE__)
     if (ok && !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_KDA_CORE) &&
         glm53_kda_split_enabled() && g->kda_split_scratch) {
@@ -56053,8 +56065,7 @@ glm_levers g_glm_levers = {
     .decode_ablate         = 0,
     .decode_concurrent     = 1,
     .chain_decode          = 0,  /* off until the C2 gates adopt it */
-    .chain_spin_us         = 0,  /* block on the command buffer straight away */
-    .hc_pre_single         = 0,  /* the split-K refuse pair, as shipped */
+    .chain_commit_ahead    = 0,  /* off until the commit-ahead arm is measured */
 };
 static int g_glm_levers_ready;
 
@@ -56063,7 +56074,6 @@ static int g_glm_levers_ready;
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 8191; return 1; }
-    if (!strcmp(name, "chain_spin_us")) { *lo = 0; *hi = 100000; return 1; }
     return 0;
 }
 
@@ -56073,8 +56083,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_ablate",         offsetof(glm_levers, decode_ablate),         "DS4_GLM_DECODE_ABLATE_MASK" },
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_CHAIN_DECODE" },
-    { "chain_spin_us",         offsetof(glm_levers, chain_spin_us),         "DS4_GLM_CHAIN_SPIN_US" },
-    { "hc_pre_single",         offsetof(glm_levers, hc_pre_single),         "DS4_GLM_DISABLE_HC_MIX_SPLITK" },
+    { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_CHAIN_COMMIT_AHEAD" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56102,20 +56111,8 @@ void glm_levers_init_from_env(void) {
     g_glm_levers.chain_decode =
         getenv("DS4_GLM_CHAIN_DECODE") != NULL &&
         getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
-    {   const char *v = getenv("DS4_GLM_CHAIN_SPIN_US");
-        if (v && v[0]) {
-            int lo = 0, hi = 0, n = atoi(v);
-            (void)glm_lever_range("chain_spin_us", &lo, &hi);
-            if (n < lo) n = lo;
-            if (n > hi) n = hi;
-            g_glm_levers.chain_spin_us = n;
-        }
-    }
-    /* The historical variable turns the split-K mixer off, which is exactly
-     * what this lever does, so the lever reports the environment's choice at
-     * startup.  The call site still tests the variable itself, so unsetting
-     * the lever afterwards cannot re-enable split-K against it. */
-    g_glm_levers.hc_pre_single = getenv("DS4_GLM_DISABLE_HC_MIX_SPLITK") != NULL;
+    g_glm_levers.chain_commit_ahead =
+        getenv("DS4_GLM_CHAIN_COMMIT_AHEAD") != NULL;
     g_glm_levers_ready = 1;
 }
 
@@ -56151,7 +56148,7 @@ int glm_levers_set(const char *name, int value) {
                 /* decode_flush_interval: -1 restores the call site's own
                  * default, 0 disables the flushes, and the graph clamps
                  * anything above the layer count.  decode_ablate is a
-                 * bitmask and chain_spin_us a microsecond budget. */
+                 * bitmask. */
                 if (value < lo || value > hi) return 0;
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value;
             } else {
@@ -74641,6 +74638,12 @@ struct ds4_chain {
     bool             have_id;
     int              pending_id;
     int              violations;
+    double           t_committed;      /* clock at the last commit, ms */
+    /* Commit-ahead (lever chain_commit_ahead): the step's prologue goes to the
+     * GPU at encode time; only the part that mutates session state waits for
+     * the confirm. */
+    bool             commit_ahead;
+    long             ahead_cbs;
     bool             verify;
     long             verify_checked;
     long             verify_mismatch;
@@ -74698,6 +74701,12 @@ ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
     ch->p = *p;
     ch->verify = getenv("DS4_GLM_CHAIN_VERIFY") != NULL;
     ch->trace = getenv("DS4_GLM_CHAIN_TRACE") != NULL;
+    glm_levers_init_from_env();
+    /* The cut lands in the first layer, so commit-ahead needs that layer to be
+     * a KDA layer: on any other the prologue would already have written the
+     * step's KV row and the indexer's pooled-key tail. */
+    ch->commit_ahead = g_glm_levers.chain_commit_ahead != 0 &&
+        ds4_glm53_layer_is_kda(s->glm_graph.layer_start);
     ch->violations = ds4_gpu_chain_violations();
     ds4_gpu_chain_trace_reset();
     /* Compile the selector pipelines here rather than inside the first step,
@@ -74775,9 +74784,11 @@ static int ds4_chain_encode_step(ds4_chain *ch, int token,
         return 1;
     }
     const double t_encode0 = ch->trace ? now_sec() : 0.0;
+    g->chain_split_armed = ch->commit_ahead ? 1 : 0;
     if (!glm_graph_forward_token_sel(g, &e->model, &e->weights,
                                      token < 0 ? 0 : token,
                                      NULL, pos, NULL, s->logits, false, &sel)) {
+        g->chain_split_armed = 0;
         if (errlen) snprintf(err, errlen, "%s GLM chain decode failed",
                              ds4_backend_name(e->backend));
         ds4_chain_invalidate(ch);
@@ -74788,6 +74799,16 @@ static int ds4_chain_encode_step(ds4_chain *ch, int token,
                              "GLM chain decode lost its confirmation gate");
         ds4_chain_invalidate(ch);
         return 1;
+    }
+    g->chain_split_armed = 0;
+    /* Commit everything but the last command buffer: the prologue runs as soon
+     * as the step in flight is done, and the step's tail -- which is what
+     * mutates the session -- stays staged until the host confirms. */
+    if (ch->commit_ahead) {
+        const int staged = ds4_gpu_chain_staged_count();
+        if (staged > 1) {
+            ch->ahead_cbs += ds4_gpu_chain_commit_staged_prefix(staged - 1);
+        }
     }
     if (ch->trace) ch->t_encode = (now_sec() - t_encode0) * 1000.0;
     ch->staged = true;
@@ -74817,6 +74838,7 @@ static int ds4_chain_commit_step(ds4_chain *ch, int token,
         t_commit0 = now_sec();
     }
     const int staged_cbs = ds4_gpu_chain_staged_count();
+    ch->t_committed = ds4_gpu_clock_ms();
     if (!ds4_gpu_chain_commit_staged()) {
         ds4_chain_err(err, errlen, "chain decode could not commit its step");
         ds4_chain_invalidate(ch);
@@ -74870,11 +74892,7 @@ static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
     ds4_glm_gpu_graph *g = &s->glm_graph;
     if (ch->inflight_event == 0) return 0;
     const double t_wait0 = now_sec();
-    glm_levers_init_from_env();
-    const int spin_us = g_glm_levers.chain_spin_us;
-    if (!ds4_gpu_chain_wait_step(ch->inflight_event,
-                                 spin_us > 0 ? (uint32_t)spin_us : 0u,
-                                 "glm chain decode")) {
+    if (!ds4_gpu_chain_wait_step("glm chain decode")) {
         ds4_chain_err(err, errlen, "chain decode failed waiting for the GPU");
         ds4_chain_invalidate(ch);
         return 1;
@@ -74889,17 +74907,17 @@ static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
          * the stall is in the wake, not in the decode. */
         fprintf(stderr,
                 "ds4: glm chain slow wait %.1f ms at step %d pos %u "
-                "(gpu_span %.1f ms, cbs %d, spin %d us)\n",
+                "(gpu_span %.1f ms, queued %.1f ms, cbs %d)\n",
                 wait_ms, ch->steps, (uint32_t)s->checkpoint.len,
                 ds4_gpu_chain_last_cb_gpu_span_ms(),
-                ds4_gpu_chain_last_step_cbs(), spin_us);
+                ds4_gpu_chain_last_cb_gpu_start_ms() - ch->t_committed,
+                ds4_gpu_chain_last_step_cbs());
     }
     const double t_read0 = ch->trace ? now_sec() : 0.0;
     if (ch->trace) {
         ch->t_wait = wait_ms;
         ch->t_gpu = ds4_gpu_chain_last_cb_gpu_span_ms();
     }
-    (void)ds4_gpu_chain_reap(mark, "glm chain decode");
     ch->inflight_event = 0;
 
     int32_t id = -1;
@@ -74914,6 +74932,14 @@ static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
         if (errlen) snprintf(err, errlen, "chain decode selected an invalid id %d", id);
         ds4_chain_invalidate(ch);
         return 1;
+    }
+    /* Retiring the finished step's transients comes after the id is in hand,
+     * and with a step staged under commit-ahead it must not join the queue at
+     * all: the next step's prologue is already on it. */
+    if (ch->commit_ahead && ch->staged) {
+        ds4_gpu_chain_release_transients(mark);
+    } else {
+        (void)ds4_gpu_chain_reap(mark, "glm chain decode");
     }
     if (ch->verify && ch->p.mode == DS4_CHAIN_GREEDY && s->logits) {
         if (ds4_gpu_tensor_read(g->logits, 0, s->logits,
@@ -74966,6 +74992,10 @@ int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen
 
 int ds4_session_chain_abort(ds4_chain *ch) {
     if (!ch) return 1;
+    /* Under commit-ahead the aborted step's prologue has already run.  It
+     * wrote only per-step scratch -- the embedding of a token the session will
+     * never keep, that layer's norm and projections -- so there is nothing to
+     * undo; ds4_session_chain_end() joins it with the rest of the queue. */
     if (ch->staged) {
         (void)ds4_gpu_chain_stage_abort();
         ch->staged = false;
@@ -74979,8 +75009,7 @@ int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
     int rc = 0;
     (void)ds4_session_chain_abort(ch);
     if (ch->inflight_event != 0) {
-        if (!ds4_gpu_chain_wait_step(ch->inflight_event, 0u,
-                                     "glm chain decode end")) {
+        if (!ds4_gpu_chain_wait_step("glm chain decode end")) {
             ds4_chain_err(err, errlen, "chain decode timed out draining the GPU");
             ch->s->checkpoint_valid = false;
             rc = 1;
@@ -75011,6 +75040,9 @@ int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
                 ch->traced, ch->sum_encode / n, ch->sum_wait / n,
                 ch->sum_read / n, ch->sum_commit / n, ch->sum_gap / n,
                 ch->sum_gpu / n, ds4_gpu_chain_last_step_cbs());
+        fprintf(stderr,
+                "ds4: glm chain trace: commit_ahead=%d prologue cbs %ld\n",
+                ch->commit_ahead ? 1 : 0, ch->ahead_cbs);
     }
     free(ch);
     return rc;

@@ -760,17 +760,13 @@ typedef struct {
      * DS4_GLM_CHAIN_DECODE turns it on at startup and DS4_GLM_DISABLE_CHAIN
      * is the kill switch that declines it wherever it is asked for. */
     int chain_decode;
-    /* C2 chain decode: microseconds to spin on the selector event's
-     * signaledValue before falling back to the blocking command-buffer wait.
-     * 0 (default) blocks straight away.  DS4_GLM_CHAIN_SPIN_US sets it at
-     * startup. */
-    int chain_spin_us;
-    /* hc_pre: 1 takes the one-dispatch narrow compound producer
-     * (ds4_gpu_hc_pre_decode_fused_tensor) instead of the split-K refuse pair,
-     * by forcing the split-K mixer off.  Default 0 = today's pair.
-     * DS4_GLM_DISABLE_HC_MIX_SPLITK is the historical variable and still
-     * forces the single form at the call site whatever the lever says. */
-    int hc_pre_single;
+    /* C2 commit-ahead: 1 cuts each chain step in two at the first
+     * state-mutating dispatch and hands the prologue to the GPU while the
+     * previous step is still running, so the queue is never empty at the
+     * token boundary.  The remainder still waits for the host's confirm, so
+     * a stop still has nothing to roll back.  DS4_GLM_CHAIN_COMMIT_AHEAD
+     * turns it on at startup. */
+    int chain_commit_ahead;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

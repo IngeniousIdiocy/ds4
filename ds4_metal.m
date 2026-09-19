@@ -10570,6 +10570,12 @@ double ds4_gpu_chain_last_cb_gpu_end_ms(void) {
     return t > 0.0 ? t * 1000.0 : 0.0;
 }
 
+double ds4_gpu_chain_last_cb_gpu_start_ms(void) {
+    if (!g_chain_last_cb) return 0.0;
+    const double t = g_chain_last_cb.GPUStartTime;
+    return t > 0.0 ? t * 1000.0 : 0.0;
+}
+
 double ds4_gpu_chain_last_cb_gpu_span_ms(void) {
     if (!g_chain_last_cb) return 0.0;
     const double s0 = g_chain_last_cb.GPUStartTime, e0 = g_chain_last_cb.GPUEndTime;
@@ -10607,6 +10613,28 @@ int ds4_gpu_chain_commit_staged(void) {
     }
     [g_chain_staged_cbs removeAllObjects];
     return 1;
+}
+
+/* Commit the first `n` staged command buffers and leave the rest staged.
+ *
+ * C2 commit-ahead: the prologue of the step being encoded -- everything up to
+ * the first dispatch that mutates state the host may have to disown -- goes to
+ * the GPU now, while the previous step is still running, so the queue is never
+ * empty at the boundary.  It deliberately does NOT move g_chain_last_cb: that
+ * handle belongs to the step the host is waiting on, not to the one it is
+ * still encoding. */
+int ds4_gpu_chain_commit_staged_prefix(int n) {
+    if (!g_chain_staged_cbs || n <= 0) return 0;
+    const int have = (int)[g_chain_staged_cbs count];
+    if (n > have) n = have;
+    for (int i = 0; i < n; i++) {
+        id<MTLCommandBuffer> cb = g_chain_staged_cbs[(NSUInteger)i];
+        [cb commit];
+        [g_pending_cbs addObject:cb];
+        ds4_gpu_stream_expert_cache_note_batch_committed();
+    }
+    [g_chain_staged_cbs removeObjectsInRange:NSMakeRange(0, (NSUInteger)n)];
+    return n;
 }
 
 int ds4_gpu_chain_discard_staged(void) {
@@ -10651,6 +10679,21 @@ int ds4_gpu_chain_stage_abort(void) {
  * the caller has just waited on the step's shared event, so every pending
  * command buffer is complete and every transient buffer allocated before
  * `mark` (i.e. before the step now being encoded) is free. */
+/* Release the transient buffers of steps that are already finished, without
+ * joining anything.  With commit-ahead the queue always holds the next step's
+ * prologue, so ds4_gpu_chain_reap()'s join would put that prologue on the
+ * host's critical path; the buffers below `mark` belong to command buffers
+ * that completed before the one the caller has just joined (the queue runs in
+ * commit order), so dropping them needs no wait of its own. */
+void ds4_gpu_chain_release_transients(unsigned long mark) {
+    if (!g_initialized) return;
+    const unsigned long have = (unsigned long)[g_transient_buffers count];
+    const unsigned long drop = mark < have ? mark : have;
+    if (drop != 0) {
+        [g_transient_buffers removeObjectsInRange:NSMakeRange(0, (NSUInteger)drop)];
+    }
+}
+
 int ds4_gpu_chain_reap(unsigned long mark, const char *label) {
     if (!g_initialized) return 0;
     const int ok = ds4_gpu_wait_pending_command_buffers(label ? label : "chain reap");
@@ -10668,23 +10711,12 @@ int ds4_gpu_chain_reap(unsigned long mark, const char *label) {
  * classic decode path uses for every command buffer -- and NOT
  * MTLSharedEvent's waitUntilSignaledValue:, whose wake travels through a
  * notification path that has been seen to arrive hundreds of milliseconds
- * late on a loaded machine.  With chain_spin_us > 0 the host first polls the
- * event's signaledValue, which is a plain read of shared memory and involves
- * no wake at all; the command-buffer join afterwards then returns immediately.
+ * late on a loaded machine.  Polling the event's signaledValue before the
+ * join was measured (lever chain_spin_us, 200 and 500 us) and recovered
+ * nothing: the residual boundary gap is GPU-side ramp, not a host wake.
  */
-int ds4_gpu_chain_wait_step(uint64_t event_value, uint32_t spin_us,
-                            const char *label) {
+int ds4_gpu_chain_wait_step(const char *label) {
     if (!g_chain_last_cb) return 0;
-    if (spin_us != 0 && event_value != 0 && g_selected_readback_event) {
-        const double deadline = ds4_gpu_clock_ms() + (double)spin_us / 1000.0;
-        for (;;) {
-            if (g_selected_readback_event.signaledValue >= event_value) break;
-            if (ds4_gpu_clock_ms() >= deadline) break;
-#if defined(__arm64__) || defined(__aarch64__)
-            __asm__ __volatile__("yield" ::: "memory");
-#endif
-        }
-    }
     return ds4_gpu_wait_command_buffer(g_chain_last_cb,
                                        label ? label : "glm chain step");
 }
