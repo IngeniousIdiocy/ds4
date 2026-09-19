@@ -54098,19 +54098,24 @@ static uint32_t ds4_gpu_glm53_hc_alg_collapse_tgs(void) {
 static int ds4_gpu_glm53_hc_refuse_tail_is_repl(void);
 
 static int ds4_gpu_glm53_hc_alg_flag(int half) {
-    static int cached[2] = { -1, -1 };
-    if (cached[half] < 0) {
-        const int def = half == 0 ? DS4_GLM53_HC_ALG_A_DEFAULT_ON
-                                  : DS4_GLM53_HC_ALG_B_DEFAULT_ON;
-        const char *en = half == 0 ? "DS4_GLM_HC_PRE_ALGEBRA_A"
-                                   : "DS4_GLM_HC_PRE_ALGEBRA_B";
-        const char *dis = half == 0 ? "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A"
-                                    : "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_B";
+    /* Half A is a campaign lever (glm_levers, ds4.h): its environment
+     * resolution happens once inside glm_levers_init_from_env(), and the value
+     * is read live here so a resident server with --debug-levers can flip it
+     * between requests.  Exact mode still clamps it off. */
+    if (half == 0) {
+        glm_levers_init_from_env();
+        return g_glm_levers.hc_pre_algebra_a != 0 && !glm53_exact_mode();
+    }
+    static int cached = -1;
+    if (cached < 0) {
+        const int def = DS4_GLM53_HC_ALG_B_DEFAULT_ON;
+        const char *en = "DS4_GLM_HC_PRE_ALGEBRA_B";
+        const char *dis = "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_B";
         int on = (def || getenv(en) != NULL) && getenv(dis) == NULL &&
                  !glm53_exact_mode();
-        cached[half] = on;
+        cached = on;
     }
-    return cached[half];
+    return cached;
 }
 
 /* The two halves as they are actually dispatched.  Both need the replicated
@@ -54118,18 +54123,20 @@ static int ds4_gpu_glm53_hc_alg_flag(int half) {
  * need every one of the four new pipelines present, so that the half A / half
  * B combination the encoder picks can never be half-resolved. */
 static int ds4_gpu_glm53_hc_alg_active(int half) {
-    static int cached[2] = { -1, -1 };
-    if (cached[0] < 0) {
+    /* The pipeline and tail-flavour preconditions are fixed for the life of
+     * the process and stay cached; only the half's own flag is read live, so
+     * half A follows its lever. */
+    static int cached = -1;
+    if (cached < 0) {
         const int pipes =
             ds4_gpu_get_pipeline(DS4_GLM53_HC_ALG_A_KERNEL) != nil &&
             ds4_gpu_get_pipeline(DS4_GLM53_HC_ALG_TAIL_KERNEL) != nil &&
             ds4_gpu_get_pipeline(DS4_GLM53_HC_SLICED_TAIL) != nil &&
             ds4_gpu_get_pipeline(DS4_GLM53_HC_SLICED_TAIL_ALG) != nil;
         const int repl = ds4_gpu_glm53_hc_refuse_tail_is_repl();
-        cached[0] = pipes && repl && ds4_gpu_glm53_hc_alg_flag(0);
-        cached[1] = pipes && repl && ds4_gpu_glm53_hc_alg_flag(1);
+        cached = pipes && repl;
     }
-    return cached[half];
+    return cached && ds4_gpu_glm53_hc_alg_flag(half);
 }
 
 static const char *ds4_gpu_glm53_hc_refuse_tail_kernel(void) {

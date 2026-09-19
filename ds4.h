@@ -666,4 +666,38 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+/* ---------------------------------------------------------------------------
+ * glm_levers - the GLM-5.3 decode campaign's kill switches in one struct.
+ *
+ * Ported from the V4.1 lane's ds41_levers (ds4-v41 ds4.c/ds4.h).  The graph
+ * reads these as plain global loads, never through getenv().  They are
+ * initialised once from the environment (the historical variable names are
+ * preserved exactly, including the DISABLE_ inversion) and can then be flipped
+ * between requests by a resident ds4-server running with --debug-levers, which
+ * is what makes a lever A/B cost one snapshot restore plus one decode instead
+ * of a 173 GiB weight load plus a full prefill.
+ *
+ * Adding a lever is one field here and one line in g_glm_lever_map[].
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    /* Layer flush interval of the decode step (glm_graph_forward_token).
+     * -1 keeps today's resolved default (4 with indexed attention, 32
+     * otherwise); 0 disables mid-step flushes; any other value >= 0 is the
+     * interval.  DS4_GLM_DECODE_FLUSH_INTERVAL sets it at startup. */
+    int decode_flush_interval;
+    /* hc_pre split-K algebra, half A (ds4_metal.m).  Default on;
+     * DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A disables it and DS4_GLM_EXACT clamps
+     * it off at the dispatch site. */
+    int hc_pre_algebra_a;
+} glm_levers;
+
+extern glm_levers g_glm_levers;
+
+void        glm_levers_init_from_env(void);
+size_t      glm_levers_count(void);
+const char *glm_levers_name(size_t i);
+const char *glm_levers_env_name(size_t i);
+int         glm_levers_get(const char *name, int *out);
+int         glm_levers_set(const char *name, int value);
+
 #endif

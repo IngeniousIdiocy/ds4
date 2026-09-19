@@ -55956,6 +55956,96 @@ static bool glm_graph_streaming_decode_sync_each_layer(void) {
 #endif
 }
 
+/* ---------------------------------------------------------------------------
+ * glm_levers - every GLM-5.3 campaign kill switch in one struct (ds4.h).
+ *
+ * A transcription of the V4.1 lane's ds41_levers.  The decode path reads the
+ * fields with plain global loads; the environment is consulted once, by
+ * glm_levers_init_from_env(), which is idempotent and is called from the first
+ * point of use in each translation unit.  A resident ds4-server started with
+ * --debug-levers can then flip a lever between requests, which is what makes a
+ * decode A/B cost one snapshot restore plus one decode instead of a weight
+ * load plus a full prefill.
+ * ------------------------------------------------------------------------ */
+glm_levers g_glm_levers = {
+    .decode_flush_interval = -1, /* -1 = the interval resolved at the call site */
+    .hc_pre_algebra_a      = 1,
+};
+static int g_glm_levers_ready;
+
+/* A counted lever carries a quantity, not a switch, so /debug/levers stores it
+ * as given (inside its own range) instead of coercing it to 0/1. */
+static int glm_lever_counted(const char *name) {
+    return !strcmp(name, "decode_flush_interval");
+}
+
+static const struct { const char *name; size_t off; const char *env; } g_glm_lever_map[] = {
+    { "decode_flush_interval", offsetof(glm_levers, decode_flush_interval), "DS4_GLM_DECODE_FLUSH_INTERVAL" },
+    { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
+};
+
+void glm_levers_init_from_env(void) {
+    if (g_glm_levers_ready) return;
+    /* Historical semantics of the getenv this lever replaced in
+     * glm_graph_forward_token: a set, non-empty variable wins, and a value
+     * that is zero or negative disables the mid-step flushes entirely. */
+    {   const char *v = getenv("DS4_GLM_DECODE_FLUSH_INTERVAL");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            g_glm_levers.decode_flush_interval = n <= 0 ? 0 : n;
+        }
+    }
+    /* Half A of the hc_pre algebra is default-on (DS4_GLM53_HC_ALG_A_DEFAULT_ON
+     * in ds4_metal.m), so its historical resolution reduces to "the DISABLE_
+     * variable is unset"; DS4_GLM_HC_PRE_ALGEBRA_A only ever re-enabled a
+     * default-off half.  DS4_GLM_EXACT still clamps the dispatch off, where it
+     * always did, in ds4_gpu_glm53_hc_alg_flag(). */
+    g_glm_levers.hc_pre_algebra_a = getenv("DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A") == NULL;
+    g_glm_levers_ready = 1;
+}
+
+size_t glm_levers_count(void) {
+    return sizeof(g_glm_lever_map) / sizeof(g_glm_lever_map[0]);
+}
+
+const char *glm_levers_name(size_t i) {
+    return i < glm_levers_count() ? g_glm_lever_map[i].name : NULL;
+}
+
+const char *glm_levers_env_name(size_t i) {
+    return i < glm_levers_count() ? g_glm_lever_map[i].env : NULL;
+}
+
+int glm_levers_get(const char *name, int *out) {
+    glm_levers_init_from_env();
+    for (size_t i = 0; i < glm_levers_count(); i++) {
+        if (!strcmp(name, g_glm_lever_map[i].name)) {
+            if (out) *out = *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int glm_levers_set(const char *name, int value) {
+    glm_levers_init_from_env();
+    for (size_t i = 0; i < glm_levers_count(); i++) {
+        if (!strcmp(name, g_glm_lever_map[i].name)) {
+            if (glm_lever_counted(name)) {
+                /* decode_flush_interval: -1 restores the call site's own
+                 * default, 0 disables the flushes, and the graph clamps
+                 * anything above the layer count. */
+                if (value < -1 || value > 256) return 0;
+                *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value;
+            } else {
+                *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value ? 1 : 0;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -55988,11 +56078,13 @@ static bool glm_graph_forward_token(
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
         decode_layer_flush_interval = use_indexed_attention ? 4u : 32u;
 #endif
-        const char *dfi = getenv("DS4_GLM_DECODE_FLUSH_INTERVAL");
-        if (dfi && dfi[0]) {
-            int v = atoi(dfi);
-            decode_layer_flush_interval = v <= 0 ? 0u : (uint32_t)v;
-        }
+        /* Campaign lever: the interval used to be resolved from the
+         * environment on every decode step.  glm_levers_init_from_env() reads
+         * that same variable once and the step now takes a plain global load,
+         * so --debug-levers can move the interval between requests. */
+        glm_levers_init_from_env();
+        const int dfi = g_glm_levers.decode_flush_interval;
+        if (dfi >= 0) decode_layer_flush_interval = (uint32_t)dfi;
         if (decode_layer_flush_interval > g->layer_count) {
             decode_layer_flush_interval = g->layer_count;
         }
