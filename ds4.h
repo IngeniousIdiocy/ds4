@@ -785,6 +785,14 @@ typedef struct {
      * reduce's summation, so it is NOT bit-identical and DS4_GLM_EXACT and an
      * explicit DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP both override it. */
     int attn_block_rows;
+    /* T2 proposal 1: the shared-down + routed-slot-sum + HC-expand epilogue in
+     * the ptail form HCX already ships (ds4_metal.m, metal/t2screen.metal).
+     * Default off = today's single-lane epilogue.  Tier 1 -- the same
+     * expression over the same values in the same order, only a different lane
+     * evaluating each (row, dst_hc) pair -- but DS4_GLM_EXACT still forces the
+     * production kernel back, as it does for HCX's ptail.  DS4_GLM_SDN_PTAIL
+     * turns it on at startup. */
+    int sdn_ptail;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

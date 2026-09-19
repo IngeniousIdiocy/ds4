@@ -53146,7 +53146,43 @@ static int ds4_gpu_shared_down_hc_expand_q8_0_impl(
             fprintf(stderr, "ds4: Metal shared-down HC fusion received an undersized routed partial buffer\n");
             return 0;
         }
-        id<MTLComputePipelineState> pipeline =
+        /* T2 proposal 1, lever sdn_ptail: the slots epilogue spread over
+         * 4*NR0 lanes instead of lane 0 of simdgroup 0, exactly as HCX's ptail
+         * already does by default.  Same kernel arguments, same threadgroup
+         * shape, same grid -- only the pipeline name changes -- so the lever is
+         * read live and an A/B costs a flip.  The capture sibling (DFlash's
+         * strict reference) and the no-partials form keep production. */
+        id<MTLComputePipelineState> pipeline = nil;
+        int sdn_ptail = 0;
+        if (routed_partials && !capture_out) {
+            glm_levers_init_from_env();
+            sdn_ptail = g_glm_levers.sdn_ptail != 0 && !glm53_exact_mode();
+        }
+        if (sdn_ptail) {
+            pipeline = ds4_gpu_get_mul_mv_pipeline(
+                "kernel_glm_t2s_shared_down_hc_expand4_slots_ptail_q8_0",
+                mv_dispatch.nsg);
+            if (!pipeline) {
+                fprintf(stderr, "ds4: SDNTAIL pipeline unavailable; using production\n");
+                sdn_ptail = 0;
+            }
+        }
+        {
+            static ds4_t2s_slot slot = { "SDNTAIL", 0, 0 };
+            ds4_t2s_hit(&slot, "%s nsg=%d nr0=%d tgs=%llu",
+                        sdn_ptail ?
+                            "kernel_glm_t2s_shared_down_hc_expand4_slots_ptail_q8_0" :
+                        capture_out ?
+                            "kernel_dsv4_shared_down_hc_expand4_slots_capture_q8_0(prod)" :
+                        routed_partials ?
+                            "kernel_dsv4_shared_down_hc_expand4_slots_q8_0(prod)" :
+                            "kernel_dsv4_shared_down_hc_expand4_q8_0(prod)",
+                        (int)mv_dispatch.nsg, (int)mv_dispatch.nr0,
+                        (unsigned long long)((out_dim + (uint64_t)mv_dispatch.nr0 - 1u) /
+                                             (uint64_t)mv_dispatch.nr0));
+        }
+        if (!pipeline)
+        pipeline =
             ds4_gpu_get_mul_mv_pipeline(
                 capture_out ?
                     "kernel_dsv4_shared_down_hc_expand4_slots_capture_q8_0" :

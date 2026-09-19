@@ -56134,6 +56134,7 @@ glm_levers g_glm_levers = {
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .attn_group            = 8,  /* heads per staged window, as shipped */
     .attn_block_rows       = 128,/* deep split geometry, as shipped */
+    .sdn_ptail             = 0,  /* off: today's single-lane SDN epilogue */
 };
 static int g_glm_levers_ready;
 
@@ -56171,6 +56172,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "attn_group",            offsetof(glm_levers, attn_group),            "DS4_GLM_ATTN_GROUP" },
     { "attn_block_rows",       offsetof(glm_levers, attn_block_rows),       "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP" },
+    { "sdn_ptail",             offsetof(glm_levers, sdn_ptail),             "DS4_GLM_SDN_PTAIL" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56227,6 +56229,10 @@ void glm_levers_init_from_env(void) {
             }
         }
     }
+    /* T2 proposal 1 is default-off, so its historical resolution is just "the
+     * ENABLE_ variable is set"; DS4_GLM_EXACT still clamps the dispatch back to
+     * the production kernel where HCX's ptail is clamped. */
+    g_glm_levers.sdn_ptail = getenv("DS4_GLM_SDN_PTAIL") != NULL;
     g_glm_levers_ready = 1;
 }
 

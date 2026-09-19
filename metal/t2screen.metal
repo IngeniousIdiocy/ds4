@@ -895,3 +895,175 @@ kernel_glm_t2s_q8_hc_expand4_q8_0_nr_impl<2, true>;
 template [[host_name("kernel_glm_t2s_q8_hc_expand4_q8_0_nr4w")]]
 kernel glm_t2s_q8_hc_expand4_nr_t
 kernel_glm_t2s_q8_hc_expand4_q8_0_nr_impl<4, true>;
+
+/* ---------------------------------------------------------------------------
+ * SDNTAIL -- the shared-down + routed-slot-sum + HC-expand epilogue in the
+ * HCXTAIL (ptail) form.
+ *
+ * Production is kernel_dsv4_shared_down_hc_expand4_slots_q8_0
+ * (metal/dsv4_hc.metal).  Its matvec half is the shortest stream in the decode
+ * graph: K = 2048 is 64 Q8_0 blocks, and at the shipped nsg = 4 with NQ = 8 the
+ * lane stride `ib += NSG*NQ` is 32, so each lane runs exactly TWO main-loop
+ * iterations before the epilogue.  The epilogue is the heaviest of the family
+ * and runs on ONE LANE (`if (tiisg == 0 && sgitg == 0)`), and because the NR0
+ * row loop is inside that guard, lane 0 of simdgroup 0 walks BOTH rows back to
+ * back: per row a slot-sum loop over n_slots partials, four strided residual
+ * loads 16 KB apart, one post load, sixteen comb loads and four stores 16 KB
+ * apart -- about thirty dependent scalar device accesses, twice, with 127
+ * threads already retired.  Behind a two-iteration stream there is nothing
+ * left in flight to hide any of it.
+ *
+ * The change, and only this change: the NR0 `simd_sum`s are taken first into
+ * registers, every simdgroup but zero returns, and lanes 0..(4*NR0 - 1) of
+ * simdgroup 0 each own one (row, dst_hc) pair and compute that output alone --
+ * exactly the mapping kernel_glm_t2s_q8_hc_expand4_q8_0_ptail above uses, which
+ * is the default on this branch (DS4_GLM_HCX_PTAIL_DEFAULT) and was the one
+ * candidate of the t2 screen that was faster at every depth it was screened at.
+ * The shared_out store is given to lane `row` of the same simdgroup.
+ *
+ * Tier 1, byte-identical by construction:
+ *   * The matvec half, the threadgroup reduction and the two barriers are
+ *     copied character for character; nothing about the dot product changes.
+ *   * The slot sum keeps production's loop -- ascending slot order, one
+ *     accumulator, no atomics -- so it is the same sequence of adds over the
+ *     same floats and yields the same bits.  The four lanes of a row each run
+ *     that loop independently and therefore all hold the identical block_v;
+ *     production computed it once and used it four times, which is the same
+ *     value.  Redundant identical loads of n_slots contiguous floats from the
+ *     same cache line cost nothing the campaign has ever been able to measure.
+ *   * Each accumulator is built by the same expression in the same order from
+ *     the same values (block_v * post, then += comb[k] * r[k] for k = 0..3).
+ *     Only which lane evaluates it changes.
+ * ------------------------------------------------------------------------- */
+kernel void kernel_glm_t2s_shared_down_hc_expand4_slots_ptail_q8_0(
+        constant ds4_metal_args_mul_mv        & mv,
+        constant ds4_metal_args_dsv4_hc_expand & hc,
+        device  const char * weight,
+        device  const char * shared_mid,
+        device        char * shared_out,
+        device  const char * routed_partials,
+        constant ds4_metal_args_dsv4_routed_slots & slots,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device        char * dst,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (hc.n_hc != 4 || hc.n_tokens != 1) {
+        return;
+    }
+
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+
+    const int nb = mv.ne00 / QK8_0;
+    const int row0 = tgpig.x * NR0;
+
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+
+    device const float *y = (device const float *)(shared_mid);
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        const uint64_t off0 = (uint64_t)(row0 + row) * mv.nb01;
+        ax[row] = (device const block_q8_0 *)(weight + off0);
+    }
+
+    float sumf[NR0] = { 0.0f };
+    float yl[NQ];
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL(short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        FOR_UNROLL(short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+
+            float sumq = 0.0f;
+            FOR_UNROLL(short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+
+        yb += NSG * NQ * QK8_0;
+    }
+
+    threadgroup float *shmem_f32[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *)shmem + NW * row;
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Every row's shared value first, so the epilogue below needs no further
+     * cross-lane communication and can be spread over 4*NR0 lanes. */
+    float sv[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        sv[row] = simd_sum(shmem_f32[row][tiisg]);
+    }
+
+    if (sgitg != 0) {
+        return;
+    }
+
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        const int d = row0 + row;
+        if (d < mv.ne01 && tiisg == (ushort)row) {
+            *((device float *)(shared_out + (uint64_t)d * sizeof(float))) = sv[row];
+        }
+    }
+
+    if (tiisg < (ushort)(4 * NR0)) {
+        const short row = (short)(tiisg >> 2);
+        const int64_t dst_hc = (int64_t)(tiisg & 3);
+        const int d = row0 + row;
+        if (d < mv.ne01) {
+            /* Production's slot sum, verbatim: ascending slot order, one
+               accumulator, no atomics.  Run once per owning lane. */
+            device const float *row_partials =
+                (device const float *)routed_partials +
+                (uint64_t)d * (uint64_t)slots.n_slots;
+            float block_v = 0.0f;
+            for (uint s = 0; s < slots.n_slots; ++s) {
+                block_v += row_partials[s];
+            }
+            block_v += sv[row];
+
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+            float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+
+            acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+            acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+            acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+            acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+
+            *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+        }
+    }
+}
