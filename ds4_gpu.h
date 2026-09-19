@@ -201,6 +201,16 @@ int ds4_gpu_chain_reap(unsigned long mark, const char *label);
 /* Sticky count of end_commands()/synchronize() calls that happened while a
  * step was staged; non-zero means the confirmation gate was bypassed. */
 int ds4_gpu_chain_violations(void);
+/* DS4_GLM_CHAIN_TRACE: how many command buffers a step holds, and the GPU
+ * span / end time of the last committed step's final command buffer.  The
+ * times are in the ds4_gpu_clock_ms() domain, which is the one
+ * MTLCommandBuffer.GPUStartTime / GPUEndTime use. */
+double ds4_gpu_clock_ms(void);
+int ds4_gpu_chain_staged_count(void);
+int ds4_gpu_chain_last_step_cbs(void);
+double ds4_gpu_chain_last_cb_gpu_end_ms(void);
+double ds4_gpu_chain_last_cb_gpu_span_ms(void);
+void ds4_gpu_chain_trace_reset(void);
 #endif
 
 #ifdef __APPLE__

@@ -56144,6 +56144,16 @@ static bool glm_graph_forward_token_sel(
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
         decode_layer_flush_interval = use_indexed_attention ? 4u : 32u;
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Chain decode: the mid-step flushes exist so the GPU can start this
+         * step before the host has finished encoding it.  A chain step may not
+         * start until the caller confirms the token that feeds it, and by then
+         * it is fully encoded, so splitting it costs a command-buffer
+         * allocation, a commit, an encoder close and a GPU command-buffer
+         * launch every four layers and buys nothing.  One buffer per step.
+         * The lever still overrides, so the split is one A/B away. */
+        if (sel) decode_layer_flush_interval = 0;
+#endif
         /* Campaign lever: the interval used to be resolved from the
          * environment on every decode step.  glm_levers_init_from_env() reads
          * that same variable once and the step now takes a plain global load,
@@ -74465,6 +74475,11 @@ struct ds4_chain {
     bool             verify;
     long             verify_checked;
     long             verify_mismatch;
+    /* DS4_GLM_CHAIN_TRACE: the host timeline of one token. */
+    bool             trace;
+    double           t_encode, t_wait, t_read, t_commit, t_gap, t_gpu;
+    double           sum_encode, sum_wait, sum_read, sum_commit, sum_gap, sum_gpu;
+    long             traced;
 };
 
 static void ds4_chain_err(char *err, size_t errlen, const char *what) {
@@ -74513,7 +74528,9 @@ ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
     ch->s = s;
     ch->p = *p;
     ch->verify = getenv("DS4_GLM_CHAIN_VERIFY") != NULL;
+    ch->trace = getenv("DS4_GLM_CHAIN_TRACE") != NULL;
     ch->violations = ds4_gpu_chain_violations();
+    ds4_gpu_chain_trace_reset();
     return ch;
 }
 
@@ -74576,6 +74593,7 @@ static int ds4_chain_encode_step(ds4_chain *ch, int token,
         ds4_chain_err(err, errlen, "chain decode could not stage its step");
         return 1;
     }
+    const double t_encode0 = ch->trace ? now_sec() : 0.0;
     if (!glm_graph_forward_token_sel(g, &e->model, &e->weights,
                                      token < 0 ? 0 : token,
                                      NULL, pos, NULL, s->logits, false, &sel)) {
@@ -74590,6 +74608,7 @@ static int ds4_chain_encode_step(ds4_chain *ch, int token,
         ds4_chain_invalidate(ch);
         return 1;
     }
+    if (ch->trace) ch->t_encode = (now_sec() - t_encode0) * 1000.0;
     ch->staged = true;
     ch->staged_slot = sel.params.ring_slot;
     ch->staged_pos = pos;
@@ -74607,10 +74626,35 @@ static int ds4_chain_commit_step(ds4_chain *ch, int token,
         ds4_chain_err(err, errlen, "chain decode has no staged step to commit");
         return 1;
     }
+    double t_commit0 = 0.0;
+    if (ch->trace) {
+        /* From the moment the previous step's last command buffer left the GPU
+         * to the moment this step is handed to the queue: the boundary the
+         * chain exists to shrink. */
+        const double gpu_end = ds4_gpu_chain_last_cb_gpu_end_ms();
+        ch->t_gap = gpu_end > 0.0 ? ds4_gpu_clock_ms() - gpu_end : 0.0;
+        t_commit0 = now_sec();
+    }
+    const int staged_cbs = ds4_gpu_chain_staged_count();
     if (!ds4_gpu_chain_commit_staged()) {
         ds4_chain_err(err, errlen, "chain decode could not commit its step");
         ds4_chain_invalidate(ch);
         return 1;
+    }
+    if (ch->trace) {
+        ch->t_commit = (now_sec() - t_commit0) * 1000.0;
+        ch->sum_encode += ch->t_encode;
+        ch->sum_wait += ch->t_wait;
+        ch->sum_read += ch->t_read;
+        ch->sum_commit += ch->t_commit;
+        ch->sum_gap += ch->t_gap;
+        ch->sum_gpu += ch->t_gpu;
+        ch->traced++;
+        fprintf(stderr,
+                "ds4: glm chain trace step %d pos %u: encode %.3f wait %.3f "
+                "read %.3f commit %.3f gap %.3f gpu_last_cb %.3f cbs %d\n",
+                ch->steps, ch->staged_pos, ch->t_encode, ch->t_wait, ch->t_read,
+                ch->t_commit, ch->t_gap, ch->t_gpu, staged_cbs);
     }
     token_vec_push(&s->checkpoint, token);
     s->checkpoint_valid = true;
@@ -74644,11 +74688,17 @@ static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
     ds4_session *s = ch->s;
     ds4_glm_gpu_graph *g = &s->glm_graph;
     if (ch->inflight_event == 0) return 0;
+    const double t_wait0 = ch->trace ? now_sec() : 0.0;
     if (!ds4_gpu_wait_selected_readback_ready(ch->inflight_event,
                                               "glm chain decode")) {
         ds4_chain_err(err, errlen, "chain decode timed out waiting for the GPU");
         ds4_chain_invalidate(ch);
         return 1;
+    }
+    const double t_read0 = ch->trace ? now_sec() : 0.0;
+    if (ch->trace) {
+        ch->t_wait = (t_read0 - t_wait0) * 1000.0;
+        ch->t_gpu = ds4_gpu_chain_last_cb_gpu_span_ms();
     }
     (void)ds4_gpu_chain_reap(mark, "glm chain decode");
     ch->inflight_event = 0;
@@ -74680,6 +74730,7 @@ static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
             }
         }
     }
+    if (ch->trace) ch->t_read = (now_sec() - t_read0) * 1000.0;
     ch->have_id = true;
     ch->pending_id = (int)id;
     return 0;
@@ -74751,6 +74802,16 @@ int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
     if (ch->verify && ch->verify_checked) {
         fprintf(stderr, "ds4: glm chain verify: %ld/%ld mismatches\n",
                 ch->verify_mismatch, ch->verify_checked);
+    }
+    if (ch->trace && ch->traced > 0) {
+        const double n = (double)ch->traced;
+        fprintf(stderr,
+                "ds4: glm chain trace mean over %ld tokens: encode %.3f "
+                "wait %.3f read %.3f commit %.3f gap %.3f gpu_last_cb %.3f "
+                "cbs/step %d\n",
+                ch->traced, ch->sum_encode / n, ch->sum_wait / n,
+                ch->sum_read / n, ch->sum_commit / n, ch->sum_gap / n,
+                ch->sum_gpu / n, ds4_gpu_chain_last_step_cbs());
     }
     free(ch);
     return rc;

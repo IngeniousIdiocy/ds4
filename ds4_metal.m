@@ -10543,6 +10543,38 @@ int ds4_gpu_flush_encoder(void) {
 static BOOL g_chain_staging;
 static NSMutableArray<id<MTLCommandBuffer>> *g_chain_staged_cbs;
 static int g_chain_violations;
+/* Trace support: the last command buffer of the most recently committed step,
+ * kept so the host can read its GPU span and ask how long the GPU was idle
+ * between it and the next commit. */
+static id<MTLCommandBuffer> g_chain_last_cb;
+static int g_chain_last_cb_count;
+
+/* The clock MTLCommandBuffer.GPUStartTime / GPUEndTime are expressed in. */
+double ds4_gpu_clock_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
+int ds4_gpu_chain_staged_count(void) {
+    return g_chain_staged_cbs ? (int)[g_chain_staged_cbs count] : 0;
+}
+
+int ds4_gpu_chain_last_step_cbs(void) {
+    return g_chain_last_cb_count;
+}
+
+double ds4_gpu_chain_last_cb_gpu_end_ms(void) {
+    if (!g_chain_last_cb) return 0.0;
+    const double t = g_chain_last_cb.GPUEndTime;
+    return t > 0.0 ? t * 1000.0 : 0.0;
+}
+
+double ds4_gpu_chain_last_cb_gpu_span_ms(void) {
+    if (!g_chain_last_cb) return 0.0;
+    const double s0 = g_chain_last_cb.GPUStartTime, e0 = g_chain_last_cb.GPUEndTime;
+    return e0 > s0 ? (e0 - s0) * 1000.0 : 0.0;
+}
 
 int ds4_gpu_chain_stage_begin(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
@@ -10566,6 +10598,8 @@ unsigned long ds4_gpu_chain_transient_mark(void) {
 
 int ds4_gpu_chain_commit_staged(void) {
     if (!g_chain_staged_cbs) return 1;
+    g_chain_last_cb_count = (int)[g_chain_staged_cbs count];
+    g_chain_last_cb = [g_chain_staged_cbs lastObject];
     for (id<MTLCommandBuffer> cb in g_chain_staged_cbs) {
         [cb commit];
         [g_pending_cbs addObject:cb];
@@ -10631,6 +10665,11 @@ int ds4_gpu_chain_reap(unsigned long mark, const char *label) {
 int ds4_gpu_chain_stage_finish(void) {
     g_chain_staging = NO;
     return ds4_gpu_chain_discard_staged();
+}
+
+void ds4_gpu_chain_trace_reset(void) {
+    g_chain_last_cb = nil;
+    g_chain_last_cb_count = 0;
 }
 
 int ds4_gpu_flush_commands(void) {
