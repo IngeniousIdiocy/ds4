@@ -756,41 +756,31 @@ kernel void kernel_glm53_topk_fast_gather(
     }
 }
 
-/* One threadgroup.  Sorts the narrowed candidates descending by (key, index) -
- * a total order, so the result is deterministic regardless of the gather's
- * atomic arrival order - checks the acceptance predicate, and on acceptance
- * writes the ordered pool list and runs the pool expansion with the body
- * copied verbatim from kernel_argsort_merge_fused_f32_i32_desc above, so the
- * 2,051-slot list and its `visible % 4` tail sentinels are produced by the
- * same arithmetic.  It also writes the fallback dispatches' threadgroup counts
- * (zero when accepted) and clears the scratch for the next call. */
-kernel void kernel_glm53_topk_fast_finish(
+/* The candidate sort, acceptance predicate, output writes, pool expansion,
+ * fallback grids and telemetry, factored out of kernel_glm53_topk_fast_finish
+ * so that the fused single-dispatch path below runs the SAME TEXT on the same
+ * values.  `cur` is this lane's candidate (key, index) - already loaded by the
+ * caller, since the candidate list lives in device memory for the three-
+ * dispatch chain and in threadgroup memory for the fused kernel - and `flags`
+ * and `count` are the caller's accumulated reject flags and candidate count.
+ * `bad_bits` is a threadgroup atomic owned by the calling kernel, because the
+ * threadgroup address space may only be declared at kernel scope. */
+static inline void ds4_topk_fast_tail(
         constant ds4_metal_args_glm53_topk_fast & args,
+        uint2 cur,
+        uint  flags,
+        uint  count,
+        threadgroup uint2 * sortbuf,
+        threadgroup atomic_uint * bad_bits,
         device atomic_uint * ctrl,
         device uint        * hist,
-        device const uint2 * cand,
         device int32_t     * out_idx,
         device uint32_t    * raw,
         device uint32_t    * indirect,
-        threadgroup uint2  * shmem [[threadgroup(0)]],
-        ushort3 tpitg [[thread_position_in_threadgroup]],
-        ushort3 ntg   [[threads_per_threadgroup]]) {
-    const uint nth = ntg.x;             // == args.cand_cap, one candidate per lane
-    const uint tid = tpitg.x;
-
-    const uint flags = atomic_load_explicit(&ctrl[0], memory_order_relaxed);
-    const uint count = atomic_load_explicit(&ctrl[1], memory_order_relaxed);
-    const uint have  = min(count, args.cand_cap);
-
-    /* Register-resident bitonic sort, descending by (key, index).  Exactly the
-     * structure of kernel_argsort_f32_i32_desc_pair above: every stage with
-     * j < 32 is a simd_shuffle_xor and the rest use double-buffered threadgroup
-     * staging, so 55 stages cost 15 barriers instead of 55.  (key, index) is a
-     * total order, so the result does not depend on the order in which the
-     * gather's atomic counter handed out candidate slots. */
-    uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
-    threadgroup uint2 *buf0 = shmem;
-    threadgroup uint2 *buf1 = shmem + nth;
+        uint tid,
+        uint nth) {
+    threadgroup uint2 *buf0 = sortbuf;
+    threadgroup uint2 *buf1 = sortbuf + nth;
     bool use_buf1 = false;
     for (uint k = 2u; k <= nth; k <<= 1) {
         for (uint j = k >> 1; j > 0u; j >>= 1) {
@@ -829,8 +819,7 @@ kernel void kernel_glm53_topk_fast_finish(
      * ONE uniform value and both causes survive.  The bits are the same
      * DS4_TOPK_FAST_FLAG_* values used device-side, so the OR composes with
      * `flags` directly.  No floating-point operation changes. */
-    threadgroup atomic_uint bad_bits;
-    if (tid == 0u) atomic_store_explicit(&bad_bits, 0u, memory_order_relaxed);
+    if (tid == 0u) atomic_store_explicit(bad_bits, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint ncheck = min(count, args.top_k + 1u);   // covers the cut tie at 511/512
     uint mine = 0u;
@@ -838,11 +827,11 @@ kernel void kernel_glm53_topk_fast_finish(
         if (s[i].x == s[i + 1u].x) mine |= DS4_TOPK_FAST_FLAG_TIE;
     for (uint i = tid; i < args.top_k && i < nth; i += nth)
         if (s[i].y >= args.n_comp) mine |= DS4_TOPK_FAST_FLAG_BADIDX;
-    if (mine) atomic_fetch_or_explicit(&bad_bits, mine, memory_order_relaxed);
+    if (mine) atomic_fetch_or_explicit(bad_bits, mine, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     /* one uniform acceptance value, published after the reduction */
-    uint reject = flags | atomic_load_explicit(&bad_bits, memory_order_relaxed);
+    uint reject = flags | atomic_load_explicit(bad_bits, memory_order_relaxed);
     if (count < args.top_k || count > args.cand_cap || nth != args.cand_cap)
         reject |= DS4_TOPK_FAST_FLAG_SHORT;
     const bool accept = (reject == 0u);
@@ -903,4 +892,203 @@ kernel void kernel_glm53_topk_fast_finish(
                 atomic_store_explicit(&ctrl[14], run, memory_order_relaxed);
         }
     }
+}
+
+/* One threadgroup.  Sorts the narrowed candidates descending by (key, index) -
+ * a total order, so the result is deterministic regardless of the gather's
+ * atomic arrival order - checks the acceptance predicate, and on acceptance
+ * writes the ordered pool list and runs the pool expansion with the body
+ * copied verbatim from kernel_argsort_merge_fused_f32_i32_desc above, so the
+ * 2,051-slot list and its `visible % 4` tail sentinels are produced by the
+ * same arithmetic.  It also writes the fallback dispatches' threadgroup counts
+ * (zero when accepted) and clears the scratch for the next call. */
+kernel void kernel_glm53_topk_fast_finish(
+        constant ds4_metal_args_glm53_topk_fast & args,
+        device atomic_uint * ctrl,
+        device uint        * hist,
+        device const uint2 * cand,
+        device int32_t     * out_idx,
+        device uint32_t    * raw,
+        device uint32_t    * indirect,
+        threadgroup uint2  * shmem [[threadgroup(0)]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const uint nth = ntg.x;             // == args.cand_cap, one candidate per lane
+    const uint tid = tpitg.x;
+
+    const uint flags = atomic_load_explicit(&ctrl[0], memory_order_relaxed);
+    const uint count = atomic_load_explicit(&ctrl[1], memory_order_relaxed);
+    const uint have  = min(count, args.cand_cap);
+
+    /* Register-resident bitonic sort, descending by (key, index).  Exactly the
+     * structure of kernel_argsort_f32_i32_desc_pair above: every stage with
+     * j < 32 is a simd_shuffle_xor and the rest use double-buffered threadgroup
+     * staging, so 55 stages cost 15 barriers instead of 55.  (key, index) is a
+     * total order, so the result does not depend on the order in which the
+     * gather's atomic counter handed out candidate slots. */
+    uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
+    threadgroup atomic_uint bad_bits;
+    ds4_topk_fast_tail(args, cur, flags, count, shmem, &bad_bits,
+                       ctrl, hist, out_idx, raw, indirect, tid, nth);
+}
+
+/* ---------------------------------------------------------------------------
+ * kernel_glm53_topk_fast_fused - lever `topk_fused`=1.
+ *
+ * The hist + gather + finish chain above as ONE dispatch of ONE threadgroup of
+ * cand_cap lanes.  Everything that decides the answer is unchanged: the same
+ * ds4_topk_fast_key mapping, the same 2^hist_bits bins, the same per-thread
+ * bin block and the same suffix-scan cut arithmetic, the same
+ * `(key >> shift) >= bin_lo` candidate test against the same cand_cap, the
+ * same six reject causes written to the same ctrl slots, and the sort,
+ * acceptance, output, pool expansion, fallback grids and telemetry run from
+ * ds4_topk_fast_tail, which is the finisher's own text.  What changes is only
+ * where the histogram and the candidate list live - threadgroup memory instead
+ * of device memory - which removes both device atomic sites and the two
+ * dependent dispatch edges between them (§7.12: those edges, not the encode,
+ * are the fixed cost of a small-grid chain).
+ *
+ * Byte-identity: the histogram counts are the same integers however they are
+ * stored, so bin_lo is the same bin; the candidate SET is therefore the same
+ * set; and the sort key (key, index) is a total order, so the candidates'
+ * arrival order in the list - the one thing that does differ - cannot change
+ * the sorted result.  `count` is the same integer, so every reject condition
+ * evaluates the same way.  No floating-point operation is performed at all.
+ *
+ * Threadgroup budget, 32 KB.  A 8,192-bin uint32 histogram would be 32,768 B
+ * on its own, so the bins are PACKED two 16-bit counters per uint32 word
+ * (4,096 words, 16 KB).  Neither half can overflow: the largest possible
+ * count is n_comp, and the host refuses this path unless n_comp < 65,536.
+ * Layout in uint words: [0,16) scalars, live throughout; the histogram
+ * [16, 16+nbins/2) and the cut scan [.., +nth+2) live in phases 1-2; the
+ * candidate list (cand_cap uint2) and the sort double buffer (2*nth uint2)
+ * overlay them from word 16 in phases 3-4, after the last read of the scan.
+ * Peak 16 + max(4096+1026, 2048+4096) = 6,160 words = 24,640 B at the
+ * certified tuple.
+ * ------------------------------------------------------------------------- */
+kernel void kernel_glm53_topk_fast_fused(
+        constant ds4_metal_args_glm53_topk_fast & args,
+        device const float * scores,
+        device atomic_uint * ctrl,
+        device uint        * hist,
+        device int32_t     * out_idx,
+        device uint32_t    * raw,
+        device uint32_t    * indirect,
+        threadgroup uint   * shm [[threadgroup(0)]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const uint nth   = ntg.x;           // == args.cand_cap, one candidate per lane
+    const uint tid   = tpitg.x;
+    const uint nbins = 1u << args.hist_bits;
+    const uint shift = 32u - args.hist_bits;
+    const uint hwords = nbins >> 1;     // packed: two 16-bit counters per word
+
+    threadgroup uint  *sc    = shm;                       // [0,16) scalars
+    threadgroup uint  *hpack = shm + 16u;                 // phases 1-2
+    threadgroup uint  *sscan = shm + 16u + hwords;        // phases 1-2
+    threadgroup uint2 *cand  = (threadgroup uint2 *)(shm + 16u);   // phases 3-4
+    threadgroup uint2 *sortbuf = cand + args.cand_cap;             // phases 3-4
+    threadgroup atomic_uint *fl = (threadgroup atomic_uint *)&sc[0];  // reject flags
+    threadgroup atomic_uint *nc = (threadgroup atomic_uint *)&sc[1];  // candidates
+    threadgroup atomic_uint bad_bits;
+
+    /* ---- phase 0: clear the packed histogram and the scalars ----------- */
+    for (uint w = tid; w < hwords; w += nth) hpack[w] = 0u;
+    if (tid < 16u) sc[tid] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* ---- phase 1: histogram (kernel_glm53_topk_fast_hist, one TG) ------ */
+    uint nonfinite = 0u;
+    for (uint i = tid; i < args.n_comp; i += nth) {
+        const float v = scores[i];
+        const uint  b = as_type<uint>(v);
+        const uint e = b & 0x7f800000u;
+        const uint m = b & 0x007fffffu;
+        if (e == 0x7f800000u) nonfinite = 1u;                   // Inf or NaN
+        if (e == 0u && m != 0u) nonfinite = 1u;                 // subnormal
+        const uint bin = ds4_topk_fast_key(v) >> shift;
+        atomic_fetch_add_explicit((threadgroup atomic_uint *)&hpack[bin >> 1],
+                                  (bin & 1u) ? 0x10000u : 1u,
+                                  memory_order_relaxed);
+    }
+    if (nonfinite)
+        atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_NONFINITE,
+                                 memory_order_relaxed);
+    if (tid == 0u) {
+        atomic_fetch_add_explicit(&ctrl[4], 1u, memory_order_relaxed);
+        if (args.n_comp < args.top_k)
+            atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_SHORT,
+                                     memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* ---- phase 2: the cut bin (kernel_glm53_topk_fast_gather prologue) -
+     * identical arithmetic on the identical integer counts, read back out of
+     * the packed words.  With one threadgroup `per` is the same value the
+     * chain uses, because the chain's threadgroups each scanned all nbins. */
+    const uint per = (nbins + nth - 1u) / nth;
+    uint mine = 0u;
+    const uint b0 = tid * per;
+    for (uint b = b0; b < b0 + per && b < nbins; b++)
+        mine += (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
+    sscan[tid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // inclusive SUFFIX sum over sscan[0..nth) (Hillis-Steele, reversed)
+    for (uint off = 1u; off < nth; off <<= 1) {
+        const uint add = (tid + off < nth) ? sscan[tid + off] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sscan[tid] += add;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) { sscan[nth] = 0xffffffffu; sscan[nth + 1u] = 0u; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint above_block = (tid + 1u < nth) ? sscan[tid + 1u] : 0u;
+    if (above_block < args.top_k && b0 < nbins) {
+        uint acc = above_block;
+        const uint hi = min(b0 + per, nbins);
+        for (uint b = hi; b-- > b0; ) {
+            const uint c = (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
+            if (acc < args.top_k && acc + c >= args.top_k) {
+                sscan[nth]      = b;
+                sscan[nth + 1u] = acc;
+                break;
+            }
+            acc += c;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint bin_lo = sscan[nth];
+    if (bin_lo == 0xffffffffu && tid == 0u)
+        atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_NOBIN,
+                                 memory_order_relaxed);
+    /* The chain RETURNS here, leaving count at 0 so the finisher rejects; the
+     * fused kernel cannot return - it still owes the fallback grids and the
+     * ctrl codes - so it skips the gather and falls through with count 0,
+     * which reaches the same reject through the same predicate. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // last read of sscan
+
+    /* ---- phase 3: gather into threadgroup memory ----------------------- */
+    if (bin_lo != 0xffffffffu) {
+        for (uint i = tid; i < args.n_comp; i += nth) {
+            const uint key = ds4_topk_fast_key(scores[i]);
+            if ((key >> shift) >= bin_lo) {
+                const uint slot = atomic_fetch_add_explicit(nc, 1u,
+                                                            memory_order_relaxed);
+                if (slot < args.cand_cap) cand[slot] = uint2(key, i);
+                else atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_OVERFLOW,
+                                              memory_order_relaxed);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* ---- phase 4: the finisher's own body ------------------------------ */
+    const uint flags = atomic_load_explicit(fl, memory_order_relaxed);
+    const uint count = atomic_load_explicit(nc, memory_order_relaxed);
+    const uint have  = min(count, args.cand_cap);
+    uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
+    ds4_topk_fast_tail(args, cur, flags, count, sortbuf, &bad_bits,
+                       ctrl, hist, out_idx, raw, indirect, tid, nth);
 }

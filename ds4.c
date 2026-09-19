@@ -56119,6 +56119,7 @@ glm_levers g_glm_levers = {
     .decode_concurrent     = 1,
     .chain_decode          = 1,  /* on: +0.61 t/s at 62k, +0.72 at 8k */
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
+    .topk_fused            = 0,  /* off until measured */
 };
 static int g_glm_levers_ready;
 
@@ -56137,6 +56138,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_DISABLE_CHAIN" },
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
+    { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_TOPK_FUSED" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56173,6 +56175,10 @@ void glm_levers_init_from_env(void) {
     g_glm_levers.chain_commit_ahead =
         getenv("DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD") == NULL &&
         getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
+    /* Default off, so this one is a plain ENABLE variable; the encoder falls
+     * back to the three-dispatch chain whenever the fused shape does not fit
+     * (see ds4_gpu_glm_topk_fast_fused_ok in ds4_metal.m). */
+    g_glm_levers.topk_fused = getenv("DS4_GLM_TOPK_FUSED") != NULL;
     g_glm_levers_ready = 1;
 }
 

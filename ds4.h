@@ -767,6 +767,15 @@ typedef struct {
      * a stop still has nothing to roll back.  Default ON with the chain;
      * DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD is the kill switch. */
     int chain_commit_ahead;
+    /* Fused top-k select: 1 replaces the fast top-k chain's three dependent
+     * dispatches (histogram, gather, finish) with ONE dispatch of one
+     * threadgroup per DSA site, holding the histogram and the candidate list
+     * in threadgroup memory instead of device memory.  Selection semantics are
+     * identical - same key mapping, bins, cut arithmetic, cand_cap, reject
+     * causes and ctrl codes - and the sort key is a total order, so the output
+     * is byte-identical.  Default off pending its A/B; DS4_GLM_TOPK_FUSED=1
+     * turns it on at startup and /debug/levers moves it live. */
+    int topk_fused;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
