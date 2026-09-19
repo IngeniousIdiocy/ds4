@@ -765,6 +765,12 @@ typedef struct {
      * 0 (default) blocks straight away.  DS4_GLM_CHAIN_SPIN_US sets it at
      * startup. */
     int chain_spin_us;
+    /* hc_pre: 1 takes the one-dispatch narrow compound producer
+     * (ds4_gpu_hc_pre_decode_fused_tensor) instead of the split-K refuse pair,
+     * by forcing the split-K mixer off.  Default 0 = today's pair.
+     * DS4_GLM_DISABLE_HC_MIX_SPLITK is the historical variable and still
+     * forces the single form at the call site whatever the lever says. */
+    int hc_pre_single;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

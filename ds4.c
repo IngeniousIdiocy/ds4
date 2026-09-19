@@ -45289,8 +45289,13 @@ static bool glm53_graph_hc_pre(
      * the cost of a second dispatch and a different summation order. Because
      * the order changes, it stays off unless asked for, and it takes the
      * unfused ladder so the split-K matvec is the mix step. */
+    /* Campaign lever hc_pre_single: 1 takes the split-K mixer out, which hands
+     * the stage to the one-dispatch compound producer below.  The historical
+     * kill switch is unchanged and still wins on its own. */
+    glm_levers_init_from_env();
     const bool splitk_mix = hc_mix_bf16 &&
         g->hc_mix_partials != NULL &&
+        !g_glm_levers.hc_pre_single &&
         getenv("DS4_GLM_DISABLE_HC_MIX_SPLITK") == NULL;
     const bool fuse_single = fuse_norm && !splitk_mix &&
         (fn->type == DS4_TENSOR_F16 || hc_mix_bf16) &&
@@ -45340,9 +45345,16 @@ static bool glm53_graph_hc_pre(
     (void)hc_mix_bf16;
     (void)splitk_mix;
     (void)fuse_refuse;
-    static int logged = 0;
-    if (!logged) {
-        logged = 1;
+    /* Logged on the first call and again whenever the selection changes: with
+     * hc_pre_single live, a server that ran both arms would otherwise report
+     * only the first one's path. */
+    const int fusion_state =
+        (int)fuse_norm_mix | ((int)fuse_norm << 1) | ((int)fuse_single << 2) |
+        ((int)splitk_mix << 3) | ((int)fuse_refuse << 4) |
+        ((int)fuse_one_dispatch << 5);
+    static int logged_state = -1;
+    if (logged_state != fusion_state) {
+        logged_state = fusion_state;
         fprintf(stderr,
                 "ds4: glm hc_pre fusion: norm_mix=%d norm=%d single=%d "
                 "mix_splitk=%d refuse=%d one_dispatch=%d fn_type=%d\n",
@@ -56042,6 +56054,7 @@ glm_levers g_glm_levers = {
     .decode_concurrent     = 1,
     .chain_decode          = 0,  /* off until the C2 gates adopt it */
     .chain_spin_us         = 0,  /* block on the command buffer straight away */
+    .hc_pre_single         = 0,  /* the split-K refuse pair, as shipped */
 };
 static int g_glm_levers_ready;
 
@@ -56061,6 +56074,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_CHAIN_DECODE" },
     { "chain_spin_us",         offsetof(glm_levers, chain_spin_us),         "DS4_GLM_CHAIN_SPIN_US" },
+    { "hc_pre_single",         offsetof(glm_levers, hc_pre_single),         "DS4_GLM_DISABLE_HC_MIX_SPLITK" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56097,6 +56111,11 @@ void glm_levers_init_from_env(void) {
             g_glm_levers.chain_spin_us = n;
         }
     }
+    /* The historical variable turns the split-K mixer off, which is exactly
+     * what this lever does, so the lever reports the environment's choice at
+     * startup.  The call site still tests the variable itself, so unsetting
+     * the lever afterwards cannot re-enable split-K against it. */
+    g_glm_levers.hc_pre_single = getenv("DS4_GLM_DISABLE_HC_MIX_SPLITK") != NULL;
     g_glm_levers_ready = 1;
 }
 
