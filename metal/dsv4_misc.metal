@@ -364,6 +364,10 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
+    /* Lever dsa_reduce_lanes, read only by the reduce kernels' value
+     * projection: 0 today's one-thread-per-row dot, 1 the Tier 1 batched-load
+     * form, 2 the Tier 2 lane split.  Threadgroup-uniform. */
+    uint32_t value_lanes;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -1889,6 +1893,72 @@ static inline float glm_q8_0_dot_row_tg_f32_512_u16(
             acc += d * (float)lo * x[base + 2u * p];
             acc += d * (float)hi * x[base + 2u * p + 1u];
         }
+    }
+    return acc;
+}
+
+/* Lever dsa_reduce_lanes = 1 (Tier 1).  Identical addends in identical order
+ * to glm_q8_0_dot_row_tg_f32_512_u16 above -- the FMA chain is untouched -- but
+ * the next block's seventeen loads are issued BEFORE the current block's
+ * thirty-two multiply-adds, so a thread keeps two blocks of weight in flight
+ * instead of one.  It cannot widen the loads: a Q8_0 block is 34 bytes, so its
+ * quantised bytes are 4-byte aligned only on odd blocks and ushort stays the
+ * widest universally legal load.  It also cannot fix the access pattern, since
+ * one thread still owns one row and the thirty-two lanes of a load instruction
+ * still touch thirty-two different rows; that is what value 2 is for. */
+static inline float glm_q8_0_dot_row_tg_f32_512_u16_pf(
+        device const char *row,
+        threadgroup const float *x) {
+    float acc = 0.0f;
+    ushort w[16];
+    float d_cur = (float)(*((device const half *)row));
+    FOR_UNROLL (uint p = 0; p < 16u; p++) {
+        w[p] = ((device const ushort *)(row + 2u))[p];
+    }
+    for (uint block = 0; block < 16u; block++) {
+        const float d = d_cur;
+        ushort wn[16];
+        if (block + 1u < 16u) {
+            device const char *nxt = row + (uint64_t)(block + 1u) * 34u;
+            d_cur = (float)(*((device const half *)nxt));
+            FOR_UNROLL (uint p = 0; p < 16u; p++) {
+                wn[p] = ((device const ushort *)(nxt + 2u))[p];
+            }
+        }
+        const uint base = block << 5;
+        FOR_UNROLL (uint p = 0; p < 16u; p++) {
+            const ushort ww = w[p];
+            const int8_t lo = (int8_t)(ww & 0xffu);
+            const int8_t hi = (int8_t)(ww >> 8);
+            acc += d * (float)lo * x[base + 2u * p];
+            acc += d * (float)hi * x[base + 2u * p + 1u];
+        }
+        FOR_UNROLL (uint p = 0; p < 16u; p++) {
+            w[p] = wn[p];
+        }
+    }
+    return acc;
+}
+
+/* Lever dsa_reduce_lanes = 2 (Tier 2).  One simdgroup per output row: lane l
+ * takes element l of every 32-element Q8_0 block, so the thirty-two lanes of a
+ * load instruction read thirty-two CONTIGUOUS bytes instead of thirty-two rows
+ * 544 bytes apart, and the caller simd_sums the lanes.  This is the shape
+ * glm_q4_K_dot_row_lane_f32 already uses on the Q4_K path.  It reassociates:
+ * today one thread sums elements 0..511 in order, here lane l sums its sixteen
+ * strided elements and the lanes are combined by the simd_sum tree.  The
+ * per-lane dependent chain drops from 512 FMAs to 16, and all 512 threads of
+ * the threadgroup are busy instead of 256. */
+static inline float glm_q8_0_dot_row_lane_f32_512(
+        device const char *row,
+        threadgroup const float *x,
+        ushort lane) {
+    float acc = 0.0f;
+    for (uint block = 0; block < 16u; block++) {
+        device const char *block_base = row + (uint64_t)block * 34u;
+        const float d = (float)(*((device const half *)block_base));
+        device const int8_t *qs = (device const int8_t *)(block_base + 2u);
+        acc += d * (float)qs[lane] * x[(block << 5) + lane];
     }
     return acc;
 }
@@ -4226,16 +4296,38 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
                 out[d] = sum;
             }
         }
+    } else if (args.value_lanes == 2u &&
+               args.value_type == DS4_METAL_GGUF_Q8_0 &&
+               args.kv_lora_dim == 512u) {
+        /* Tier 2 lane split, the same structure the Q4_K branch above uses. */
+        const uint vp_sg = tid >> 5u;
+        const uint vp_lane = tid & 31u;
+        const uint vp_nsg = nth >> 5u;
+        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
+            device const char *row =
+                value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
+            const float part =
+                glm_q8_0_dot_row_lane_f32_512(row, lora_sum, (ushort)vp_lane);
+            const float sum = simd_sum(part);
+            if (vp_lane == 0u) {
+                out[d] = sum;
+            }
+        }
     } else {
+        const bool q8_512 = args.value_type == DS4_METAL_GGUF_Q8_0 &&
+                            args.kv_lora_dim == 512u;
         for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
-            /* Q8_U16 reads the same row as ushort pairs in the same order. */
-            out[d] = (Q8_U16 && args.value_type == DS4_METAL_GGUF_Q8_0 &&
-                      args.kv_lora_dim == 512u)
-                         ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
-                         : glm_quant_dot_row_tg_f32(args.value_type, row,
-                                                    lora_sum, args.kv_lora_dim);
+            /* Q8_U16 reads the same row as ushort pairs in the same order;
+             * value_lanes 1 keeps that order and only moves the loads. */
+            out[d] = (args.value_lanes == 1u && q8_512)
+                         ? glm_q8_0_dot_row_tg_f32_512_u16_pf(row, lora_sum)
+                         : ((Q8_U16 && q8_512)
+                                ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
+                                : glm_quant_dot_row_tg_f32(args.value_type, row,
+                                                           lora_sum,
+                                                           args.kv_lora_dim));
         }
     }
 }

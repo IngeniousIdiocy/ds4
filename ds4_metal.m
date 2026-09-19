@@ -7712,6 +7712,9 @@ typedef struct {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
+    /* Lever dsa_reduce_lanes; mirrors value_lanes in
+     * ds4_metal_args_glm_attention_indexed_decode_split. */
+    uint32_t value_lanes;
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -41304,6 +41307,43 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                 }
             }
         }
+        /* Lever dsa_reduce_lanes (T2-REPORT.md section 8.8).  The reduce's
+         * value projection streams 139 KB of Q8_0 weight per head at 4.3 GB/s
+         * per core, against the 8.8 GB/s the full-grid mul_mv kernels reach,
+         * because today one THREAD owns one 544-byte row: the thirty-two lanes
+         * of every load instruction touch thirty-two rows 544 bytes apart, so
+         * nothing coalesces, the dependent FMA chain is 512 long, and with
+         * value_dim 256 against 512 threads only half the threadgroup is busy.
+         * 1 keeps the accumulation order exactly and only carries two blocks
+         * of weight in flight instead of one (Tier 1); 2 gives one simdgroup
+         * per row with lane l taking element l of each block, which makes the
+         * loads contiguous, shortens the per-lane chain to 16 and uses all 512
+         * threads, at the cost of reassociating the sum through simd_sum
+         * (Tier 2, the shape the Q4_K branch already ships).  Both are refused
+         * unless the weights are Q8_0 with kv_lora_dim 512. */
+        uint32_t reduce_lanes = 0u;
+        if ((g_glm_levers.dsa_reduce_lanes == 1 ||
+             g_glm_levers.dsa_reduce_lanes == 2) &&
+            !glm53_exact_mode() &&
+            value_weight_type == DS4_METAL_TENSOR_Q8_0 &&
+            kv_lora_dim == 512u) {
+            reduce_lanes = (uint32_t)g_glm_levers.dsa_reduce_lanes;
+        }
+        {
+            static int announced_lanes = -1;
+            static int announced_lanes_lever = -2;
+            if (announced_lanes != (int)reduce_lanes ||
+                announced_lanes_lever != g_glm_levers.dsa_reduce_lanes) {
+                announced_lanes = (int)reduce_lanes;
+                announced_lanes_lever = g_glm_levers.dsa_reduce_lanes;
+                fprintf(stderr,
+                        "ds4: DSAREDLANES lever=%d -> value_lanes=%u "
+                        "(type=%u kv_lora=%u value_dim=%u)\n",
+                        g_glm_levers.dsa_reduce_lanes, reduce_lanes,
+                        (unsigned)value_weight_type, (unsigned)kv_lora_dim,
+                        (unsigned)value_dim);
+            }
+        }
         {
             static ds4_t2s_slot slot = { "DSAREDSPLIT", 0, 0 };
             ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) value_dim=%u",
@@ -41357,6 +41397,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
+            .value_lanes = reduce_lanes,
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;

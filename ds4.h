@@ -955,6 +955,40 @@ typedef struct {
      * 38.237 mean, 2 = 37.809, i.e. -0.43.  DS4_GLM_KDA_GLUE_SPLIT sets it at
      * startup. */
     int kda_glue_split;
+    /* How the DSA attention reduce's value projection reads a weight row:
+     * 0 today, 1 the Tier 1 batched-load form, 2 the Tier 2 lane split.
+     *
+     * The projection is essentially the whole of the reduce's 32.33 us --
+     * section 8.7's split measurement showed the 17-partial blend is nearly
+     * free -- and it streams 139 KB of Q8_0 weight per head at 4.3 GB/s per
+     * core against the 8.8 GB/s the full-grid mul_mv kernels reach.  The
+     * reason is the access pattern, not latency: today one THREAD owns one
+     * 544-byte row, so the thirty-two lanes of every load instruction touch
+     * thirty-two rows 544 bytes apart and nothing coalesces; the dependent FMA
+     * chain is 512 long; and with value_dim 256 against 512 threads only half
+     * the threadgroup is busy.
+     *
+     * 1 is Tier 1: identical addends in identical order, with the next
+     * block's seventeen loads issued before the current block's thirty-two
+     * multiply-adds so a thread holds two blocks of weight in flight instead
+     * of one.  It cannot widen the loads -- a Q8_0 block is 34 bytes, so the
+     * quantised bytes are 4-byte aligned only on odd blocks and ushort stays
+     * the widest legal load -- and it cannot fix the access pattern, so the
+     * honest expectation is small.
+     *
+     * 2 is Tier 2: one simdgroup per output row, lane l taking element l of
+     * every 32-element block, so a load instruction reads thirty-two
+     * CONTIGUOUS bytes, the per-lane chain is 16 FMAs and all 512 threads
+     * work.  It reassociates -- today one thread sums 0..511 in order, here
+     * the lanes are combined by the simd_sum tree -- and it is exactly the
+     * shape glm_q4_K_dot_row_lane_f32 already ships on the Q4_K path.  At the
+     * 8.8 GB/s per-core rate the projection floor is about 16 us a head
+     * against 32.33 today, so about 16 us x 11 sites, 0.18 ms.
+     *
+     * Both are refused unless the value weights are Q8_0 with kv_lora_dim 512,
+     * and 2 is registered so DS4_GLM_EXACT=1 clamps it back to 0.
+     * DS4_GLM_DSA_REDUCE_LANES sets it at startup. */
+    int dsa_reduce_lanes;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
