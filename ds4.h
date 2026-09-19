@@ -767,6 +767,24 @@ typedef struct {
      * a stop still has nothing to roll back.  Default ON with the chain;
      * DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD is the kill switch. */
     int chain_commit_ahead;
+    /* A2: how many heads share one staged window in the DSA decode attention
+     * partial (ds4_metal.m).  Counted 8 (shipped) or 32; 32 widens the
+     * threadgroup to 1024 threads so each selected row is gathered from the
+     * compact cache once per 32 heads instead of once per 8.  Tier 1 on its
+     * own -- the staged window is read-only and each simdgroup keeps the
+     * group8 row order, lane mapping and online-softmax update -- but it only
+     * pays at 64-row blocks: measured +0.19 t/s at 62k with
+     * attn_block_rows=64 and -0.48 at 128, so the dispatch site refuses 32
+     * unless the resolved geometry is 64 rows and falls back to 8, logging
+     * once.  (Group 16 was measured flat, +0.08 / -0.05, and is gone.)
+     * DS4_GLM_ATTN_GROUP sets it at startup. */
+    int attn_group;
+    /* A2: rows per block of the DSA decode attention split, for the deep
+     * (n_selected > 1024) geometry.  Counted 64 / 128; 128 is shipped.
+     * n_blocks follows it.  Tier 2 -- a different block partition changes the
+     * reduce's summation, so it is NOT bit-identical and DS4_GLM_EXACT and an
+     * explicit DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP both override it. */
+    int attn_block_rows;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

@@ -42487,16 +42487,29 @@ static uint32_t glm_graph_t2s_env_u32(const char *name, uint32_t dflt) {
 
 static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selected) {
     static uint32_t shallow, deep;
+    static int deep_from_env;
     if (shallow == 0u) {
         if (glm53_exact_mode_c()) {
             shallow = 32u;
             deep = 128u;
         } else {
+            const char *v = getenv("DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP");
+            deep_from_env = v != NULL && v[0] != '\0';
             shallow = glm_graph_t2s_env_u32("DS4_GLM_SPLIT8_BLOCK_ROWS_SHALLOW", 32u);
             deep = glm_graph_t2s_env_u32("DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP", 128u);
         }
     }
     uint32_t rows = n_selected <= 1024u ? shallow : deep;
+    /* A2: the live attn_block_rows lever owns the deep geometry, so a block
+     * count can be A/B'd on the resident server.  It yields to an explicit
+     * DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP and to exact mode, which pins the shipped
+     * partition: changing the partition changes the reduce's summation, so
+     * this lever is Tier 2, unlike attn_group. */
+    if (n_selected > 1024u && !deep_from_env && !glm53_exact_mode_c()) {
+        glm_levers_init_from_env();
+        const int lever_rows = g_glm_levers.attn_block_rows;
+        if (lever_rows == 64 || lever_rows == 128) rows = (uint32_t)lever_rows;
+    }
     while (rows < n_selected && (n_selected + rows - 1u) / rows > 64u) rows++;
     return rows;
 }
@@ -56119,6 +56132,8 @@ glm_levers g_glm_levers = {
     .decode_concurrent     = 1,
     .chain_decode          = 1,  /* on: +0.61 t/s at 62k, +0.72 at 8k */
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
+    .attn_group            = 8,  /* heads per staged window, as shipped */
+    .attn_block_rows       = 128,/* deep split geometry, as shipped */
 };
 static int g_glm_levers_ready;
 
@@ -56127,7 +56142,24 @@ static int g_glm_levers_ready;
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
+    if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
+    if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
     return 0;
+}
+
+/* Two of the counted levers are enumerations, not intervals: a value inside
+ * the range but outside the set would be accepted by /debug/levers and then
+ * silently resolved back to the default at the dispatch site, which would make
+ * an A/B arm quietly measure the control. */
+static int glm_lever_counted_member(const char *name, int value) {
+    if (!strcmp(name, "attn_group")) {
+        /* 16 was measured flat (+0.08 / -0.05 t/s) and its kernels are gone. */
+        return value == 8 || value == 32;
+    }
+    if (!strcmp(name, "attn_block_rows")) {
+        return value == 64 || value == 128;
+    }
+    return 1;
 }
 
 static const struct { const char *name; size_t off; const char *env; } g_glm_lever_map[] = {
@@ -56137,6 +56169,8 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_DISABLE_CHAIN" },
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
+    { "attn_group",            offsetof(glm_levers, attn_group),            "DS4_GLM_ATTN_GROUP" },
+    { "attn_block_rows",       offsetof(glm_levers, attn_block_rows),       "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56173,6 +56207,26 @@ void glm_levers_init_from_env(void) {
     g_glm_levers.chain_commit_ahead =
         getenv("DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD") == NULL &&
         getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
+    /* Both A2 levers are enumerations: an environment value outside the set
+     * leaves the shipped geometry, and for attn_block_rows the historical
+     * variable keeps winning at the call site (see
+     * glm_graph_indexed_decode_split_block_rows_for). */
+    {   const char *v = getenv("DS4_GLM_ATTN_GROUP");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("attn_group", n)) {
+                g_glm_levers.attn_group = n;
+            }
+        }
+    }
+    {   const char *v = getenv("DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("attn_block_rows", n)) {
+                g_glm_levers.attn_block_rows = n;
+            }
+        }
+    }
     g_glm_levers_ready = 1;
 }
 
@@ -56210,6 +56264,7 @@ int glm_levers_set(const char *name, int value) {
                  * anything above the layer count.  decode_ablate is a
                  * bitmask. */
                 if (value < lo || value > hi) return 0;
+                if (!glm_lever_counted_member(name, value)) return 0;
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value;
             } else {
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value ? 1 : 0;
