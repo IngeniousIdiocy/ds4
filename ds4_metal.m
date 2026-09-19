@@ -7712,12 +7712,6 @@ typedef struct {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
-    /* Lever dsa_reduce_lanes; mirrors value_lanes in
-     * ds4_metal_args_glm_attention_indexed_decode_split. */
-    uint32_t value_lanes;
-    /* Lever dsa_reduce_blend; mirrors blend_layout in
-     * ds4_metal_args_glm_attention_indexed_decode_split. */
-    uint32_t blend_layout;
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -21127,53 +21121,26 @@ static int ds4_gpu_indexer_topk_fused(
     }
     uint32_t fb_slot = 0;
 
-    /* Lever topk_fallback_encode: when the fast path is in play, the legacy
-     * pair and every fused-merge level are still ENCODED, with indirect grids
-     * the finisher zeroes on acceptance.  Each is a zero-threadgroup dispatch
-     * that still costs the ~10.2 us encoder boundary measured in
-     * T2-REPORT.md section 3.1, and at 62k that is one pair plus two merges per
-     * DSA site, 33 empty dispatches per token over the 11 sites.  Setting the
-     * lever to 0 does not encode them at all.
-     *
-     * NEVER SHIP.  It is only correct while the fast path ACCEPTS; on any
-     * reject (non-finite score, candidate overflow, no boundary bin, a tie in
-     * the top k, a short count, a bad index) the fallback is the thing that
-     * produces the right top-k, and without it the indexer selects garbage and
-     * the generated text changes.  The text column is the tripwire, and it is
-     * a binary one: a clean run says only that this fixture never tripped a
-     * reject, not that the rejects cannot happen. */
-    const bool skip_fallback = use_fast && g_glm_levers.topk_fallback_encode == 0;
-    if (skip_fallback) {
-        static ds4_t2s_slot slot = { "TOPKFB", 0, 0 };
-        ds4_t2s_hit(&slot, "skipping legacy pair + %u merge dispatches "
-                           "(n_comp=%d top_k=%d work_width=%d one_pass=%d)",
-                    (unsigned)(fast_args.fb_count ? fast_args.fb_count - 1u : 0u),
-                    (int)n_comp, (int)top_k, (int)work_width, (int)one_pass);
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_argsort_pair_pipeline];
+    [enc setBytes:&sort_args length:sizeof(sort_args) atIndex:0];
+    [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+    [enc setBuffer:one_pass ? selbuf : g_indexer_topk_pair_buffer
+            offset:one_pass ? ds4_gpu_tensor_offset(selected) : 0
+           atIndex:2];
+    [enc setThreadgroupMemoryLength:(NSUInteger)2 * (NSUInteger)nth * pair_bytes atIndex:0];
+    if (use_fast) {
+        [enc dispatchThreadgroupsWithIndirectBuffer:g_topk_fast_scratch
+                               indirectBufferOffset:fast_off_ind + fb_slot * 12u
+                              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
+        fb_slot++;
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
     }
+    ds4_gpu_end_compute_encoder(cb, enc);
 
-    id<MTLComputeCommandEncoder> enc = nil;
-    if (!skip_fallback) {
-        enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_argsort_pair_pipeline];
-        [enc setBytes:&sort_args length:sizeof(sort_args) atIndex:0];
-        [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
-        [enc setBuffer:one_pass ? selbuf : g_indexer_topk_pair_buffer
-                offset:one_pass ? ds4_gpu_tensor_offset(selected) : 0
-               atIndex:2];
-        [enc setThreadgroupMemoryLength:(NSUInteger)2 * (NSUInteger)nth * pair_bytes atIndex:0];
-        if (use_fast) {
-            [enc dispatchThreadgroupsWithIndirectBuffer:g_topk_fast_scratch
-                                   indirectBufferOffset:fast_off_ind + fb_slot * 12u
-                                  threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
-            fb_slot++;
-        } else {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
-        }
-        ds4_gpu_end_compute_encoder(cb, enc);
-    }
-
-    if (!one_pass && !skip_fallback) {
+    if (!one_pass) {
         NSUInteger tg_threads = g_argsort_merge_fused_pipeline.maxTotalThreadsPerThreadgroup;
         if (tg_threads == 0) tg_threads = 256;
         if (tg_threads > 1024u) tg_threads = 1024u;
@@ -41091,52 +41058,6 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                 }
             }
         }
-        /* A2: attn_group -- how many heads share one staged window.  The
-         * group8 partial gathers every selected row once per head group, so at
-         * 8 heads per threadgroup each row is read from the compact cache
-         * eight times per layer; 32 quarters that traffic.  Tier 1 (the staged
-         * window is read-only and each simdgroup keeps the group8 row order,
-         * lane mapping and online-softmax update), so the only things to
-         * police are the shape and the block geometry: the widening is written
-         * for the certified GLM-5.3 decode tuple alone, and it only PAYS at 64
-         * rows per block (measured +0.19 t/s at 62k and +0.16 at 8k with
-         * attn_block_rows=64, and -0.48 at the shipped 128, where 16 blocks of
-         * 128 rows already saturate the stage).  Either miss falls back to the
-         * shipped group8 dispatch after one log line -- loudly, so an arm that
-         * sets attn_group alone cannot quietly measure the control. */
-        uint32_t attn_group = 8u;
-        {
-            glm_levers_init_from_env();
-            const int want = g_glm_levers.attn_group;
-            if (want == 32) {
-                const uint32_t g = (uint32_t)want;
-                const bool tuple_ok =
-                    !t2s_split8 &&
-                    n_head == 64u && (n_head % g) == 0u &&
-                    kv_lora_dim == 512u && qk_rope == 0u && cache_f16 &&
-                    value_weight_type == DS4_METAL_TENSOR_Q8_0 &&
-                    n_selected <= 2051u;
-                if (tuple_ok && block_rows == 64u) {
-                    attn_group = g;
-                } else {
-                    static int refused;
-                    if (!refused) {
-                        refused = 1;
-                        fprintf(stderr,
-                                "ds4: DSA decode attn_group=%d refused "
-                                "(n_head %u kv_lora %u qk_rope %u f16 %d "
-                                "value_type %u n_selected %u block_rows %u "
-                                "screen %s); using group8%s\n",
-                                want, n_head, kv_lora_dim, qk_rope,
-                                cache_f16 ? 1 : 0, value_weight_type,
-                                n_selected, block_rows,
-                                t2s_split8 ? t2s_split8 : "off",
-                                tuple_ok ? " -- attn_group=32 needs "
-                                           "attn_block_rows=64" : "");
-                    }
-                }
-            }
-        }
         id<MTLComputePipelineState> partial_pipeline = nil;
         if (t2s_split8) {
             char fn[96];
@@ -41145,48 +41066,6 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             if (!partial_pipeline) {
                 fprintf(stderr, "ds4: T2SCREEN SPLIT8DBL variant %s unavailable; using production\n", t2s_split8);
                 t2s_split8 = NULL;
-            }
-        }
-        /* A missing or too-narrow widened kernel is a property of the build,
-         * not of the request, so each group remembers its own refusal instead
-         * of retrying (and re-logging) the lookup at every layer. */
-        static int attn_group_unavailable;
-        int *attn_group_refused = &attn_group_unavailable;
-        if (attn_group != 8u && *attn_group_refused) attn_group = 8u;
-        if (!partial_pipeline && attn_group != 8u) {
-            /* Same variant ladder as group8 below: the widened kernel has a
-             * twin of every instantiation, so the group never weakens the
-             * row/head contract. */
-            char fn[128];
-            snprintf(fn, sizeof(fn),
-                     "kernel_glm_attention_indexed_decode_split_group%u_partial%s",
-                     attn_group,
-                     use_prefix_fullheads ? "_prefix_fullheads" :
-                     use_valid_fullheads ? "_valid_fullheads" : "");
-            partial_pipeline = ds4_gpu_get_pipeline(fn);
-            const NSUInteger want_threads = (NSUInteger)attn_group * 32u;
-            if (partial_pipeline &&
-                partial_pipeline.maxTotalThreadsPerThreadgroup < want_threads) {
-                /* register pressure: the widened threadgroup does not fit */
-                fprintf(stderr,
-                        "ds4: DSA decode %s allows only %lu threads "
-                        "(needs %lu); using group8\n",
-                        fn,
-                        (unsigned long)partial_pipeline.maxTotalThreadsPerThreadgroup,
-                        (unsigned long)want_threads);
-                partial_pipeline = nil;
-            }
-            if (!partial_pipeline) {
-                fprintf(stderr,
-                        "ds4: DSA decode %s unavailable; using group8\n", fn);
-                *attn_group_refused = 1;
-                attn_group = 8u;
-            } else {
-                static uint32_t announced;
-                if (announced != attn_group) {
-                    announced = attn_group;
-                    fprintf(stderr, "ds4: DSA decode attn_group on: %s\n", fn);
-                }
             }
         }
         if (!partial_pipeline && use_prefix_fullheads) {
@@ -41271,152 +41150,6 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                                  use_reduce_u16 ?
                                      "kernel_glm_attention_indexed_decode_split_group8_reduce_u16" :
                                      "kernel_glm_attention_indexed_decode_split_group8_reduce");
-        /* Lever dsa_reduce_split (T2-REPORT.md section 8.3).  The reduce runs one
-         * threadgroup per head, 64 of the machine's 80 cores, and streams
-         * 11.2 MB of value weights and block partials at 346 GB/s against the
-         * 564 GB/s that 64 cores could reach and the 705 GB/s the ledger shows
-         * at large grids.  Halving the output rows over two threadgroups per
-         * head replicates only the 2.23 MB blend and puts 128 cores on the
-         * weights.  Tier 1: the blend is redundant recomputation of the same
-         * reduction tree over read-only inputs, and each output row keeps its
-         * own arithmetic because a row is one thread's serial dot (Q8_0) or a
-         * fixed lane split reduced by simd_sum (Q4_K) whichever threadgroup
-         * runs it.  Refused back to one threadgroup per head when the shape has
-         * no twin: the VPLANE screen kernel, or a value_dim the split cannot
-         * halve. */
-        uint32_t reduce_split = 1u;
-        const char *reduce_split_name = "production(1 TG/head)";
-        if (!t2s_vplane && g_glm_levers.dsa_reduce_split == 2 &&
-            value_dim >= 2u) {
-            const char *split_name =
-                use_reduce16 ?
-                    "kernel_glm_attention_indexed_decode_split_group8_reduce16_split2" :
-                use_reduce_u16 ?
-                    "kernel_glm_attention_indexed_decode_split_group8_reduce_u16_split2" :
-                    "kernel_glm_attention_indexed_decode_split_group8_reduce_split2";
-            id<MTLComputePipelineState> split_pipeline =
-                ds4_gpu_get_pipeline(split_name);
-            if (split_pipeline) {
-                reduce_pipeline = split_pipeline;
-                reduce_split = 2u;
-                reduce_split_name = split_name;
-            } else {
-                static int warned;
-                if (!warned) {
-                    warned = 1;
-                    fprintf(stderr,
-                            "ds4: DSAREDSPLIT pipeline %s unavailable; "
-                            "using one threadgroup per head\n", split_name);
-                }
-            }
-        }
-        /* Lever dsa_reduce_blend (T2-REPORT.md section 8.9).  partial_lora is
-         * written block-major by the partial and read head-major by the
-         * reduce, so for one head the n_blocks reads are n_head * kv_lora_dim
-         * * 4 bytes apart -- 131,072 at this shape -- with no row-buffer reuse
-         * and no TLB locality, and with nth equal to kv_lora_dim each thread
-         * handles exactly one j so nothing hides the latency.  1 planes the
-         * array by head instead, which makes the reduce's run contiguous and
-         * the partial's stores eight 2 KB chunks at n_blocks * 2 KB stride --
-         * independent stores that do not stall.  2 adds the reduction fix:
-         * the two block reductions sweep all nth leaves to combine n_blocks
-         * values, and the kernel's identity-leaf argument shows the five
-         * simdgroup-wide steps are the only ones that do anything.
-         *
-         * Both values are Tier 1.  Both are refused when either T2 screen
-         * variant of this pair is selected, because the screen kernels in
-         * metal/t2screen.metal carry their own copies of the two loops and
-         * would keep the old layout: producer and consumer must never
-         * disagree.  Every other reader and writer of partial_lora is one of
-         * the six production partial instantiations or the six production
-         * reduce instantiations, which share this args struct; the buffer is
-         * per-dispatch scratch that is never serialised, snapshotted or read
-         * by any DFlash path. */
-        uint32_t blend_layout = 0u;
-        if ((g_glm_levers.dsa_reduce_blend == 1 ||
-             g_glm_levers.dsa_reduce_blend == 2) &&
-            !t2s_split8 && !t2s_vplane && n_blocks > 0u) {
-            blend_layout = (uint32_t)g_glm_levers.dsa_reduce_blend;
-        }
-        {
-            static int announced_blend = -1;
-            static int announced_blend_lever = -2;
-            if (announced_blend != (int)blend_layout ||
-                announced_blend_lever != g_glm_levers.dsa_reduce_blend) {
-                announced_blend = (int)blend_layout;
-                announced_blend_lever = g_glm_levers.dsa_reduce_blend;
-                fprintf(stderr,
-                        "ds4: DSAREDBLEND lever=%d -> blend_layout=%u "
-                        "(n_blocks=%u n_head=%u kv_lora=%u screen split8=%s "
-                        "vplane=%d)\n",
-                        g_glm_levers.dsa_reduce_blend, blend_layout,
-                        (unsigned)n_blocks, (unsigned)n_head,
-                        (unsigned)kv_lora_dim,
-                        t2s_split8 ? t2s_split8 : "off", t2s_vplane);
-            }
-        }
-        /* Lever dsa_reduce_lanes (T2-REPORT.md section 8.8).  The reduce's
-         * value projection streams 139 KB of Q8_0 weight per head at 4.3 GB/s
-         * per core, against the 8.8 GB/s the full-grid mul_mv kernels reach,
-         * because today one THREAD owns one 544-byte row: the thirty-two lanes
-         * of every load instruction touch thirty-two rows 544 bytes apart, so
-         * nothing coalesces, the dependent FMA chain is 512 long, and with
-         * value_dim 256 against 512 threads only half the threadgroup is busy.
-         * 1 keeps the accumulation order exactly and only carries two blocks
-         * of weight in flight instead of one (Tier 1); 2 gives one simdgroup
-         * per row with lane l taking element l of each block, which makes the
-         * loads contiguous, shortens the per-lane chain to 16 and uses all 512
-         * threads, at the cost of reassociating the sum through simd_sum
-         * (Tier 2, the shape the Q4_K branch already ships).  Both are refused
-         * unless the weights are Q8_0 with kv_lora_dim 512. */
-        uint32_t reduce_lanes = 0u;
-        if ((g_glm_levers.dsa_reduce_lanes == 1 ||
-             g_glm_levers.dsa_reduce_lanes == 2) &&
-            !glm53_exact_mode() &&
-            value_weight_type == DS4_METAL_TENSOR_Q8_0 &&
-            kv_lora_dim == 512u) {
-            reduce_lanes = (uint32_t)g_glm_levers.dsa_reduce_lanes;
-        }
-        {
-            static int announced_lanes = -1;
-            static int announced_lanes_lever = -2;
-            if (announced_lanes != (int)reduce_lanes ||
-                announced_lanes_lever != g_glm_levers.dsa_reduce_lanes) {
-                announced_lanes = (int)reduce_lanes;
-                announced_lanes_lever = g_glm_levers.dsa_reduce_lanes;
-                fprintf(stderr,
-                        "ds4: DSAREDLANES lever=%d -> value_lanes=%u "
-                        "(type=%u kv_lora=%u value_dim=%u)\n",
-                        g_glm_levers.dsa_reduce_lanes, reduce_lanes,
-                        (unsigned)value_weight_type, (unsigned)kv_lora_dim,
-                        (unsigned)value_dim);
-            }
-        }
-        {
-            static ds4_t2s_slot slot = { "DSAREDSPLIT", 0, 0 };
-            ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) value_dim=%u",
-                        reduce_split, n_head, reduce_split, value_dim);
-            /* Announce on every VALUE CHANGE as well as on the first dispatch.
-             * These are live levers, moved through /debug/levers on a resident
-             * server, so the first-dispatch line only records whichever arm
-             * ran first and says nothing about take-up afterwards.  The line
-             * carries the lever's value AND the kernel actually selected, so a
-             * silent refusal is distinguishable from a lever that never
-             * moved. */
-            static uint32_t announced_split = 0xffffffffu;
-            static int announced_lever = -1;
-            if (announced_split != reduce_split ||
-                announced_lever != g_glm_levers.dsa_reduce_split) {
-                announced_split = reduce_split;
-                announced_lever = g_glm_levers.dsa_reduce_split;
-                fprintf(stderr,
-                        "ds4: DSAREDSPLIT lever=%d -> split=%u grid=(%u,%u) "
-                        "value_dim=%u kernel=%s\n",
-                        g_glm_levers.dsa_reduce_split, reduce_split,
-                        n_head, reduce_split, value_dim, reduce_split_name);
-            }
-        }
-
         if (!partial_pipeline || !reduce_pipeline) return 0;
 
         int owned = 0;
@@ -41445,8 +41178,6 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
-            .value_lanes = reduce_lanes,
-            .blend_layout = blend_layout,
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;
@@ -41458,12 +41189,12 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         {
             static ds4_t2s_slot slot = { "SPLIT8DBL", 0, 0 };
             ds4_t2s_hit(&slot,
-                        "%s group=%u block_rows=%u n_blocks=%u stage_rows=%lu "
+                        "%s block_rows=%u n_blocks=%u stage_rows=%lu "
                         "bufs=%lu scratch=%lu B",
                         t2s_split8 ?
                             "kernel_glm_t2s_split_group8_partial" :
                             "kernel_glm_attention_indexed_decode_split_group_partial(prod)",
-                        attn_group, block_rows, n_blocks,
+                        block_rows, n_blocks,
                         (unsigned long)stage_rows, (unsigned long)stage_bufs,
                         (unsigned long)partial_scratch_bytes);
         }
@@ -41515,9 +41246,9 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:partial_msbuf offset:ds4_gpu_tensor_offset(partial_ms) atIndex:7];
         [enc setThreadgroupMemoryLength:partial_scratch_bytes atIndex:0];
         for (int rep = 0; rep < rep_partial; rep++) {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / attn_group,
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / 8u,
                                                   (NSUInteger)n_blocks, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)attn_group, 1)];
+                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         }
@@ -41536,8 +41267,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:4];
         [enc setThreadgroupMemoryLength:reduce_scratch_floats * sizeof(float) atIndex:0];
         for (int rep = 0; rep < rep_reduce; rep++) {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
-                                                  (NSUInteger)reduce_split, 1)
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(reduce_threads, 1, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -44106,40 +43836,6 @@ static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_split_pipeline(void) 
     return cached;
 }
 
-/* C1 (lever sdn_fold): the same split body with coherent partial stores, a
- * per-row-pair last-arrival ticket and the shared-down + slot-sum + HC-expand
- * consumer as its tail.  See metal/dsv4_hc.metal.  Mode 1 is the form measured
- * at -0.86 t/s; 2 is the publication-only ablation (no tail, the host still
- * dispatches the consumer); 3 is the full fold with the slot as the
- * fastest-varying grid axis. */
-static const char *ds4_gpu_glm_routed_down_sdn_fold_kernel(int mode) {
-    switch (mode) {
-    case 1: return "kernel_glm_q4_K_down_simd_split_sdn_fold_f32";
-    case 2: return "kernel_glm_q4_K_down_simd_split_sdn_pub_f32";
-    case 3: return "kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32";
-    case 4: return "kernel_glm_q4_K_down_simd_split_sdn_pub_nofence_f32";
-    case 5: return "kernel_glm_q4_K_down_simd_split_sdn_fold_nofence_f32";
-    case 6: return "kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32";
-    default: return NULL;
-    }
-}
-
-static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_sdn_fold_pipeline(int mode) {
-    static id<MTLComputePipelineState> cached[7];
-    static int tried[7];
-    if (mode < 1 || mode > 6) return nil;
-    if (!tried[mode]) {
-        tried[mode] = 1;
-        cached[mode] =
-            ds4_gpu_get_pipeline(ds4_gpu_glm_routed_down_sdn_fold_kernel(mode));
-        if (!cached[mode]) {
-            fprintf(stderr, "ds4: SDNFOLD pipeline %s unavailable; using the pair\n",
-                    ds4_gpu_glm_routed_down_sdn_fold_kernel(mode));
-        }
-    }
-    return cached[mode];
-}
-
 
 /* Routed-expert gate+up pair, wide-load inner loop (lever-routed-gateup).
  * Reads exactly the same bytes in the same lanes in the same order with wider
@@ -44220,10 +43916,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         bool                    force_resident,
         ds4_gpu_tensor       *routed_partials,
-        int                    *used_split,
-        ds4_gpu_sdn_fold_desc  *sdn_fold) {
+        int                    *used_split) {
     if (used_split) *used_split = 0;
-    if (sdn_fold) sdn_fold->folded = 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
@@ -44649,114 +44343,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             if (!split_pipeline) partbuf = nil;
         }
 
-        /* C1: the consumer folded into the split dispatch's last-arriving
-         * threadgroup.  Everything the pair needs is validated here, and any
-         * miss leaves fold_pipeline nil so the pair runs unchanged. */
-        id<MTLComputePipelineState> fold_pipeline = nil;
-        int fold_mode = 0;
-        id<MTLBuffer> fold_wbuf = nil, fold_midbuf = nil, fold_sharedbuf = nil;
-        id<MTLBuffer> fold_resbuf = nil, fold_splitbuf = nil, fold_outbuf = nil;
-        id<MTLBuffer> fold_ticketbuf = nil;
-        uint64_t fold_winner = 0;
-        ds4_gpu_q8_0_matvec_args fold_mv_args;
-        ds4_gpu_hc_expand_args fold_hc_args;
-        ds4_metal_dsv4_routed_slots_args fold_slot_args;
-        memset(&fold_mv_args, 0, sizeof(fold_mv_args));
-        memset(&fold_hc_args, 0, sizeof(fold_hc_args));
-        memset(&fold_slot_args, 0, sizeof(fold_slot_args));
-        if (split_pipeline && sdn_fold && !glm53_exact_mode()) {
-            glm_levers_init_from_env();
-            const ds4_gpu_mv_dispatch sdn_d = ds4_gpu_make_q8_0_mv_dispatch_fam("SDN");
-            const uint64_t fold_in_dim = sdn_fold->in_dim;
-            const uint64_t fold_row_bytes = (fold_in_dim / 32u) * 34u;
-            const uint64_t fold_weight_bytes = (uint64_t)sdn_fold->out_dim * fold_row_bytes;
-            const uint64_t embd_bytes = (uint64_t)sdn_fold->out_dim * sizeof(float);
-            const uint64_t hc_bytes =
-                (uint64_t)sdn_fold->n_hc * sdn_fold->n_embd * sizeof(float);
-            const uint64_t mix_hc =
-                2ull * sdn_fold->n_hc + (uint64_t)sdn_fold->n_hc * sdn_fold->n_hc;
-            const uint64_t ticket_bytes =
-                ((uint64_t)out_dim / 2u) * sizeof(uint32_t);
-            fold_mode = g_glm_levers.sdn_fold;
-            const bool shape_ok =
-                fold_mode >= 1 && fold_mode <= 7 && g_glm_levers.sdn_ptail == 0 &&
-                sdn_d.nsg == 4 && sdn_d.nr0 == 2 &&
-                g_tp_split_world != 2 &&
-                (out_dim & 1u) == 0u && out_dim == sdn_fold->out_dim &&
-                sdn_fold->out_dim == sdn_fold->n_embd &&
-                sdn_fold->n_hc == 4u && (fold_in_dim & 31u) == 0u &&
-                n_expert != 0u && n_expert <= 32u &&
-                sdn_fold->out_hc && sdn_fold->shared_out && sdn_fold->ticket &&
-                sdn_fold->shared_mid && sdn_fold->residual_hc && sdn_fold->split &&
-                sdn_fold->model_map != NULL &&
-                sdn_fold->weight_offset <= sdn_fold->model_size &&
-                fold_weight_bytes <= sdn_fold->model_size - sdn_fold->weight_offset;
-            if (shape_ok) {
-                fold_midbuf = ds4_gpu_tensor_buffer(sdn_fold->shared_mid);
-                fold_sharedbuf = ds4_gpu_tensor_buffer(sdn_fold->shared_out);
-                fold_resbuf = ds4_gpu_tensor_buffer(sdn_fold->residual_hc);
-                fold_splitbuf = ds4_gpu_tensor_buffer(sdn_fold->split);
-                fold_outbuf = ds4_gpu_tensor_buffer(sdn_fold->out_hc);
-                fold_ticketbuf = ds4_gpu_tensor_buffer(sdn_fold->ticket);
-                const bool bufs_ok =
-                    fold_midbuf && fold_sharedbuf && fold_resbuf &&
-                    fold_splitbuf && fold_outbuf && fold_ticketbuf &&
-                    ds4_gpu_tensor_bytes(sdn_fold->shared_mid) >= fold_in_dim * sizeof(float) &&
-                    ds4_gpu_tensor_bytes(sdn_fold->shared_out) >= embd_bytes &&
-                    ds4_gpu_tensor_bytes(sdn_fold->residual_hc) >= hc_bytes &&
-                    ds4_gpu_tensor_bytes(sdn_fold->split) >= mix_hc * sizeof(float) &&
-                    ds4_gpu_tensor_bytes(sdn_fold->out_hc) >= hc_bytes &&
-                    ds4_gpu_tensor_bytes(sdn_fold->ticket) >= ticket_bytes;
-                if (bufs_ok) {
-                    fold_wbuf = ds4_gpu_wrap_model_range(sdn_fold->model_map,
-                                                         sdn_fold->model_size,
-                                                         sdn_fold->weight_offset,
-                                                         fold_weight_bytes,
-                                                         &fold_winner);
-                }
-                if (fold_wbuf) {
-                    fold_pipeline = ds4_gpu_glm_routed_down_sdn_fold_pipeline(fold_mode);
-                }
-            }
-            if (fold_pipeline) {
-                fold_mv_args = ds4_gpu_make_q8_0_mv_args(fold_in_dim, sdn_fold->out_dim);
-                fold_mv_args.nr0 = sdn_d.nr0;
-                fold_hc_args = (ds4_gpu_hc_expand_args) {
-                    .n_embd = sdn_fold->n_embd,
-                    .n_hc = sdn_fold->n_hc,
-                    .n_tokens = 1,
-                    .nb_block0 = sizeof(float),
-                    .nb_block1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
-                    .nb_add0 = sizeof(float),
-                    .nb_add1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
-                    .nb_res0 = sizeof(float),
-                    .nb_res1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
-                    .nb_res2 = (uint64_t)sdn_fold->n_hc * sdn_fold->n_embd * sizeof(float),
-                    .nb_post0 = sizeof(float),
-                    .nb_post1 = mix_hc * sizeof(float),
-                    .nb_comb0 = sizeof(float),
-                    .nb_comb1 = (uint64_t)sdn_fold->n_hc * sizeof(float),
-                    .nb_comb2 = mix_hc * sizeof(float),
-                    .nb0 = sizeof(float),
-                    .nb1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
-                    .nb2 = (uint64_t)sdn_fold->n_hc * sdn_fold->n_embd * sizeof(float),
-                    .has_add = 1,
-                };
-                fold_slot_args.n_slots = n_expert;
-                fold_slot_args.pad0 = 0;
-            }
-            {
-                static ds4_t2s_slot slot = { "SDNFOLD", 0, 0 };
-                ds4_t2s_hit(&slot, "%s mode=%d nsg=%d nr0=%d tickets=%llu slots=%u",
-                            fold_pipeline ?
-                                ds4_gpu_glm_routed_down_sdn_fold_kernel(fold_mode) :
-                                "kernel_glm_q4_K_down_simd_split_f32(pair)",
-                            fold_pipeline ? fold_mode : 0,
-                            (int)sdn_d.nsg, (int)sdn_d.nr0,
-                            (unsigned long long)(out_dim / 2u), n_expert);
-            }
-        }
-
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -45027,8 +44613,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (!ok) return 0;
 
         enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:fold_pipeline ? fold_pipeline :
-                                      split_pipeline ? split_pipeline : down_pipeline];
+        [enc setComputePipelineState:split_pipeline ? split_pipeline : down_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:use_stream_expert_addr_table ? stream_down_addr_buf : downbuf
                 offset:use_stream_expert_addr_table ? 0u : (NSUInteger)down_inner
@@ -45040,28 +44625,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         } else {
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         }
-        if (fold_pipeline) {
-            /* The folded tail's arguments: the consumer's, unchanged. */
-            [enc setBuffer:fold_ticketbuf offset:ds4_gpu_tensor_offset(sdn_fold->ticket) atIndex:5];
-            [enc setBytes:&fold_mv_args length:sizeof(fold_mv_args) atIndex:6];
-            [enc setBytes:&fold_hc_args length:sizeof(fold_hc_args) atIndex:7];
-            [enc setBuffer:fold_wbuf offset:(NSUInteger)fold_winner atIndex:8];
-            [enc setBuffer:fold_midbuf offset:ds4_gpu_tensor_offset(sdn_fold->shared_mid) atIndex:9];
-            [enc setBuffer:fold_sharedbuf offset:ds4_gpu_tensor_offset(sdn_fold->shared_out) atIndex:10];
-            [enc setBytes:&fold_slot_args length:sizeof(fold_slot_args) atIndex:11];
-            [enc setBuffer:fold_resbuf offset:ds4_gpu_tensor_offset(sdn_fold->residual_hc) atIndex:12];
-            [enc setBuffer:fold_splitbuf
-                    offset:ds4_gpu_tensor_offset(sdn_fold->split) +
-                           (NSUInteger)sdn_fold->n_hc * sizeof(float)
-                   atIndex:13];
-            [enc setBuffer:fold_splitbuf
-                    offset:ds4_gpu_tensor_offset(sdn_fold->split) +
-                           (NSUInteger)(2u * sdn_fold->n_hc) * sizeof(float)
-                   atIndex:14];
-            [enc setBuffer:fold_outbuf offset:ds4_gpu_tensor_offset(sdn_fold->out_hc) atIndex:15];
-            /* 8 floats of virtual-simdgroup sums, then the election flag. */
-            [enc setThreadgroupMemoryLength:64u atIndex:0];
-        }
         if (use_stream_expert_addr_table) {
             const uint32_t use_count =
                 use_stream_split_deferred ? n_expert : stream_entry_count;
@@ -45072,16 +44635,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (down_threadgroup_bytes != 0u && !split_pipeline) {
             [enc setThreadgroupMemoryLength:down_threadgroup_bytes atIndex:0];
         }
-        if (fold_pipeline && fold_mode == 3) {
-            /* Same threadgroups, slot as the FASTEST-varying axis: a row
-             * pair's n_expert arrivals are then adjacent in time, so tails are
-             * elected throughout the dispatch instead of all in the last
-             * z-wave.  The kernel maps slot = x and row pair = y. */
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_expert,
-                                                  ((NSUInteger)out_dim + 1u) / 2u,
-                                                  1)
-                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        } else if (split_pipeline) {
+        if (split_pipeline) {
             /* NSG = 2 simdgroups of 32 threads, one output row each, one
              * expert slot per threadgroup: out_dim/2 in x, n_expert in z. */
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u,
@@ -45098,14 +44652,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (!ok) return 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) return 0;
         if (split_pipeline && used_split) *used_split = 1;
-        /* Modes 2, 4, 6 and 7 are the publication-only ablations: the
-         * consumer dispatch must still run, so the fold is deliberately NOT
-         * reported as done. */
-        const bool fold_publishes_only =
-            fold_mode == 2 || fold_mode == 4 || fold_mode == 6 || fold_mode == 7;
-        if (fold_pipeline && !fold_publishes_only && sdn_fold) {
-            sdn_fold->folded = 1;
-        }
 #undef DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE
     }
 
@@ -53512,43 +53058,7 @@ static int ds4_gpu_shared_down_hc_expand_q8_0_impl(
             fprintf(stderr, "ds4: Metal shared-down HC fusion received an undersized routed partial buffer\n");
             return 0;
         }
-        /* T2 proposal 1, lever sdn_ptail: the slots epilogue spread over
-         * 4*NR0 lanes instead of lane 0 of simdgroup 0, exactly as HCX's ptail
-         * already does by default.  Same kernel arguments, same threadgroup
-         * shape, same grid -- only the pipeline name changes -- so the lever is
-         * read live and an A/B costs a flip.  The capture sibling (DFlash's
-         * strict reference) and the no-partials form keep production. */
-        id<MTLComputePipelineState> pipeline = nil;
-        int sdn_ptail = 0;
-        if (routed_partials && !capture_out) {
-            glm_levers_init_from_env();
-            sdn_ptail = g_glm_levers.sdn_ptail != 0 && !glm53_exact_mode();
-        }
-        if (sdn_ptail) {
-            pipeline = ds4_gpu_get_mul_mv_pipeline(
-                "kernel_glm_t2s_shared_down_hc_expand4_slots_ptail_q8_0",
-                mv_dispatch.nsg);
-            if (!pipeline) {
-                fprintf(stderr, "ds4: SDNTAIL pipeline unavailable; using production\n");
-                sdn_ptail = 0;
-            }
-        }
-        {
-            static ds4_t2s_slot slot = { "SDNTAIL", 0, 0 };
-            ds4_t2s_hit(&slot, "%s nsg=%d nr0=%d tgs=%llu",
-                        sdn_ptail ?
-                            "kernel_glm_t2s_shared_down_hc_expand4_slots_ptail_q8_0" :
-                        capture_out ?
-                            "kernel_dsv4_shared_down_hc_expand4_slots_capture_q8_0(prod)" :
-                        routed_partials ?
-                            "kernel_dsv4_shared_down_hc_expand4_slots_q8_0(prod)" :
-                            "kernel_dsv4_shared_down_hc_expand4_q8_0(prod)",
-                        (int)mv_dispatch.nsg, (int)mv_dispatch.nr0,
-                        (unsigned long long)((out_dim + (uint64_t)mv_dispatch.nr0 - 1u) /
-                                             (uint64_t)mv_dispatch.nr0));
-        }
-        if (!pipeline)
-        pipeline =
+        id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
                 capture_out ?
                     "kernel_dsv4_shared_down_hc_expand4_slots_capture_q8_0" :
@@ -53796,22 +53306,6 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                 const int rows = cached_nr >= 100 ? cached_nr - 100 : cached_nr;
                 t2s_hcxnr = (cached_nr && !vec_hc && rows > 0 &&
                              (out_dim % (uint64_t)rows) == 0) ? cached_nr : 0;
-            }
-        }
-        /* T2 proposal 2, lever hcx_nr0.  The shipped grid gives each
-         * threadgroup two rows -- 17.4 KB of weight at in_dim 8192, 34.8 KB at
-         * 16384 -- over 2048 threadgroups, which is two or three waves on 80
-         * cores, so the dispatch's drain is a large fraction of its cost.  One
-         * row per threadgroup doubles the wave depth and halves the drain; it
-         * also doubles the activation re-read, which is already the larger of
-         * the two traffics and is L2-resident.  Read live, so an A/B is a flip;
-         * the screen's own DS4_GLM_ENABLE_HCX_NR (which only offers 4, 8, 2w
-         * and 4w) still wins if it is set, and the exact umbrella clamps the
-         * shipped grid back. */
-        if (!t2s_hcxnr && !vec_hc) {
-            glm_levers_init_from_env();
-            if (g_glm_levers.hcx_nr0 == 1 && !glm53_exact_mode()) {
-                t2s_hcxnr = 1;
             }
         }
         id<MTLComputePipelineState> pipeline = nil;
@@ -57257,9 +56751,6 @@ typedef struct {
     float norm_eps;
     int32_t snapshot_row;
     uint32_t snapshot_stride;
-    uint32_t split;
-    /* Lever kda_glue_lanes; mirrors lanes in glm53_kda_glue_args. */
-    uint32_t lanes;
     uint32_t lr_in_dim;
     uint32_t lr_q8;
     uint32_t do_prologue;
@@ -57280,14 +56771,6 @@ typedef struct {
 int ds4_gpu_glm53_kda_decode_glue(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
-        /* Lever kda_glue_split: the layer's OTHER conv-history buffer, and an
-         * out-flag set to 1 only when the split form was actually encoded.
-         * The caller flips the layer's parity on that flag alone, never on its
-         * own guess, because this function refuses the split at a dozen
-         * points.  NULL alt (or a caller that passes no flag) means the shift
-         * stays in place on conv_state, which is today's path. */
-        ds4_gpu_tensor       *conv_state_alt,
-        int                  *conv_flip_out,
         ds4_gpu_tensor       *recurrent_state,
         ds4_gpu_tensor       *split_scratch,
         const ds4_gpu_tensor *q,
@@ -57322,7 +56805,6 @@ int ds4_gpu_glm53_kda_decode_glue(
     };
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* the DFlash verify path stays on the fused kernel */
-if (conv_flip_out) *conv_flip_out = 0;
     if (g_glm53_kda_snap_base != NULL) return 0;
     if (!do_prologue && !do_out) return 0;
     /* The prologue is the only consumer of f_b/g_b and of the two low-rank
@@ -57439,101 +56921,6 @@ if (conv_flip_out) *conv_flip_out = 0;
         threads &= ~(NSUInteger)31u;
         if (threads < 128u) return 0;
 
-        /* Lever kda_glue_split (T2-REPORT.md section 8.2).  The glue runs one
-         * threadgroup per head -- 64 of the machine's 80 cores -- and each
-         * core streams its head's whole 128x128 state plus the low-rank
-         * expansion: 11.86 MB a site at 428 GB/s against the 564 GB/s 64 cores
-         * could reach.  At 2 the grid becomes (2, n_heads) and each
-         * threadgroup redundantly runs the prologue and prep and then owns
-         * half the value rows and half the conv channels, putting 128 cores on
-         * the 8.39 MB of state.  Tier 1: identical arithmetic in identical
-         * order, only the threadgroup that runs it changes.
-         *
-         * The conv history is the one destructive write, so the split reads
-         * the layer's current buffer and writes the other one; the caller
-         * flips the parity on conv_flip_out.  The head-wide output RMS cannot
-         * run inside half a head, so the split always takes the standalone
-         * kernel_glm53_kda_decode_out dispatch below -- the arm therefore
-         * prices the re-grid MINUS one dependent-dispatch boundary, and the
-         * 1-vs-2 delta is itself a measurement of that boundary. */
-        /* Lever kda_glue_lanes (T2-REPORT.md section 8.8).  The phase-3 state
-         * loop is already coalesced and lane-split -- 32 lanes cover one
-         * contiguous 512-byte state row as float4 on both the load and the
-         * write-back -- which is why the glue reaches 6.7 GB/s per core
-         * against the reduce's 4.3.  What caps it is loads in flight: the body
-         * is load -> simd_sum -> fma -> store -> simd_sum and the first
-         * reduction consumes the load at once, so a simdgroup never has more
-         * than one row outstanding.  1 keeps two rows in flight, 2 keeps four;
-         * both are Tier 1, since the rows are independent and each row's own
-         * arithmetic is untouched.  There is deliberately no Tier 2 arm here:
-         * the lane split that value 2 means elsewhere is already the shipped
-         * form, and narrowing the reduction to 16 lanes would halve the
-         * coalescing width, which is a downgrade rather than an arm. */
-        uint32_t glue_lanes = 0u;
-        if (g_glm_levers.kda_glue_lanes == 1 ||
-            g_glm_levers.kda_glue_lanes == 2) {
-            glue_lanes = (uint32_t)g_glm_levers.kda_glue_lanes;
-        }
-        {
-            static int announced_glue_lanes = -1;
-            if (announced_glue_lanes != (int)glue_lanes) {
-                announced_glue_lanes = (int)glue_lanes;
-                fprintf(stderr,
-                        "ds4: KDAGLUELANES lever=%d -> lanes=%u "
-                        "(rows in flight per simdgroup: %u)\n",
-                        g_glm_levers.kda_glue_lanes, glue_lanes,
-                        glue_lanes == 2u ? 4u : (glue_lanes == 1u ? 2u : 1u));
-            }
-        }
-        const int glue_mode = g_glm_levers.kda_glue_split;
-        uint32_t glue_split = 1u;
-        if (glue_mode == 2 && n_rows == 1u &&
-            conv_state_alt != NULL && conv_state != NULL &&
-            ds4_gpu_tensor_bytes(conv_state_alt) >=
-                ds4_gpu_tensor_bytes(conv_state) &&
-            ds4_gpu_tensor_buffer(conv_state_alt) != nil &&
-            (n_heads & 1u) == 0u) {
-            glue_split = 2u;
-        }
-        /* Mode 3 prices the epilogue's dispatch boundary ALONE: today's
-         * unsplit glue on today's grid with the in-place conv shift, but with
-         * the output RMS moved out to the standalone
-         * kernel_glm53_kda_decode_out dispatch.  Nothing else changes, so
-         * (mode 2) - (mode 3) is the re-grid's own contribution with the
-         * boundary it had to pay already subtracted.  The fused epilogue is
-         * also incompatible with the split itself, so mode 2 takes the same
-         * two-dispatch form. */
-        const int glue_do_out =
-            do_out && glue_split == 1u && glue_mode != 3;
-        {
-            static ds4_t2s_slot slot = { "KDAGLUESPLIT", 0, 0 };
-            ds4_t2s_hit(&slot, "split=%u grid=(%u,%u) heads=%u rows=%u "
-                               "fused_out=%d",
-                        glue_split,
-                        glue_split > 1u ? glue_split : (unsigned)n_rows,
-                        n_heads, n_heads, n_rows, glue_do_out);
-            /* Value-change announcement, for the same reason as DSAREDSPLIT:
-             * a live lever's take-up is otherwise invisible after the first
-             * dispatch of the process. */
-            static int announced_mode = -1;
-            static uint32_t announced_split = 0xffffffffu;
-            static int announced_out = -1;
-            if (announced_mode != glue_mode ||
-                announced_split != glue_split ||
-                announced_out != glue_do_out) {
-                announced_mode = glue_mode;
-                announced_split = glue_split;
-                announced_out = glue_do_out;
-                fprintf(stderr,
-                        "ds4: KDAGLUESPLIT lever=%d -> split=%u grid=(%u,%u) "
-                        "fused_out=%d (standalone decode_out %s)\n",
-                        glue_mode, glue_split,
-                        glue_split > 1u ? glue_split : (unsigned)n_rows,
-                        n_heads, glue_do_out,
-                        glue_do_out ? "off" : "on");
-            }
-        }
-
         glm53_gpu_kda_glue_args args = {
             .n_heads = n_heads,
             .n_rows = n_rows,
@@ -57541,12 +56928,10 @@ if (conv_flip_out) *conv_flip_out = 0;
             .norm_eps = norm_eps,
             .snapshot_row = -1,
             .snapshot_stride = 0,
-            .split = glue_split,
-            .lanes = glue_lanes,
             .lr_in_dim = lr_in_dim,
             .lr_q8 = lr_q8 ? 1u : 0u,
             .do_prologue = do_prologue ? 1u : 0u,
-            .do_out = glue_do_out ? 1u : 0u,
+            .do_out = do_out ? 1u : 0u,
         };
         glm53_gpu_kda_args out_args = {
             .n_heads = n_heads,
@@ -57609,20 +56994,11 @@ if (conv_flip_out) *conv_flip_out = 0;
         [enc setBuffer:output_norm offset:(NSUInteger)norm_inner atIndex:19];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:20];
-        {
-            /* At split 1 this aliases conv_state and the shift is in place,
-             * value for value as before. */
-            ds4_gpu_tensor *conv_write =
-                glue_split > 1u ? conv_state_alt : conv_state;
-            [enc setBuffer:ds4_gpu_tensor_buffer(conv_write)
-                    offset:ds4_gpu_tensor_offset(conv_write) atIndex:21];
-        }
         [enc setThreadgroupMemoryLength:532u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(glue_split > 1u ? glue_split : n_rows,
-                                              n_heads, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_heads, 1)
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 
-        if (!glue_do_out) {
+        if (!do_out) {
             if (needs_barrier) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
@@ -57640,15 +57016,8 @@ if (conv_flip_out) *conv_flip_out = 0;
         }
 
         ds4_gpu_end_compute_encoder(cb, enc);
-        if (!ds4_gpu_finish_command_buffer(cb, owned,
-                                           "GLM-5.3 glued KDA decode")) {
-            return 0;
-        }
-        /* Encoded, so the parity advances -- and only now.  Encode order is
-         * execution order on the serial encoder and across the decode chain's
-         * command buffers, so the host's parity matches the GPU's. */
-        if (glue_split > 1u && conv_flip_out) *conv_flip_out = 1;
-        return 1;
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "GLM-5.3 glued KDA decode");
     }
 }
 

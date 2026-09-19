@@ -41487,9 +41487,6 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *hc_mix_partials;
     /* 4-byte arrival counter for the opt-in one-dispatch HC-pre. */
     ds4_gpu_tensor *hc_pre_ticket;
-    /* One 4-byte arrival counter per routed-down output ROW PAIR for the
-     * opt-in sdn_fold (lever C1).  Self-rearming, shared by all MoE layers. */
-    ds4_gpu_tensor *sdn_fold_ticket;
     /* Arrival counter, per-slice sum-of-squares slots and watchdog counter for
      * the hc_pre algebra lever's sliced tail (half B).  Three cache lines:
      * word 0 = arrivals, words 32..63 = the C published slice sums, word 64 =
@@ -41539,16 +41536,6 @@ typedef struct ds4_glm_gpu_graph {
      * across layers -- it lives only inside one layer's dispatch chain. */
     ds4_gpu_tensor *kda_split_scratch;
     ds4_gpu_tensor *layer_kda_conv_state[DS4_MAX_LAYER];
-    /* Lever kda_glue_split.  A second conv-history buffer per KDA layer with
-     * the SAME layout, plus the parity saying which of the two is current.
-     * The split glue reads the current buffer and writes the other, so its two
-     * threadgroups per head never read what the other wrote; every other
-     * reader and writer of the conv history goes through
-     * glm53_graph_kda_conv_cur() and writes in place, so nothing but the split
-     * glue ever flips the parity.  At kda_glue_split == 1 the parity never
-     * leaves 0 and layer_kda_conv_state_alt is simply unused. */
-    ds4_gpu_tensor *layer_kda_conv_state_alt[DS4_MAX_LAYER];
-    uint8_t         layer_kda_conv_parity[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_kda_recurrent_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *router_logits;
     ds4_gpu_tensor *router_probs;
@@ -41877,37 +41864,9 @@ static bool imatrix_collect_glm_one(
                                         1);
 }
 
-/* The KDA conv history the next dispatch must READ, and its partner.  Every
- * conv-state user in this file goes through these two. */
-static ds4_gpu_tensor *glm53_graph_kda_conv_cur(const ds4_glm_gpu_graph *g,
-                                                uint32_t il) {
-    if (!g || il >= DS4_MAX_LAYER) return NULL;
-    return g->layer_kda_conv_parity[il] ? g->layer_kda_conv_state_alt[il]
-                                        : g->layer_kda_conv_state[il];
-}
-
-static ds4_gpu_tensor *glm53_graph_kda_conv_alt(const ds4_glm_gpu_graph *g,
-                                                uint32_t il) {
-    if (!g || il >= DS4_MAX_LAYER) return NULL;
-    return g->layer_kda_conv_parity[il] ? g->layer_kda_conv_state[il]
-                                        : g->layer_kda_conv_state_alt[il];
-}
-
 static bool glm_graph_reset_kda_state(ds4_glm_gpu_graph *g) {
     if (!g || !g->glm53) return true;
     for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
-        /* Reset clears BOTH conv buffers and returns the layer to parity 0,
-         * so a reset never leaves a half-written partner behind. */
-        g->layer_kda_conv_parity[il] = 0;
-        if (g->layer_kda_conv_state_alt[il]) {
-            const uint64_t alt_bytes =
-                ds4_gpu_tensor_bytes(g->layer_kda_conv_state_alt[il]);
-            if (alt_bytes &&
-                ds4_gpu_tensor_fill_f32(g->layer_kda_conv_state_alt[il], 0.0f,
-                                        alt_bytes / sizeof(float)) == 0) {
-                return false;
-            }
-        }
         ds4_gpu_tensor *conv = g->layer_kda_conv_state[il];
         ds4_gpu_tensor *recurrent = g->layer_kda_recurrent_state[il];
         if (!conv && !recurrent) continue;
@@ -42545,7 +42504,7 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
      * count can be A/B'd on the resident server.  It yields to an explicit
      * DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP and to exact mode, which pins the shipped
      * partition: changing the partition changes the reduce's summation, so
-     * this lever is Tier 2, unlike attn_group. */
+     * this lever is Tier 2. */
     if (n_selected > 1024u && !deep_from_env && !glm53_exact_mode_c()) {
         glm_levers_init_from_env();
         const int lever_rows = g_glm_levers.attn_block_rows;
@@ -43657,8 +43616,6 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_kda_conv_state[il]);
-        ds4_gpu_tensor_free(g->layer_kda_conv_state_alt[il]);
-        g->layer_kda_conv_parity[il] = 0;
         ds4_gpu_tensor_free(g->layer_kda_recurrent_state[il]);
         ds4_gpu_tensor_free(g->layer_indexer_key_cache[il]);
         ds4_gpu_tensor_free(g->layer_indexer_tail_k[il]);
@@ -43786,7 +43743,6 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->hc_split);
     ds4_gpu_tensor_free(g->hc_mix_partials);
     ds4_gpu_tensor_free(g->hc_pre_ticket);
-    ds4_gpu_tensor_free(g->sdn_fold_ticket);
     ds4_gpu_tensor_free(g->hc_mix);
     ds4_gpu_tensor_free(g->hc_flat);
     ds4_gpu_tensor_free(g->hc_next);
@@ -44363,21 +44319,6 @@ static bool glm_graph_alloc_slice(
                 ok = false;
             }
         }
-        DS4_GLM_GRAPH_ALLOC_TENSOR(g->sdn_fold_ticket,
-                                   (uint64_t)(DS4_N_EMBD / 2u) * sizeof(uint32_t));
-        if (g->sdn_fold_ticket) {
-            /* One counter per output row pair.  The last arrival for a pair
-             * rearms its own counter before running the tail, so like the
-             * HC-pre ticket this only needs to start from zero once. */
-            const uint64_t ticket_bytes =
-                (uint64_t)(DS4_N_EMBD / 2u) * sizeof(uint32_t);
-            void *zeros = calloc(1, (size_t)ticket_bytes);
-            if (!zeros ||
-                !ds4_gpu_tensor_write(g->sdn_fold_ticket, 0, zeros, ticket_bytes)) {
-                ok = false;
-            }
-            free(zeros);
-        }
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->hc_split, hc_mix_bytes);
         g->hc_post = ds4_gpu_tensor_view(
             g->hc_split,
@@ -44544,13 +44485,6 @@ static bool glm_graph_alloc_slice(
         if (g->glm53 && ds4_glm53_layer_is_kda(il)) {
             DS4_GLM_GRAPH_ALLOC_TENSOR_TIER(g->layer_kda_conv_state[il],
                                             kda_conv_state_bytes);
-            /* Lever kda_glue_split's partner buffer, same layout and size.
-             * Allocated unconditionally -- 3 * 3 * projection floats a layer,
-             * about 10 MB over the 34 KDA layers -- so the lever can be moved
-             * at runtime without reallocating state mid-session. */
-            DS4_GLM_GRAPH_ALLOC_TENSOR_TIER(g->layer_kda_conv_state_alt[il],
-                                            kda_conv_state_bytes);
-            g->layer_kda_conv_parity[il] = 0;
             DS4_GLM_GRAPH_ALLOC_TENSOR_TIER(g->layer_kda_recurrent_state[il],
                                             kda_recurrent_state_bytes);
         }
@@ -44572,8 +44506,6 @@ static bool glm_graph_alloc_slice(
         for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
             if (ds4_glm53_layer_is_kda(il)) {
                 if (ds4_gpu_tensor_fill_f32(g->layer_kda_conv_state[il], 0.0f,
-                                            kda_conv_state_bytes / sizeof(float)) == 0 ||
-                    ds4_gpu_tensor_fill_f32(g->layer_kda_conv_state_alt[il], 0.0f,
                                             kda_conv_state_bytes / sizeof(float)) == 0 ||
                     ds4_gpu_tensor_fill_f32(g->layer_kda_recurrent_state[il], 0.0f,
                                             kda_recurrent_state_bytes / sizeof(float)) == 0) {
@@ -45281,7 +45213,7 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) failed_weight = NULL;
     if (ok) ok = ds4_gpu_glm53_kda_prefill(
             g->batch_kda_out,
-            glm53_graph_kda_conv_cur(g, il),
+            g->layer_kda_conv_state[il],
             g->layer_kda_recurrent_state[il],
             g->batch_kda_q,
             g->batch_kda_k,
@@ -46018,10 +45950,6 @@ static bool glm53_graph_kda_attention(
             g->kda_output_gate, model, l->kda_g_b,
             DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
     bool kda_split_done = false;
-    /* Set by ds4_gpu_glm53_kda_decode_glue only when it actually encoded the
-     * split form, which is the sole event that advances the layer's conv-state
-     * parity.  Every other KDA path shifts in place on the current buffer. */
-    int kda_conv_flip = 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* C2 commit-ahead cut.  Everything encoded up to here -- the embedding,
      * the hc_pre stage, this layer's norm and its projections -- writes only
@@ -46041,9 +45969,7 @@ static bool glm53_graph_kda_attention(
         if (kda_glue_prologue || kda_glue_out) {
             kda_split_done = ds4_gpu_glm53_kda_decode_glue(
                 g->kda_out,
-                glm53_graph_kda_conv_cur(g, il),
-                glm53_graph_kda_conv_alt(g, il),
-                &kda_conv_flip,
+                g->layer_kda_conv_state[il],
                 g->layer_kda_recurrent_state[il],
                 g->kda_split_scratch,
                 g->kda_q,
@@ -46072,9 +45998,6 @@ static bool glm53_graph_kda_attention(
                 kda_glue_out ? 1 : 0,
                 DS4_KDA_GATE_LOWER_BOUND,
                 DS4_RMS_EPS) != 0;
-            if (kda_split_done && kda_conv_flip) {
-                g->layer_kda_conv_parity[il] ^= 1u;
-            }
             /* It refused after the pack above skipped pair2in on the
              * strength of the prologue: emit pair2in now, in order, so the
              * fallback path below still sees the gates it needs. */
@@ -46107,7 +46030,7 @@ static bool glm53_graph_kda_attention(
         if (ok && !kda_split_done && glm53_kda_refuse_enabled()) {
             kda_split_done = ds4_gpu_glm53_kda_decode_split2(
                 g->kda_out,
-                glm53_graph_kda_conv_cur(g, il),
+                g->layer_kda_conv_state[il],
                 g->layer_kda_recurrent_state[il],
                 g->kda_split_scratch,
                 g->kda_q,
@@ -46131,7 +46054,7 @@ static bool glm53_graph_kda_attention(
         }
         if (ok && !kda_split_done) kda_split_done = ds4_gpu_glm53_kda_decode_split(
             g->kda_out,
-            glm53_graph_kda_conv_cur(g, il),
+            g->layer_kda_conv_state[il],
             g->layer_kda_recurrent_state[il],
             g->kda_split_scratch,
             g->kda_q,
@@ -46160,7 +46083,7 @@ static bool glm53_graph_kda_attention(
         /* split path already produced kda_out */
     } else if (ok) ok = ds4_gpu_glm53_kda_decode(
             g->kda_out,
-            glm53_graph_kda_conv_cur(g, il),
+            g->layer_kda_conv_state[il],
             g->layer_kda_recurrent_state[il],
             g->kda_q,
             g->kda_k,
@@ -46445,14 +46368,6 @@ static bool glm_graph_prefill_stage_boundary(
     return true;
 }
 
-/* Read live at the routed-down dispatch site, so a resident server can flip
- * the pair and the fold between requests. */
-static bool glm53_graph_sdn_fold_enabled(void) DS4_MAYBE_UNUSED;
-static bool glm53_graph_sdn_fold_enabled(void) {
-    glm_levers_init_from_env();
-    return g_glm_levers.sdn_fold != 0;
-}
-
 static int glm_graph_routed_moe_one_dispatch(
         const ds4_glm_gpu_graph *g,
         const ds4_model         *model,
@@ -46462,7 +46377,6 @@ static int glm_graph_routed_moe_one_dispatch(
         ds4_gpu_tensor          *mid,
         ds4_gpu_tensor          *routed_partials,
         int                     *used_split,
-        ds4_gpu_sdn_fold_desc   *sdn_fold,
         uint64_t                 gate_expert_bytes,
         uint64_t                 gate_row_bytes,
         uint64_t                 up_expert_bytes,
@@ -46557,8 +46471,7 @@ static int glm_graph_routed_moe_one_dispatch(
                                              x,
                                              force_resident,
                                              routed_partials,
-                                             used_split,
-                                             sdn_fold);
+                                             used_split);
 }
 
 /* Post-compute visibility for GLM TP debugging: the combine stashes the
@@ -47477,41 +47390,6 @@ static bool glm_graph_encode_sparse_ffn_one(
      * and left per-slot partials in g->routed_partials instead of a summed
      * row in ffn_out. */
     int routed_down_split = 0;
-    /* Already computed at the head of the block by the router+shared fold,
-     * into its own tensor so that ffn_mid stays the routed experts'.  Hoisted
-     * above the routed dispatch because lever C1 hands it to that dispatch. */
-    ds4_gpu_tensor *shared_mid = router_shared_folded ?
-        g->moe_block_shared_mid : ffn_mid;
-    /* C1 (lever sdn_fold): let the routed-down split dispatch's last-arriving
-     * threadgroup run the shared-down + slot-sum + HC-expand consumer for its
-     * own row pair, and skip the consumer dispatch when it does.  Every
-     * condition the consumer call below checks is checked again by the
-     * encoder, which falls back to the pair on any miss. */
-    ds4_gpu_sdn_fold_desc sdn_fold_desc;
-    ds4_gpu_sdn_fold_desc *sdn_fold = NULL;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (fold_shared_down_hc && g->sdn_fold_ticket &&
-        glm53_graph_sdn_fold_enabled() &&
-        !shared_first && !hc_fold->capture_out &&
-        !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED) &&
-        !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_DOWN)) {
-        memset(&sdn_fold_desc, 0, sizeof(sdn_fold_desc));
-        sdn_fold_desc.out_hc        = hc_fold->out_hc;
-        sdn_fold_desc.shared_out    = ffn_sum;
-        sdn_fold_desc.ticket        = g->sdn_fold_ticket;
-        sdn_fold_desc.model_map     = model->map;
-        sdn_fold_desc.model_size    = model->size;
-        sdn_fold_desc.weight_offset = l->ffn_down_shexp->abs_offset;
-        sdn_fold_desc.in_dim        = DS4_N_FF_EXP;
-        sdn_fold_desc.out_dim       = DS4_N_EMBD;
-        sdn_fold_desc.shared_mid    = shared_mid;
-        sdn_fold_desc.residual_hc   = hc_fold->residual_hc;
-        sdn_fold_desc.split         = hc_fold->split;
-        sdn_fold_desc.n_embd        = DS4_N_EMBD;
-        sdn_fold_desc.n_hc          = DS4_N_HC;
-        sdn_fold = &sdn_fold_desc;
-    }
-#endif
     if (ok && !ablate_router &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = glm_graph_routed_moe_one_dispatch(
@@ -47523,7 +47401,6 @@ static bool glm_graph_encode_sparse_ffn_one(
             ffn_mid,
             fold_shared_down_hc ? g->routed_partials : NULL,
             fold_shared_down_hc ? &routed_down_split : NULL,
-            sdn_fold,
             gate_out * gate_row_bytes,
             gate_row_bytes,
             up_out * up_row_bytes,
@@ -47569,6 +47446,10 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          stage_t0);
     if (ok && !shared_first &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED)) {
+        /* Already computed at the head of the block by the router+shared fold,
+         * into its own tensor so that ffn_mid stays the routed experts'. */
+        ds4_gpu_tensor *shared_mid = router_shared_folded ?
+            g->moe_block_shared_mid : ffn_mid;
         if (router_shared_folded &&
             (glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_UP)) {
             /* The shared up/gate+swiglu is inside the router's single
@@ -47608,11 +47489,8 @@ static bool glm_graph_encode_sparse_ffn_one(
             }
         } else if (ok && fold_shared_down_hc) {
             bool capture_done = false;
-            /* C1: the routed-down dispatch's elected threadgroups already ran
-             * this kernel's body for their own row pairs. */
-            const bool sdn_folded = sdn_fold != NULL && sdn_fold->folded != 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-            if (!sdn_folded && routed_down_split && hc_fold->capture_out &&
+            if (routed_down_split && hc_fold->capture_out &&
                 hc_fold->capture_mean) {
                 capture_done =
                     ds4_gpu_shared_down_hc_expand_capture_q8_0_tensor(
@@ -47635,7 +47513,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                         hc_fold->capture_mean) != 0;
             }
 #endif
-            if (!sdn_folded && !capture_done) {
+            if (!capture_done) {
                 ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                         hc_fold->out_hc,
                         ffn_sum,
@@ -49764,12 +49642,7 @@ static void glm53_graph_spec_state_tensors(const ds4_glm_gpu_graph *g,
                                           uint32_t il,
                                           ds4_gpu_tensor *state[2]) {
     if (ds4_glm53_layer_is_kda(il)) {
-        /* Save reads the current conv buffer; restore writes it back into the
-         * SAME buffer this returns, and glm53_graph_copy_spec_state_to resets
-         * the layer to parity 0 first so a restore always lands in buffer 0.
-         * The serialized size is one buffer either way -- the partner is never
-         * part of the layout. */
-        state[0] = glm53_graph_kda_conv_cur(g, il);
+        state[0] = g->layer_kda_conv_state[il];
         state[1] = g->layer_kda_recurrent_state[il];
     } else {
         /* The K tail owns the contiguous K+gate allocation; the gate is a view. */
@@ -49830,12 +49703,6 @@ static bool glm53_graph_copy_spec_state_to(
     bool ok = glm_graph_begin_commands_if_needed();
     uint64_t offset = 0;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
-        /* A restore reinstates a state the split glue may have left in the
-         * partner buffer; put the layer back on buffer 0 before the copy so
-         * the restored history is always the current one. */
-        if (!save && ds4_glm53_layer_is_kda(il)) {
-            g->layer_kda_conv_parity[il] = 0;
-        }
         ds4_gpu_tensor *state[2];
         glm53_graph_spec_state_tensors(g, il, state);
         for (uint32_t i = 0; ok && i < 2; i++) {
@@ -49908,9 +49775,6 @@ static bool glm53_graph_restore_kda_rowsnap(ds4_glm_gpu_graph *g) {
     uint64_t offset = 0;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         if (!ds4_glm53_layer_is_kda(il)) continue;
-        /* Restore only: the snapshot goes back into buffer 0 and the layer
-         * returns to parity 0. */
-        g->layer_kda_conv_parity[il] = 0;
         ds4_gpu_tensor *state[2] = {
             g->layer_kda_conv_state[il],
             g->layer_kda_recurrent_state[il],
@@ -50380,7 +50244,6 @@ static bool glm_graph_mtp_step(
                                                        il,
                                                        routed_dst,
                                                        g->ffn_mid,
-                                                       NULL,
                                                        NULL,
                                                        NULL,
                                                        gate_out * gate_row_bytes,
@@ -56269,17 +56132,7 @@ glm_levers g_glm_levers = {
     .decode_concurrent     = 1,
     .chain_decode          = 1,  /* on: +0.61 t/s at 62k, +0.72 at 8k */
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
-    .attn_group            = 8,  /* heads per staged window, as shipped */
     .attn_block_rows       = 128,/* deep split geometry, as shipped */
-    .sdn_ptail             = 0,  /* off: today's single-lane SDN epilogue */
-    .hcx_nr0               = 2,  /* rows per threadgroup, as shipped */
-    .sdn_fold              = 0,  /* off: routed-down and shared-down as a pair */
-    .topk_fallback_encode  = 1,  /* on: the legacy argsort chain is encoded */
-    .dsa_reduce_split      = 1,  /* one reduce threadgroup per head, as shipped */
-    .kda_glue_split        = 1,  /* one glue threadgroup per head, as shipped */
-    .dsa_reduce_lanes      = 0,  /* one thread per value row, as shipped */
-    .kda_glue_lanes        = 0,  /* one state row in flight, as shipped */
-    .dsa_reduce_blend      = 0,  /* block-planed partials, as shipped */
 };
 static int g_glm_levers_ready;
 
@@ -56288,91 +56141,17 @@ static int g_glm_levers_ready;
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
-    if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
     if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
-    if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
-    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 6; return 1; }
-    if (!strcmp(name, "topk_fallback_encode")) { *lo = 0; *hi = 1; return 1; }
-    if (!strcmp(name, "dsa_reduce_split")) { *lo = 1; *hi = 2; return 1; }
-    if (!strcmp(name, "kda_glue_split")) { *lo = 1; *hi = 3; return 1; }
-    if (!strcmp(name, "dsa_reduce_lanes")) { *lo = 0; *hi = 2; return 1; }
-    if (!strcmp(name, "kda_glue_lanes")) { *lo = 0; *hi = 2; return 1; }
-    if (!strcmp(name, "dsa_reduce_blend")) { *lo = 0; *hi = 2; return 1; }
     return 0;
 }
 
-/* Two of the counted levers are enumerations, not intervals: a value inside
- * the range but outside the set would be accepted by /debug/levers and then
+/* Some counted levers are enumerations, not intervals: a value inside the
+ * range but outside the set would be accepted by /debug/levers and then
  * silently resolved back to the default at the dispatch site, which would make
  * an A/B arm quietly measure the control. */
 static int glm_lever_counted_member(const char *name, int value) {
-    if (!strcmp(name, "attn_group")) {
-        /* 16 was measured flat (+0.08 / -0.05 t/s) and its kernels are gone. */
-        return value == 8 || value == 32;
-    }
     if (!strcmp(name, "attn_block_rows")) {
         return value == 64 || value == 128;
-    }
-    if (!strcmp(name, "hcx_nr0")) {
-        /* 4 and 8 were measured flat by the t2 screen and are not offered
-         * here; only the shipped 2 and the untried 1. */
-        return value == 1 || value == 2;
-    }
-    if (!strcmp(name, "sdn_fold")) {
-        /* 0 pair, 1 fold, 2 publication-only, 3 slot-fastest fold,
-         * 4 publication-only without the device fences, 5 fold without them,
-         * 6 publication-only with the seq_cst fences issued by tid 0 alone.
-         * 4, 5 and 6 are diagnostics and must NEVER SHIP: 4 and 5 are not
-         * memory-safe across the two dies at all, and 6 leans on the
-         * threadgroup barrier to stand in for the other 63 threads' fences.
-         * There is no release/acquire arm -- this box's runtime Metal compiler
-         * declares only relaxed and seq_cst, and a release fence fails the
-         * whole library. */
-        return value >= 0 && value <= 6;
-    }
-    if (!strcmp(name, "topk_fallback_encode")) {
-        /* 1 = encode the legacy argsort pair and merges behind the fast top-k
-         * path, as today; 0 = do not encode them at all.  DIAGNOSTIC, NEVER
-         * SHIP: 0 is only correct while the fast path accepts, and a reject
-         * there would leave the indexer selecting from a buffer nothing wrote.
-         * It exists to price the 33 zero-threadgroup dispatches per token that
-         * the accepted fast path leaves in the command buffer. */
-        return value == 0 || value == 1;
-    }
-    if (!strcmp(name, "dsa_reduce_split")) {
-        /* Threadgroups per head in the DSA attention reduce.  1 is the shipped
-         * grid; 2 halves the value projection's output rows across two
-         * threadgroups that each recompute the blend.  Tier 1 either way -- see
-         * ds4.h -- so this one is meant to ship if it measures. */
-        return value == 1 || value == 2;
-    }
-    if (!strcmp(name, "kda_glue_split")) {
-        /* 1 the shipped grid and the in-place conv shift; 2 halves the value
-         * rows and the conv channels across two threadgroups per head and
-         * ping-pongs the conv buffer; 3 is 1 with the output RMS moved to the
-         * standalone kda_decode_out dispatch, which prices the boundary 2 has
-         * to pay so that (2) - (3) isolates the re-grid.  All Tier 1 -- see
-         * ds4.h.  3 is a measurement arm, not a shipping candidate. */
-        return value >= 1 && value <= 3;
-    }
-    if (!strcmp(name, "dsa_reduce_lanes")) {
-        /* 0 the shipped one-thread-per-row value projection, 1 the Tier 1
-         * batched-load form with the accumulation order untouched, 2 the
-         * Tier 2 lane split with simd_sum.  See ds4.h.  2 reassociates, so it
-         * is registered for exact mode. */
-        return value >= 0 && value <= 2;
-    }
-    if (!strcmp(name, "kda_glue_lanes")) {
-        /* Rows of the glue's state loop in flight per simdgroup: 0 one as
-         * shipped, 1 two, 2 four.  Both non-zero values are Tier 1 -- see
-         * ds4.h -- so this one is meant to ship if it measures. */
-        return value >= 0 && value <= 2;
-    }
-    if (!strcmp(name, "dsa_reduce_blend")) {
-        /* 0 the shipped block-planed partial_lora, 1 the head-planed layout,
-         * 2 that plus the shrunken block reductions.  Both Tier 1 -- see
-         * ds4.h -- so this one is meant to ship if it measures. */
-        return value >= 0 && value <= 2;
     }
     return 1;
 }
@@ -56384,17 +56163,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "decode_concurrent",     offsetof(glm_levers, decode_concurrent),     "DS4_GLM_DISABLE_DECODE_CONCURRENT" },
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_DISABLE_CHAIN" },
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
-    { "attn_group",            offsetof(glm_levers, attn_group),            "DS4_GLM_ATTN_GROUP" },
     { "attn_block_rows",       offsetof(glm_levers, attn_block_rows),       "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP" },
-    { "sdn_ptail",             offsetof(glm_levers, sdn_ptail),             "DS4_GLM_SDN_PTAIL" },
-    { "hcx_nr0",               offsetof(glm_levers, hcx_nr0),               "DS4_GLM_HCX_NR0" },
-    { "sdn_fold",              offsetof(glm_levers, sdn_fold),              "DS4_GLM_SDN_FOLD" },
-    { "topk_fallback_encode",  offsetof(glm_levers, topk_fallback_encode),  "DS4_GLM_TOPK_FALLBACK_ENCODE" },
-    { "dsa_reduce_split",      offsetof(glm_levers, dsa_reduce_split),      "DS4_GLM_DSA_REDUCE_SPLIT" },
-    { "kda_glue_split",        offsetof(glm_levers, kda_glue_split),        "DS4_GLM_KDA_GLUE_SPLIT" },
-    { "dsa_reduce_lanes",      offsetof(glm_levers, dsa_reduce_lanes),      "DS4_GLM_DSA_REDUCE_LANES" },
-    { "kda_glue_lanes",        offsetof(glm_levers, kda_glue_lanes),        "DS4_GLM_KDA_GLUE_LANES" },
-    { "dsa_reduce_blend",      offsetof(glm_levers, dsa_reduce_blend),      "DS4_GLM_DSA_REDUCE_BLEND" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56431,107 +56200,15 @@ void glm_levers_init_from_env(void) {
     g_glm_levers.chain_commit_ahead =
         getenv("DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD") == NULL &&
         getenv("DS4_GLM_DISABLE_CHAIN") == NULL;
-    /* Both A2 levers are enumerations: an environment value outside the set
-     * leaves the shipped geometry, and for attn_block_rows the historical
-     * variable keeps winning at the call site (see
+    /* attn_block_rows is an enumeration: an environment value outside the set
+     * leaves the shipped geometry, and the historical variable keeps winning
+     * at the call site (see
      * glm_graph_indexed_decode_split_block_rows_for). */
-    {   const char *v = getenv("DS4_GLM_ATTN_GROUP");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("attn_group", n)) {
-                g_glm_levers.attn_group = n;
-            }
-        }
-    }
     {   const char *v = getenv("DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP");
         if (v && v[0]) {
             const int n = atoi(v);
             if (glm_lever_counted_member("attn_block_rows", n)) {
                 g_glm_levers.attn_block_rows = n;
-            }
-        }
-    }
-    /* T2 proposal 1 is default-off, so its historical resolution is just "the
-     * ENABLE_ variable is set"; DS4_GLM_EXACT still clamps the dispatch back to
-     * the production kernel where HCX's ptail is clamped. */
-    g_glm_levers.sdn_ptail = getenv("DS4_GLM_SDN_PTAIL") != NULL;
-    /* Counted enumeration, same rule as the A2 pair: a value outside the set
-     * leaves the shipped grid. */
-    {   const char *v = getenv("DS4_GLM_HCX_NR0");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("hcx_nr0", n)) {
-                g_glm_levers.hcx_nr0 = n;
-            }
-        }
-    }
-    /* Counted 0..6, default 0; a value outside the set leaves the pair. */
-    {   const char *v = getenv("DS4_GLM_SDN_FOLD");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("sdn_fold", n)) {
-                g_glm_levers.sdn_fold = n;
-            }
-        }
-    }
-    /* Default 1 (encode as today); only 0 changes anything, and only while
-     * the fast top-k path is selected.  NEVER SHIP at 0. */
-    {   const char *v = getenv("DS4_GLM_TOPK_FALLBACK_ENCODE");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("topk_fallback_encode", n)) {
-                g_glm_levers.topk_fallback_encode = n;
-            }
-        }
-    }
-    /* Counted 1..2, default 1; a value outside the set leaves the shipped
-     * one-threadgroup-per-head grid. */
-    {   const char *v = getenv("DS4_GLM_DSA_REDUCE_SPLIT");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("dsa_reduce_split", n)) {
-                g_glm_levers.dsa_reduce_split = n;
-            }
-        }
-    }
-    /* Counted 1..2, default 1; a value outside the set leaves the shipped
-     * one-threadgroup-per-head grid and the in-place conv shift. */
-    {   const char *v = getenv("DS4_GLM_KDA_GLUE_SPLIT");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("kda_glue_split", n)) {
-                g_glm_levers.kda_glue_split = n;
-            }
-        }
-    }
-    /* Counted 0..2, default 0; a value outside the set leaves the shipped
-     * one-thread-per-row projection.  Value 2 reassociates and is clamped by
-     * DS4_GLM_EXACT at the dispatch site. */
-    {   const char *v = getenv("DS4_GLM_DSA_REDUCE_LANES");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("dsa_reduce_lanes", n)) {
-                g_glm_levers.dsa_reduce_lanes = n;
-            }
-        }
-    }
-    /* Counted 0..2, default 0; a value outside the set leaves one state row
-     * in flight per simdgroup. */
-    {   const char *v = getenv("DS4_GLM_KDA_GLUE_LANES");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("kda_glue_lanes", n)) {
-                g_glm_levers.kda_glue_lanes = n;
-            }
-        }
-    }
-    /* Counted 0..2, default 0; a value outside the set leaves the shipped
-     * block-planed layout and the nth-wide block reductions. */
-    {   const char *v = getenv("DS4_GLM_DSA_REDUCE_BLEND");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (glm_lever_counted_member("dsa_reduce_blend", n)) {
-                g_glm_levers.dsa_reduce_blend = n;
             }
         }
     }
@@ -58503,7 +58180,6 @@ static int glm_metal_first_token_logits(
                     il,
                     ffn_out,
                     ffn_mid,
-                    NULL,
                     NULL,
                     NULL,
                     gate_out * gate_row_bytes,
@@ -60987,7 +60663,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         for (uint32_t il = layer_start; rc == 0 && il <= layer_end; il++) {
             if (g->glm53 && ds4_glm53_layer_is_kda(il)) {
                 rc = payload_write_tensor_span(
-                    fp, glm53_graph_kda_conv_cur(g, il), 0,
+                    fp, g->layer_kda_conv_state[il], 0,
                     session_glm_kda_conv_state_bytes(), buf,
                     DS4_SESSION_IO_CHUNK, err, errlen);
                 if (rc == 0) {
@@ -61339,8 +61015,6 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         for (uint32_t i = 0; rc == 0 && i < n_layers; i++) {
             const uint32_t il = layer_start + i;
             if (g->glm53 && ds4_glm53_layer_is_kda(il)) {
-                /* A loaded session always lands on buffer 0. */
-                g->layer_kda_conv_parity[il] = 0;
                 rc = payload_read_tensor_span(
                     fp, g->layer_kda_conv_state[il], 0,
                     session_glm_kda_conv_state_bytes(), buf,
@@ -62336,7 +62010,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         for (uint32_t il = 0; rc == 0 && il < g->normal_layers; il++) {
             if (g->glm53 && ds4_glm53_layer_is_kda(il)) {
                 rc = payload_write_tensor_span(
-                    fp, glm53_graph_kda_conv_cur(g, il), 0,
+                    fp, g->layer_kda_conv_state[il], 0,
                     session_glm_kda_conv_state_bytes(), buf,
                     DS4_SESSION_IO_CHUNK, err, errlen);
                 if (rc == 0) {
@@ -62785,8 +62459,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         int rc = 0;
         for (uint32_t il = 0; rc == 0 && il < g->normal_layers; il++) {
             if (g->glm53 && ds4_glm53_layer_is_kda(il)) {
-                /* A loaded session always lands on buffer 0. */
-                g->layer_kda_conv_parity[il] = 0;
                 rc = payload_read_tensor_span(
                     fp, g->layer_kda_conv_state[il], 0,
                     session_glm_kda_conv_state_bytes(), buf,
@@ -65777,7 +65449,6 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                     ffn_mid,
                     NULL,
                     NULL,
-                    NULL,
                     gate_out * gate_row_bytes,
                     gate_row_bytes,
                     up_out * up_row_bytes,
@@ -66075,7 +65746,6 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                     il,
                     ffn_out,
                     ffn_mid,
-                    NULL,
                     NULL,
                     NULL,
                     gate_out * gate_row_bytes,
@@ -75739,7 +75409,7 @@ static bool glm53_graph_encode_kda_session_batch(
         if (ok) {
             ok = ds4_gpu_glm53_kda_decode(
                     out,
-                    glm53_graph_kda_conv_cur(g, il),
+                    g->layer_kda_conv_state[il],
                     g->layer_kda_recurrent_state[il],
                     q, k, v, raw_gate, raw_beta, output_gate,
                     model->map, model->size,

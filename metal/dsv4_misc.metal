@@ -364,17 +364,6 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
-    /* Lever dsa_reduce_lanes, read only by the reduce kernels' value
-     * projection: 0 today's one-thread-per-row dot, 1 the Tier 1 batched-load
-     * form, 2 the Tier 2 lane split.  Threadgroup-uniform. */
-    uint32_t value_lanes;
-    /* Lever dsa_reduce_blend.  0 partial_lora is planed by block, as shipped;
-     * >= 1 it is planed by head, so the reduce's n_blocks reads for one head
-     * are one contiguous run instead of n_blocks chunks a whole block-plane
-     * apart; >= 2 additionally shrinks the two block reductions from nth
-     * leaves to one simdgroup.  Read by BOTH the partial and the reduce, which
-     * share this struct, so producer and consumer can never disagree. */
-    uint32_t blend_layout;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -1900,72 +1889,6 @@ static inline float glm_q8_0_dot_row_tg_f32_512_u16(
             acc += d * (float)lo * x[base + 2u * p];
             acc += d * (float)hi * x[base + 2u * p + 1u];
         }
-    }
-    return acc;
-}
-
-/* Lever dsa_reduce_lanes = 1 (Tier 1).  Identical addends in identical order
- * to glm_q8_0_dot_row_tg_f32_512_u16 above -- the FMA chain is untouched -- but
- * the next block's seventeen loads are issued BEFORE the current block's
- * thirty-two multiply-adds, so a thread keeps two blocks of weight in flight
- * instead of one.  It cannot widen the loads: a Q8_0 block is 34 bytes, so its
- * quantised bytes are 4-byte aligned only on odd blocks and ushort stays the
- * widest universally legal load.  It also cannot fix the access pattern, since
- * one thread still owns one row and the thirty-two lanes of a load instruction
- * still touch thirty-two different rows; that is what value 2 is for. */
-static inline float glm_q8_0_dot_row_tg_f32_512_u16_pf(
-        device const char *row,
-        threadgroup const float *x) {
-    float acc = 0.0f;
-    ushort w[16];
-    float d_cur = (float)(*((device const half *)row));
-    FOR_UNROLL (uint p = 0; p < 16u; p++) {
-        w[p] = ((device const ushort *)(row + 2u))[p];
-    }
-    for (uint block = 0; block < 16u; block++) {
-        const float d = d_cur;
-        ushort wn[16];
-        if (block + 1u < 16u) {
-            device const char *nxt = row + (uint64_t)(block + 1u) * 34u;
-            d_cur = (float)(*((device const half *)nxt));
-            FOR_UNROLL (uint p = 0; p < 16u; p++) {
-                wn[p] = ((device const ushort *)(nxt + 2u))[p];
-            }
-        }
-        const uint base = block << 5;
-        FOR_UNROLL (uint p = 0; p < 16u; p++) {
-            const ushort ww = w[p];
-            const int8_t lo = (int8_t)(ww & 0xffu);
-            const int8_t hi = (int8_t)(ww >> 8);
-            acc += d * (float)lo * x[base + 2u * p];
-            acc += d * (float)hi * x[base + 2u * p + 1u];
-        }
-        FOR_UNROLL (uint p = 0; p < 16u; p++) {
-            w[p] = wn[p];
-        }
-    }
-    return acc;
-}
-
-/* Lever dsa_reduce_lanes = 2 (Tier 2).  One simdgroup per output row: lane l
- * takes element l of every 32-element Q8_0 block, so the thirty-two lanes of a
- * load instruction read thirty-two CONTIGUOUS bytes instead of thirty-two rows
- * 544 bytes apart, and the caller simd_sums the lanes.  This is the shape
- * glm_q4_K_dot_row_lane_f32 already uses on the Q4_K path.  It reassociates:
- * today one thread sums elements 0..511 in order, here lane l sums its sixteen
- * strided elements and the lanes are combined by the simd_sum tree.  The
- * per-lane dependent chain drops from 512 FMAs to 16, and all 512 threads of
- * the threadgroup are busy instead of 256. */
-static inline float glm_q8_0_dot_row_lane_f32_512(
-        device const char *row,
-        threadgroup const float *x,
-        ushort lane) {
-    float acc = 0.0f;
-    for (uint block = 0; block < 16u; block++) {
-        device const char *block_base = row + (uint64_t)block * 34u;
-        const float d = (float)(*((device const half *)block_base));
-        device const int8_t *qs = (device const int8_t *)(block_base + 2u);
-        acc += d * (float)qs[lane] * x[(block << 5) + lane];
     }
     return acc;
 }
@@ -3942,16 +3865,8 @@ kernel void kernel_glm_value_project_q8_0_batch_heads_mma(
  * single final block of at most 3 rows -- pay the per-row bounds test.  A pad
  * row is then masked out of the softmax entirely (score -FLT_MAX/2, no
  * accumulator update), never admitted as a zero-valued member. */
-/* group_heads_t (A2): how many heads share one staged window.  8 is the
- * shipped geometry; 32 widens the threadgroup to 1024 threads so each selected
- * row is gathered from the compact cache once per 32 heads instead of once per
- * 8.  (A 16-head instantiation measured flat, +0.08 / -0.05 t/s at 62k, and is
- * not built.)  Only the cooperative staging stride changes with it
- * -- per simdgroup the rows are visited in the same order, with the same lane
- * mapping, the same simd_sum tree and the same online-softmax update, so every
- * output word is bit-identical to the group8 kernel. */
 template <bool assume_valid_rows, bool assume_valid_heads,
-          bool prefix_checked = false, uint group_heads_t = 8u>
+          bool prefix_checked = false>
 kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *q,
@@ -3966,8 +3881,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         ushort lane_u [[thread_index_in_simdgroup]],
         ushort sg_u [[simdgroup_index_in_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
-    constexpr uint group_heads = group_heads_t;
-    constexpr uint group_threads = group_heads_t * 32u;
+    constexpr uint group_heads = 8u;
     constexpr uint stage_rows = 16u;
     const uint tid = (uint)tid_u;
     const uint lane = (uint)lane_u;
@@ -4038,7 +3952,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
 
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
-        for (uint off = tid; off < rows * kv_vecs; off += group_threads) {
+        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
             const uint rr = off / kv_vecs;
             const uint vv = off - rr * kv_vecs;
             const uint row = selected[base + rr];
@@ -4052,7 +3966,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
                 kv_shared[off] = half4(half(0.0f));
             }
         }
-        for (uint off = tid; off < rows * rope_vecs; off += group_threads) {
+        for (uint off = tid; off < rows * rope_vecs; off += 256u) {
             const uint rr = off / rope_vecs;
             const uint vv = off - rr * rope_vecs;
             const uint r = vv * 4u;
@@ -4125,18 +4039,25 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     }
 
     if (valid_head) {
-        /* Lever dsa_reduce_blend >= 1: plane by head instead of by block.  The
-         * same 512 floats are written by the same lane in the same order; only
-         * the plane's base moves, so this threadgroup's eight heads become
-         * eight 2 KB chunks at n_blocks * 2 KB stride instead of eight
-         * contiguous ones -- independent stores that do not stall -- and the
-         * reduce's side becomes contiguous. */
-        const uint64_t plane = args.blend_layout != 0u
-            ? ((uint64_t)head * args.n_blocks + block)
-            : ((uint64_t)block * args.n_head + head);
+        /* partial_lora is planed by HEAD -- (head * n_blocks + block) * kv_lora_dim --
+        so the reduce's n_blocks reads for one head are a single contiguous run
+        instead of n_blocks chunks a whole block plane apart.  Under the block-major
+        layout this file shipped until 2026-09-19 those chunks were
+        n_head * kv_lora_dim * 4 bytes apart, 131,072 at the GLM-5.3 decode shape,
+        and with nth equal to kv_lora_dim each thread handles exactly one j, so
+        nothing in the threadgroup hid that latency.  The partial's stores become
+        eight 2 KB chunks at n_blocks * 2 KB stride, which is the better place for
+        the stride: they are independent and do not stall.  Same values, same lane,
+        same order of accumulation over b -- only the addresses moved.  Measured
+        +0.047 t/s at 62k over five interleaved reps (redblend5-62k), text
+        identical.  Producer and consumer MUST agree, so every kernel that touches
+        partial_lora -- the six production partial instantiations, the six
+        production reduce instantiations and the two T2 screen copies in
+        metal/t2screen.metal -- uses this expression and there is no switch. */
         device float4 *out4 =
             (device float4 *)(partial_lora +
-                plane * args.kv_lora_dim * sizeof(float));
+                ((uint64_t)head * args.n_blocks + block) *
+                    args.kv_lora_dim * sizeof(float));
         out4[lane + 0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -4169,37 +4090,7 @@ template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_p
 kernel glm_attention_indexed_decode_split_group8_partial_t
 kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true>;
 
-/* A2: the same body with 32 heads (1024 threads) per threadgroup.  The host
- * picks it with the attn_group lever; the grid's x extent becomes n_head/32
- * and the threadgroup becomes (32, 32, 1).  Every variant the group8 path can
- * select has a twin here so the lever never has to weaken the row/head
- * contract to widen the group. */
-template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial")]]
-kernel glm_attention_indexed_decode_split_group8_partial_t
-kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false, false, 32u>;
-
-template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial_valid_fullheads")]]
-kernel glm_attention_indexed_decode_split_group8_partial_t
-kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, false, 32u>;
-
-template [[host_name("kernel_glm_attention_indexed_decode_split_group32_partial_prefix_fullheads")]]
-kernel glm_attention_indexed_decode_split_group8_partial_t
-kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, true, 32u>;
-
-/* SPLIT (host lever dsa_reduce_split) divides the value projection's output
- * rows between SPLIT threadgroups per head, grid (n_head, SPLIT).  Each of
- * them recomputes the whole 17-partial online-softmax blend -- same nth, same
- * reduction trees, same block_scale, read-only inputs -- so every replica
- * holds a bit-identical lora_sum, and then walks only its contiguous half of
- * value_dim with the SAME lane and simdgroup assignment it would have used
- * inside that half.  Each output row's arithmetic is therefore untouched: in
- * the Q8_0 path a row is one thread's serial dot whichever thread runs it, and
- * in the Q4_K path a row is a fixed lane split reduced by simd_sum whichever
- * simdgroup runs it.  T2-REPORT.md section 8.3 prices it; the redundant blend
- * is the section 3.3 redundant-recomputation argument, and the only device
- * write in this kernel is out[d], so no head-wide value needs an owner.
- * SPLIT == 1 is today's path byte for byte. */
-template<uint FIXED_BLOCKS, bool Q8_U16, uint SPLIT = 1u>
+template<uint FIXED_BLOCKS, bool Q8_U16>
 static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *partial_lora,
@@ -4217,19 +4108,9 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         args.kv_lora_dim != 512u ||
         n_blocks == 0u ||
         n_blocks > 64u ||
-        (FIXED_BLOCKS != 0u && args.n_blocks != FIXED_BLOCKS) ||
-        (SPLIT > 1u && (args.value_dim < SPLIT || tgpig.y >= SPLIT))) {
+        (FIXED_BLOCKS != 0u && args.n_blocks != FIXED_BLOCKS)) {
         return;
     }
-
-    /* Contiguous half (or SPLIT-th) of the output rows this threadgroup owns.
-     * With SPLIT == 1 these collapse to the full range and both loops below
-     * are textually the loops that were there. */
-    const uint vd_chunk =
-        SPLIT > 1u ? (args.value_dim + SPLIT - 1u) / SPLIT : args.value_dim;
-    const uint vd_lo = SPLIT > 1u ? (uint)tgpig.y * vd_chunk : 0u;
-    const uint vd_hi = SPLIT > 1u ? min(vd_lo + vd_chunk, args.value_dim)
-                                  : args.value_dim;
 
     const uint nth = ntg_u.x;
     /* Scratch is laid out relative to nth so the host can widen the
@@ -4248,21 +4129,21 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
                 ((uint64_t)tid * args.n_head + head) * 2u * sizeof(float));
         local_m = ms[1] > 0.0f ? ms[0] : -FLT_MAX / 2.0f;
     }
-    /* Lever dsa_reduce_blend >= 2: reduce the n_blocks leaves inside ONE
-     * simdgroup instead of sweeping all nth of them.
-     *
-     * Bit-identity is this kernel's own identity-leaf argument read backwards.
-     * Leaves at tid >= n_blocks hold the identities (-FLT_MAX/2 for the max,
-     * 0.0f for the sum), so in the nth-wide sweep every step whose stride is
-     * at least 32 pairs a real leaf with an identity and is a no-op for the
-     * lanes that matter; only the steps 16, 8, 4, 2, 1 do anything.  Running
-     * exactly those five steps as simd_shuffle_xor with masks 16..1 reproduces
-     * the same binary tree lane 0 would have got -- for the max because max is
-     * order-independent and exact, and for the sum because xor masks in
-     * descending order pair (0,16) then (0..15 with 8..23) and so on, which is
-     * the pairing the Hillis-Steele down-sweep makes.  Guarded on
-     * n_blocks <= 32 so the leaves fit one simdgroup; 17 at 62k. */
-    const bool blend_simd = args.blend_layout >= 2u && n_blocks <= 32u;
+    /* The n_blocks leaves are reduced inside ONE simdgroup, not swept across
+     * all nth of them.  Bit-identity is this kernel's own identity-leaf
+     * argument read backwards: leaves at tid >= n_blocks hold the identities
+     * (-FLT_MAX/2 for the max, 0.0f for the sum), so in the nth-wide sweep
+     * every step of stride 32 or more pairs a real leaf with an identity and
+     * is a no-op for the lanes that matter, and only the steps 16, 8, 4, 2 and
+     * 1 do anything.  Running exactly those five as simd_shuffle_xor
+     * reproduces the tree lane 0 would have got: max is order-independent and
+     * exact, and for the sum, xor masks in descending order make the same
+     * pairing the Hillis-Steele down-sweep makes.  They are written out rather
+     * than calling simd_sum, whose internal association is not specified.  The
+     * nth-wide sweep is kept for n_blocks above 32, which the certified decode
+     * tuple never reaches (17 at 62k) but the kernel's own guard still
+     * admits. */
+    const bool blend_simd = n_blocks <= 32u;
     if (blend_simd) {
         if (tid < 32u) {
             float v = local_m;
@@ -4321,19 +4202,13 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
     for (uint j = tid; j < args.kv_lora_dim; j += nth) {
         float acc = 0.0f;
         for (uint b = 0u; b < n_blocks; b++) {
-            /* Same addends in the same order over b; only the address moves.
-             * At blend_layout 0 consecutive b are n_head * kv_lora_dim * 4
-             * bytes apart -- 128 KB at this shape -- and with nth equal to
-             * kv_lora_dim each thread handles exactly one j, so there is no
-             * other work in the threadgroup to hide that latency behind.  At
-             * >= 1 they are kv_lora_dim * 4 bytes apart and the whole run is
-             * contiguous. */
-            const uint64_t plane = args.blend_layout != 0u
-                ? ((uint64_t)head * n_blocks + b)
-                : ((uint64_t)b * args.n_head + head);
+            /* Head-planed: consecutive b are kv_lora_dim * 4 bytes apart and
+             * the whole run is contiguous.  See the note at the partial's
+             * write.  Same addends in the same order over b. */
             device const float *src =
                 (device const float *)(partial_lora +
-                    plane * args.kv_lora_dim * sizeof(float));
+                    ((uint64_t)head * n_blocks + b) *
+                        args.kv_lora_dim * sizeof(float));
             acc += src[j] * block_scale[b];
         }
         lora_sum[j] = acc / denom;
@@ -4350,7 +4225,7 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         const uint vp_sg = tid >> 5u;
         const uint vp_lane = tid & 31u;
         const uint vp_nsg = nth >> 5u;
-        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
+        for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
@@ -4361,38 +4236,16 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
                 out[d] = sum;
             }
         }
-    } else if (args.value_lanes == 2u &&
-               args.value_type == DS4_METAL_GGUF_Q8_0 &&
-               args.kv_lora_dim == 512u) {
-        /* Tier 2 lane split, the same structure the Q4_K branch above uses. */
-        const uint vp_sg = tid >> 5u;
-        const uint vp_lane = tid & 31u;
-        const uint vp_nsg = nth >> 5u;
-        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
-            device const char *row =
-                value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
-            const float part =
-                glm_q8_0_dot_row_lane_f32_512(row, lora_sum, (ushort)vp_lane);
-            const float sum = simd_sum(part);
-            if (vp_lane == 0u) {
-                out[d] = sum;
-            }
-        }
     } else {
-        const bool q8_512 = args.value_type == DS4_METAL_GGUF_Q8_0 &&
-                            args.kv_lora_dim == 512u;
-        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
+        for (uint d = tid; d < args.value_dim; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
-            /* Q8_U16 reads the same row as ushort pairs in the same order;
-             * value_lanes 1 keeps that order and only moves the loads. */
-            out[d] = (args.value_lanes == 1u && q8_512)
-                         ? glm_q8_0_dot_row_tg_f32_512_u16_pf(row, lora_sum)
-                         : ((Q8_U16 && q8_512)
-                                ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
-                                : glm_quant_dot_row_tg_f32(args.value_type, row,
-                                                           lora_sum,
-                                                           args.kv_lora_dim));
+            /* Q8_U16 reads the same row as ushort pairs in the same order. */
+            out[d] = (Q8_U16 && args.value_type == DS4_METAL_GGUF_Q8_0 &&
+                      args.kv_lora_dim == 512u)
+                         ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
+                         : glm_quant_dot_row_tg_f32(args.value_type, row,
+                                                    lora_sum, args.kv_lora_dim);
         }
     }
 }
@@ -4441,56 +4294,6 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_reduce16(
         ushort3 ntg_u [[threads_per_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
     kernel_glm_attention_indexed_decode_split_group8_reduce_impl<16, false>(
-            args, partial_lora, partial_ms, value_weight, heads, scratch,
-            tid, ntg_u, tgpig);
-}
-
-/* dsa_reduce_split = 2: the three production reduce shapes above with the
- * output rows halved over two threadgroups per head, grid (n_head, 2).  Every
- * other argument, binding and threadgroup-memory size is unchanged; the host
- * refuses back to one threadgroup per head on any shape without a twin here
- * (the VPLANE screen kernel in metal/t2screen.metal has none). */
-kernel void kernel_glm_attention_indexed_decode_split_group8_reduce_split2(
-        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
-        device const char *partial_lora,
-        device const char *partial_ms,
-        device const char *value_weight,
-        device char *heads,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
-        uint3 tgpig [[threadgroup_position_in_grid]]) {
-    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0, false, 2u>(
-            args, partial_lora, partial_ms, value_weight, heads, scratch,
-            tid, ntg_u, tgpig);
-}
-
-kernel void kernel_glm_attention_indexed_decode_split_group8_reduce_u16_split2(
-        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
-        device const char *partial_lora,
-        device const char *partial_ms,
-        device const char *value_weight,
-        device char *heads,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
-        uint3 tgpig [[threadgroup_position_in_grid]]) {
-    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<0, true, 2u>(
-            args, partial_lora, partial_ms, value_weight, heads, scratch,
-            tid, ntg_u, tgpig);
-}
-
-kernel void kernel_glm_attention_indexed_decode_split_group8_reduce16_split2(
-        constant ds4_metal_args_glm_attention_indexed_decode_split & args,
-        device const char *partial_lora,
-        device const char *partial_ms,
-        device const char *value_weight,
-        device char *heads,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
-        uint3 tgpig [[threadgroup_position_in_grid]]) {
-    kernel_glm_attention_indexed_decode_split_group8_reduce_impl<16, false, 2u>(
             args, partial_lora, partial_ms, value_weight, heads, scratch,
             tid, ntg_u, tgpig);
 }
