@@ -587,6 +587,10 @@ ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
                                    char *err, size_t errlen);
 int ds4_session_chain_eval(ds4_chain *ch, int token, char *err, size_t errlen);
 int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen);
+/* Wait for the step in flight without ending the chain: everything that reads
+ * or serializes session state between two tokens (a disk-cache waypoint) needs
+ * a quiet GPU first. */
+int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen);
 int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen);
 int ds4_session_chain_abort(ds4_chain *ch);
 int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen);

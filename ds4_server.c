@@ -13150,6 +13150,27 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
+    /* C2 chain decode: the GPU picks the next id inside the step that produced
+     * the logits and the following step is encoded while it runs.  It replaces
+     * the sample + eval pair of the serial path only, and only when nothing in
+     * the request needs per-token logits or a sampler the selector does not
+     * implement.  Tool-bearing chats are declined because a DSML payload flips
+     * the temperature mid-stream, and the selector for token k+1 is encoded
+     * before token k's text exists.  Speculative decoding, batched mode and
+     * ignore_eos keep the classic path. */
+    ds4_chain *chain = NULL;
+    const bool chain_speculative =
+        !s->batched_mode &&
+        ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+    bool chain_allowed = !s->batched_mode && !chain_speculative &&
+                         !j->req.ignore_eos && !j->req.has_tools;
+    if (chain_allowed) {
+        int lever_chain = 0;
+        glm_levers_get("chain_decode", &lever_chain);
+        chain_allowed = lever_chain != 0;
+    }
+
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
@@ -13158,7 +13179,22 @@ decode_again:
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         ds4_session_decode_reasoning(slot->session, thinking.inside);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal) {
+                /* A chain leaves a step in flight between tokens; a waypoint
+                 * serializes the session, so quiesce the GPU first (only on
+                 * the tokens where a store actually happens). */
+                if (chain) {
+                    const ds4_tokens *live = ds4_session_tokens(slot->session);
+                    if (live &&
+                        kv_cache_slot_continued_target(s, slot, live->len) != 0) {
+                        char cerr[160];
+                        pthread_mutex_lock(&s->inference_mu);
+                        (void)ds4_session_chain_sync(chain, cerr, sizeof(cerr));
+                        pthread_mutex_unlock(&s->inference_mu);
+                    }
+                }
+                kv_cache_maybe_store_continued(s, slot);
+            }
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -13178,11 +13214,34 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
-            ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k,
-                               top_p, min_p, &rng);
+        /* One chain step is select + eval as a single critical section: the
+         * staged step must be committed or dropped before another request can
+         * touch the GPU. */
+        bool chain_pending = false;
+        int token;
+        if (chain) {
+            if (g_stop_requested || job_cancelled(j)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "%s",
+                         g_stop_requested ? "shutdown requested" :
+                                            "client disconnected");
+                break;
+            }
+            pthread_mutex_lock(&s->inference_mu);
+            token = ds4_session_chain_next(chain, err, sizeof(err));
+            if (token < 0) {
+                pthread_mutex_unlock(&s->inference_mu);
+                finish = "error";
+                break;
+            }
+            chain_pending = true;
+        } else {
+            token = j->req.ignore_eos ?
+                ds4_session_argmax_ignoring_eos(slot->session,
+                                                j->req.think_mode) :
+                ds4_session_sample(slot->session, temperature, top_k,
+                                   top_p, min_p, &rng);
+        }
         if (token < 0) {
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -13191,13 +13250,68 @@ decode_again:
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
+            if (chain_pending) {
+                /* The step that would consume this token was never committed,
+                 * so the session stops exactly where the classic loop stops. */
+                (void)ds4_session_chain_abort(chain);
+                pthread_mutex_unlock(&s->inference_mu);
+            }
             finish = "stop";
             break;
         }
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode &&
+        if (chain_pending) {
+            const int crc = ds4_session_chain_confirm(chain, token,
+                                                      err, sizeof(err));
+            pthread_mutex_unlock(&s->inference_mu);
+            if (crc != 0) {
+                finish = "error";
+                break;
+            }
+            toks[0] = token;
+            ntok = 1;
+        } else if (chain_allowed && !chain) {
+            /* First token of the request: it came from the host sampler, like
+             * the classic loop's first iteration, and starting the chain here
+             * makes its eval the chain's first step. */
+            ds4_chain_params cp = {
+                .mode = temperature > 0.0f ? DS4_CHAIN_SAMPLE : DS4_CHAIN_GREEDY,
+                .excluded_id = -1,
+                .temperature = temperature,
+                .top_k = top_k,
+                .top_p = top_p,
+                .min_p = min_p,
+                .rng = &rng,
+            };
+            pthread_mutex_lock(&s->inference_mu);
+            if (ds4_session_chain_supported(slot->session, &cp)) {
+                chain = ds4_session_chain_begin(slot->session, &cp,
+                                                err, sizeof(err));
+            }
+            int crc = 1;
+            if (chain) {
+                crc = ds4_session_chain_eval(chain, token, err, sizeof(err));
+                if (crc != 0) {
+                    (void)ds4_session_chain_end(chain, err, sizeof(err));
+                    chain = NULL;
+                }
+            }
+            pthread_mutex_unlock(&s->inference_mu);
+            if (!chain) {
+                /* Declined, or it could not start: this request stays on the
+                 * classic path for good. */
+                chain_allowed = false;
+                if (crc != 0 &&
+                    server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+                    finish = "error";
+                    break;
+                }
+            }
+            toks[0] = token;
+            ntok = 1;
+        } else if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -13419,6 +13533,12 @@ decode_again:
         ds4_session_decode_ack(slot->session, completion - before_consumed,
             stop_decode || completion >= max_tokens || job_cancelled(j) || g_stop_requested);
         if (stop_decode) break;
+    }
+    if (chain) {
+        pthread_mutex_lock(&s->inference_mu);
+        (void)ds4_session_chain_end(chain, err, sizeof(err));
+        pthread_mutex_unlock(&s->inference_mu);
+        chain = NULL;
     }
     ds4_session_decode_ack(slot->session, 0, true);
     server_generation_leave(s);

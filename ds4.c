@@ -74448,6 +74448,12 @@ struct ds4_chain {
     int              staged_token;     /* -1 = the GPU picked it */
     uint32_t         staged_pos;
     bool             staged_dense;
+    int              committed;        /* steps the GPU has been given */
+    /* An id harvested from a finished step but not yet handed to the caller:
+     * ds4_session_chain_sync() leaves one behind so the host can read session
+     * state with a quiet GPU. */
+    bool             have_id;
+    int              pending_id;
     int              violations;
     bool             verify;
     long             verify_checked;
@@ -74502,17 +74508,13 @@ ds4_chain *ds4_session_chain_begin(ds4_session *s, const ds4_chain_params *p,
     ch->staged_token = -1;
     ch->verify = getenv("DS4_GLM_CHAIN_VERIFY") != NULL;
     ch->violations = ds4_gpu_chain_violations();
-    if (!ds4_gpu_chain_stage_begin()) {
-        free(ch);
-        ds4_chain_err(err, errlen, "chain decode could not start command staging");
-        return NULL;
-    }
     return ch;
 }
 
 static void ds4_chain_invalidate(ds4_chain *ch) {
     ds4_session *s = ch->s;
     (void)ds4_gpu_chain_stage_abort();
+    (void)ds4_gpu_chain_stage_finish();
     ch->staged = false;
     ch->inflight_event = 0;
     s->checkpoint_valid = false;
@@ -74560,6 +74562,14 @@ static int ds4_chain_encode_step(ds4_chain *ch, int token,
     }
 
     const bool dense = glm_graph_decode_updates_dense_cache(g, pos, s->logits);
+    /* Staging is open only from here to the commit or the abort, i.e. inside
+     * whatever lock the caller holds around one chain step.  It is a process
+     * global, so leaving it on across an unlocked window would park another
+     * thread's command buffers in this chain's staging list. */
+    if (!ds4_gpu_chain_stage_begin()) {
+        ds4_chain_err(err, errlen, "chain decode could not stage its step");
+        return 1;
+    }
     if (!glm_graph_forward_token_sel(g, &e->model, &e->weights,
                                      token < 0 ? 0 : token,
                                      NULL, pos, NULL, s->logits, false, &sel)) {
@@ -74604,6 +74614,8 @@ static int ds4_chain_commit_step(ds4_chain *ch, int token,
     ch->inflight_event = ch->staged_event;
     ch->inflight_slot = ch->staged_slot;
     ch->staged = false;
+    ch->committed++;
+    (void)ds4_gpu_chain_stage_finish();
     return 0;
 }
 
@@ -74620,22 +74632,18 @@ int ds4_session_chain_eval(ds4_chain *ch, int token, char *err, size_t errlen) {
     return ds4_chain_commit_step(ch, token, err, errlen);
 }
 
-/* Encode the next step, then wait for the one in flight and return the id it
- * chose.  The next step is not committed: the caller decides. */
-int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
-    if (!ch || ch->inflight_event == 0 || ch->staged) {
-        ds4_chain_err(err, errlen, "chain decode has no step in flight");
-        return -1;
-    }
+/* Wait for the step in flight and take the id it chose.  `mark` bounds the
+ * transient buffers that belong to steps that are now finished. */
+static int ds4_chain_harvest(ds4_chain *ch, unsigned long mark,
+                             char *err, size_t errlen) {
     ds4_session *s = ch->s;
     ds4_glm_gpu_graph *g = &s->glm_graph;
-    const unsigned long mark = ds4_gpu_chain_transient_mark();
-    if (ds4_chain_encode_step(ch, -1, err, errlen) != 0) return -1;
+    if (ch->inflight_event == 0) return 0;
     if (!ds4_gpu_wait_selected_readback_ready(ch->inflight_event,
                                               "glm chain decode")) {
         ds4_chain_err(err, errlen, "chain decode timed out waiting for the GPU");
         ds4_chain_invalidate(ch);
-        return -1;
+        return 1;
     }
     (void)ds4_gpu_chain_reap(mark, "glm chain decode");
     ch->inflight_event = 0;
@@ -74646,12 +74654,12 @@ int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
                              &id, sizeof(id))) {
         ds4_chain_err(err, errlen, "chain decode could not read the selected id");
         ds4_chain_invalidate(ch);
-        return -1;
+        return 1;
     }
     if (id < 0 || id >= (int32_t)DS4_N_VOCAB) {
         if (errlen) snprintf(err, errlen, "chain decode selected an invalid id %d", id);
         ds4_chain_invalidate(ch);
-        return -1;
+        return 1;
     }
     if (ch->verify && ch->p.mode == DS4_CHAIN_GREEDY && s->logits) {
         if (ds4_gpu_tensor_read(g->logits, 0, s->logits,
@@ -74667,7 +74675,33 @@ int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
             }
         }
     }
-    return (int)id;
+    ch->have_id = true;
+    ch->pending_id = (int)id;
+    return 0;
+}
+
+/* Quiesce the GPU without giving up the chain: the caller wants to read or
+ * serialize session state (a disk-cache waypoint) between two tokens. */
+int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen) {
+    if (!ch || ch->staged) {
+        ds4_chain_err(err, errlen, "chain decode cannot sync with a staged step");
+        return 1;
+    }
+    return ds4_chain_harvest(ch, ds4_gpu_chain_transient_mark(), err, errlen);
+}
+
+/* Encode the next step, then wait for the one in flight and return the id it
+ * chose.  The next step is not committed: the caller decides. */
+int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
+    if (!ch || ch->staged || (ch->inflight_event == 0 && !ch->have_id)) {
+        ds4_chain_err(err, errlen, "chain decode has no step in flight");
+        return -1;
+    }
+    const unsigned long mark = ds4_gpu_chain_transient_mark();
+    if (ds4_chain_encode_step(ch, -1, err, errlen) != 0) return -1;
+    if (ds4_chain_harvest(ch, mark, err, errlen) != 0) return -1;
+    ch->have_id = false;
+    return ch->pending_id;
 }
 
 int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen) {
@@ -74678,9 +74712,10 @@ int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen
 int ds4_session_chain_abort(ds4_chain *ch) {
     if (!ch) return 1;
     if (ch->staged) {
-        (void)ds4_gpu_chain_discard_staged();
+        (void)ds4_gpu_chain_stage_abort();
         ch->staged = false;
     }
+    (void)ds4_gpu_chain_stage_finish();
     return 0;
 }
 
@@ -74694,15 +74729,16 @@ int ds4_session_chain_end(ds4_chain *ch, char *err, size_t errlen) {
             ds4_chain_err(err, errlen, "chain decode timed out draining the GPU");
             ch->s->checkpoint_valid = false;
             rc = 1;
-        } else if (ch->s->logits) {
-            /* Leave the session exactly as the classic loop would: the logits
-             * of the last committed token.  One 605 KiB read per generation
-             * instead of one per token, and it keeps snapshots, continuations
-             * and logprob callers honest. */
-            (void)ds4_gpu_tensor_read(ch->s->glm_graph.logits, 0, ch->s->logits,
-                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
         }
         ch->inflight_event = 0;
+    }
+    if (rc == 0 && ch->committed > 0 && ch->s->logits && ch->s->checkpoint_valid) {
+        /* Leave the session exactly as the classic loop would: the logits of
+         * the last committed token.  One 605 KiB read per generation instead
+         * of one per token, and it keeps snapshots, continuations and logprob
+         * callers honest. */
+        (void)ds4_gpu_tensor_read(ch->s->glm_graph.logits, 0, ch->s->logits,
+                                  (uint64_t)DS4_N_VOCAB * sizeof(float));
     }
     (void)ds4_gpu_chain_reap(ds4_gpu_chain_transient_mark(),
                              "glm chain decode end");
@@ -74784,6 +74820,11 @@ int ds4_session_chain_eval(ds4_chain *ch, int token, char *err, size_t errlen) {
 int ds4_session_chain_next(ds4_chain *ch, char *err, size_t errlen) {
     (void)ch; (void)err; (void)errlen;
     return -1;
+}
+
+int ds4_session_chain_sync(ds4_chain *ch, char *err, size_t errlen) {
+    (void)ch; (void)err; (void)errlen;
+    return 1;
 }
 
 int ds4_session_chain_confirm(ds4_chain *ch, int token, char *err, size_t errlen) {
