@@ -56213,7 +56213,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
     if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
     if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
-    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 5; return 1; }
+    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 7; return 1; }
     return 0;
 }
 
@@ -56236,10 +56236,15 @@ static int glm_lever_counted_member(const char *name, int value) {
     }
     if (!strcmp(name, "sdn_fold")) {
         /* 0 pair, 1 fold, 2 publication-only, 3 slot-fastest fold,
-         * 4 publication-only without the device fences, 5 fold without them.
-         * 4 and 5 are diagnostics: they are not memory-safe across the two
-         * dies and must never ship. */
-        return value >= 0 && value <= 5;
+         * 4 publication-only without the device fences, 5 fold without them,
+         * 6 publication-only with release/acquire fences, 7 publication-only
+         * with the seq_cst fences issued by tid 0 alone.  4, 5 and 7 are
+         * diagnostics and must never ship: 4 and 5 are not memory-safe across
+         * the two dies at all, and 7 leans on the threadgroup barrier to stand
+         * in for the other threads' fences.  6 is the one weakening that is
+         * spec-clean, and it is only present if the Metal language version
+         * compiled it. */
+        return value >= 0 && value <= 7;
     }
     return 1;
 }

@@ -832,7 +832,21 @@ typedef struct {
      * expensive.  4 and 5 are DIAGNOSTICS ONLY: without the fences a partial
      * can be invisible or stale across the two dies, and a stale partial is the
      * previous layer's value, so it reaches the generated text.  Neither may
-     * ship whatever it measures. */
+     * ship whatever it measures.  Measured: 0 = 38.462, 4 = 38.382,
+     * 5 = 38.244, so the two fences are about 0.67 of the 0.75 the publication
+     * costs, the stores and ticket are near free, and 5 - 4 says the tail in
+     * the last slot wave costs more than the consumer dispatch plus its own
+     * boundary -- C1 is structurally dead whatever the publication costs.
+     *
+     * 6 and 7 price the fence VARIANT, both publication-only like 4: 6 uses
+     * release/acquire instead of seq_cst (spec-clean, and the only one of the
+     * diagnostics that could ship; absent entirely if the Metal language
+     * version lacks non-seq_cst fence orders, in which case the host says the
+     * pipeline is unavailable and runs the pair), and 7 keeps seq_cst but
+     * issues it from tid 0 alone behind threadgroup_barrier(mem_device), which
+     * leans on that barrier to stand in for the other 63 threads' fences and
+     * so is a diagnostic only.  Their point is whether the cost is per fence
+     * instruction (64 per threadgroup today) or per threadgroup. */
     int sdn_fold;
 } glm_levers;
 

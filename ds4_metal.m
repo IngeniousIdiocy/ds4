@@ -43937,14 +43937,16 @@ static const char *ds4_gpu_glm_routed_down_sdn_fold_kernel(int mode) {
     case 3: return "kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32";
     case 4: return "kernel_glm_q4_K_down_simd_split_sdn_pub_nofence_f32";
     case 5: return "kernel_glm_q4_K_down_simd_split_sdn_fold_nofence_f32";
+    case 6: return "kernel_glm_q4_K_down_simd_split_sdn_pub_relacq_f32";
+    case 7: return "kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32";
     default: return NULL;
     }
 }
 
 static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_sdn_fold_pipeline(int mode) {
-    static id<MTLComputePipelineState> cached[6];
-    static int tried[6];
-    if (mode < 1 || mode > 5) return nil;
+    static id<MTLComputePipelineState> cached[8];
+    static int tried[8];
+    if (mode < 1 || mode > 7) return nil;
     if (!tried[mode]) {
         tried[mode] = 1;
         cached[mode] =
@@ -44496,7 +44498,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 ((uint64_t)out_dim / 2u) * sizeof(uint32_t);
             fold_mode = g_glm_levers.sdn_fold;
             const bool shape_ok =
-                fold_mode >= 1 && fold_mode <= 5 && g_glm_levers.sdn_ptail == 0 &&
+                fold_mode >= 1 && fold_mode <= 7 && g_glm_levers.sdn_ptail == 0 &&
                 sdn_d.nsg == 4 && sdn_d.nr0 == 2 &&
                 g_tp_split_world != 2 &&
                 (out_dim & 1u) == 0u && out_dim == sdn_fold->out_dim &&
@@ -44915,10 +44917,12 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (!ok) return 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) return 0;
         if (split_pipeline && used_split) *used_split = 1;
-        /* Modes 2 and 4 are the publication-only ablations: the consumer
-         * dispatch must still run, so the fold is deliberately NOT reported as
-         * done. */
-        if (fold_pipeline && fold_mode != 2 && fold_mode != 4 && sdn_fold) {
+        /* Modes 2, 4, 6 and 7 are the publication-only ablations: the
+         * consumer dispatch must still run, so the fold is deliberately NOT
+         * reported as done. */
+        const bool fold_publishes_only =
+            fold_mode == 2 || fold_mode == 4 || fold_mode == 6 || fold_mode == 7;
+        if (fold_pipeline && !fold_publishes_only && sdn_fold) {
             sdn_fold->folded = 1;
         }
 #undef DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE

@@ -4402,19 +4402,51 @@ DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
 // out_dim, or an SDN dispatch whose nsg is not 4 or nr0 not 2 -- because the
 // virtual-simdgroup emulation above is written for the (4, 2) shape alone.
 // ===========================================================================
-/* FENCED=false drops BOTH seq_cst thread_scope_device fences and keeps
- * everything else -- the coherent partial stores, both threadgroup barriers,
- * the relaxed fetch_add and the self-rearm.  It exists to price the fences,
- * which are the leading suspect for the publication cost: a device-scope fence
- * is a cache-maintenance operation, and with 16,384 threadgroups each core runs
- * about 200 of them.  It is NOT a shipping form: without the release fence a
- * partial can be invisible to the reader on the other die, and without the
- * acquire fence the reader can see a stale line.  A stale partial is the
- * PREVIOUS LAYER's value, so it is a materially wrong number that reaches the
- * generated text -- the harness identity column is the detector, and a
- * fence-free arm that is both fast and identical needs many runs before it
- * means anything (see T2-REPORT.md section 7.4). */
-template <bool RUN_TAIL, bool SLOT_MAJOR, bool FENCED>
+/* FENCE_MODE selects how the publication is ordered.  Measured at 62k, three
+ * interleaved reps, all texts identical: mode 1 (value 2) 37.668 against the
+ * pair's 38.462, mode 0 (value 4) 38.382.  So the two seq_cst device fences
+ * are about 0.67 of the 0.75 t/s the publication costs -- roughly 11 us per
+ * layer at 16,384 producer threadgroups, about 200 device-scope fences per
+ * core -- and the coherent stores, the barriers and the ticket are near free.
+ *
+ *   0  no fences at all.  DIAGNOSTIC ONLY: without the release fence a partial
+ *      can be invisible to a reader on the other die, and without the acquire
+ *      fence the reader can see a stale line.  A stale partial is the PREVIOUS
+ *      layer's value, so it is a materially wrong number that reaches the
+ *      generated text -- the harness identity column is the detector, and a
+ *      fence-free arm that is both fast and identical needs many runs before
+ *      that means anything (T2-REPORT.md section 7.4).
+ *   1  seq_cst thread_scope_device on both sides, every thread.  The router
+ *      fold's pattern, the one qualified against the Phase 1 stale-row
+ *      finding, and the only form here that is known correct.
+ *   2  release on the producer side and acquire on the reader side, every
+ *      thread.  The spec-clean weakening: release/acquire is exactly the
+ *      ordering this handoff needs, and it should not carry seq_cst's total
+ *      order.  Only compiled when the Metal language version has non-seq_cst
+ *      fence orders; otherwise the kernel is not defined at all and the host
+ *      reports the pipeline as unavailable and runs the pair, rather than the
+ *      whole library failing to compile.
+ *   3  seq_cst on both sides but issued by tid 0 ALONE, behind
+ *      threadgroup_barrier(mem_device).  DIAGNOSTIC: this leans on the
+ *      threadgroup barrier to order the other 63 threads' stores before the
+ *      one thread's fence, which is a stronger assumption than the memory
+ *      model gives for a device-scope fence.  It exists to answer one
+ *      question -- is the cost per fence INSTRUCTION (64 per threadgroup
+ *      today) or per threadgroup?
+ *
+ * Modes 2 and 3 issue the reader-side fence before the RUN_TAIL early-out, so
+ * a publication-only arm still pays it in the one threadgroup in n_slots that
+ * would have run the tail; modes 0 and 1 are left exactly as they were
+ * measured. */
+#ifndef DS4_GLM_SDN_FENCE_RELACQ
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
+#define DS4_GLM_SDN_FENCE_RELACQ 1
+#else
+#define DS4_GLM_SDN_FENCE_RELACQ 0
+#endif
+#endif
+
+template <bool RUN_TAIL, bool SLOT_MAJOR, short FENCE_MODE>
 static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
         constant ds4_metal_glm_routed_moe_args  & args,
         device  const char    * down,
@@ -4458,16 +4490,27 @@ static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
         args, down, selected, mid, partials, ptg, tiisg, sgitg);
 
     // ---- Publish, then ticket (the router fold's pattern) -----------------
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup_barrier(mem_flags::mem_device);
-    if (FENCED) {
-        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
-                            thread_scope_device);
-    }
-
     threadgroup float *vsum    = (threadgroup float *)shmem;
     threadgroup uint  *elected = (threadgroup uint *)(shmem + 32);
     const ushort tid = (ushort)(sgitg * 32u + tiisg);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device);
+    if (FENCE_MODE == 1) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                            thread_scope_device);
+    } else if (FENCE_MODE == 2) {
+#if DS4_GLM_SDN_FENCE_RELACQ
+        atomic_thread_fence(mem_flags::mem_device, memory_order_release,
+                            thread_scope_device);
+#endif
+    } else if (FENCE_MODE == 3) {
+        if (tid == 0u) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                                thread_scope_device);
+        }
+    }
+
     if (tid == 0u) {
         const uint prev =
             atomic_fetch_add_explicit(&ticket[pair], 1u, memory_order_relaxed);
@@ -4481,10 +4524,23 @@ static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
         elected[0] = last ? 1u : 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    /* Modes 2 and 3 pay the reader-side fence even when no tail follows, so a
+     * publication-only arm prices the whole pattern. */
+    if (FENCE_MODE >= 2 && elected[0] != 0u) {
+        if (FENCE_MODE == 2) {
+#if DS4_GLM_SDN_FENCE_RELACQ
+            atomic_thread_fence(mem_flags::mem_device, memory_order_acquire,
+                                thread_scope_device);
+#endif
+        } else if (tid == 0u) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                                thread_scope_device);
+        }
+    }
     /* Publication-only ablation: everything above has been paid. */
     if (!RUN_TAIL) return;
     if (elected[0] == 0u) return;
-    if (FENCED) {
+    if (FENCE_MODE == 1) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                             thread_scope_device);
     }
@@ -4593,7 +4649,7 @@ static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
     }
 }
 
-#define DS4_GLM_SDN_FOLD_KERNEL(NAME, RUN_TAIL_V, SLOT_MAJOR_V, FENCED_V)     \
+#define DS4_GLM_SDN_FOLD_KERNEL(NAME, RUN_TAIL_V, SLOT_MAJOR_V, FENCE_MODE_V) \
 kernel void NAME(                                                             \
         constant ds4_metal_glm_routed_moe_args  & args,                       \
         device  const char    * down,                                         \
@@ -4615,26 +4671,39 @@ kernel void NAME(                                                             \
         uint3  tgpig [[threadgroup_position_in_grid]],                        \
         ushort tiisg [[thread_index_in_simdgroup]],                           \
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {                    \
-    glm_q4_K_down_sdn_fold_body<RUN_TAIL_V, SLOT_MAJOR_V, FENCED_V>(           \
+    glm_q4_K_down_sdn_fold_body<RUN_TAIL_V, SLOT_MAJOR_V, FENCE_MODE_V>(       \
         args, down, selected, mid, partials, ticket, mv, hc, weight,          \
         shared_mid, shared_out, slots, residual, post, comb, dst, shmem,      \
         tgpig, tiisg, sgitg);                                                 \
 }
 
 /* Lever 1: the measured form -- tail on, slot in z.  -0.862 t/s at 62k. */
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_f32,       true,  false, true)
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_f32,       true,  false, 1)
 /* Lever 2: publication and ticket only, the host still dispatches the pair's
  * consumer.  Prices the publication pattern at 16,384 threadgroups: it came
  * back at 37.668 against 38.414 for the pair, i.e. the publication alone is
  * the whole of value 1's loss. */
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_f32,        false, false, true)
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_f32,        false, false, 1)
 /* Lever 3: the full fold with the slot as the fastest-varying grid axis.
  * Priced the dispatch order and lost a further 0.36 t/s -- interleaving eight
  * experts' row streams costs more routed-down locality than the earlier tail
  * election wins.  Kept only so the measurement is reproducible. */
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32, true,  true,  true)
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32, true,  true,  1)
 /* Lever 4: value 2 with both device fences removed.  Prices the fences inside
  * the publication cost.  Diagnostic only -- see the FENCED note above. */
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_nofence_f32, false, false, false)
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_nofence_f32, false, false, 0)
 /* Lever 5: value 1 with both device fences removed.  Diagnostic only. */
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_nofence_f32, true, false, false)
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_nofence_f32, true, false, 0)
+/* Lever 6: publication only with RELEASE/ACQUIRE device fences instead of
+ * seq_cst -- the spec-clean weakening, and the only one of these diagnostics
+ * that could ship if it is both fast and correct.  Defined only when the Metal
+ * language version has non-seq_cst fence orders; otherwise the host finds no
+ * pipeline, says so once and runs the pair. */
+#if DS4_GLM_SDN_FENCE_RELACQ
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_relacq_f32, false, false, 2)
+#endif
+/* Lever 7: publication only with the seq_cst fences issued by tid 0 ALONE.
+ * Diagnostic: it leans on threadgroup_barrier(mem_device) to stand in for the
+ * other 63 threads' fences, which is more than the memory model promises.  It
+ * answers whether the cost is per fence instruction or per threadgroup. */
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32,   false, false, 3)
