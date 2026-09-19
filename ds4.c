@@ -47377,6 +47377,52 @@ static bool glm_graph_encode_sparse_ffn_one(
      * and left per-slot partials in g->routed_partials instead of a summed
      * row in ffn_out. */
     int routed_down_split = 0;
+    /* Lever sdn_concurrent (glm_levers, ds4.h): the guide's §4.2 applied to
+     * the shared expert's down projection.  That matvec depends only on
+     * shared_mid, which the router+shared fold wrote before the routed experts
+     * started, yet today it runs LAST as a trailing single-wave dispatch that
+     * streams 9 MB at 380 GB/s -- about half the DRAM rate idle.  With the
+     * lever on it joins level one of a concurrent group beside the 75 MB
+     * routed gate/up stream that is already DRAM-bound, the group barrier
+     * orders the routed down behind both, and what is left after the group is
+     * an epilogue dispatch that is the fused consumer's epilogue statement for
+     * statement with shared_v loaded from shared_out.
+     *
+     * Hazards, all checked here rather than assumed: shared_mid is READ in
+     * level one, so nothing in level one may write it -- which is why
+     * router_shared_folded is required (without the fold shared_mid IS
+     * ffn_mid, the routed experts' own buffer); shared_out is WRITTEN in level
+     * one and read after the group; routed_partials is WRITTEN in level two
+     * and read after the group.  The group's end() closes the encoder, and
+     * that boundary is what makes both visible to the epilogue.  The tensor
+     * identities below are compared, not reasoned about.
+     *
+     * The GROUP itself is opened and closed inside the routed MoE encoder, not
+     * here: dispatches in a concurrent encoder carry no implicit ordering, so
+     * only the branch that emits the barrier between the routed gate/up and
+     * the routed down may open one.  Arming is all this call site does. */
+    int sdn_fired = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool sdn_eligible =
+        ok && fold_shared_down_hc && router_shared_folded &&
+        !(hc_fold->capture_out && hc_fold->capture_mean) &&
+        g->moe_block_shared_mid && g->routed_partials && ffn_sum &&
+        g->moe_block_shared_mid != ffn_mid &&
+        g->moe_block_shared_mid != ffn_out &&
+        g->moe_block_shared_mid != ffn_sum &&
+        g->moe_block_shared_mid != g->routed_partials &&
+        ffn_sum != ffn_mid && ffn_sum != ffn_out &&
+        ffn_sum != g->routed_partials && ffn_sum != hc_fold->out_hc;
+    if (sdn_eligible) {
+        (void)ds4_gpu_glm53_sdn_concurrent_arm(ffn_sum,
+                                               model->map,
+                                               model->size,
+                                               l->ffn_down_shexp->abs_offset,
+                                               DS4_N_FF_EXP,
+                                               DS4_N_EMBD,
+                                               g->moe_block_shared_mid);
+    }
+#endif
     if (ok && !ablate_router &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = glm_graph_routed_moe_one_dispatch(
@@ -47399,6 +47445,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             ffn_norm,
             g->ssd_streaming && !streaming_selected_cache) != 0;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    sdn_fired = ds4_gpu_glm53_sdn_concurrent_fired();
+    ds4_gpu_glm53_sdn_concurrent_disarm();
+#endif
+    (void)sdn_fired;
     if (ok && g->imatrix && !ablate_router &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = imatrix_collect_glm_one(g->imatrix, g, il);
@@ -47476,8 +47527,27 @@ static bool glm_graph_encode_sparse_ffn_one(
             }
         } else if (ok && fold_shared_down_hc) {
             bool capture_done = false;
+            bool sdn_done = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-            if (routed_down_split && hc_fold->capture_out &&
+            /* Lever sdn_concurrent: the matvec already ran inside the routed
+             * group's level one and shared_out holds its result, so only the
+             * consumer's epilogue is left.  If the epilogue refuses, fall
+             * through to the full fused consumer, which recomputes the matvec
+             * into the same shared_out and is self-contained. */
+            if (sdn_fired && routed_down_split) {
+                sdn_done = ds4_gpu_glm53_sdn_epilogue_tensor(
+                        hc_fold->out_hc,
+                        ffn_sum,
+                        g->routed_partials,
+                        hc_fold->residual_hc,
+                        hc_fold->split,
+                        DS4_N_FF_EXP,
+                        DS4_N_EMBD,
+                        DS4_N_EMBD,
+                        DS4_N_HC,
+                        DS4_N_EXPERT_USED) != 0;
+            }
+            if (!sdn_done && routed_down_split && hc_fold->capture_out &&
                 hc_fold->capture_mean) {
                 capture_done =
                     ds4_gpu_shared_down_hc_expand_capture_q8_0_tensor(
@@ -47500,7 +47570,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                         hc_fold->capture_mean) != 0;
             }
 #endif
-            if (!capture_done) {
+            if (!sdn_done && !capture_done) {
                 ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                         hc_fold->out_hc,
                         ffn_sum,
@@ -56120,6 +56190,7 @@ glm_levers g_glm_levers = {
     .chain_decode          = 1,  /* on: +0.61 t/s at 62k, +0.72 at 8k */
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
+    .sdn_concurrent        = 0,  /* off until measured */
 };
 static int g_glm_levers_ready;
 
@@ -56139,6 +56210,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_DISABLE_CHAIN" },
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
+    { "sdn_concurrent",        offsetof(glm_levers, sdn_concurrent),        "DS4_GLM_SDN_CONCURRENT" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56181,6 +56253,10 @@ void glm_levers_init_from_env(void) {
      * and whenever the fused shape does not fit (see
      * ds4_gpu_glm_topk_fast_fused_ok in ds4_metal.m). */
     g_glm_levers.topk_fused = getenv("DS4_GLM_DISABLE_TOPK_FUSED") == NULL;
+    /* Default off, so a plain ENABLE variable; every refusal path in
+     * ds4_gpu_glm53_sdn_concurrent_arm() falls back to today's fused
+     * shared-down consumer with nothing skipped. */
+    g_glm_levers.sdn_concurrent = getenv("DS4_GLM_SDN_CONCURRENT") != NULL;
     g_glm_levers_ready = 1;
 }
 

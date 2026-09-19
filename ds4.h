@@ -778,6 +778,14 @@ typedef struct {
      * the kill switch, exact mode clamps it off, and /debug/levers moves it
      * live. */
     int topk_fused;
+    /* Shared-expert down projection in the routed concurrent group: 1 moves
+     * the shared-down matvec out of its trailing single-wave dispatch and into
+     * level one of the routed group, beside the DRAM-bound routed gate/up
+     * stream, leaving a small epilogue dispatch that is the fused consumer's
+     * epilogue statement for statement with shared_v read from shared_out.
+     * Byte-identical.  Default off pending its A/B; DS4_GLM_SDN_CONCURRENT=1
+     * turns it on at startup and /debug/levers moves it live. */
+    int sdn_concurrent;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
