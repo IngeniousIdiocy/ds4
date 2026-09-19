@@ -4037,28 +4037,19 @@ kernel void kernel_glm53_hc_reduce_wsum_repl_alg(
 
 
 
-// Retirement of one participant of the one-pass grid.  counters[1] counts
-// EVERY participant -- each producer simdgroup TASK and each tail threadgroup
-// -- and the last one to retire re-arms both counters for the next dispatch,
-// which is strictly ordered after this one in the serial encoder.
-//
-// Counting every participant, and not just the tails, is what keeps the
-// re-arm safe when a tail threadgroup's watchdog fires: that threadgroup
-// proceeds WITHOUT waiting, so it can retire while producer tasks still have
-// counters[0] increments to make, and a re-arm keyed on the tails alone would
-// zero a counter that is about to be incremented and leave the NEXT
-// dispatch's tail believing the producers had already arrived.  A producer
-// task increments counters[0] and then, behind a device-scope seq_cst fence,
-// counters[1]; so the RETIRE_TOTAL-th retirement provably follows all W
-// arrivals and zeroing counters[0] there cannot race a pending one.
-//
-// Call from lane 0 of a producer task, or thread 0 of a tail threadgroup.
+// Retirement of one threadgroup of the one-pass grid.  counters[1] counts the
+// WHOLE grid -- producers and tail threadgroups alike -- and the last one to
+// retire re-arms both counters for the next dispatch, which is strictly
+// ordered after this one in the serial encoder.  Counting the whole grid, and
+// not just the tail, is what keeps the re-arm safe when a tail threadgroup's
+// watchdog fires and it retires before a producer has arrived.  Call from
+// thread 0 only.
 static __attribute__((always_inline)) inline void glm53_hc_onepass_retire(
         device atomic_uint *counters,
-        uint total) {
+        uint n_tgs) {
     const uint prev = atomic_fetch_add_explicit(&counters[1], 1u,
                                                 memory_order_relaxed);
-    if (prev + 1u >= total) {
+    if (prev + 1u >= n_tgs) {
         atomic_store_explicit(&counters[0], 0u, memory_order_relaxed);
         atomic_store_explicit(&counters[1], 0u, memory_order_relaxed);
     }
@@ -4079,30 +4070,14 @@ static __attribute__((always_inline)) inline void glm53_hc_onepass_retire(
 // single-core bandwidth bound (see the replicated-tail comment) and measured
 // slower.  This kernel keeps the 13-threadgroup wide tail: the grid is
 //
-//     P producer threadgroups  +  T tail threadgroups,   P = out_dim*n_slices/NSG_A
+//     P producer threadgroups  +  T tail threadgroups,   P = out_dim*n_slices/NSG
 //
-// all of them 1024 threads, because Metal takes one threadgroup size for the
-// whole grid and the tail's reduction tree is a 1024-thread tree.
-//
-// The PRODUCER PACKING is kernel A's own.  Each producer threadgroup does the
-// work of one nsg-8 kernel A threadgroup: simdgroups 0..NSG_A-1 take the
-// simdgroup tasks `flat = tgx*NSG_A + sgitg` and simdgroups NSG_A..NSG-1
-// leave immediately.  That is the same per-simdgroup slice dot in the same
-// lane stride and the same eight-way order, and a partial depends only on its
-// lane and its slice bounds, so it is bit-identical at any threadgroup width
-// (which is also why glm53_hc_pre_splitk_single_body can regroup them).
-//
-// The packing is the whole reason this is the SECOND shape of this kernel.
-// The first ran P = W/32 = 12 fat producer threadgroups of 32 working
-// simdgroups: bit-exact over 50,000 poisoned draws, but 0.31 t/s SLOWER at 8k
-// and 0.29 at 62k, because it put the 786 KB mixer stream on 12 cores instead
-// of the 48 kernel A uses.  At the ~26 GB/s one core sustains that is ~2.5 us
-// of stream per site instead of ~0.6, with the 13 tails' 64 KB prefetches
-// competing in the same window -- more than the dispatch boundary was worth.
-// W/NSG_A = 48 producer threadgroups + 13 tails = 61, still one threadgroup
-// per core on this machine, and the stream is spread as widely as the pair
-// spreads it.
-//
+// all of them 1024 threads.  Producer threadgroup p runs kernel A's body for
+// simdgroup-flat indices [p*32, p*32+32): the SAME per-simdgroup slice dot in
+// the SAME lane stride and the same eight-way order kernel A runs at nsg 8,
+// only grouped 32 to a threadgroup, which is exactly what
+// glm53_hc_pre_splitk_single_body already does and is bit-identical by
+// construction (a partial depends only on its lane and its slice bounds).
 // Tail threadgroup k == 0 is the comb threadgroup and k == 1..T-1 are the
 // collapse threadgroups of kernel_glm53_hc_reduce_wsum_repl_alg.
 //
@@ -4114,12 +4089,6 @@ static __attribute__((always_inline)) inline void glm53_hc_onepass_retire(
 //   * every collapse threadgroup loads its four residual float4s into
 //     registers BEFORE it waits, so the 64 KB stream read is in flight while
 //     the mixer runs instead of starting after it.
-//
-// There is no threadgroup barrier in a producer at all.  The handoff is per
-// SIMDGROUP: a working simdgroup publishes its own partial (and its slice's
-// sum of squares when it owns one), fences at device scope, and counts itself
-// in.  Nothing waits on a sibling simdgroup, and the idle simdgroups
-// NSG_A..NSG-1 cannot hold a barrier that a working one is standing in.
 //
 // Cross-threadgroup publication.  Everything a tail threadgroup reads from a
 // producer -- the 24*n_slices split-K partials and the n_slices sums of
@@ -4133,8 +4102,7 @@ static __attribute__((always_inline)) inline void glm53_hc_onepass_retire(
 //
 // Bit-exactness against the pair:
 //   * Producers are kernel_glm53_hc_rms_splitk_alg's body with the two plain
-//     stores replaced by atomic stores of the same bits, at kernel A's own
-//     nsg-8 simdgroup packing.
+//     stores replaced by atomic stores of the same bits.
 //   * The tail reads the published words into a threadgroup mirror of the
 //     partials array laid out exactly like the device one, and then runs
 //     glm53_hc_alg_mix_reduce<true>'s block over that mirror: the same ss
@@ -4150,21 +4118,25 @@ static __attribute__((always_inline)) inline void glm53_hc_onepass_retire(
 //     are issued and not what they are.
 //
 // Watchdog.  If the arrival wait exceeds its spin cap the tail threadgroup
-// does NOT give up: it recomputes all W = out_dim*n_slices partials and all
-// n_slices sums of squares itself, one simdgroup per (out_row, slice) in
-// W/NSG rounds of 32 -- the same per-slice lane stride and the same eight-way
-// order the producers use -- into the same threadgroup mirror, and the reduce
+// does NOT give up: it recomputes all out_dim*n_slices partials and all
+// n_slices sums of squares itself, one simdgroup per (out_row, slice) in P
+// rounds of 32 -- the same per-slice lane stride and the same eight-way order
+// the producers use -- into the same threadgroup mirror, and the reduce
 // proceeds unchanged.  The recovered values are bit-identical to the fast
 // path's, so a watchdog firing costs time and nothing else.  Slow, never
 // wrong.  DS4_GLM_HC_TAIL_SPIN_CAP=0 forces it for testing.
 //
 // Counters (hc_tail_counters, the same 512-byte tensor half B uses; the host
 // refuses this path whenever half B is active or the encoder is concurrent,
-// so the two never share a dispatch).  counters[0] counts producer TASK
-// arrivals and the tail waits for W of them; counters[1] counts retirements
-// of every participant, W producer tasks plus T tail threadgroups, and the
-// RETIRE_TOTAL-th zeroes both.  See glm53_hc_onepass_retire above for why the
-// re-arm has to be keyed on every participant rather than on the tails.
+// so the two never share a dispatch).  counters[0] is the producer arrival
+// count and counters[1] the retirement count of the WHOLE grid.  The last of
+// the P+T threadgroups to retire zeroes both.  Counting retirements over the
+// whole grid rather than over the tail alone is what makes the re-arm safe on
+// the watchdog path: a tail threadgroup that gives up on the wait can reach
+// its retirement before a producer has incremented counters[0], and a re-arm
+// keyed on the tail alone would then zero the counter with producer
+// increments still to come and leave the NEXT dispatch's tail believing the
+// producers had already arrived.
 //
 // Threadgroup memory: the replicated tail's layout (the host's 17776-byte
 // formula) plus MIX_SLOTS*n_slices + DS4_GLM53_HC_PRE_SUMSQ_SLOTS floats for
@@ -4198,33 +4170,23 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
         ushort nsg   [[simdgroups_per_threadgroup]]) {
     constexpr short NW        = DS4_HC_PRE_FUSED_NW;
     constexpr short NSG       = DS4_HC_PRE_FUSED_NSG;
-    constexpr short NSG_A     = DS4_HC_PRE_FUSED_NSG_A;
     constexpr short NCLUSTER  = DS4_HC_PRE_FUSED_NCLUSTER;
     constexpr short NR0       = DS4_HC_PRE_FUSED_NR0;
     constexpr short MIX_SLOTS = DS4_HC_PRE_FUSED_MIX;
 
     const uint n_embd = uint(split_args.n_embd);
     const uint n4 = n_embd >> 2;
-    // W simdgroup tasks (one slice dot each), NSG_A of them per producer
-    // threadgroup, so P producer threadgroups and T tail threadgroups.  The
-    // grid is P + T; the arrival counter counts TASKS, not threadgroups, and
-    // the retirement counter counts tasks plus tails.
-    const uint W  = args.out_dim * args.n_slices;
-    const uint P  = W / (uint)NSG_A;
-    const uint T  = n_tgs - P;
-    const uint RETIRE_TOTAL = W + T;
+    const uint P  = (args.out_dim * args.n_slices) / (uint)NSG;
 
     // Uniform gates: every thread of every threadgroup takes the same branch,
     // so a refusal refuses the whole dispatch rather than stranding the
     // counters.  ntg is pinned to the shipped tail's 1024 so the replicated
     // sumsq tree is the shipped tree, and n4 == ntg so every collapse thread
-    // owns exactly one float4 and can prefetch it before the wait.  W has to
-    // divide by NSG_A (the producer packing) and by NSG (the watchdog's
-    // recompute rounds).
+    // owns exactly one float4 and can prefetch it before the wait.
     if (norm_args.n != (int32_t)args.in_dim || args.in_dim != 16384u ||
         args.out_dim != (uint)MIX_SLOTS || args.n_rows != 1u ||
         args.n_slices == 0u || args.n_slices > 32u ||
-        (W % (uint)NSG_A) != 0u || (W % (uint)NSG) != 0u ||
+        (args.out_dim * args.n_slices) % (uint)NSG != 0u ||
         ntg != (ushort)(NSG*NW) || nsg != (ushort)NSG ||
         split_args.n_rows != 1 || split_args.n_hc != 4 ||
         (split_args.n_embd & 3) != 0 ||
@@ -4233,27 +4195,13 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
     }
 
     // ---- Producer threadgroups: kernel_glm53_hc_rms_splitk_alg's body -----
-    // ONE simdgroup task per working simdgroup, at kernel A's OWN packing:
-    // `flat = tgx*NSG_A + sgitg` with NSG_A == 8, so a producer threadgroup
-    // carries the same eight slice dots kernel A's nsg-8 threadgroup carries
-    // and the 786 KB mixer stream is spread over W/NSG_A = 48 cores, not over
-    // 12.  Simdgroups NSG_A..NSG-1 have no task and leave immediately; the
-    // threadgroup size is 1024 only because Metal needs one size for the whole
-    // grid and the tail's reduction tree is a 1024-thread tree.
-    //
-    // There is NO threadgroup barrier anywhere in a producer.  Each working
-    // simdgroup publishes its own partial (and its slice's sum of squares when
-    // it owns one) with relaxed atomic stores, fences at device scope, and
-    // only then counts itself in.  The handoff is therefore per SIMDGROUP:
-    // nothing a producer publishes has to wait on a sibling simdgroup, and an
-    // idle simdgroup cannot hold a barrier that a working one is standing in.
-    //
     // Kernel A's `out_row >= out_dim || token >= n_rows` guard is absent
-    // because the gate above pins the grid: flat < W == out_dim*n_slices for
-    // every working simdgroup, and n_rows is 1.
+    // because the gate above pins the grid: P*NSG == out_dim*n_slices, so
+    // flat < out_dim*n_slices for every simdgroup and n_rows is 1.  Its
+    // k0 >= in_dim guard becomes an if/else rather than a return, because the
+    // threadgroup barrier below has to be reached by every thread.
     if (tgx < P) {
-        if (sgitg >= (ushort)NSG_A) return;
-        const uint flat = tgx * (uint)NSG_A + sgitg;
+        const uint flat = tgx * (uint)nsg + sgitg;
         const uint out_row = flat / args.n_slices;
         const uint slice = flat - out_row * args.n_slices;
         const ulong slot = (ulong)out_row * args.n_slices + slice;
@@ -4348,23 +4296,25 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
             }
         }
 
-        // Writer side of the handoff, per simdgroup: retire this task's stores
-        // before its arrival becomes visible.
+        // Writer side of the handoff: retire this threadgroup's partial
+        // stores before its arrival becomes visible.
+        threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                             thread_scope_device);
-        if (tiisg == 0u) {
+        if (tid == 0u) {
             atomic_fetch_add_explicit(&counters[0], 1u, memory_order_relaxed);
-            // Orders this task's arrival before its retirement, so the grid's
-            // last retirement really does follow every arrival.
+            // Orders this threadgroup's arrival before its retirement, so the
+            // grid's last retirement really does follow every arrival.
             atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                                 thread_scope_device);
-            glm53_hc_onepass_retire(counters, RETIRE_TOTAL);
+            glm53_hc_onepass_retire(counters, n_tgs);
         }
         return;
     }
 
     // ---- Tail threadgroups: kernel_glm53_hc_reduce_wsum_repl_alg ----------
     const uint k = tgx - P;              // 0 = comb threadgroup, 1..T-1 collapse
+    const uint T = n_tgs - P;
 
     threadgroup float  *mix_shmem  = (threadgroup float *)shmem;
     threadgroup float  *norm_shmem = mix_shmem  + MIX_SLOTS;
@@ -4411,7 +4361,7 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
                 break;
             }
             if (atomic_load_explicit(&counters[0],
-                                     memory_order_relaxed) >= W) {
+                                     memory_order_relaxed) >= P) {
                 break;
             }
             ++spins;
@@ -4433,11 +4383,10 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
     } else {
         // Watchdog recovery: recompute every partial and every slice sum of
         // squares in this threadgroup, one simdgroup per (out_row, slice) in
-        // W/NSG rounds of 32, in the same per-slice lane stride and the same
+        // P rounds of 32, in the same per-slice lane stride and the same
         // eight-way order the producers use, so the mirror is bit-identical
         // to what the fast path would have read.  Slow, never wrong.
-        const uint rounds = W / (uint)nsg;
-        for (uint r = 0; r < rounds; ++r) {
+        for (uint r = 0; r < P; ++r) {
             const uint flat = r * (uint)nsg + sgitg;
             const uint out_row = flat / args.n_slices;
             const uint slice = flat - out_row * args.n_slices;
@@ -4590,7 +4539,7 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
             ds4_hc_comb_weights4_exact(
                 split_args, (device volatile const float *)mixes,
                 hc_scale, hc_base, out);
-            glm53_hc_onepass_retire(counters, RETIRE_TOTAL);
+            glm53_hc_onepass_retire(counters, n_tgs);
         }
         return;
     }
@@ -4639,7 +4588,7 @@ kernel void kernel_glm53_hc_pre_onepass_alg(
         norm4[i] = (v * norm_scale) * w4[i];
     }
 
-    if (tid == 0) glm53_hc_onepass_retire(counters, RETIRE_TOTAL);
+    if (tid == 0) glm53_hc_onepass_retire(counters, n_tgs);
 }
 
 

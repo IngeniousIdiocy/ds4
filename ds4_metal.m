@@ -54050,36 +54050,18 @@ static uint32_t ds4_gpu_glm53_hc_repl_tail_tgs(void) {
 
 /* H1: half A's PAIR as one dispatch with the replicated wide tail.
  *
- * P = out_dim*n_slices/8 producer threadgroups run kernel A's per-simdgroup
- * slice dots at kernel A's OWN nsg-8 packing -- simdgroups 0..7 of each
- * producer threadgroup take the tasks and 8..31 leave immediately, the
- * threadgroup being 1024 threads only because Metal takes one size for the
- * whole grid and the tail needs 1024.  They publish the partials and the
- * per-slice sums of squares with relaxed device atomics and count themselves
- * in per SIMDGROUP, with no threadgroup barrier anywhere in a producer; the
- * same dispatch also carries the replicated wide tail's 1 + (N-1)
- * threadgroups, which prefetch their residual float4s, wait for all
- * out_dim*n_slices arrivals behind a seq_cst device fence, and then run
- * kernel_glm53_hc_reduce_wsum_repl_alg's reduce, gates, Sinkhorn, collapse
- * and stores unchanged.  What goes away is the dependent-dispatch boundary
- * between the two, the tail's launch ramp, and the 64 KB residual read that
- * used to start only after the mixer retired.
- *
- * The packing matters and was measured: a first form at 32 working simdgroups
- * per producer threadgroup (12 fat threadgroups instead of 48) was bit-exact
- * over 50,000 poisoned draws but ran 0.31 t/s slower at 8k and 0.29 at 62k,
- * because it put the 786 KB mixer stream on 12 cores instead of the 48 the
- * pair uses -- ~2.5 us of stream per site at the ~26 GB/s one core sustains,
- * against ~0.6 -- with the tails' prefetches competing in the same window.
- * 48 + 13 = 61 threadgroups is still one per core on this machine.
- *
+ * P = out_dim*n_slices/32 producer threadgroups run kernel A's per-simdgroup
+ * slice dots grouped 32 to a threadgroup (the same dots in the same order, so
+ * the same bits), publish the partials and the per-slice sums of squares with
+ * relaxed device atomics and increment an arrival counter; the same dispatch
+ * also carries the replicated wide tail's 1 + (N-1) threadgroups, which
+ * prefetch their residual float4s, wait on that counter behind a seq_cst
+ * device fence, and then run kernel_glm53_hc_reduce_wsum_repl_alg's reduce,
+ * gates, Sinkhorn, collapse and stores unchanged.  What goes away is the
+ * dependent-dispatch boundary between the two, the tail's launch ramp, and
+ * the 64 KB residual read that used to start only after the mixer retired.
  * See metal/dsv4_hc.metal for the bit-exactness argument and the watchdog. */
 #define DS4_GLM53_HC_ONEPASS_KERNEL    "kernel_glm53_hc_pre_onepass_alg"
-
-/* Working simdgroups per producer threadgroup.  MUST match
- * DS4_HC_PRE_FUSED_NSG_A in metal/dsv4_hc.metal, which is kernel A's own
- * shipped threadgroup width. */
-#define DS4_GLM53_HC_ONEPASS_ACTIVE_NSG 8u
 
 /* Compile-time defaults. */
 #ifndef DS4_GLM53_HC_ALG_A_DEFAULT_ON
@@ -54429,10 +54411,9 @@ static int ds4_gpu_glm53_hc_pre_splitk_impl(
         if (onepass) {
             const uint32_t op_nsg =
                 (uint32_t)DS4_HC_PRE_DECODE_FUSED_THREADS / 32u;
-            const uint32_t op_active = DS4_GLM53_HC_ONEPASS_ACTIVE_NSG;
             pipe_op = ds4_gpu_get_pipeline(DS4_GLM53_HC_ONEPASS_KERNEL);
             op_tail_tgs = ds4_gpu_glm53_hc_repl_tail_tgs();
-            op_producers = (mix_dim * slices) / op_active;
+            op_producers = (mix_dim * slices) / op_nsg;
             /* The replicated tail's layout plus the threadgroup mirror of the
              * partials array the tail reduces over. */
             op_shared_bytes =
@@ -54447,7 +54428,6 @@ static int ds4_gpu_glm53_hc_pre_splitk_impl(
                 ds4_gpu_tensor_bytes(tail_counters) < 512u ||
                 pipe_op.maxTotalThreadsPerThreadgroup <
                     DS4_HC_PRE_DECODE_FUSED_THREADS ||
-                ((mix_dim * slices) % op_active) != 0u ||
                 ((mix_dim * slices) % op_nsg) != 0u || op_producers == 0u ||
                 op_tail_tgs < 2u ||
                 (n_embd >> 2) != DS4_HC_PRE_DECODE_FUSED_THREADS ||
@@ -54547,18 +54527,14 @@ static int ds4_gpu_glm53_hc_pre_splitk_impl(
             return ds4_gpu_finish_command_buffer(cb, owned, "split-K HC-pre") ? 1 : 0;
         }
         if (onepass) {
-            /* One dispatch: P producer threadgroups running kernel A's slice
-             * dots on their first ACTIVE_NSG simdgroups, then the replicated
-             * wide tail's 1 + (N-1) threadgroups waiting on the arrival
-             * counter. */
+            /* One dispatch: P producer threadgroups of 32 simdgroups running
+             * kernel A's slice dots, then the replicated wide tail's
+             * 1 + (N-1) threadgroups waiting on the arrival counter. */
             {   static ds4_t2s_slot slot = { "HCP1PASS", 0, 0 };
                 ds4_t2s_hit(&slot,
-                            "%s producers=%u active_sg=%u tail_tgs=%u "
-                            "slices=%u smem=%lu",
+                            "%s producers=%u tail_tgs=%u slices=%u smem=%lu",
                             DS4_GLM53_HC_ONEPASS_KERNEL,
-                            (unsigned)op_producers,
-                            (unsigned)DS4_GLM53_HC_ONEPASS_ACTIVE_NSG,
-                            (unsigned)op_tail_tgs,
+                            (unsigned)op_producers, (unsigned)op_tail_tgs,
                             (unsigned)slices, (unsigned long)op_shared_bytes);
             }
             const uint32_t op_spin_cap = ds4_gpu_glm53_hc_alg_spin_cap();
