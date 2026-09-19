@@ -4306,3 +4306,232 @@ kernel void NAME(                                                             \
 DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced, false)
 // Both halves.
 DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
+
+
+// ===========================================================================
+// C1 -- the routed-down split with the shared-down + slot-sum + HC-expand
+// epilogue folded into its LAST-ARRIVING threadgroup.
+//
+// The pair today is two dispatches: kernel_glm_q4_K_down_simd_split_f32
+// (metal/moe.metal, 2048 x 1 x n_expert_used threadgroups of 64 threads, one
+// row per simdgroup and one expert slot per threadgroup) writing per-slot
+// partials, then kernel_dsv4_shared_down_hc_expand4_slots_q8_0 above (2048
+// threadgroups of 32 x nsg) summing the slots and running the shared-down
+// matvec and the HC epilogue.  T2-REPORT.md section 3 measured the boundary
+// between them at about 10 us, which is 0.42 ms/token over 42 MoE layers.
+//
+// The dependency is the most LOCAL one in the decode graph: consumer
+// threadgroup x owns rows 2x and 2x+1, and those two rows' partials come from
+// exactly the n_expert_used producer threadgroups (x, 0, slot).  Fan-in 8,
+// fan-out 1.  So one ticket per row pair elects the eighth arrival to run the
+// consumer's work for its own two rows -- work that one threadgroup was always
+// going to do -- and 2048 of those tails run concurrently.  That is the
+// opposite of hc_pre's one-dispatch form, where a single global reduction put
+// ~19 us of serial tail on one threadgroup and lost 1.05 t/s.
+//
+// PUBLICATION.  The tail reads partials written by other threadgroups of the
+// same dispatch on a two-die part, so this copies the router+shared fold's
+// pattern (metal/glm53_moe_block.metal), which is the one that was qualified
+// against the Phase 1 stale-row finding: coherent (relaxed atomic) stores for
+// the partials, a threadgroup barrier and a device barrier and a seq_cst
+// thread_scope_device fence before the ticket, and another seq_cst
+// thread_scope_device fence on the acquire side after the election.  It does
+// NOT copy the hc_pre single-dispatch body, which has only a
+// threadgroup_barrier(mem_device_and_threadgroup) and no acquire-side fence.
+// No threadgroup ever waits on another: the winner is by construction the one
+// that arrived after all the others, so there is no spin, no residency
+// assumption and no forward-progress requirement.
+//
+// The ticket buffer holds one counter per row pair and is self-rearming -- the
+// last arrival resets its own counter before doing the tail -- so all 42 layers
+// reuse it.  hc_pre dispatches and these are strictly ordered by the encoder,
+// so a counter is always 0 when the next layer's dispatch starts.
+//
+// TIER 1.  Every arithmetic operation, its order and its rounding points are
+// the consumer's; only the threadgroup that executes them changes.
+//   * The producer half is glm_q4_K_down_simd_split_impl<2,1> with COHERENT
+//     stores -- the same float bits at the same addresses.
+//   * The consumer runs its matvec on FOUR simdgroups striding
+//     ib = sgitg*NQ + ix, ib += NSG*NQ.  This threadgroup has TWO, so real
+//     simdgroup s evaluates the virtual simdgroups v = s and v = s + 2 as two
+//     separate accumulators, each with the consumer's exact ib sequence and
+//     the consumer's exact inner loop, and simd_sum's each one over the same
+//     32 lanes with the same ix/il mapping.  The four results are then placed
+//     in lanes 0..3 of a 32-lane vector with zeros above -- exactly the
+//     consumer's shmem_f32[row][sgitg] layout, whose lanes 4..31 it zeroes --
+//     and simd_sum'd.  Same values in the same lanes through the same
+//     butterfly is the same bits.
+//   * The slot sum reads ALL n_slots partials from memory in ascending slot
+//     order, including this threadgroup's own (the register value is NOT
+//     reused), so it is the consumer's loop over the consumer's values.
+//   * The residual/post/comb epilogue is copied statement for statement.
+//
+// The host refuses this kernel and runs the pair whenever the split refuses,
+// and additionally on capture_out, exact mode, sdn_ptail, TP world 2, an odd
+// out_dim, or an SDN dispatch whose nsg is not 4 or nr0 not 2 -- because the
+// virtual-simdgroup emulation above is written for the (4, 2) shape alone.
+// ===========================================================================
+kernel void kernel_glm_q4_K_down_simd_split_sdn_fold_f32(
+        constant ds4_metal_glm_routed_moe_args  & args,
+        device  const char    * down,
+        device  const int32_t * selected,
+        device  const float   * mid,
+        device        float   * partials,
+        device        atomic_uint * ticket,
+        constant ds4_metal_args_mul_mv          & mv,
+        constant ds4_metal_args_dsv4_hc_expand  & hc,
+        device  const char    * weight,
+        device  const char    * shared_mid,
+        device        char    * shared_out,
+        constant ds4_metal_args_dsv4_routed_slots & slots,
+        device  const char    * residual,
+        device  const char    * post,
+        device  const char    * comb,
+        device        char    * dst,
+        threadgroup   char    * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    // Uniform gate: every thread of every threadgroup takes the same branch,
+    // so a refusal here refuses the whole dispatch rather than stranding a
+    // ticket.  The host checks all of it too; this is belt and braces.
+    if (hc.n_hc != 4 || hc.n_tokens != 1 || args.n_tokens != 1u ||
+        args.tp_world > 1 || (args.out_dim & 1u) != 0u ||
+        mv.ne01 != (int32_t)args.out_dim ||
+        slots.n_slots != args.n_expert_used ||
+        args.n_expert_used == 0u) {
+        return;
+    }
+
+    // ---- Producer: the shipped split body, coherent stores ----------------
+    glm_q4_K_down_simd_split_impl<2, 1, true>(
+        args, down, selected, mid, partials, tgpig, tiisg, sgitg);
+
+    // ---- Publish, then ticket (the router fold's pattern) -----------------
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                        thread_scope_device);
+
+    threadgroup float *vsum    = (threadgroup float *)shmem;
+    threadgroup uint  *elected = (threadgroup uint *)(shmem + 32);
+    const ushort tid = (ushort)(sgitg * 32u + tiisg);
+    if (tid == 0u) {
+        const uint prev =
+            atomic_fetch_add_explicit(&ticket[tgpig.x], 1u, memory_order_relaxed);
+        const bool last = (prev + 1u) >= args.n_expert_used;
+        if (last) {
+            // Rearm for the next layer's dispatch, which cannot start before
+            // this one retires.
+            atomic_store_explicit(&ticket[tgpig.x], 0u, memory_order_relaxed);
+        }
+        elected[0] = last ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (elected[0] == 0u) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                        thread_scope_device);
+
+    // ---- Tail: kernel_dsv4_shared_down_hc_expand4_slots_q8_0, rows 2x/2x+1 -
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NQ  = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short CONS_NSG = 4;   // the consumer's simdgroup count
+
+    const int nb   = mv.ne00 / QK8_0;
+    const int row0 = (int)tgpig.x * NR0;
+
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+
+    device const float *y = (device const float *)(shared_mid);
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        const uint64_t off0 = (uint64_t)(row0 + row) * mv.nb01;
+        ax[row] = (device const block_q8_0 *)(weight + off0);
+    }
+
+    // Real simdgroup s evaluates the consumer's virtual simdgroups s and s+2.
+    for (short vk = 0; vk < 2; ++vk) {
+        const short v = (short)(sgitg + (ushort)vk * 2u);
+        const int ib0 = (int)v * NQ + ix;
+        device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+        float sumf[NR0] = { 0.0f };
+        float yl[NQ];
+
+        for (int ib = ib0; ib < nb; ib += CONS_NSG * NQ) {
+            FOR_UNROLL(short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
+            }
+
+            FOR_UNROLL(short row = 0; row < NR0; ++row) {
+                device const int8_t *qs = ax[row][ib].qs + il * NQ;
+
+                float sumq = 0.0f;
+                FOR_UNROLL(short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[i];
+                }
+
+                sumf[row] += sumq * ax[row][ib].d;
+            }
+
+            yb += CONS_NSG * NQ * QK8_0;
+        }
+
+        FOR_UNROLL(short row = 0; row < NR0; ++row) {
+            const float s = simd_sum(sumf[row]);
+            if (tiisg == 0u) {
+                vsum[row * CONS_NSG + v] = s;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL(short row = 0; row < NR0; ++row) {
+        const int d = row0 + row;
+        if (d >= mv.ne01) {
+            continue;
+        }
+
+        // The consumer's shmem_f32[row][tiisg]: four simdgroup sums in lanes
+        // 0..3, zeros in 4..31.
+        const float lane_v =
+            tiisg < (ushort)CONS_NSG ? vsum[row * CONS_NSG + tiisg] : 0.0f;
+        const float shared_v = simd_sum(lane_v);
+
+        if (tiisg == 0 && sgitg == 0) {
+            *((device float *)(shared_out + (uint64_t)d * sizeof(float))) = shared_v;
+
+            /* The consumer's slot sum: ascending slot order, one accumulator,
+               no atomics -- read coherently, and read this threadgroup's own
+               slot from memory like every other. */
+            device atomic_uint *row_partials =
+                (device atomic_uint *)partials +
+                (uint64_t)d * (uint64_t)slots.n_slots;
+            float block_v = 0.0f;
+            for (uint s = 0; s < slots.n_slots; ++s) {
+                block_v += as_type<float>(
+                    atomic_load_explicit(&row_partials[s], memory_order_relaxed));
+            }
+            block_v += shared_v;
+
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+            for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+
+                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+            }
+        }
+    }
+}

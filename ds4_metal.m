@@ -43924,6 +43924,22 @@ static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_split_pipeline(void) 
     return cached;
 }
 
+/* C1 (lever sdn_fold): the same split body with coherent partial stores, a
+ * per-row-pair last-arrival ticket and the shared-down + slot-sum + HC-expand
+ * consumer as its tail.  See metal/dsv4_hc.metal. */
+static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_sdn_fold_pipeline(void) {
+    static id<MTLComputePipelineState> cached = nil;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        cached = ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_split_sdn_fold_f32");
+        if (!cached) {
+            fprintf(stderr, "ds4: SDNFOLD pipeline unavailable; using the pair\n");
+        }
+    }
+    return cached;
+}
+
 
 /* Routed-expert gate+up pair, wide-load inner loop (lever-routed-gateup).
  * Reads exactly the same bytes in the same lanes in the same order with wider
@@ -44004,8 +44020,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         bool                    force_resident,
         ds4_gpu_tensor       *routed_partials,
-        int                    *used_split) {
+        int                    *used_split,
+        ds4_gpu_sdn_fold_desc  *sdn_fold) {
     if (used_split) *used_split = 0;
+    if (sdn_fold) sdn_fold->folded = 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
@@ -44431,6 +44449,111 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             if (!split_pipeline) partbuf = nil;
         }
 
+        /* C1: the consumer folded into the split dispatch's last-arriving
+         * threadgroup.  Everything the pair needs is validated here, and any
+         * miss leaves fold_pipeline nil so the pair runs unchanged. */
+        id<MTLComputePipelineState> fold_pipeline = nil;
+        id<MTLBuffer> fold_wbuf = nil, fold_midbuf = nil, fold_sharedbuf = nil;
+        id<MTLBuffer> fold_resbuf = nil, fold_splitbuf = nil, fold_outbuf = nil;
+        id<MTLBuffer> fold_ticketbuf = nil;
+        uint64_t fold_winner = 0;
+        ds4_gpu_q8_0_matvec_args fold_mv_args;
+        ds4_gpu_hc_expand_args fold_hc_args;
+        ds4_metal_dsv4_routed_slots_args fold_slot_args;
+        memset(&fold_mv_args, 0, sizeof(fold_mv_args));
+        memset(&fold_hc_args, 0, sizeof(fold_hc_args));
+        memset(&fold_slot_args, 0, sizeof(fold_slot_args));
+        if (split_pipeline && sdn_fold && !glm53_exact_mode()) {
+            glm_levers_init_from_env();
+            const ds4_gpu_mv_dispatch sdn_d = ds4_gpu_make_q8_0_mv_dispatch_fam("SDN");
+            const uint64_t fold_in_dim = sdn_fold->in_dim;
+            const uint64_t fold_row_bytes = (fold_in_dim / 32u) * 34u;
+            const uint64_t fold_weight_bytes = (uint64_t)sdn_fold->out_dim * fold_row_bytes;
+            const uint64_t embd_bytes = (uint64_t)sdn_fold->out_dim * sizeof(float);
+            const uint64_t hc_bytes =
+                (uint64_t)sdn_fold->n_hc * sdn_fold->n_embd * sizeof(float);
+            const uint64_t mix_hc =
+                2ull * sdn_fold->n_hc + (uint64_t)sdn_fold->n_hc * sdn_fold->n_hc;
+            const uint64_t ticket_bytes =
+                ((uint64_t)out_dim / 2u) * sizeof(uint32_t);
+            const bool shape_ok =
+                g_glm_levers.sdn_fold != 0 && g_glm_levers.sdn_ptail == 0 &&
+                sdn_d.nsg == 4 && sdn_d.nr0 == 2 &&
+                g_tp_split_world != 2 &&
+                (out_dim & 1u) == 0u && out_dim == sdn_fold->out_dim &&
+                sdn_fold->out_dim == sdn_fold->n_embd &&
+                sdn_fold->n_hc == 4u && (fold_in_dim & 31u) == 0u &&
+                n_expert != 0u && n_expert <= 32u &&
+                sdn_fold->out_hc && sdn_fold->shared_out && sdn_fold->ticket &&
+                sdn_fold->shared_mid && sdn_fold->residual_hc && sdn_fold->split &&
+                sdn_fold->model_map != NULL &&
+                sdn_fold->weight_offset <= sdn_fold->model_size &&
+                fold_weight_bytes <= sdn_fold->model_size - sdn_fold->weight_offset;
+            if (shape_ok) {
+                fold_midbuf = ds4_gpu_tensor_buffer(sdn_fold->shared_mid);
+                fold_sharedbuf = ds4_gpu_tensor_buffer(sdn_fold->shared_out);
+                fold_resbuf = ds4_gpu_tensor_buffer(sdn_fold->residual_hc);
+                fold_splitbuf = ds4_gpu_tensor_buffer(sdn_fold->split);
+                fold_outbuf = ds4_gpu_tensor_buffer(sdn_fold->out_hc);
+                fold_ticketbuf = ds4_gpu_tensor_buffer(sdn_fold->ticket);
+                const bool bufs_ok =
+                    fold_midbuf && fold_sharedbuf && fold_resbuf &&
+                    fold_splitbuf && fold_outbuf && fold_ticketbuf &&
+                    ds4_gpu_tensor_bytes(sdn_fold->shared_mid) >= fold_in_dim * sizeof(float) &&
+                    ds4_gpu_tensor_bytes(sdn_fold->shared_out) >= embd_bytes &&
+                    ds4_gpu_tensor_bytes(sdn_fold->residual_hc) >= hc_bytes &&
+                    ds4_gpu_tensor_bytes(sdn_fold->split) >= mix_hc * sizeof(float) &&
+                    ds4_gpu_tensor_bytes(sdn_fold->out_hc) >= hc_bytes &&
+                    ds4_gpu_tensor_bytes(sdn_fold->ticket) >= ticket_bytes;
+                if (bufs_ok) {
+                    fold_wbuf = ds4_gpu_wrap_model_range(sdn_fold->model_map,
+                                                         sdn_fold->model_size,
+                                                         sdn_fold->weight_offset,
+                                                         fold_weight_bytes,
+                                                         &fold_winner);
+                }
+                if (fold_wbuf) {
+                    fold_pipeline = ds4_gpu_glm_routed_down_sdn_fold_pipeline();
+                }
+            }
+            if (fold_pipeline) {
+                fold_mv_args = ds4_gpu_make_q8_0_mv_args(fold_in_dim, sdn_fold->out_dim);
+                fold_mv_args.nr0 = sdn_d.nr0;
+                fold_hc_args = (ds4_gpu_hc_expand_args) {
+                    .n_embd = sdn_fold->n_embd,
+                    .n_hc = sdn_fold->n_hc,
+                    .n_tokens = 1,
+                    .nb_block0 = sizeof(float),
+                    .nb_block1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
+                    .nb_add0 = sizeof(float),
+                    .nb_add1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
+                    .nb_res0 = sizeof(float),
+                    .nb_res1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
+                    .nb_res2 = (uint64_t)sdn_fold->n_hc * sdn_fold->n_embd * sizeof(float),
+                    .nb_post0 = sizeof(float),
+                    .nb_post1 = mix_hc * sizeof(float),
+                    .nb_comb0 = sizeof(float),
+                    .nb_comb1 = (uint64_t)sdn_fold->n_hc * sizeof(float),
+                    .nb_comb2 = mix_hc * sizeof(float),
+                    .nb0 = sizeof(float),
+                    .nb1 = (uint64_t)sdn_fold->n_embd * sizeof(float),
+                    .nb2 = (uint64_t)sdn_fold->n_hc * sdn_fold->n_embd * sizeof(float),
+                    .has_add = 1,
+                };
+                fold_slot_args.n_slots = n_expert;
+                fold_slot_args.pad0 = 0;
+            }
+            {
+                static ds4_t2s_slot slot = { "SDNFOLD", 0, 0 };
+                ds4_t2s_hit(&slot, "%s nsg=%d nr0=%d tickets=%llu slots=%u",
+                            fold_pipeline ?
+                                "kernel_glm_q4_K_down_simd_split_sdn_fold_f32" :
+                                "kernel_glm_q4_K_down_simd_split_f32(pair)",
+                            (int)sdn_d.nsg, (int)sdn_d.nr0,
+                            (unsigned long long)(out_dim / 2u), n_expert);
+            }
+        }
+
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -44701,7 +44824,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (!ok) return 0;
 
         enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:split_pipeline ? split_pipeline : down_pipeline];
+        [enc setComputePipelineState:fold_pipeline ? fold_pipeline :
+                                      split_pipeline ? split_pipeline : down_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:use_stream_expert_addr_table ? stream_down_addr_buf : downbuf
                 offset:use_stream_expert_addr_table ? 0u : (NSUInteger)down_inner
@@ -44712,6 +44836,28 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             [enc setBuffer:partbuf offset:ds4_gpu_tensor_offset(routed_partials) atIndex:4];
         } else {
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        }
+        if (fold_pipeline) {
+            /* The folded tail's arguments: the consumer's, unchanged. */
+            [enc setBuffer:fold_ticketbuf offset:ds4_gpu_tensor_offset(sdn_fold->ticket) atIndex:5];
+            [enc setBytes:&fold_mv_args length:sizeof(fold_mv_args) atIndex:6];
+            [enc setBytes:&fold_hc_args length:sizeof(fold_hc_args) atIndex:7];
+            [enc setBuffer:fold_wbuf offset:(NSUInteger)fold_winner atIndex:8];
+            [enc setBuffer:fold_midbuf offset:ds4_gpu_tensor_offset(sdn_fold->shared_mid) atIndex:9];
+            [enc setBuffer:fold_sharedbuf offset:ds4_gpu_tensor_offset(sdn_fold->shared_out) atIndex:10];
+            [enc setBytes:&fold_slot_args length:sizeof(fold_slot_args) atIndex:11];
+            [enc setBuffer:fold_resbuf offset:ds4_gpu_tensor_offset(sdn_fold->residual_hc) atIndex:12];
+            [enc setBuffer:fold_splitbuf
+                    offset:ds4_gpu_tensor_offset(sdn_fold->split) +
+                           (NSUInteger)sdn_fold->n_hc * sizeof(float)
+                   atIndex:13];
+            [enc setBuffer:fold_splitbuf
+                    offset:ds4_gpu_tensor_offset(sdn_fold->split) +
+                           (NSUInteger)(2u * sdn_fold->n_hc) * sizeof(float)
+                   atIndex:14];
+            [enc setBuffer:fold_outbuf offset:ds4_gpu_tensor_offset(sdn_fold->out_hc) atIndex:15];
+            /* 8 floats of virtual-simdgroup sums, then the election flag. */
+            [enc setThreadgroupMemoryLength:64u atIndex:0];
         }
         if (use_stream_expert_addr_table) {
             const uint32_t use_count =
@@ -44740,6 +44886,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (!ok) return 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) return 0;
         if (split_pipeline && used_split) *used_split = 1;
+        if (fold_pipeline && sdn_fold) sdn_fold->folded = 1;
 #undef DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE
     }
 

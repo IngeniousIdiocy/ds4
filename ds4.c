@@ -41487,6 +41487,9 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *hc_mix_partials;
     /* 4-byte arrival counter for the opt-in one-dispatch HC-pre. */
     ds4_gpu_tensor *hc_pre_ticket;
+    /* One 4-byte arrival counter per routed-down output ROW PAIR for the
+     * opt-in sdn_fold (lever C1).  Self-rearming, shared by all MoE layers. */
+    ds4_gpu_tensor *sdn_fold_ticket;
     /* Arrival counter, per-slice sum-of-squares slots and watchdog counter for
      * the hc_pre algebra lever's sliced tail (half B).  Three cache lines:
      * word 0 = arrivals, words 32..63 = the C published slice sums, word 64 =
@@ -43743,6 +43746,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->hc_split);
     ds4_gpu_tensor_free(g->hc_mix_partials);
     ds4_gpu_tensor_free(g->hc_pre_ticket);
+    ds4_gpu_tensor_free(g->sdn_fold_ticket);
     ds4_gpu_tensor_free(g->hc_mix);
     ds4_gpu_tensor_free(g->hc_flat);
     ds4_gpu_tensor_free(g->hc_next);
@@ -44318,6 +44322,21 @@ static bool glm_graph_alloc_slice(
                                       sizeof(zero))) {
                 ok = false;
             }
+        }
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->sdn_fold_ticket,
+                                   (uint64_t)(DS4_N_EMBD / 2u) * sizeof(uint32_t));
+        if (g->sdn_fold_ticket) {
+            /* One counter per output row pair.  The last arrival for a pair
+             * rearms its own counter before running the tail, so like the
+             * HC-pre ticket this only needs to start from zero once. */
+            const uint64_t ticket_bytes =
+                (uint64_t)(DS4_N_EMBD / 2u) * sizeof(uint32_t);
+            void *zeros = calloc(1, (size_t)ticket_bytes);
+            if (!zeros ||
+                !ds4_gpu_tensor_write(g->sdn_fold_ticket, 0, zeros, ticket_bytes)) {
+                ok = false;
+            }
+            free(zeros);
         }
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->hc_split, hc_mix_bytes);
         g->hc_post = ds4_gpu_tensor_view(
@@ -46368,6 +46387,14 @@ static bool glm_graph_prefill_stage_boundary(
     return true;
 }
 
+/* Read live at the routed-down dispatch site, so a resident server can flip
+ * the pair and the fold between requests. */
+static bool glm53_graph_sdn_fold_enabled(void) DS4_MAYBE_UNUSED;
+static bool glm53_graph_sdn_fold_enabled(void) {
+    glm_levers_init_from_env();
+    return g_glm_levers.sdn_fold != 0;
+}
+
 static int glm_graph_routed_moe_one_dispatch(
         const ds4_glm_gpu_graph *g,
         const ds4_model         *model,
@@ -46377,6 +46404,7 @@ static int glm_graph_routed_moe_one_dispatch(
         ds4_gpu_tensor          *mid,
         ds4_gpu_tensor          *routed_partials,
         int                     *used_split,
+        ds4_gpu_sdn_fold_desc   *sdn_fold,
         uint64_t                 gate_expert_bytes,
         uint64_t                 gate_row_bytes,
         uint64_t                 up_expert_bytes,
@@ -46471,7 +46499,8 @@ static int glm_graph_routed_moe_one_dispatch(
                                              x,
                                              force_resident,
                                              routed_partials,
-                                             used_split);
+                                             used_split,
+                                             sdn_fold);
 }
 
 /* Post-compute visibility for GLM TP debugging: the combine stashes the
@@ -47390,6 +47419,41 @@ static bool glm_graph_encode_sparse_ffn_one(
      * and left per-slot partials in g->routed_partials instead of a summed
      * row in ffn_out. */
     int routed_down_split = 0;
+    /* Already computed at the head of the block by the router+shared fold,
+     * into its own tensor so that ffn_mid stays the routed experts'.  Hoisted
+     * above the routed dispatch because lever C1 hands it to that dispatch. */
+    ds4_gpu_tensor *shared_mid = router_shared_folded ?
+        g->moe_block_shared_mid : ffn_mid;
+    /* C1 (lever sdn_fold): let the routed-down split dispatch's last-arriving
+     * threadgroup run the shared-down + slot-sum + HC-expand consumer for its
+     * own row pair, and skip the consumer dispatch when it does.  Every
+     * condition the consumer call below checks is checked again by the
+     * encoder, which falls back to the pair on any miss. */
+    ds4_gpu_sdn_fold_desc sdn_fold_desc;
+    ds4_gpu_sdn_fold_desc *sdn_fold = NULL;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (fold_shared_down_hc && g->sdn_fold_ticket &&
+        glm53_graph_sdn_fold_enabled() &&
+        !shared_first && !hc_fold->capture_out &&
+        !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED) &&
+        !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_DOWN)) {
+        memset(&sdn_fold_desc, 0, sizeof(sdn_fold_desc));
+        sdn_fold_desc.out_hc        = hc_fold->out_hc;
+        sdn_fold_desc.shared_out    = ffn_sum;
+        sdn_fold_desc.ticket        = g->sdn_fold_ticket;
+        sdn_fold_desc.model_map     = model->map;
+        sdn_fold_desc.model_size    = model->size;
+        sdn_fold_desc.weight_offset = l->ffn_down_shexp->abs_offset;
+        sdn_fold_desc.in_dim        = DS4_N_FF_EXP;
+        sdn_fold_desc.out_dim       = DS4_N_EMBD;
+        sdn_fold_desc.shared_mid    = shared_mid;
+        sdn_fold_desc.residual_hc   = hc_fold->residual_hc;
+        sdn_fold_desc.split         = hc_fold->split;
+        sdn_fold_desc.n_embd        = DS4_N_EMBD;
+        sdn_fold_desc.n_hc          = DS4_N_HC;
+        sdn_fold = &sdn_fold_desc;
+    }
+#endif
     if (ok && !ablate_router &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = glm_graph_routed_moe_one_dispatch(
@@ -47401,6 +47465,7 @@ static bool glm_graph_encode_sparse_ffn_one(
             ffn_mid,
             fold_shared_down_hc ? g->routed_partials : NULL,
             fold_shared_down_hc ? &routed_down_split : NULL,
+            sdn_fold,
             gate_out * gate_row_bytes,
             gate_row_bytes,
             up_out * up_row_bytes,
@@ -47446,10 +47511,6 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          stage_t0);
     if (ok && !shared_first &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED)) {
-        /* Already computed at the head of the block by the router+shared fold,
-         * into its own tensor so that ffn_mid stays the routed experts'. */
-        ds4_gpu_tensor *shared_mid = router_shared_folded ?
-            g->moe_block_shared_mid : ffn_mid;
         if (router_shared_folded &&
             (glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED_UP)) {
             /* The shared up/gate+swiglu is inside the router's single
@@ -47489,8 +47550,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             }
         } else if (ok && fold_shared_down_hc) {
             bool capture_done = false;
+            /* C1: the routed-down dispatch's elected threadgroups already ran
+             * this kernel's body for their own row pairs. */
+            const bool sdn_folded = sdn_fold != NULL && sdn_fold->folded != 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-            if (routed_down_split && hc_fold->capture_out &&
+            if (!sdn_folded && routed_down_split && hc_fold->capture_out &&
                 hc_fold->capture_mean) {
                 capture_done =
                     ds4_gpu_shared_down_hc_expand_capture_q8_0_tensor(
@@ -47513,7 +47577,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                         hc_fold->capture_mean) != 0;
             }
 #endif
-            if (!capture_done) {
+            if (!sdn_folded && !capture_done) {
                 ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                         hc_fold->out_hc,
                         ffn_sum,
@@ -50244,6 +50308,7 @@ static bool glm_graph_mtp_step(
                                                        il,
                                                        routed_dst,
                                                        g->ffn_mid,
+                                                       NULL,
                                                        NULL,
                                                        NULL,
                                                        gate_out * gate_row_bytes,
@@ -56136,6 +56201,7 @@ glm_levers g_glm_levers = {
     .attn_block_rows       = 128,/* deep split geometry, as shipped */
     .sdn_ptail             = 0,  /* off: today's single-lane SDN epilogue */
     .hcx_nr0               = 2,  /* rows per threadgroup, as shipped */
+    .sdn_fold              = 0,  /* off: routed-down and shared-down as a pair */
 };
 static int g_glm_levers_ready;
 
@@ -56181,6 +56247,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "attn_block_rows",       offsetof(glm_levers, attn_block_rows),       "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP" },
     { "sdn_ptail",             offsetof(glm_levers, sdn_ptail),             "DS4_GLM_SDN_PTAIL" },
     { "hcx_nr0",               offsetof(glm_levers, hcx_nr0),               "DS4_GLM_HCX_NR0" },
+    { "sdn_fold",              offsetof(glm_levers, sdn_fold),              "DS4_GLM_SDN_FOLD" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56251,6 +56318,8 @@ void glm_levers_init_from_env(void) {
             }
         }
     }
+    /* Also default-off, same resolution as sdn_ptail. */
+    g_glm_levers.sdn_fold = getenv("DS4_GLM_SDN_FOLD") != NULL;
     g_glm_levers_ready = 1;
 }
 
@@ -58219,6 +58288,7 @@ static int glm_metal_first_token_logits(
                     il,
                     ffn_out,
                     ffn_mid,
+                    NULL,
                     NULL,
                     NULL,
                     gate_out * gate_row_bytes,
@@ -65488,6 +65558,7 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                     ffn_mid,
                     NULL,
                     NULL,
+                    NULL,
                     gate_out * gate_row_bytes,
                     gate_row_bytes,
                     up_out * up_row_bytes,
@@ -65785,6 +65856,7 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                     il,
                     ffn_out,
                     ffn_mid,
+                    NULL,
                     NULL,
                     NULL,
                     gate_out * gate_row_bytes,

@@ -2837,6 +2837,28 @@ int ds4_gpu_glm_router_select_batch_tensor(
         float                   expert_weight_scale,
         uint32_t                n_tokens);
 
+/* C1 (lever sdn_fold): the shared-down + slot-sum + HC-expand consumer folded
+ * into the routed-down split dispatch's last-arriving threadgroup.  NULL keeps
+ * the pair.  The caller fills the consumer's own arguments; the routed-MoE
+ * encoder sets `folded` to 1 when it took the fold, and the caller must then
+ * SKIP its shared-down dispatch. */
+typedef struct {
+    ds4_gpu_tensor       *out_hc;        /* the consumer's dst        */
+    ds4_gpu_tensor       *shared_out;    /* the consumer's shared_out */
+    ds4_gpu_tensor       *ticket;        /* out_dim/2 uint32, zeroed  */
+    const void             *model_map;
+    uint64_t                model_size;
+    uint64_t                weight_offset;
+    uint32_t                in_dim;      /* shared-down K             */
+    uint32_t                out_dim;     /* shared-down rows = n_embd */
+    const ds4_gpu_tensor *shared_mid;
+    const ds4_gpu_tensor *residual_hc;
+    const ds4_gpu_tensor *split;
+    uint32_t                n_embd;
+    uint32_t                n_hc;
+    int                     folded;      /* out */
+} ds4_gpu_sdn_fold_desc;
+
 int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -2872,7 +2894,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
          * caller must consume the partials with the slot-summing shared-down
          * epilogue.  Pass NULL / NULL for the unsplit behaviour. */
         ds4_gpu_tensor       *routed_partials,
-        int                    *used_split);
+        int                    *used_split,
+        ds4_gpu_sdn_fold_desc  *sdn_fold);
 
 /* --- GLM-5.3 expanded-expert one-layer bank (EXPERT-BANK-DESIGN.md rev 3) ---
  * One routed layer's three expert tensors dequantized once into a half image

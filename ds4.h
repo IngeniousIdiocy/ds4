@@ -803,6 +803,18 @@ typedef struct {
      * screen.  Costs one extra read of the activation vector per row.
      * DS4_GLM_HCX_NR0 sets it at startup. */
     int hcx_nr0;
+    /* C1: the shared-down + slot-sum + HC-expand consumer folded into the
+     * routed-down split dispatch's LAST-ARRIVING threadgroup, one ticket per
+     * output row pair (metal/dsv4_hc.metal,
+     * kernel_glm_q4_K_down_simd_split_sdn_fold_f32).  Fan-in 8, fan-out 1, so
+     * the elected threadgroup does exactly the work one consumer threadgroup
+     * was going to do and 2048 tails run concurrently -- unlike hc_pre's
+     * one-dispatch form, which put a global reduction on one threadgroup and
+     * lost 1.05 t/s.  Tier 1: same operations, same order, same rounding
+     * points; only the threadgroup that runs them changes.  Default off.
+     * DS4_GLM_SDN_FOLD turns it on at startup; DS4_GLM_EXACT, sdn_ptail and
+     * every condition the split itself refuses on fall back to the pair. */
+    int sdn_fold;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

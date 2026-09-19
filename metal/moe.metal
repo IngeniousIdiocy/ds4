@@ -2716,10 +2716,13 @@ kernel void kernel_glm_q4_K_down_simd_f32(
 // leave the 530 GB/s the sequential form reads.
 //
 // Each threadgroup writes its own slot's contribution to
-// partials[(token*n_expert_used + slot)*out_dim + row] with plain stores; the
-// values are consumed after the dispatch boundary by the shared-down epilogue
-// (kernel_dsv4_shared_down_hc_expand4_slots_q8_0), so the cross-die
-// publication rule for same-dispatch readers does not apply.
+// partials[(token*n_expert_used + slot)*out_dim + row]; in the shipped form
+// those are plain stores, because the values are consumed after the dispatch
+// boundary by the shared-down epilogue
+// (kernel_dsv4_shared_down_hc_expand4_slots_q8_0) and the cross-die
+// publication rule for same-dispatch readers does not apply.  The COHERENT
+// template flag below turns them into relaxed device atomics for the one
+// caller that DOES read them inside the same dispatch.
 //
 // NOT bit-exact, and deliberately so: the unsplit kernel keeps one `sumf`
 // accumulator across all slots and all Q4_K blocks and reduces once at the end,
@@ -2728,7 +2731,14 @@ kernel void kernel_glm_q4_K_down_simd_f32(
 // The order is fixed (slot index, ascending, in one thread) with no float
 // atomics, so it is deterministic.  kernel_glm_q4_K_down_simd_f32 above is left
 // byte-identical so both arms of the comparison cannot move together.
-template<short NSG_T, short NR0_T>
+/* COHERENT (default false, so every shipped instantiation is untouched): the
+ * per-slot partial goes out through a relaxed device atomic instead of a plain
+ * store, so a reader inside the SAME dispatch can see it.  Same bit pattern at
+ * the same address -- as_type both ways -- so the partials, and everything
+ * downstream of them, are identical either way.  Used by
+ * kernel_glm_q4_K_down_simd_split_sdn_fold_f32 in metal/dsv4_hc.metal, which
+ * elects its last-arriving threadgroup to consume them. */
+template<short NSG_T, short NR0_T, bool COHERENT = false>
 void glm_q4_K_down_simd_split_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
@@ -2776,8 +2786,17 @@ void glm_q4_K_down_simd_split_impl(
             /* An expert this rank does not own contributes nothing; the
                unsplit kernel simply skipped it, so the slot's partial is 0. */
             for (short row = 0; row < nr0 && row0 + (uint)row < args.out_dim; row++) {
-                if (tiisg == 0u)
-                    partials[(part_base + row0 + (uint)row) * n_slots + slot] = 0.0f;
+                if (tiisg == 0u) {
+                    const uint64_t pi =
+                        (part_base + row0 + (uint)row) * n_slots + slot;
+                    if (COHERENT) {
+                        atomic_store_explicit((device atomic_uint *)&partials[pi],
+                                              as_type<uint>(0.0f),
+                                              memory_order_relaxed);
+                    } else {
+                        partials[pi] = 0.0f;
+                    }
+                }
             }
             return;
         }
@@ -2846,7 +2865,14 @@ void glm_q4_K_down_simd_split_impl(
     for (short row = 0; row < nr0 && row0 + (uint)row < args.out_dim; row++) {
         const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0u) {
-            partials[(part_base + row0 + (uint)row) * n_slots + slot] = sum_all;
+            const uint64_t pi = (part_base + row0 + (uint)row) * n_slots + slot;
+            if (COHERENT) {
+                atomic_store_explicit((device atomic_uint *)&partials[pi],
+                                      as_type<uint>(sum_all),
+                                      memory_order_relaxed);
+            } else {
+                partials[pi] = sum_all;
+            }
         }
     }
 }
