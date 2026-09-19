@@ -337,7 +337,8 @@ static inline void glm53_moe_block_shared_down_slots_impl(
 // sides of the handoff from the first line of code (Phase 1's 5-in-100,000
 // stale-row finding).  Verified over 100,000 poisoned dispatches.
 // ===========================================================================
-kernel void kernel_glm_router_shared_gateup_fold(
+template<short SH_NSG>
+kernel void glm53_router_shared_gateup_fold_impl(
         constant ds4_metal_args_mul_mv & mv_args,   /* router matvec  */
         constant ds4_metal_args_mul_mv & sh_args,   /* shared gate/up */
         constant ds4_metal_args_glm_router_select_one & args,
@@ -364,17 +365,29 @@ kernel void kernel_glm_router_shared_gateup_fold(
         ushort nsg  [[simdgroups_per_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    /* ---- shared-expert region: two virtual NSG-4 cohorts ---------------- */
+    /* ---- shared-expert region: nsg/SH_NSG virtual NSG-SH_NSG cohorts ---- */
     if (tgpig.x >= n_router_groups) {
         constexpr short NW = N_SIMDWIDTH;
         constexpr short NR0 = N_R0_Q8_0;
-        const ushort cohort = sgitg >> 2;
-        const ushort vsg    = sgitg & 3;
+        /* SH_NSG 4 is the shipped packing: two cohorts share one 256-thread
+         * threadgroup, so the grid carries n_ff_exp/4 shared threadgroups of
+         * four rows each.  SH_NSG 8 gives each threadgroup ONE cohort of two
+         * rows, doubling the shared threadgroup count and halving the bytes
+         * per threadgroup; the expressions below reduce to the shipped ones at
+         * SH_NSG 4 (cohorts = 2, sgitg/4 == sgitg >> 2, sgitg % 4 == sgitg & 3).
+         * Tier 2 at SH_NSG 8 and only there: NSG sets the lane's K-block
+         * stride (ib0 = sgitg*NQ + ix, stride NSG*NQ), so each shared row's
+         * dot product is summed in a different order.  The router half below
+         * is untouched and its ticket still counts the same n_router_groups,
+         * so logits, selected, weights and probs stay bit-identical. */
+        const ushort cohorts = (ushort)(nsg / SH_NSG);
+        const ushort cohort  = (ushort)(sgitg / SH_NSG);
+        const ushort vsg     = (ushort)(sgitg % SH_NSG);
         uint3 vtg = tgpig;
-        vtg.x = (tgpig.x - n_router_groups) * 2u + (uint)cohort;
+        vtg.x = (tgpig.x - n_router_groups) * (uint)cohorts + (uint)cohort;
         threadgroup char *slice =
             shmem + (uint)cohort * (2u * (uint)NR0 * (uint)NW * sizeof(float));
-        glm53_moe_block_shared_gate_up_impl<4, NR0, false>(
+        glm53_moe_block_shared_gate_up_impl<SH_NSG, NR0, false>(
             sh_args, sh_gate, sh_up, sh_x, sh_dgate, sh_dup, sh_dmid,
             clamp_value, slice, vtg, tiisg, vsg);
         return;
@@ -442,6 +455,22 @@ kernel void kernel_glm_router_shared_gateup_fold(
                                         (uint)sgitg,
                                         (uint)tiisg);
 }
+
+typedef decltype(glm53_router_shared_gateup_fold_impl<4>)
+        glm53_router_shared_gateup_fold_t;
+
+/* The shipped fold: two virtual NSG-4 cohorts per 256-thread threadgroup. */
+template [[host_name("kernel_glm_router_shared_gateup_fold")]]
+kernel glm53_router_shared_gateup_fold_t
+glm53_router_shared_gateup_fold_impl<4>;
+
+/* T2 proposal 3 (lever shg_split): one NSG-8 cohort per threadgroup, so the
+ * shared half dispatches n_ff_exp/2 threadgroups of two rows instead of
+ * n_ff_exp/4 of four.  The 656-threadgroup grid becomes 1168 and the drain the
+ * dispatch cannot amortise halves.  Tier 2 -- see the shared-expert region. */
+template [[host_name("kernel_glm_t2s_router_shared_gateup_fold_nsg8")]]
+kernel glm53_router_shared_gateup_fold_t
+glm53_router_shared_gateup_fold_impl<8>;
 
 // ===========================================================================
 // Steps 0(c)/0(d): the persistent MoE-block dataflow kernel.
