@@ -689,12 +689,6 @@ typedef struct {
      * DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A disables it and DS4_GLM_EXACT clamps
      * it off at the dispatch site. */
     int hc_pre_algebra_a;
-    /* hc_pre half A as ONE dispatch with the wide waiting tail (H1,
-     * ds4_metal.m).  Default on wherever the half-A pair is what would
-     * otherwise be encoded; DS4_GLM_DISABLE_HC_PRE_ONEPASS disables it, and
-     * half A's own clamps (exact mode, a concurrent encoder, half B) refuse
-     * it at the dispatch site. */
-    int hc_pre_onepass;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
