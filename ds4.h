@@ -793,6 +793,16 @@ typedef struct {
      * production kernel back, as it does for HCX's ptail.  DS4_GLM_SDN_PTAIL
      * turns it on at startup. */
     int sdn_ptail;
+    /* T2 proposal 2: rows per threadgroup of the attn-out / dense-down + HC
+     * expand family (ds4_metal.m, metal/t2screen.metal).  Counted 2 (shipped
+     * grid, 2048 threadgroups) or 1 (4096 threadgroups, half the bytes per
+     * threadgroup).  Tier 1 -- each output row's dot product is accumulated by
+     * the same lanes over the same blocks in the same order and there is no
+     * cross-row reduction, so NR0 only changes how the grid is packed -- but
+     * DS4_GLM_EXACT clamps it back to the shipped grid with the rest of the
+     * screen.  Costs one extra read of the activation vector per row.
+     * DS4_GLM_HCX_NR0 sets it at startup. */
+    int hcx_nr0;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

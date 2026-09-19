@@ -53432,6 +53432,22 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                              (out_dim % (uint64_t)rows) == 0) ? cached_nr : 0;
             }
         }
+        /* T2 proposal 2, lever hcx_nr0.  The shipped grid gives each
+         * threadgroup two rows -- 17.4 KB of weight at in_dim 8192, 34.8 KB at
+         * 16384 -- over 2048 threadgroups, which is two or three waves on 80
+         * cores, so the dispatch's drain is a large fraction of its cost.  One
+         * row per threadgroup doubles the wave depth and halves the drain; it
+         * also doubles the activation re-read, which is already the larger of
+         * the two traffics and is L2-resident.  Read live, so an A/B is a flip;
+         * the screen's own DS4_GLM_ENABLE_HCX_NR (which only offers 4, 8, 2w
+         * and 4w) still wins if it is set, and the exact umbrella clamps the
+         * shipped grid back. */
+        if (!t2s_hcxnr && !vec_hc) {
+            glm_levers_init_from_env();
+            if (g_glm_levers.hcx_nr0 == 1 && !glm53_exact_mode()) {
+                t2s_hcxnr = 1;
+            }
+        }
         id<MTLComputePipelineState> pipeline = nil;
         const int t2s_nr_rows = t2s_hcxnr >= 100 ? t2s_hcxnr - 100 : t2s_hcxnr;
         if (t2s_hcxnr) {

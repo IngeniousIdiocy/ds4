@@ -56135,6 +56135,7 @@ glm_levers g_glm_levers = {
     .attn_group            = 8,  /* heads per staged window, as shipped */
     .attn_block_rows       = 128,/* deep split geometry, as shipped */
     .sdn_ptail             = 0,  /* off: today's single-lane SDN epilogue */
+    .hcx_nr0               = 2,  /* rows per threadgroup, as shipped */
 };
 static int g_glm_levers_ready;
 
@@ -56145,6 +56146,7 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
     if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
     if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
+    if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
     return 0;
 }
 
@@ -56160,6 +56162,11 @@ static int glm_lever_counted_member(const char *name, int value) {
     if (!strcmp(name, "attn_block_rows")) {
         return value == 64 || value == 128;
     }
+    if (!strcmp(name, "hcx_nr0")) {
+        /* 4 and 8 were measured flat by the t2 screen and are not offered
+         * here; only the shipped 2 and the untried 1. */
+        return value == 1 || value == 2;
+    }
     return 1;
 }
 
@@ -56173,6 +56180,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "attn_group",            offsetof(glm_levers, attn_group),            "DS4_GLM_ATTN_GROUP" },
     { "attn_block_rows",       offsetof(glm_levers, attn_block_rows),       "DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP" },
     { "sdn_ptail",             offsetof(glm_levers, sdn_ptail),             "DS4_GLM_SDN_PTAIL" },
+    { "hcx_nr0",               offsetof(glm_levers, hcx_nr0),               "DS4_GLM_HCX_NR0" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56233,6 +56241,16 @@ void glm_levers_init_from_env(void) {
      * ENABLE_ variable is set"; DS4_GLM_EXACT still clamps the dispatch back to
      * the production kernel where HCX's ptail is clamped. */
     g_glm_levers.sdn_ptail = getenv("DS4_GLM_SDN_PTAIL") != NULL;
+    /* Counted enumeration, same rule as the A2 pair: a value outside the set
+     * leaves the shipped grid. */
+    {   const char *v = getenv("DS4_GLM_HCX_NR0");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("hcx_nr0", n)) {
+                g_glm_levers.hcx_nr0 = n;
+            }
+        }
+    }
     g_glm_levers_ready = 1;
 }
 

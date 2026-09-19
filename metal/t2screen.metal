@@ -880,6 +880,15 @@ kernel void kernel_glm_t2s_q8_hc_expand4_q8_0_nr_impl(
 typedef decltype(kernel_glm_t2s_q8_hc_expand4_q8_0_nr_impl<4, false>)
         glm_t2s_q8_hc_expand4_nr_t;
 
+/* NR0 = 1: ONE row per threadgroup, 4096 threadgroups instead of 2048.  The
+ * opposite direction from nr4/nr8 -- those gave each threadgroup more bytes and
+ * cut the threadgroup count, which lengthens the drain the dispatch cannot
+ * amortise; this halves per-threadgroup bytes and doubles the wave depth.  The
+ * epilogue mapping needs 4*NR0 = 4 lanes, well inside one simdgroup. */
+template [[host_name("kernel_glm_t2s_q8_hc_expand4_q8_0_nr1")]]
+kernel glm_t2s_q8_hc_expand4_nr_t
+kernel_glm_t2s_q8_hc_expand4_q8_0_nr_impl<1, false>;
+
 template [[host_name("kernel_glm_t2s_q8_hc_expand4_q8_0_nr4")]]
 kernel glm_t2s_q8_hc_expand4_nr_t
 kernel_glm_t2s_q8_hc_expand4_q8_0_nr_impl<4, false>;
