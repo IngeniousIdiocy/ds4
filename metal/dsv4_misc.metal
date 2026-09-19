@@ -1516,7 +1516,7 @@ kernel void kernel_glm_attention_full(
         const float denom = red[0];
         device float *out = (device float *)(heads +
             ((uint64_t)token * args.n_head + head) * args.value_dim * sizeof(float));
-        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
+        for (uint d = tid; d < args.value_dim; d += nth) {
             float acc = 0.0f;
             for (uint s = 0; s < visible; s++) {
                 const uint64_t vbase = ((uint64_t)s * args.n_head + head) * args.value_dim;
@@ -1559,7 +1559,7 @@ kernel void kernel_glm_attention_full(
         const float denom = red[0];
         device float *out = (device float *)(heads +
             ((uint64_t)token * args.n_head + head) * args.value_dim * sizeof(float));
-        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
+        for (uint d = tid; d < args.value_dim; d += nth) {
             float acc = 0.0f;
             for (uint s = 0; s < visible; s++) {
                 const uint64_t vbase = ((uint64_t)s * args.n_head + head) * args.value_dim;
@@ -4138,8 +4138,8 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
     }
 
     /* Contiguous half (or SPLIT-th) of the output rows this threadgroup owns.
-     * With SPLIT == 1 these collapse to the full range and every loop below is
-     * textually today's loop. */
+     * With SPLIT == 1 these collapse to the full range and both loops below
+     * are textually the loops that were there. */
     const uint vd_chunk =
         SPLIT > 1u ? (args.value_dim + SPLIT - 1u) / SPLIT : args.value_dim;
     const uint vd_lo = SPLIT > 1u ? (uint)tgpig.y * vd_chunk : 0u;
@@ -4477,7 +4477,7 @@ kernel void kernel_glm_attention_indexed_decode(
 
         device float *out =
             (device float *)(heads + (uint64_t)head * args.value_dim * sizeof(float));
-        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
+        for (uint d = tid; d < args.value_dim; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);
@@ -4583,7 +4583,7 @@ kernel void kernel_glm_attention_indexed_decode(
         const uint vp_sg = tid >> 5u;
         const uint vp_lane = tid & 31u;
         const uint vp_nsg = nth >> 5u;
-        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
+        for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
@@ -4595,7 +4595,7 @@ kernel void kernel_glm_attention_indexed_decode(
             }
         }
     } else {
-        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
+        for (uint d = tid; d < args.value_dim; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);
@@ -4737,7 +4737,7 @@ kernel void kernel_glm_attention_indexed_batch(
         const uint vp_sg = tid >> 5u;
         const uint vp_lane = tid & 31u;
         const uint vp_nsg = nth >> 5u;
-        for (uint d = vd_lo + vp_sg; d < vd_hi; d += vp_nsg) {
+        for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
@@ -4749,7 +4749,7 @@ kernel void kernel_glm_attention_indexed_batch(
             }
         }
     } else {
-        for (uint d = vd_lo + tid; d < vd_hi; d += nth) {
+        for (uint d = tid; d < args.value_dim; d += nth) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             out[d] = glm_quant_dot_row_tg_f32(args.value_type, row, lora_sum, args.kv_lora_dim);

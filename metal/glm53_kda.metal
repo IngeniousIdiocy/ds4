@@ -42,15 +42,9 @@ kernel void kernel_glm53_kda_decode(
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint D = 128u;
     constexpr uint HISTORY = 3u;
-    const uint nsplit = args.split > 1u ? args.split : 1u;
-    const uint rsplit = nsplit > 1u ? tgpig.x : 0u;
-    const uint row = nsplit > 1u ? 0u : tgpig.x;
+    const uint row = tgpig.x;
     const uint head = tgpig.y;
-    if (row >= args.n_rows || head >= args.n_heads || rsplit >= nsplit) return;
-    /* This threadgroup's contiguous half of the 128 value rows and of the 128
-     * conv channels.  Both collapse to the full range at nsplit == 1. */
-    const uint half_lo = nsplit > 1u ? rsplit * (D / nsplit) : 0u;
-    const uint half_hi = nsplit > 1u ? half_lo + (D / nsplit) : D;
+    if (row >= args.n_rows || head >= args.n_heads) return;
 
     threadgroup float *sq = scratch;
     threadgroup float *sk = sq + D;
@@ -90,25 +84,15 @@ kernel void kernel_glm53_kda_decode(
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
 
-        /* Every threadgroup READS all 128 channels above -- the RMS scales
-         * and the decay vector need them -- but only writes its own half of
-         * the shifted history, so the two halves together write each channel
-         * exactly once. */
-        if (tid >= half_lo && tid < half_hi) {
-            device float *q_out = conv_state_out +
-                (ulong)row * conv_row_stride;
-            device float *k_out = q_out + HISTORY * projection;
-            device float *v_out = k_out + HISTORY * projection;
-            q_out[channel] = q_state[projection + channel];
-            q_out[projection + channel] = q_state[2ul * projection + channel];
-            q_out[2ul * projection + channel] = q_new;
-            k_out[channel] = k_state[projection + channel];
-            k_out[projection + channel] = k_state[2ul * projection + channel];
-            k_out[2ul * projection + channel] = k_new;
-            v_out[channel] = v_state[projection + channel];
-            v_out[projection + channel] = v_state[2ul * projection + channel];
-            v_out[2ul * projection + channel] = v_new;
-        }
+        q_state[channel] = q_state[projection + channel];
+        q_state[projection + channel] = q_state[2ul * projection + channel];
+        q_state[2ul * projection + channel] = q_new;
+        k_state[channel] = k_state[projection + channel];
+        k_state[projection + channel] = k_state[2ul * projection + channel];
+        k_state[2ul * projection + channel] = k_new;
+        v_state[channel] = v_state[projection + channel];
+        v_state[projection + channel] = v_state[2ul * projection + channel];
+        v_state[2ul * projection + channel] = v_new;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -235,15 +219,9 @@ kernel void kernel_glm53_kda_decode_prep(
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint D = 128u;
     constexpr uint HISTORY = 3u;
-    const uint nsplit = args.split > 1u ? args.split : 1u;
-    const uint rsplit = nsplit > 1u ? tgpig.x : 0u;
-    const uint row = nsplit > 1u ? 0u : tgpig.x;
+    const uint row = tgpig.x;
     const uint head = tgpig.y;
-    if (row >= args.n_rows || head >= args.n_heads || rsplit >= nsplit) return;
-    /* This threadgroup's contiguous half of the 128 value rows and of the 128
-     * conv channels.  Both collapse to the full range at nsplit == 1. */
-    const uint half_lo = nsplit > 1u ? rsplit * (D / nsplit) : 0u;
-    const uint half_hi = nsplit > 1u ? half_lo + (D / nsplit) : D;
+    if (row >= args.n_rows || head >= args.n_heads) return;
 
     threadgroup float *sq = scratch;
     threadgroup float *sk = sq + D;
@@ -281,25 +259,15 @@ kernel void kernel_glm53_kda_decode_prep(
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
 
-        /* Every threadgroup READS all 128 channels above -- the RMS scales
-         * and the decay vector need them -- but only writes its own half of
-         * the shifted history, so the two halves together write each channel
-         * exactly once. */
-        if (tid >= half_lo && tid < half_hi) {
-            device float *q_out = conv_state_out +
-                (ulong)row * conv_row_stride;
-            device float *k_out = q_out + HISTORY * projection;
-            device float *v_out = k_out + HISTORY * projection;
-            q_out[channel] = q_state[projection + channel];
-            q_out[projection + channel] = q_state[2ul * projection + channel];
-            q_out[2ul * projection + channel] = q_new;
-            k_out[channel] = k_state[projection + channel];
-            k_out[projection + channel] = k_state[2ul * projection + channel];
-            k_out[2ul * projection + channel] = k_new;
-            v_out[channel] = v_state[projection + channel];
-            v_out[projection + channel] = v_state[2ul * projection + channel];
-            v_out[2ul * projection + channel] = v_new;
-        }
+        q_state[channel] = q_state[projection + channel];
+        q_state[projection + channel] = q_state[2ul * projection + channel];
+        q_state[2ul * projection + channel] = q_new;
+        k_state[channel] = k_state[projection + channel];
+        k_state[projection + channel] = k_state[2ul * projection + channel];
+        k_state[2ul * projection + channel] = k_new;
+        v_state[channel] = v_state[projection + channel];
+        v_state[projection + channel] = v_state[2ul * projection + channel];
+        v_state[2ul * projection + channel] = v_new;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -484,15 +452,9 @@ kernel void kernel_glm53_kda_decode_prep_state(
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint D = 128u;
     constexpr uint HISTORY = 3u;
-    const uint nsplit = args.split > 1u ? args.split : 1u;
-    const uint rsplit = nsplit > 1u ? tgpig.x : 0u;
-    const uint row = nsplit > 1u ? 0u : tgpig.x;
+    const uint row = tgpig.x;
     const uint head = tgpig.y;
-    if (row >= args.n_rows || head >= args.n_heads || rsplit >= nsplit) return;
-    /* This threadgroup's contiguous half of the 128 value rows and of the 128
-     * conv channels.  Both collapse to the full range at nsplit == 1. */
-    const uint half_lo = nsplit > 1u ? rsplit * (D / nsplit) : 0u;
-    const uint half_hi = nsplit > 1u ? half_lo + (D / nsplit) : D;
+    if (row >= args.n_rows || head >= args.n_heads) return;
 
     threadgroup float *sq = scratch;
     threadgroup float *sk = sq + D;
@@ -532,25 +494,15 @@ kernel void kernel_glm53_kda_decode_prep_state(
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
 
-        /* Every threadgroup READS all 128 channels above -- the RMS scales
-         * and the decay vector need them -- but only writes its own half of
-         * the shifted history, so the two halves together write each channel
-         * exactly once. */
-        if (tid >= half_lo && tid < half_hi) {
-            device float *q_out = conv_state_out +
-                (ulong)row * conv_row_stride;
-            device float *k_out = q_out + HISTORY * projection;
-            device float *v_out = k_out + HISTORY * projection;
-            q_out[channel] = q_state[projection + channel];
-            q_out[projection + channel] = q_state[2ul * projection + channel];
-            q_out[2ul * projection + channel] = q_new;
-            k_out[channel] = k_state[projection + channel];
-            k_out[projection + channel] = k_state[2ul * projection + channel];
-            k_out[2ul * projection + channel] = k_new;
-            v_out[channel] = v_state[projection + channel];
-            v_out[projection + channel] = v_state[2ul * projection + channel];
-            v_out[2ul * projection + channel] = v_new;
-        }
+        q_state[channel] = q_state[projection + channel];
+        q_state[projection + channel] = q_state[2ul * projection + channel];
+        q_state[2ul * projection + channel] = q_new;
+        k_state[channel] = k_state[projection + channel];
+        k_state[projection + channel] = k_state[2ul * projection + channel];
+        k_state[2ul * projection + channel] = k_new;
+        v_state[channel] = v_state[projection + channel];
+        v_state[projection + channel] = v_state[2ul * projection + channel];
+        v_state[2ul * projection + channel] = v_new;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -606,7 +558,7 @@ kernel void kernel_glm53_kda_decode_prep_state(
     const ulong state_head =
         ((ulong)row * args.n_heads + head) * D * D;
 
-    for (uint value = half_lo + sg; value < half_hi; value += n_sg) {
+    for (uint value = sg; value < D; value += n_sg) {
         device float4 *hptr =
             (device float4 *)(state + state_head + (ulong)value * D + k0);
         float4 h = *hptr * decay4;
@@ -749,7 +701,8 @@ struct glm53_kda_glue_args {
      * threadgroup redundantly runs the whole prologue and prep -- same
      * arithmetic, same order, read-only inputs -- and then owns half of the
      * 128 value rows and half of the 128 conv channels.  T2-REPORT.md
-     * section 8.2. */
+     * section 8.2.  This field exists ONLY in glm53_kda_glue_args; the other
+     * KDA kernels use glm53_kda_args and are untouched. */
     uint split;
     uint lr_in_dim;
     /* 0: f_b/g_b are BF16 (the fork's custom layout); 1: Q8_0 (the
