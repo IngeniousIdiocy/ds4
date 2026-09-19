@@ -4419,14 +4419,7 @@ DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
  *   1  seq_cst thread_scope_device on both sides, every thread.  The router
  *      fold's pattern, the one qualified against the Phase 1 stale-row
  *      finding, and the only form here that is known correct.
- *   2  release on the producer side and acquire on the reader side, every
- *      thread.  The spec-clean weakening: release/acquire is exactly the
- *      ordering this handoff needs, and it should not carry seq_cst's total
- *      order.  Only compiled when the Metal language version has non-seq_cst
- *      fence orders; otherwise the kernel is not defined at all and the host
- *      reports the pipeline as unavailable and runs the pair, rather than the
- *      whole library failing to compile.
- *   3  seq_cst on both sides but issued by tid 0 ALONE, behind
+ *   2  seq_cst on both sides but issued by tid 0 ALONE, behind
  *      threadgroup_barrier(mem_device).  DIAGNOSTIC: this leans on the
  *      threadgroup barrier to order the other 63 threads' stores before the
  *      one thread's fence, which is a stronger assumption than the memory
@@ -4434,17 +4427,16 @@ DS4_GLM53_HC_TAIL_SLICED_KERNEL(kernel_glm53_hc_tail_sliced_alg, true)
  *      question -- is the cost per fence INSTRUCTION (64 per threadgroup
  *      today) or per threadgroup?
  *
- * Modes 2 and 3 issue the reader-side fence before the RUN_TAIL early-out, so
- * a publication-only arm still pays it in the one threadgroup in n_slots that
+ * Mode 2 issues the reader-side fence before the RUN_TAIL early-out, so a
+ * publication-only arm still pays it in the one threadgroup in n_slots that
  * would have run the tail; modes 0 and 1 are left exactly as they were
- * measured. */
-#ifndef DS4_GLM_SDN_FENCE_RELACQ
-#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
-#define DS4_GLM_SDN_FENCE_RELACQ 1
-#else
-#define DS4_GLM_SDN_FENCE_RELACQ 0
-#endif
-#endif
+ * measured.
+ *
+ * There is no release/acquire mode: the runtime Metal compiler on this box
+ * (GPUCompiler 32023) declares only memory_order_relaxed and
+ * memory_order_seq_cst, so a release/acquire fence is a hard compile error
+ * that fails the whole library and leaves the server with no Metal backend at
+ * all.  A __METAL_VERSION__ guard does not predict it. */
 
 template <bool RUN_TAIL, bool SLOT_MAJOR, short FENCE_MODE>
 static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
@@ -4500,11 +4492,6 @@ static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                             thread_scope_device);
     } else if (FENCE_MODE == 2) {
-#if DS4_GLM_SDN_FENCE_RELACQ
-        atomic_thread_fence(mem_flags::mem_device, memory_order_release,
-                            thread_scope_device);
-#endif
-    } else if (FENCE_MODE == 3) {
         if (tid == 0u) {
             atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                                 thread_scope_device);
@@ -4524,18 +4511,11 @@ static __attribute__((always_inline)) inline void glm_q4_K_down_sdn_fold_body(
         elected[0] = last ? 1u : 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    /* Modes 2 and 3 pay the reader-side fence even when no tail follows, so a
+    /* Mode 2 pays the reader-side fence even when no tail follows, so a
      * publication-only arm prices the whole pattern. */
-    if (FENCE_MODE >= 2 && elected[0] != 0u) {
-        if (FENCE_MODE == 2) {
-#if DS4_GLM_SDN_FENCE_RELACQ
-            atomic_thread_fence(mem_flags::mem_device, memory_order_acquire,
-                                thread_scope_device);
-#endif
-        } else if (tid == 0u) {
-            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
-                                thread_scope_device);
-        }
+    if (FENCE_MODE == 2 && elected[0] != 0u && tid == 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                            thread_scope_device);
     }
     /* Publication-only ablation: everything above has been paid. */
     if (!RUN_TAIL) return;
@@ -4694,16 +4674,10 @@ DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32, true
 DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_nofence_f32, false, false, 0)
 /* Lever 5: value 1 with both device fences removed.  Diagnostic only. */
 DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_fold_nofence_f32, true, false, 0)
-/* Lever 6: publication only with RELEASE/ACQUIRE device fences instead of
- * seq_cst -- the spec-clean weakening, and the only one of these diagnostics
- * that could ship if it is both fast and correct.  Defined only when the Metal
- * language version has non-seq_cst fence orders; otherwise the host finds no
- * pipeline, says so once and runs the pair. */
-#if DS4_GLM_SDN_FENCE_RELACQ
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_relacq_f32, false, false, 2)
-#endif
-/* Lever 7: publication only with the seq_cst fences issued by tid 0 ALONE.
+/* Lever 6: publication only with the seq_cst fences issued by tid 0 ALONE.
  * Diagnostic: it leans on threadgroup_barrier(mem_device) to stand in for the
  * other 63 threads' fences, which is more than the memory model promises.  It
- * answers whether the cost is per fence instruction or per threadgroup. */
-DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32,   false, false, 3)
+ * answers whether the cost is per fence instruction or per threadgroup.
+ * (This was lever 7 until the release/acquire arm was deleted for not
+ * compiling on this box's runtime Metal compiler.) */
+DS4_GLM_SDN_FOLD_KERNEL(kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32,   false, false, 2)

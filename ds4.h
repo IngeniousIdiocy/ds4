@@ -838,16 +838,38 @@ typedef struct {
      * the last slot wave costs more than the consumer dispatch plus its own
      * boundary -- C1 is structurally dead whatever the publication costs.
      *
-     * 6 and 7 price the fence VARIANT, both publication-only like 4: 6 uses
-     * release/acquire instead of seq_cst (spec-clean, and the only one of the
-     * diagnostics that could ship; absent entirely if the Metal language
-     * version lacks non-seq_cst fence orders, in which case the host says the
-     * pipeline is unavailable and runs the pair), and 7 keeps seq_cst but
-     * issues it from tid 0 alone behind threadgroup_barrier(mem_device), which
-     * leans on that barrier to stand in for the other 63 threads' fences and
-     * so is a diagnostic only.  Their point is whether the cost is per fence
-     * instruction (64 per threadgroup today) or per threadgroup. */
+     * 6 prices the fence VARIANT, publication-only like 4: it keeps seq_cst
+     * but issues it from tid 0 alone behind threadgroup_barrier(mem_device),
+     * which leans on that barrier to stand in for the other 63 threads'
+     * fences and so is a DIAGNOSTIC ONLY.  Its point is whether the cost is
+     * per fence instruction (64 per threadgroup today) or per threadgroup.
+     * There is no release/acquire arm: it was built and deleted unmeasured
+     * because this box's runtime Metal compiler (GPUCompiler 32023) declares
+     * only memory_order_relaxed and memory_order_seq_cst, so the release fence
+     * was a hard compile error that failed the whole Metal library and left
+     * the server with no backend.  A __METAL_VERSION__ guard did not predict
+     * it, so a weaker fence order cannot be probed on this toolchain at all. */
     int sdn_fold;
+    /* Whether the legacy argsort fallback (the pair dispatch and every fused
+     * merge level) is ENCODED behind the fast top-k path.  It is today, with
+     * indirect grids that kernel_glm53_topk_fast_finish zeroes when it accepts
+     * -- so on the happy path they run zero threadgroups but still pay the
+     * per-dispatch encoder boundary, ~10.2 us each by the fit in T2-REPORT.md
+     * section 3.1.  At 62k that is one pair plus two merges per DSA site and
+     * 33 empty dispatches per token over the 11 sites.  1 = encode as today,
+     * 0 = do not encode them; the lever only takes effect while the fast path
+     * is selected.  DS4_GLM_TOPK_FALLBACK_ENCODE sets it at startup.
+     *
+     * DIAGNOSTIC, NEVER SHIP.  Value 0 is correct only while finish ACCEPTS.
+     * Any reject -- a non-finite or subnormal score, more than cand_cap
+     * candidates at or above the boundary bin, no boundary bin, an exact tie
+     * inside the top k, a short count, an out-of-range index -- means the
+     * fallback is the path that produces the right top-k, and with it not
+     * encoded the indexer would select from an unwritten buffer and the
+     * generated text would change.  That makes the text column a tripwire,
+     * and a binary one: an identical run says this fixture never tripped a
+     * reject, not that a reject cannot happen. */
+    int topk_fallback_encode;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

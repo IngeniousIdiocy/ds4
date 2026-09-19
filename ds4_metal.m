@@ -21121,26 +21121,53 @@ static int ds4_gpu_indexer_topk_fused(
     }
     uint32_t fb_slot = 0;
 
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:g_argsort_pair_pipeline];
-    [enc setBytes:&sort_args length:sizeof(sort_args) atIndex:0];
-    [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
-    [enc setBuffer:one_pass ? selbuf : g_indexer_topk_pair_buffer
-            offset:one_pass ? ds4_gpu_tensor_offset(selected) : 0
-           atIndex:2];
-    [enc setThreadgroupMemoryLength:(NSUInteger)2 * (NSUInteger)nth * pair_bytes atIndex:0];
-    if (use_fast) {
-        [enc dispatchThreadgroupsWithIndirectBuffer:g_topk_fast_scratch
-                               indirectBufferOffset:fast_off_ind + fb_slot * 12u
-                              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
-        fb_slot++;
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
+    /* Lever topk_fallback_encode: when the fast path is in play, the legacy
+     * pair and every fused-merge level are still ENCODED, with indirect grids
+     * the finisher zeroes on acceptance.  Each is a zero-threadgroup dispatch
+     * that still costs the ~10.2 us encoder boundary measured in
+     * T2-REPORT.md section 3.1, and at 62k that is one pair plus two merges per
+     * DSA site, 33 empty dispatches per token over the 11 sites.  Setting the
+     * lever to 0 does not encode them at all.
+     *
+     * NEVER SHIP.  It is only correct while the fast path ACCEPTS; on any
+     * reject (non-finite score, candidate overflow, no boundary bin, a tie in
+     * the top k, a short count, a bad index) the fallback is the thing that
+     * produces the right top-k, and without it the indexer selects garbage and
+     * the generated text changes.  The text column is the tripwire, and it is
+     * a binary one: a clean run says only that this fixture never tripped a
+     * reject, not that the rejects cannot happen. */
+    const bool skip_fallback = use_fast && g_glm_levers.topk_fallback_encode == 0;
+    if (skip_fallback) {
+        static ds4_t2s_slot slot = { "TOPKFB", 0, 0 };
+        ds4_t2s_hit(&slot, "skipping legacy pair + %u merge dispatches "
+                           "(n_comp=%d top_k=%d work_width=%d one_pass=%d)",
+                    (unsigned)(fast_args.fb_count ? fast_args.fb_count - 1u : 0u),
+                    (int)n_comp, (int)top_k, (int)work_width, (int)one_pass);
     }
-    ds4_gpu_end_compute_encoder(cb, enc);
 
-    if (!one_pass) {
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (!skip_fallback) {
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_argsort_pair_pipeline];
+        [enc setBytes:&sort_args length:sizeof(sort_args) atIndex:0];
+        [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+        [enc setBuffer:one_pass ? selbuf : g_indexer_topk_pair_buffer
+                offset:one_pass ? ds4_gpu_tensor_offset(selected) : 0
+               atIndex:2];
+        [enc setThreadgroupMemoryLength:(NSUInteger)2 * (NSUInteger)nth * pair_bytes atIndex:0];
+        if (use_fast) {
+            [enc dispatchThreadgroupsWithIndirectBuffer:g_topk_fast_scratch
+                                   indirectBufferOffset:fast_off_ind + fb_slot * 12u
+                                  threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
+            fb_slot++;
+        } else {
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+    }
+
+    if (!one_pass && !skip_fallback) {
         NSUInteger tg_threads = g_argsort_merge_fused_pipeline.maxTotalThreadsPerThreadgroup;
         if (tg_threads == 0) tg_threads = 256;
         if (tg_threads > 1024u) tg_threads = 1024u;
@@ -43937,16 +43964,15 @@ static const char *ds4_gpu_glm_routed_down_sdn_fold_kernel(int mode) {
     case 3: return "kernel_glm_q4_K_down_simd_split_sdn_fold_slotx_f32";
     case 4: return "kernel_glm_q4_K_down_simd_split_sdn_pub_nofence_f32";
     case 5: return "kernel_glm_q4_K_down_simd_split_sdn_fold_nofence_f32";
-    case 6: return "kernel_glm_q4_K_down_simd_split_sdn_pub_relacq_f32";
-    case 7: return "kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32";
+    case 6: return "kernel_glm_q4_K_down_simd_split_sdn_pub_tid0_f32";
     default: return NULL;
     }
 }
 
 static id<MTLComputePipelineState> ds4_gpu_glm_routed_down_sdn_fold_pipeline(int mode) {
-    static id<MTLComputePipelineState> cached[8];
-    static int tried[8];
-    if (mode < 1 || mode > 7) return nil;
+    static id<MTLComputePipelineState> cached[7];
+    static int tried[7];
+    if (mode < 1 || mode > 6) return nil;
     if (!tried[mode]) {
         tried[mode] = 1;
         cached[mode] =

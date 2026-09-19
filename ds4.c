@@ -56202,6 +56202,7 @@ glm_levers g_glm_levers = {
     .sdn_ptail             = 0,  /* off: today's single-lane SDN epilogue */
     .hcx_nr0               = 2,  /* rows per threadgroup, as shipped */
     .sdn_fold              = 0,  /* off: routed-down and shared-down as a pair */
+    .topk_fallback_encode  = 1,  /* on: the legacy argsort chain is encoded */
 };
 static int g_glm_levers_ready;
 
@@ -56213,7 +56214,8 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "attn_group")) { *lo = 8; *hi = 32; return 1; }
     if (!strcmp(name, "attn_block_rows")) { *lo = 64; *hi = 128; return 1; }
     if (!strcmp(name, "hcx_nr0")) { *lo = 1; *hi = 2; return 1; }
-    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 7; return 1; }
+    if (!strcmp(name, "sdn_fold")) { *lo = 0; *hi = 6; return 1; }
+    if (!strcmp(name, "topk_fallback_encode")) { *lo = 0; *hi = 1; return 1; }
     return 0;
 }
 
@@ -56237,14 +56239,23 @@ static int glm_lever_counted_member(const char *name, int value) {
     if (!strcmp(name, "sdn_fold")) {
         /* 0 pair, 1 fold, 2 publication-only, 3 slot-fastest fold,
          * 4 publication-only without the device fences, 5 fold without them,
-         * 6 publication-only with release/acquire fences, 7 publication-only
-         * with the seq_cst fences issued by tid 0 alone.  4, 5 and 7 are
-         * diagnostics and must never ship: 4 and 5 are not memory-safe across
-         * the two dies at all, and 7 leans on the threadgroup barrier to stand
-         * in for the other threads' fences.  6 is the one weakening that is
-         * spec-clean, and it is only present if the Metal language version
-         * compiled it. */
-        return value >= 0 && value <= 7;
+         * 6 publication-only with the seq_cst fences issued by tid 0 alone.
+         * 4, 5 and 6 are diagnostics and must NEVER SHIP: 4 and 5 are not
+         * memory-safe across the two dies at all, and 6 leans on the
+         * threadgroup barrier to stand in for the other 63 threads' fences.
+         * There is no release/acquire arm -- this box's runtime Metal compiler
+         * declares only relaxed and seq_cst, and a release fence fails the
+         * whole library. */
+        return value >= 0 && value <= 6;
+    }
+    if (!strcmp(name, "topk_fallback_encode")) {
+        /* 1 = encode the legacy argsort pair and merges behind the fast top-k
+         * path, as today; 0 = do not encode them at all.  DIAGNOSTIC, NEVER
+         * SHIP: 0 is only correct while the fast path accepts, and a reject
+         * there would leave the indexer selecting from a buffer nothing wrote.
+         * It exists to price the 33 zero-threadgroup dispatches per token that
+         * the accepted fast path leaves in the command buffer. */
+        return value == 0 || value == 1;
     }
     return 1;
 }
@@ -56261,6 +56272,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "sdn_ptail",             offsetof(glm_levers, sdn_ptail),             "DS4_GLM_SDN_PTAIL" },
     { "hcx_nr0",               offsetof(glm_levers, hcx_nr0),               "DS4_GLM_HCX_NR0" },
     { "sdn_fold",              offsetof(glm_levers, sdn_fold),              "DS4_GLM_SDN_FOLD" },
+    { "topk_fallback_encode",  offsetof(glm_levers, topk_fallback_encode),  "DS4_GLM_TOPK_FALLBACK_ENCODE" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56331,12 +56343,22 @@ void glm_levers_init_from_env(void) {
             }
         }
     }
-    /* Counted 0..3, default 0; a value outside the set leaves the pair. */
+    /* Counted 0..6, default 0; a value outside the set leaves the pair. */
     {   const char *v = getenv("DS4_GLM_SDN_FOLD");
         if (v && v[0]) {
             const int n = atoi(v);
             if (glm_lever_counted_member("sdn_fold", n)) {
                 g_glm_levers.sdn_fold = n;
+            }
+        }
+    }
+    /* Default 1 (encode as today); only 0 changes anything, and only while
+     * the fast top-k path is selected.  NEVER SHIP at 0. */
+    {   const char *v = getenv("DS4_GLM_TOPK_FALLBACK_ENCODE");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (glm_lever_counted_member("topk_fallback_encode", n)) {
+                g_glm_levers.topk_fallback_encode = n;
             }
         }
     }
