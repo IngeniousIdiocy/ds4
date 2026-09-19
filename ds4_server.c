@@ -14636,19 +14636,79 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     if (!toks) { snprintf(err, errlen, "oom"); goto out; }
     double first_sec = 0.0, steady_sec = 0.0;
     int done = 0;
+    /* Lever chain_decode: the same greedy EOS-excluded decode, but the id is
+     * chosen on the GPU and the next step is encoded before this one retires.
+     * Token ids and text must come out identical to the classic loop. */
+    ds4_chain *chain = NULL;
+    int chain_steps = 0;
+    {
+        int lever_chain = 0;
+        glm_levers_get("chain_decode", &lever_chain);
+        ds4_chain_params cp = {
+            .mode = DS4_CHAIN_GREEDY,
+            .excluded_id = eos,
+            .temperature = 0.0f,
+            .top_k = 0,
+            .top_p = 1.0f,
+            .min_p = 0.0f,
+            .rng = NULL,
+        };
+        if (lever_chain && ds4_session_chain_supported(f->session, &cp)) {
+            chain = ds4_session_chain_begin(f->session, &cp, serr, sizeof(serr));
+            if (!chain) {
+                snprintf(err, errlen, "chain decode failed to start: %s", serr);
+                free(toks);
+                goto out;
+            }
+        }
+    }
     const double gen_t0 = bench_now_sec_srv();
     while (done < gen_tokens) {
-        const int token = ds4_session_argmax_excluding(f->session, eos);
-        if (token < 0) { snprintf(err, errlen, "argmax failed"); free(toks); goto out; }
-        const double t0 = bench_now_sec_srv();
-        if (ds4_session_eval(f->session, token, serr, sizeof(serr)) != 0) {
-            snprintf(err, errlen, "decode failed: %s", serr);
+        int token = -1;
+        int rc = 0;
+        double t0;
+        if (chain) {
+            t0 = bench_now_sec_srv();
+            if (done == 0) {
+                token = ds4_session_argmax_excluding(f->session, eos);
+                if (token >= 0) {
+                    rc = ds4_session_chain_eval(chain, token, serr, sizeof(serr));
+                }
+            } else {
+                token = ds4_session_chain_next(chain, serr, sizeof(serr));
+                if (token >= 0) {
+                    rc = ds4_session_chain_confirm(chain, token, serr, sizeof(serr));
+                }
+            }
+        } else {
+            token = ds4_session_argmax_excluding(f->session, eos);
+            t0 = bench_now_sec_srv();
+            if (token >= 0 &&
+                ds4_session_eval(f->session, token, serr, sizeof(serr)) != 0) {
+                rc = 1;
+            }
+        }
+        if (token < 0 || rc != 0) {
+            if (chain) {
+                chain_steps = ds4_session_chain_steps(chain);
+                (void)ds4_session_chain_end(chain, serr, sizeof(serr));
+            }
+            if (token < 0) snprintf(err, errlen, "argmax failed");
+            else snprintf(err, errlen, "decode failed: %s", serr);
             free(toks);
             goto out;
         }
         const double t1 = bench_now_sec_srv();
         toks[done++] = token;
         if (done == 1) first_sec = t1 - t0; else steady_sec += t1 - t0;
+    }
+    if (chain) {
+        chain_steps = ds4_session_chain_steps(chain);
+        if (ds4_session_chain_end(chain, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "chain decode failed to drain: %s", serr);
+            free(toks);
+            goto out;
+        }
     }
     const double gen_sec = bench_now_sec_srv() - gen_t0;
     const bool ledger_written = ledger_mode && bench_ledger_write(bench_ledger_dump) != 0;
@@ -14674,6 +14734,9 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     buf_printf(&b, ",\"gen_steady_tokens\":%d,\"gen_steady_tps\":%.4f",
                done > 1 ? done - 1 : 0,
                steady_sec > 0.0 ? (double)(done - 1) / steady_sec : 0.0);
+    /* 0 means the chain never ran: the lever was off or the session declined
+     * it, and this arm is the classic loop whatever the lever says. */
+    buf_printf(&b, ",\"chain_steps\":%d", chain_steps);
     buf_puts(&b, ",\"token_ids\":[");
     for (int i = 0; i < done; ++i) buf_printf(&b, "%s%d", i ? "," : "", toks[i]);
     buf_puts(&b, "]");
