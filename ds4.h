@@ -767,12 +767,6 @@ typedef struct {
      * a stop still has nothing to roll back.  Default ON with the chain;
      * DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD is the kill switch. */
     int chain_commit_ahead;
-    /* A2: rows per block of the DSA decode attention split, for the deep
-     * (n_selected > 1024) geometry.  Counted 64 / 128; 128 is shipped.
-     * n_blocks follows it.  Tier 2 -- a different block partition changes the
-     * reduce's summation, so it is NOT bit-identical and DS4_GLM_EXACT and an
-     * explicit DS4_GLM_SPLIT8_BLOCK_ROWS_DEEP both override it. */
-    int attn_block_rows;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

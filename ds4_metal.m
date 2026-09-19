@@ -41189,12 +41189,10 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         {
             static ds4_t2s_slot slot = { "SPLIT8DBL", 0, 0 };
             ds4_t2s_hit(&slot,
-                        "%s block_rows=%u n_blocks=%u stage_rows=%lu "
-                        "bufs=%lu scratch=%lu B",
+                        "%s stage_rows=%lu bufs=%lu scratch=%lu B",
                         t2s_split8 ?
                             "kernel_glm_t2s_split_group8_partial" :
-                            "kernel_glm_attention_indexed_decode_split_group_partial(prod)",
-                        block_rows, n_blocks,
+                            "kernel_glm_attention_indexed_decode_split_group8_partial(prod)",
                         (unsigned long)stage_rows, (unsigned long)stage_bufs,
                         (unsigned long)partial_scratch_bytes);
         }
@@ -41246,8 +41244,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:partial_msbuf offset:ds4_gpu_tensor_offset(partial_ms) atIndex:7];
         [enc setThreadgroupMemoryLength:partial_scratch_bytes atIndex:0];
         for (int rep = 0; rep < rep_partial; rep++) {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / 8u,
-                                                  (NSUInteger)n_blocks, 1)
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / 8u, (NSUInteger)n_blocks, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
