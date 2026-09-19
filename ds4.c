@@ -46688,6 +46688,11 @@ static double glm_graph_streaming_async_profile_ms(void) {
 
 static uint32_t glm_decode_ablate_mask(void) {
     static int cached = -1;
+    /* Campaign lever (timing-only diagnostic): a non-zero decode_ablate
+     * bitmask wins over the cached environment mask, so the resident bench
+     * can ablate families without a restart. */
+    glm_levers_init_from_env();
+    if (g_glm_levers.decode_ablate != 0) return (uint32_t)g_glm_levers.decode_ablate;
     if (cached < 0) {
         uint32_t mask = 0;
         const char *env = getenv("DS4_GLM_DECODE_ABLATE");
@@ -55970,18 +55975,21 @@ static bool glm_graph_streaming_decode_sync_each_layer(void) {
 glm_levers g_glm_levers = {
     .decode_flush_interval = -1, /* -1 = the interval resolved at the call site */
     .hc_pre_algebra_a      = 1,
+    .decode_ablate         = 0,
 };
 static int g_glm_levers_ready;
 
 /* A counted lever carries a quantity, not a switch, so /debug/levers stores it
  * as given (inside its own range) instead of coercing it to 0/1. */
 static int glm_lever_counted(const char *name) {
-    return !strcmp(name, "decode_flush_interval");
+    return !strcmp(name, "decode_flush_interval") ||
+           !strcmp(name, "decode_ablate");
 }
 
 static const struct { const char *name; size_t off; const char *env; } g_glm_lever_map[] = {
     { "decode_flush_interval", offsetof(glm_levers, decode_flush_interval), "DS4_GLM_DECODE_FLUSH_INTERVAL" },
     { "hc_pre_algebra_a",      offsetof(glm_levers, hc_pre_algebra_a),      "DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A" },
+    { "decode_ablate",         offsetof(glm_levers, decode_ablate),         "DS4_GLM_DECODE_ABLATE_MASK" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56035,7 +56043,9 @@ int glm_levers_set(const char *name, int value) {
                 /* decode_flush_interval: -1 restores the call site's own
                  * default, 0 disables the flushes, and the graph clamps
                  * anything above the layer count. */
-                if (value < -1 || value > 256) return 0;
+                if (!strcmp(name, "decode_ablate")) {
+                    if (value < 0 || value > 8191) return 0;
+                } else if (value < -1 || value > 256) return 0;
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value;
             } else {
                 *(int *)((char *)&g_glm_levers + g_glm_lever_map[i].off) = value ? 1 : 0;

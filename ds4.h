@@ -689,6 +689,7 @@ typedef struct {
      * DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A disables it and DS4_GLM_EXACT clamps
      * it off at the dispatch site. */
     int hc_pre_algebra_a;
+    int decode_ablate;      /* diagnostic: DS4_GLM_DECODE_ABLATE bitmask, live; 0 = env/none */
 } glm_levers;
 
 extern glm_levers g_glm_levers;
