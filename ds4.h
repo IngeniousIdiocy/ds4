@@ -786,7 +786,15 @@ typedef struct {
      * plus pool expansion plus output/grid/ctrl writes (the ctrl telemetry
      * counters are guarded so they do not double-count), 12 = histogram clear
      * plus histogram scan, 13 = the bitonic sort (a sorting network is
-     * idempotent on sorted input).  Any other value runs production. */
+     * idempotent on sorted input).
+     *
+     * 14-16 (§18) are Tier-1 REPLACEMENTS, not probes: 14 runs the fifteen
+     * cross-simdgroup bitonic stages in place in one buffer with nth/2 threads
+     * owning a pair each, 15 replaces the cut scan's ten-round Hillis-Steele
+     * with a three-barrier reduce-then-scan over all 1,024 threads, and 16 is
+     * both.  The results are integer and unique, so any correct algorithm
+     * yields the same sequence and the same bin_lo.  Any other value runs
+     * production. */
     int topk_fused;
 } glm_levers;
 

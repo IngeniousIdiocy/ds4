@@ -20883,14 +20883,17 @@ static int ds4_gpu_glm_topk_fused_lever(void) {
     int v = glm53_exact_mode() ? 0 : g_glm_levers.topk_fused;
     /* 0 = chain, 1 = fused, 10..13 = the §17 doubling probes.  Nothing else is
      * a defined value; anything else runs the production fused kernel. */
-    if (v != 0 && (v < 10 || v > 13)) v = 1;
+    if (v != 0 && (v < 10 || v > 16)) v = 1;
     static int last = -1;
     if (v != last) {
-        static const char *what[4] = {
+        static const char *what[7] = {
             "PROBE x2: cut scan",
             "PROBE x2: acceptance, expansion, output and grid writes",
             "PROBE x2: histogram clear and scan",
-            "PROBE x2: bitonic sort" };
+            "PROBE x2: bitonic sort",
+            "in-place cross-simdgroup sort stages",
+            "reduce-then-scan cut scan",
+            "in-place sort + reduce-then-scan cut scan" };
         fprintf(stderr, "[T2] topk_fused=%d (%s)\n", v,
                 v == 0 ? "three-dispatch chain" :
                 v == 1 ? "fused" : what[v - 10]);
@@ -20903,7 +20906,7 @@ static int ds4_gpu_glm_topk_fused_lever(void) {
  * Every probe is Tier 1: the doubled phase writes the same values to the same
  * addresses, so the output is byte-identical and the delta is pure cost. */
 static uint32_t ds4_gpu_glm_topk_fused_dbg(int lever) {
-    return (lever >= 10 && lever <= 13) ? (uint32_t)(lever - 9) : 0u;
+    return (lever >= 10 && lever <= 16) ? (uint32_t)(lever - 9) : 0u;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar

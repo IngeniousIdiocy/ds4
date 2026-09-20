@@ -788,7 +788,63 @@ static inline void ds4_topk_fast_tail(
      * exactly - every compare-exchange finds its pair already in the wanted
      * order - so the second pass changes no value and the delta against value
      * 1 is the network's cost.  Tier 1. */
+    /* §18 value 14 (and 16): the fifteen CROSS-SIMDGROUP stages run in place
+     * in a SINGLE buffer instead of the double-buffered round trip.  nth/2
+     * threads each own one compare-exchange pair, read both slots, write the
+     * wanted order back to both, and one barrier per stage suffices because no
+     * other thread touches either slot in that stage.  The forty j < 32 stages
+     * stay as shuffles.  Same network, same order, every call - no
+     * special-casing on count.
+     *
+     * Tier 1: the comparator is the same total order on (key, index) and each
+     * stage performs the same set of compare-exchanges, so the sequence after
+     * every stage is identical to the double-buffered form.
+     *
+     * Barrier arithmetic, stated so the result is readable either way: today
+     * is one barrier per cross stage, 15.  This form is 15 plus one publish
+     * and one read-back at each of the five k-levels that have cross stages,
+     * so 25 - but it halves the sort's threadgroup working set from two 8 KB
+     * buffers to one, and the per-stage slot traffic is unchanged (1,024 reads
+     * and 1,024 writes either way).  If it wins, the footprint was the cost;
+     * if it loses, the barrier was. */
+    const bool inplace = (dbg == 5u || dbg == 7u);
     for (uint pass = 0u; pass < ((dbg == 4u) ? 2u : 1u); pass++)
+    if (inplace) {
+        for (uint k = 2u; k <= nth; k <<= 1) {
+            bool published = false;
+            for (uint j = k >> 1; j >= 32u; j >>= 1) {
+                if (!published) { buf0[tid] = cur; published = true; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < (nth >> 1)) {
+                    const uint lo = ((tid & ~(j - 1u)) << 1) | (tid & (j - 1u));
+                    const uint hi = lo | j;
+                    uint2 a = buf0[lo];
+                    uint2 b = buf0[hi];
+                    const bool a_greater = (a.x != b.x) ? (a.x > b.x)
+                                                        : (a.y < b.y);
+                    if (a_greater != ((lo & k) == 0u)) {
+                        const uint2 t = a; a = b; b = t;
+                    }
+                    buf0[lo] = a;
+                    buf0[hi] = b;
+                }
+            }
+            if (published) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                cur = buf0[tid];
+            }
+            for (uint j = min(k >> 1, 16u); j > 0u; j >>= 1) {
+                uint2 other;
+                other.x = simd_shuffle_xor(cur.x, (ushort)j);
+                other.y = simd_shuffle_xor(cur.y, (ushort)j);
+                const uint partner = tid ^ j;
+                const bool cur_greater = (cur.x != other.x) ? (cur.x > other.x)
+                                                            : (cur.y < other.y);
+                const bool want_greater = ((tid & k) == 0u) == (tid < partner);
+                if (cur_greater != want_greater) cur = other;
+            }
+        }
+    } else
     for (uint k = 2u; k <= nth; k <<= 1) {
         for (uint j = k >> 1; j > 0u; j >>= 1) {
             const uint partner = tid ^ j;
@@ -994,7 +1050,9 @@ kernel void kernel_glm53_topk_fast_fused(
         device uint32_t    * indirect,
         threadgroup uint   * shm [[threadgroup(0)]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
-        ushort3 ntg   [[threads_per_threadgroup]]) {
+        ushort3 ntg   [[threads_per_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
     const uint nth   = ntg.x;           // == args.cand_cap, one candidate per lane
     const uint tid   = tpitg.x;
     const uint nbins = 1u << args.hist_bits;
@@ -1060,6 +1118,68 @@ kernel void kernel_glm53_topk_fast_fused(
      * is the scan's ten rounds and twenty barriers plus the block search. */
     const uint per = (nbins + nth - 1u) / nth;
     const uint b0 = tid * per;
+    if (dbg == 6u || dbg == 7u) {
+        /* §18 value 15 (and 16): the same cut, by REDUCE-THEN-SCAN instead of
+         * a ten-round, twenty-barrier Hillis-Steele over all nth entries.
+         * Each thread sums its own `per` bins; each simdgroup carries an
+         * inclusive suffix over its 32 lanes with shuffles and publishes its
+         * total; one simdgroup takes an exclusive suffix over the 32
+         * simdgroup totals; every thread adds its simdgroup's offset back.
+         * THREE barriers, all 1,024 threads working - this is not value 9's
+         * 32-lane serial walk.
+         *
+         * Tier 1.  `above_block` must be the exact integer sum of `mine` over
+         * every thread with a higher index, and `mine` is the exact integer
+         * count of that thread's bins.  Both shapes compute that same sum;
+         * they differ only in the association order of an integer addition,
+         * which is exact and associative, so every thread sees the identical
+         * above_block.  The entry predicate then admits the same threads and
+         * the descending in-block search finds the same unique bin b - unique
+         * because the running count is non-decreasing as b falls, so once
+         * acc + c >= top_k holds, acc < top_k fails for every lower bin.  Same
+         * bin_lo, same candidate set, same output. */
+        const uint nsg = nth >> 5;
+        uint mine = 0u;
+        for (uint b = b0; b < b0 + per && b < nbins; b++)
+            mine += (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
+        uint inc = mine;                       // inclusive suffix over 32 lanes
+        for (uint off = 1u; off < 32u; off <<= 1) {
+            const uint up = simd_shuffle_down(inc, (ushort)off);
+            if ((uint)tiisg + off < 32u) inc += up;
+        }
+        const uint nxt = simd_shuffle_down(inc, (ushort)1);
+        const uint suf_excl = ((uint)tiisg + 1u < 32u) ? nxt : 0u;
+        if (tiisg == 0u) sscan[sgitg] = inc;   // this simdgroup's total
+        if (tid == 0u) { sscan[nth] = 0xffffffffu; sscan[nth + 1u] = 0u; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0u) {                     // exclusive suffix over totals
+            uint t = ((uint)tiisg < nsg) ? sscan[tiisg] : 0u;
+            uint inc2 = t;
+            for (uint off = 1u; off < 32u; off <<= 1) {
+                const uint up = simd_shuffle_down(inc2, (ushort)off);
+                if ((uint)tiisg + off < 32u) inc2 += up;
+            }
+            const uint nxt2 = simd_shuffle_down(inc2, (ushort)1);
+            if ((uint)tiisg < nsg)
+                sscan[tiisg] = ((uint)tiisg + 1u < 32u) ? nxt2 : 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint above_block = sscan[sgitg] + suf_excl;
+        if (above_block < args.top_k && b0 < nbins) {
+            uint acc = above_block;
+            const uint hi = min(b0 + per, nbins);
+            for (uint b = hi; b-- > b0; ) {
+                const uint c = (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
+                if (acc < args.top_k && acc + c >= args.top_k) {
+                    sscan[nth]      = b;
+                    sscan[nth + 1u] = acc;
+                    break;
+                }
+                acc += c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else
     for (uint crep = 0u; crep < ((dbg == 1u) ? 2u : 1u); crep++) {
     uint mine = 0u;
     for (uint b = b0; b < b0 + per && b < nbins; b++)
