@@ -654,7 +654,8 @@ static inline void glm53_mul_mv_q8_0_f32_row_at(
         uint                             out_row,
         uint                             token,
         ushort                           lane,
-        bool                             wide) {
+        bool                             wide,
+        bool                             lanes) {
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
     if (out_row >= out_dim || token >= n_rows) return;
@@ -663,6 +664,64 @@ static inline void glm53_mul_mv_q8_0_f32_row_at(
     device const block_q8_0 *ax = (device const block_q8_0 *)
         (weights + (ulong)out_row * (ulong)nb * sizeof(block_q8_0));
     device const float *y = x + (ulong)token * in_dim;
+
+    /* §21.7, lever kda_prologue_lanes.  TIER 2 - this is the only change in
+     * the prologue that is not bit-identical, and it is deliberate.
+     *
+     * The shipped partition is ix = lane / 4 over ib0 = ix in 0..NQ-1 with
+     * NQ = 8, while nb = 4 at this shape, so lanes 16..31 never enter the loop
+     * and feed an untouched +0.0 into the reduction: the row is computed by
+     * sixteen lanes out of thirty-two, and glueprobe-62k's 405 GB/s on a
+     * cached pass is what that costs.  Reclaiming them cannot be done at
+     * Tier 1 - any partition that puts work in those lanes changes which
+     * products land in which lane's partial sum, and the reduction's inputs
+     * change with it.
+     *
+     * Here every lane takes FOUR consecutive elements: lane L owns elements
+     * 4L..4L+3, so blk = 4L/32 and the offset inside the block is 4L mod 32.
+     * Thirty-two lanes times four elements is 128, which is in_dim, so the
+     * coverage is exact and each of the 128 products is formed from the same
+     * two operands, with the same int8-to-float conversion, as today.  What
+     * changes is the addition tree: today one lane sums eight products of one
+     * block and multiplies by that block's d once; here two lanes each sum
+     * four and each multiplies by the same d, so (a + b) * d becomes
+     * a * d + b * d, and the cross-lane sum is over thirty-two real partials
+     * instead of sixteen partials and sixteen zeros.
+     *
+     * The reduction is written out as an explicit five-round butterfly rather
+     * than left to simd_sum, whose internal association this tree records as
+     * unspecified (see the hc_pre kernels, which write theirs out for the same
+     * reason).  The tree is therefore documented and reproducible: pairs at
+     * distance 16, then 8, 4, 2, 1.
+     *
+     * Expected perturbation: a sum of 128 terms either way, so the relative
+     * error bound is unchanged at order 128 * eps, about 1e-5 worst case and a
+     * few ULP typically.  The row feeds raw_gate and output_gate, which reach
+     * the state only through exp and sigmoid - smooth and saturating - so the
+     * perturbation neither grows nor cancels.  The text WILL diverge at long
+     * context; this arm is measured at 8k. */
+    if (lanes && in_dim == (uint)(NW * 4)) {
+        const uint e0 = (uint)lane * 4u;
+        const uint blk = e0 >> 5;
+        const uint off = e0 & 31u;
+        const float4 yv = *((device const float4 *)(y + e0));
+        device const packed_char4 *q4 =
+            (device const packed_char4 *)(ax[blk].qs + off);
+        const packed_char4 a0 = q4[0];
+        float sumq = 0.f;
+        sumq += a0[0] * yv.x;
+        sumq += a0[1] * yv.y;
+        sumq += a0[2] * yv.z;
+        sumq += a0[3] * yv.w;
+        float part = sumq * ax[blk].d;
+        part += simd_shuffle_xor(part, (ushort)16);
+        part += simd_shuffle_xor(part, (ushort)8);
+        part += simd_shuffle_xor(part, (ushort)4);
+        part += simd_shuffle_xor(part, (ushort)2);
+        part += simd_shuffle_xor(part, (ushort)1);
+        if (lane == 0u) out[(ulong)token * out_dim + out_row] = part;
+        return;
+    }
 
     const short ix = (short)lane / (NW / NQ);
     const short il = (short)lane % (NW / NQ);
@@ -752,6 +811,10 @@ struct glm53_kda_glue_args {
      * bytes in the same lane feeding the same products in the same order, and
      * the redundant reduction dropped. */
     uint lr_wide;
+    /* §21.7 lever kda_prologue_lanes, TIER 2: 0 = today's half-idle
+     * simdgroup; 1 = all 32 lanes, four elements each, with a hand-written
+     * butterfly.  The same 128 products in a different addition tree. */
+    uint lr_lanes;
 };
 
 kernel void kernel_glm53_kda_decode_glue(
@@ -831,7 +894,8 @@ kernel void kernel_glm53_kda_decode_glue(
                 glm53_mul_mv_q8_0_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows, w, x, o,
                                              head * D + local, row, lane,
-                                             args.lr_wide != 0u);
+                                             args.lr_wide != 0u,
+                                             args.lr_lanes != 0u);
             } else {
                 glm53_mul_mv_bf16_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows,

@@ -817,6 +817,25 @@ typedef struct {
      * Tier 1: no arithmetic and no order changes, and the dropped reduction
      * returns its own input because its other 31 slots are +0.0. */
     int kda_prologue_wide;
+
+    /* topk_fused_min_comp (§23): the minimum candidate-row width at which the
+     * top-k fast path is admitted at all.  Default 12,288, the value the
+     * pre-fusion crossover table fixed for the THREE-DISPATCH chain.  The
+     * fused kernel has since replaced that chain above the threshold and been
+     * made cheaper twice, so the crossover is re-measurable rather than
+     * inherited; 2,048 is the 8k arm.  0 restores the ungated behaviour.
+     * Tier 1 in both directions: whichever path is admitted produces the same
+     * selection, which is what the fused kernel's reject arm guarantees. */
+    int topk_fused_min_comp;
+
+    /* kda_prologue_lanes (§21.7), TIER 2: 0 = today, where lanes 16..31 of
+     * every prologue simdgroup are idle because ib0 = lane/4 ranges to 7 while
+     * nb is 4; 1 = all 32 lanes take four elements each, with a hand-written
+     * five-round butterfly in place of simd_sum so the association is explicit.
+     * The same 128 products from the same operands in a different addition
+     * tree, so the output moves by a few ULP and the text diverges at long
+     * context.  Exact mode clamps it off. */
+    int kda_prologue_lanes;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

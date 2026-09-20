@@ -56124,6 +56124,8 @@ glm_levers g_glm_levers = {
     .kda_glue_probe        = 0,  /* diagnostic only; never ships non-zero */
     .hc_pre_probe          = 0,  /* diagnostic only; never ships non-zero */
     .kda_prologue_wide     = 0,  /* 0 = today's scalar prologue loads */
+    .topk_fused_min_comp   = 12288, /* the pre-fusion crossover; §23 re-opens it */
+    .kda_prologue_lanes    = 0,  /* Tier 2; off until measured at 8k */
 };
 static int g_glm_levers_ready;
 
@@ -56138,6 +56140,8 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "kda_glue_probe")) { *lo = 0; *hi = 4; return 1; }
     /* hc_pre_probe: 0 = production, 1 = kernel A, 2 = kernel B. */
     if (!strcmp(name, "hc_pre_probe")) { *lo = 0; *hi = 2; return 1; }
+    /* topk_fused_min_comp is a WIDTH, not a switch: 0 admits every width. */
+    if (!strcmp(name, "topk_fused_min_comp")) { *lo = 0; *hi = 1 << 20; return 1; }
     return 0;
 }
 
@@ -56153,6 +56157,8 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "kda_glue_probe",        offsetof(glm_levers, kda_glue_probe),        "DS4_GLM_KDA_GLUE_PROBE" },
     { "hc_pre_probe",          offsetof(glm_levers, hc_pre_probe),          "DS4_GLM_HC_PRE_PROBE" },
     { "kda_prologue_wide",     offsetof(glm_levers, kda_prologue_wide),     "DS4_GLM_KDA_PROLOGUE_WIDE" },
+    { "topk_fused_min_comp",   offsetof(glm_levers, topk_fused_min_comp),   "DS4_GLM_TOPK_FAST_MIN_COMP" },
+    { "kda_prologue_lanes",    offsetof(glm_levers, kda_prologue_lanes),    "DS4_GLM_KDA_PROLOGUE_LANES" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56216,6 +56222,18 @@ void glm_levers_init_from_env(void) {
     }
     {   const char *v = getenv("DS4_GLM_KDA_PROLOGUE_WIDE");
         if (v && v[0]) g_glm_levers.kda_prologue_wide = atoi(v) == 1 ? 1 : 0;
+    }
+    {   const char *v = getenv("DS4_GLM_KDA_PROLOGUE_LANES");
+        if (v && v[0]) g_glm_levers.kda_prologue_lanes = atoi(v) == 1 ? 1 : 0;
+    }
+    /* Historical semantics of the getenv this lever replaced in
+     * ds4_gpu_glm_topk_fast_min_comp: any value in [0, 2^30) wins, and 0
+     * restores the ungated behaviour. */
+    {   const char *v = getenv("DS4_GLM_TOPK_FAST_MIN_COMP");
+        if (v && v[0]) {
+            const long n = strtol(v, NULL, 10);
+            if (n >= 0 && n < (1L << 20)) g_glm_levers.topk_fused_min_comp = (int)n;
+        }
     }
     g_glm_levers_ready = 1;
 }
