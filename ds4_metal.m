@@ -610,7 +610,6 @@ static id<MTLComputePipelineState> g_topk_fast_hist_pipeline;
 static id<MTLComputePipelineState> g_topk_fast_gather_pipeline;
 static id<MTLComputePipelineState> g_topk_fast_finish_pipeline;
 static id<MTLComputePipelineState> g_topk_fast_fused_pipeline;  /* lever topk_fused */
-static id<MTLComputePipelineState> g_topk_fast_fused_split_pipeline;  /* topk_fused >= 2 */
 static NSUInteger g_indexer_topk_pair_bytes;
 static id<MTLComputePipelineState> g_sum_rows_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_pipeline;
@@ -20751,7 +20750,6 @@ typedef struct {
 #define DS4_TOPK_FAST_BITS_DEFAULT 13u
 #define DS4_TOPK_FAST_CAND_CAP     1024u
 #define DS4_TOPK_FAST_MAX_FB       8u
-#define DS4_TOPK_FAST_MAX_PROD     4u   /* lever topk_fused = 2..4 */
 
 /* The one configuration this path is certified for (Tier 1, revision 2).  The
  * host gate below requires ALL FOUR to match exactly; nothing else is claimed. */
@@ -20770,7 +20768,7 @@ typedef struct {
     uint32_t output_width;
     uint32_t pos0;
     uint32_t fb_count;
-    uint32_t n_producers;
+    uint32_t pad0;
     uint32_t fb_grid[16];
 } ds4_gpu_kargs_topk_fast;
 
@@ -20882,14 +20880,10 @@ static int ds4_gpu_glm_topk_fast_pipelines(void) {
  * resident server with --debug-levers can move it between requests. */
 static int ds4_gpu_glm_topk_fused_lever(void) {
     glm_levers_init_from_env();
-    int on = glm53_exact_mode() ? 0 : g_glm_levers.topk_fused;
-    if (on < 0) on = 0;
-    if (on > (int)DS4_TOPK_FAST_MAX_PROD) on = (int)DS4_TOPK_FAST_MAX_PROD;
+    const int on = g_glm_levers.topk_fused != 0 && !glm53_exact_mode();
     static int last = -1;
     if (on != last) {
-        fprintf(stderr, "[T2] topk_fused=%d (%s)\n", on,
-                on == 0 ? "three-dispatch chain" :
-                on == 1 ? "one fused threadgroup" : "split histogram scan");
+        fprintf(stderr, "[T2] topk_fused=%d\n", on);
         last = on;
     }
     return on;
@@ -20909,24 +20903,15 @@ static NSUInteger ds4_gpu_topk_fast_fused_tgmem(uint32_t bits, NSUInteger nth) {
 /* The fused shape has two requirements the chain does not: the packed 16-bit
  * bin counters must not be able to overflow (the largest count is n_comp), and
  * the whole working set must fit one threadgroup allocation. */
-static int ds4_gpu_glm_topk_fast_fused_ok(uint32_t n_comp, uint32_t bits,
-                                          NSUInteger nth, int producers) {
+static int ds4_gpu_glm_topk_fast_fused_ok(uint32_t n_comp, uint32_t bits, NSUInteger nth) {
     if (n_comp >= 65536u) return 0;
-    if (ds4_gpu_topk_fast_fused_tgmem(bits, nth) > g_device.maxThreadgroupMemoryLength)
-        return 0;
-    if (producers >= 2) {
-        /* every producer must own a non-empty slice */
-        if ((uint32_t)producers > n_comp) return 0;
-        if (!g_topk_fast_fused_split_pipeline)
-            g_topk_fast_fused_split_pipeline =
-                ds4_gpu_get_pipeline("kernel_glm53_topk_fast_fused_split");
-        if (!g_topk_fast_fused_split_pipeline) return 0;
-        return g_topk_fast_fused_split_pipeline.maxTotalThreadsPerThreadgroup >= nth;
-    }
     if (!g_topk_fast_fused_pipeline)
         g_topk_fast_fused_pipeline = ds4_gpu_get_pipeline("kernel_glm53_topk_fast_fused");
     if (!g_topk_fast_fused_pipeline) return 0;
-    return g_topk_fast_fused_pipeline.maxTotalThreadsPerThreadgroup >= nth;
+    if (g_topk_fast_fused_pipeline.maxTotalThreadsPerThreadgroup < nth) return 0;
+    if (ds4_gpu_topk_fast_fused_tgmem(bits, nth) > g_device.maxThreadgroupMemoryLength)
+        return 0;
+    return 1;
 }
 
 /* Scratch layout, 256-byte aligned: ctrl | hist | cand | indirect args. */
@@ -20937,22 +20922,6 @@ static NSUInteger ds4_gpu_topk_fast_off_cand(uint32_t bits) {
 }
 static NSUInteger ds4_gpu_topk_fast_off_indirect(uint32_t bits) {
     return ds4_gpu_topk_fast_off_cand(bits) + DS4_TOPK_FAST_CAND_CAP * 8u;
-}
-/* topk_fused >= 2: one published packed histogram per scan threadgroup
- * (nbins/2 words) plus four words of flags and padding, then the ticket.  The
- * region is always allocated, so the lever can move live in either direction
- * without a reallocation, and the whole scratch starts zeroed so the ticket
- * begins at 0 and every elected threadgroup rearms it. */
-static NSUInteger ds4_gpu_topk_fast_part_stride(uint32_t bits) {
-    return (((NSUInteger)1u << bits) / 2u + 4u) * sizeof(uint32_t);
-}
-static NSUInteger ds4_gpu_topk_fast_off_part(uint32_t bits) {
-    return ds4_gpu_topk_fast_off_indirect(bits) +
-           DS4_TOPK_FAST_MAX_FB * 3u * sizeof(uint32_t);
-}
-static NSUInteger ds4_gpu_topk_fast_off_ticket(uint32_t bits) {
-    return ds4_gpu_topk_fast_off_part(bits) +
-           DS4_TOPK_FAST_MAX_PROD * ds4_gpu_topk_fast_part_stride(bits);
 }
 
 /* Cumulative telemetry for the harness and the in-graph runs: calls and
@@ -21107,7 +21076,7 @@ static int ds4_gpu_indexer_topk_fused(
     if (use_fast) {
         fast_off_cand = ds4_gpu_topk_fast_off_cand(fast_bits);
         fast_off_ind  = ds4_gpu_topk_fast_off_indirect(fast_bits);
-        const NSUInteger need = ds4_gpu_topk_fast_off_ticket(fast_bits) + 64u;
+        const NSUInteger need = fast_off_ind + DS4_TOPK_FAST_MAX_FB * 3u * sizeof(uint32_t);
         if (!g_topk_fast_scratch || g_topk_fast_scratch_bytes < need) {
             g_topk_fast_scratch =
                 [g_device newBufferWithLength:need options:MTLResourceStorageModeShared];
@@ -21130,7 +21099,6 @@ static int ds4_gpu_indexer_topk_fused(
         fast_args.index_topk = index_topk;
         fast_args.output_width = output_width;
         fast_args.pos0 = pos0;
-        fast_args.n_producers = 1u;
         /* Collect the production chain's grids, in encode order, so the
          * finisher can zero or reinstate them. */
         uint32_t fb = 0;
@@ -21155,31 +21123,17 @@ static int ds4_gpu_indexer_topk_fused(
         }
         fast_args.fb_count = fb;
     }
-    int fast_producers = 0;
-    if (use_fast) {
-        fast_producers = ds4_gpu_glm_topk_fused_lever();
-        if (fast_producers &&
-            !ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth,
-                                            fast_producers)) {
-            /* the split shape refused: fall back to one producer, and if that
-             * refuses too, to the three-dispatch chain */
-            fast_producers =
-                (fast_producers >= 2 &&
-                 ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth, 1))
-                    ? 1 : 0;
-        }
-        if (fast_producers) fast_args.n_producers = (uint32_t)fast_producers;
-    }
-    const int fast_fused = fast_producers != 0;
+    int fast_fused = 0;
+    if (use_fast)
+        fast_fused = ds4_gpu_glm_topk_fused_lever() &&
+                     ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
     if (fast_fused) {
-        /* Lever topk_fused >= 1: the whole chain as one dispatch, of one
-         * threadgroup at 1 or of n_producers scanning threadgroups above it.  The fallback dispatches below are encoded exactly as
+        /* Lever topk_fused=1: the whole chain as one dispatch of one
+         * threadgroup.  The fallback dispatches below are encoded exactly as
          * they are for the chain, off the same indirect grids, which the
          * fused kernel writes from the same acceptance predicate. */
         id<MTLComputeCommandEncoder> fenc = ds4_gpu_compute_encoder(cb);
-        [fenc setComputePipelineState:fast_producers >= 2 ?
-                                      g_topk_fast_fused_split_pipeline :
-                                      g_topk_fast_fused_pipeline];
+        [fenc setComputePipelineState:g_topk_fast_fused_pipeline];
         [fenc setBytes:&fast_args length:sizeof(fast_args) atIndex:0];
         [fenc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
         [fenc setBuffer:g_topk_fast_scratch offset:DS4_TOPK_FAST_OFF_CTRL atIndex:2];
@@ -21187,15 +21141,9 @@ static int ds4_gpu_indexer_topk_fused(
         [fenc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
         [fenc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_selected) atIndex:5];
         [fenc setBuffer:g_topk_fast_scratch offset:fast_off_ind atIndex:6];
-        if (fast_producers >= 2) {
-            [fenc setBuffer:g_topk_fast_scratch
-                     offset:ds4_gpu_topk_fast_off_part(fast_bits) atIndex:7];
-            [fenc setBuffer:g_topk_fast_scratch
-                     offset:ds4_gpu_topk_fast_off_ticket(fast_bits) atIndex:8];
-        }
         [fenc setThreadgroupMemoryLength:ds4_gpu_topk_fast_fused_tgmem(fast_bits, fast_nth)
                                  atIndex:0];
-        [fenc dispatchThreadgroups:MTLSizeMake((NSUInteger)fast_producers, 1, 1)
+        [fenc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(fast_nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, fenc);
     } else if (use_fast) {

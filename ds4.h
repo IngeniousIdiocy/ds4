@@ -776,10 +776,7 @@ typedef struct {
      * is byte-identical.  Default ON since fused-62k (+0.127 t/s at 62k over
      * three interleaved reps, identical text); DS4_GLM_DISABLE_TOPK_FUSED is
      * the kill switch, exact mode clamps it off, and /debug/levers moves it
-     * live.  A COUNTED lever: the value is the number of histogram-scan
-     * threadgroups, so 2..4 split the 62 KB scan over that many producers and
-     * merge their published packed histograms through the router fold's ticket
-     * (§14).  Same integers, same selection, same ctrl codes. */
+     * live. */
     int topk_fused;
 } glm_levers;
 

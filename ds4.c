@@ -56128,10 +56128,6 @@ static int g_glm_levers_ready;
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
-    /* topk_fused carries the number of histogram-scan threadgroups: 0 = the
-     * three-dispatch chain, 1 = one fused threadgroup, 2..4 = the split scan
-     * with that many producers and the ticket. */
-    if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 4; return 1; }
     return 0;
 }
 
