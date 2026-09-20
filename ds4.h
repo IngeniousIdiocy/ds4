@@ -781,14 +781,6 @@ typedef struct {
      * Any value other than 0 runs the fused kernel. */
     int topk_fused;
 
-    /* attn_probe (§19): a NEVER-SHIP Tier-1 doubling probe inside the DSA
-     * attention partial, one value per phase, used to locate that kernel's
-     * 82.8 us.  0 = production.  1 doubles the staged tile load, 2 the dot
-     * products and their simd_sum, 3 the online-softmax update, 4 the output
-     * writes.  Every value writes the same values to the same addresses, so
-     * the token text is identical and the A/B delta over the eleven DSA
-     * layers is that phase's cost. */
-    int attn_probe;
 
     /* attn_kv_regs (§19.6), DEFAULT ON: 0 = the kill switch, each lane reads its row's four staged
      * half4 from threadgroup memory in the dots and reads the same four
@@ -800,13 +792,6 @@ typedef struct {
      * is what leaves the doubled shared-memory traffic as the suspect. */
     int attn_kv_regs;
 
-    /* reduce_probe (§20): a NEVER-SHIP Tier-1 doubling probe inside the DSA
-     * reduce, one value per phase.  0 = production.  1 doubles the softmax
-     * rescale prologue (both partial_ms passes and their shuffle trees), 2 the
-     * lora blend over partial_lora, 3 the value projection, 4 the output
-     * stores.  Every value rewrites the same values to the same addresses, so
-     * the token text is identical. */
-    int reduce_probe;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

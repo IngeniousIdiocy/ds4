@@ -7713,9 +7713,7 @@ typedef struct {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
-    uint32_t dbg_double;          /* §19 attn_probe; 0 in production */
     uint32_t kv_regs;             /* §19.6 attn_kv_regs; 0 in production */
-    uint32_t dbg_reduce;          /* §20 reduce_probe; 0 in production */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -20893,51 +20891,6 @@ static int ds4_gpu_glm_topk_fused_lever(void) {
         last = v;
     }
     return v;
-}
-
-/* §19 attn_probe: 0 in production, 1..4 select a Tier-1 doubling probe inside
- * the DSA attention partial (1 the staged tile load, 2 the dot products and
- * their simd_sum, 3 the online-softmax update, 4 the output writes).  Every
- * probe writes the same values to the same addresses, so the token text is
- * identical; the A/B delta over the eleven DSA layers is that phase's cost.
- * This NEVER ships non-zero, and exact mode clamps it off like every other
- * lever. */
-static uint32_t ds4_gpu_glm_attn_probe(void) {
-    glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_probe;
-    if (v < 0 || v > 4) v = 0;
-    static int last = -1;
-    if (v != last) {
-        static const char *const what[5] = {
-            "production", "double staged load", "double dots + simd_sum",
-            "double softmax update", "double output writes"
-        };
-        fprintf(stderr, "[T2] attn_probe=%d (%s)\n", v, what[v]);
-        last = v;
-    }
-    return (uint32_t)v;
-}
-
-/* §20 reduce_probe: 0 in production, 1..4 select a Tier-1 doubling probe
- * inside the DSA reduce (1 the softmax rescale prologue over partial_ms and
- * its two shuffle trees, 2 the lora blend over partial_lora, 3 the value
- * projection, 4 the output stores).  Every probe rewrites the same values to
- * the same addresses, so the token text is identical.  NEVER ships non-zero;
- * exact mode clamps it off. */
-static uint32_t ds4_gpu_glm_reduce_probe(void) {
-    glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 0 : g_glm_levers.reduce_probe;
-    if (v < 0 || v > 4) v = 0;
-    static int last = -1;
-    if (v != last) {
-        static const char *const what[5] = {
-            "production", "double ms prologue", "double lora blend",
-            "double value projection", "double output stores"
-        };
-        fprintf(stderr, "[T2] reduce_probe=%d (%s)\n", v, what[v]);
-        last = v;
-    }
-    return (uint32_t)v;
 }
 
 /* §19.6 attn_kv_regs, DEFAULT ON since kvregs-62k (+0.110 t/s over three
@@ -41321,38 +41274,28 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        /* The three diagnostic/lever values are read HERE, as ordinary
-         * statements, rather than inside the designated initializer below.
-         * redprobe-62k ran five arms of reduce_probe and the server logged one
-         * "reduce_probe=0" and nothing else, so every arm measured production
-         * and the run said nothing.  The wiring was correct by inspection and
-         * the format strings are in the binary, so the value never reached
-         * g_glm_levers on that process -- but a read buried in an initializer
-         * is not something you can confirm from a log, and that is the part
-         * worth fixing.  Read them into named locals, encode those, and then
-         * announce THE ENCODED VALUE next to the reduce kernel the shape
-         * actually bound, so an arm is either confirmed by one line or known
-         * bad before any number is read from it. */
-        const uint32_t probe_attn   = ds4_gpu_glm_attn_probe();
-        const uint32_t probe_kvregs = ds4_gpu_glm_attn_kv_regs();
-        const uint32_t probe_reduce = ds4_gpu_glm_reduce_probe();
+        /* The lever value is read HERE, as an ordinary statement, and the
+         * ENCODED value is announced next to the pipelines the shape actually
+         * bound.  redprobe-62k's first run measured five arms of the
+         * production reduce because the value never reached g_glm_levers and
+         * nothing in the log said so; §20.4 records the rule that came out of
+         * it.  A read buried in a designated initializer cannot be confirmed
+         * from a log, so no probe family in this tree does that again. */
+        const uint32_t enc_kv_regs = ds4_gpu_glm_attn_kv_regs();
         {
-            static uint32_t last_enc[3] = { 0xffffffffu, 0xffffffffu, 0xffffffffu };
-            if (probe_attn != last_enc[0] || probe_kvregs != last_enc[1] ||
-                probe_reduce != last_enc[2]) {
+            static uint32_t last_enc = 0xffffffffu;
+            if (enc_kv_regs != last_enc) {
                 fprintf(stderr,
-                        "[T2] encoded attn_probe=%u attn_kv_regs=%u reduce_probe=%u"
+                        "[T2] encoded attn_kv_regs=%u"
                         " (partial=%s, reduce=%s, n_blocks=%u)\n",
-                        probe_attn, probe_kvregs, probe_reduce,
+                        enc_kv_regs,
                         use_prefix_fullheads ?
                             "group8_partial_prefix_fullheads" : "group8_partial",
                         t2s_vplane ? "t2s_reduce_vplane" :
                         use_reduce16 ? "group8_reduce16" :
                         use_reduce_u16 ? "group8_reduce_u16" : "group8_reduce",
                         (unsigned)n_blocks);
-                last_enc[0] = probe_attn;
-                last_enc[1] = probe_kvregs;
-                last_enc[2] = probe_reduce;
+                last_enc = enc_kv_regs;
             }
         }
         ds4_gpu_glm_attention_indexed_decode_split_args args = {
@@ -41377,9 +41320,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
-            .dbg_double = probe_attn,
-            .kv_regs = probe_kvregs,
-            .dbg_reduce = probe_reduce,
+            .kv_regs = enc_kv_regs,
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;

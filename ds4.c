@@ -56120,9 +56120,7 @@ glm_levers g_glm_levers = {
     .chain_decode          = 1,  /* on: +0.61 t/s at 62k, +0.72 at 8k */
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
-    .attn_probe            = 0,  /* diagnostic only; never ships non-zero */
     .attn_kv_regs          = 1,  /* on: +0.110 t/s at 62k, identical text */
-    .reduce_probe          = 0,  /* diagnostic only; never ships non-zero */
 };
 static int g_glm_levers_ready;
 
@@ -56133,10 +56131,6 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
     /* topk_fused: 0 = the three-dispatch chain, 1 = the fused kernel. */
     if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 1; return 1; }
-    /* attn_probe: 0 = production, 1..4 = the §19 doubling probes. */
-    if (!strcmp(name, "attn_probe")) { *lo = 0; *hi = 4; return 1; }
-    /* reduce_probe: 0 = production, 1..4 = the §20 doubling probes. */
-    if (!strcmp(name, "reduce_probe")) { *lo = 0; *hi = 4; return 1; }
     return 0;
 }
 
@@ -56148,9 +56142,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_decode",          offsetof(glm_levers, chain_decode),          "DS4_GLM_DISABLE_CHAIN" },
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
-    { "attn_probe",            offsetof(glm_levers, attn_probe),            "DS4_GLM_ATTN_PROBE" },
     { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_DISABLE_ATTN_KV_REGS" },
-    { "reduce_probe",          offsetof(glm_levers, reduce_probe),          "DS4_GLM_REDUCE_PROBE" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56193,25 +56185,11 @@ void glm_levers_init_from_env(void) {
      * and whenever the fused shape does not fit (see
      * ds4_gpu_glm_topk_fast_fused_ok in ds4_metal.m). */
     g_glm_levers.topk_fused = getenv("DS4_GLM_DISABLE_TOPK_FUSED") == NULL;
-    /* Diagnostic, so it reads its value straight: unset or out of range is
-     * production. */
-    {   const char *v = getenv("DS4_GLM_ATTN_PROBE");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            g_glm_levers.attn_probe = (n >= 0 && n <= 4) ? n : 0;
-        }
-    }
     /* Default ON since kvregs-62k (+0.110 t/s over three interleaved reps,
      * every pair positive, identical text).  Same DISABLE_ inversion as the
      * levers above: the variable is the only way to take it off at startup,
      * and exact mode clamps it off at the read site. */
     g_glm_levers.attn_kv_regs = getenv("DS4_GLM_DISABLE_ATTN_KV_REGS") == NULL;
-    {   const char *v = getenv("DS4_GLM_REDUCE_PROBE");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            g_glm_levers.reduce_probe = (n >= 0 && n <= 4) ? n : 0;
-        }
-    }
     g_glm_levers_ready = 1;
 }
 
