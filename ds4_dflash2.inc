@@ -1727,6 +1727,27 @@ static int dflash2_layer_forward_gpu(
             DS4_TENSOR_Q4_K, H, ff, ffn_input, L)) {
         fused_ffn = 1;
     }
+    /* Wave D (D4a): the target's own fused Q8_0
+     * gate/up + SwiGLU kernel (kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_4)
+     * in place of two mul_mv_ext dispatches plus kernel_swiglu_flat_f32.
+     * Same arithmetic: the pair kernel's per-row accumulation, simd
+     * reduction and nsg/nxpsg/r1ptg selection are the mul_mv_ext ones, and
+     * with clamp 0 its epilogue is silu(g)*u, which is today's
+     * ds4_gpu_swiglu_tensor(..., clamp 0, alpha 1) with the exact-x1.0f
+     * multiply. */
+    if (ok && !fused_ffn &&
+        l->ffn_gate->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_gate->ndim >= 2u && l->ffn_up->ndim >= 2u &&
+        l->ffn_gate->dim[0] == H && l->ffn_up->dim[0] == H &&
+        l->ffn_gate->elements == (uint64_t)H * ff &&
+        l->ffn_up->elements == (uint64_t)H * ff &&
+        ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+            tgate, tup, tmid, m->map, m->size,
+            l->ffn_gate->abs_offset, l->ffn_up->abs_offset,
+            H, ff, ffn_input, L, 0.0f)) {
+        fused_ffn = 1;
+    }
     if (!fused_ffn) {
         DFLASH2_STEP("ffn_gate", dflash2_gpu_gemm(
             tgate, m, l->ffn_gate, ffn_input, L));
