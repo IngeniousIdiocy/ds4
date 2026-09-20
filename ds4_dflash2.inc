@@ -2049,9 +2049,6 @@ static int dflash2_propose_confident(
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const uint32_t layer_mv_max = ds4_gpu_glm53_bf16_mv_max_get();
     ds4_gpu_glm53_bf16_mv_max_set(1);
-    /* Wave D (D7): the drafter's 8-row Q8_0 projections on r1_8 while the
-     * draft runs; the target's own shapes are untouched. */
-    ds4_gpu_mv_ext_r1_8_scope_set(1);
     if (cache && !dflash_cache_make_room(cache, dw, target_rows)) {
         ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
         free(h); free(fc_out); free(h_ctx);
@@ -2060,6 +2057,11 @@ static int dflash2_propose_confident(
             sizeof(cache->layer[0]), cache->n_layer);
     }
     h_live = 0;
+    /* Wave D (D7): the drafter's 8-row Q8_0 projections take r1_8 while the
+     * five layers run; the target's own shapes keep r1_4.  Set here, after
+     * the last early return above, and cleared on every exit from the loop
+     * below, so no later target projection can inherit it. */
+    ds4_gpu_mv_ext_r1_8_scope_set(1);
     if (g_dflash_pool.inited && ds4_gpu_begin_commands()) {
         int ok = 1;
         uint32_t fail_il = 0;
@@ -2094,10 +2096,10 @@ static int dflash2_propose_confident(
         static int nbeg;
         if (nbeg++ < 2) fprintf(stderr, "ds4: dflash batched begin fail inited=%d\n", g_dflash_pool.inited);
     }
+    ds4_gpu_mv_ext_r1_8_scope_set(0);
 #endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
-    ds4_gpu_mv_ext_r1_8_scope_set(0);
 #endif
     if (!gpu_all) {
         if (cache) {
