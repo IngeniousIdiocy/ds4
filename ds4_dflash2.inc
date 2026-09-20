@@ -1786,7 +1786,7 @@ static int dflash2_layer_forward_gpu(
             tmid, tgate, tup, L * ff, 0.0f, 1.0f));
     }
     DFLASH2_STEP("ffn_down", dflash2_gpu_gemm(
-        tffn, m, l->ffn_down, tmid, L, DFLASH2_NT_NONE));
+        tffn, m, l->ffn_down, tmid, L, DFLASH2_NT_DOWN));
     if (!cfg->classic) {
         DFLASH2_STEP("ffn_conv1", ds4_gpu_dflash2_grouped_conv(tfin, tffn, tdyn, m->map, m->size, l->ffn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 1));
     }
