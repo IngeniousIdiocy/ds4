@@ -778,13 +778,17 @@ typedef struct {
      * the kill switch, exact mode clamps it off, and /debug/levers moves it
      * live.
      *
-     * Value 17 (§18.4) replaces the 55-stage bitonic sort with a RANK SORT:
-     * the composites are unique, so each element's final position is exactly
-     * the number of composites ordering before it, which two barriers and one
-     * broadcast pass compute directly.  Tier 1 by the same argument - a unique
-     * total order has a unique rank per element, so the sequence is the one
-     * any correct sort produces.  Any other value runs production. */
+     * Any value other than 0 runs the fused kernel. */
     int topk_fused;
+
+    /* attn_probe (§19): a NEVER-SHIP Tier-1 doubling probe inside the DSA
+     * attention partial, one value per phase, used to locate that kernel's
+     * 82.8 us.  0 = production.  1 doubles the staged tile load, 2 the dot
+     * products and their simd_sum, 3 the online-softmax update, 4 the output
+     * writes.  Every value writes the same values to the same addresses, so
+     * the token text is identical and the A/B delta over the eleven DSA
+     * layers is that phase's cost. */
+    int attn_probe;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

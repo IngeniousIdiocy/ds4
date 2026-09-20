@@ -364,6 +364,10 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
+    /* §19 diagnostic, lever attn_probe; 0 in production.  Appended, so every
+     * field above keeps its offset and the kernels that ignore it - including
+     * the two T2 screen copies - are unaffected. */
+    uint32_t dbg_double;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -3950,8 +3954,22 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     float4 o2 = 0.0f;
     float4 o3 = 0.0f;
 
+    /* §19 doubling probes, lever attn_probe, diagnostic only.  Each repeat
+     * count is a RUNTIME uniform, never a compile-time constant, so the
+     * compiler cannot unroll the loop and common-subexpression the second pass
+     * away: it would have to prove the body idempotent, which it cannot for a
+     * body containing device loads, threadgroup stores or simd_sum.  Every
+     * probe is Tier 1 - the doubled phase writes the same values to the same
+     * addresses - so the token text is identical and the A/B delta over the
+     * eleven DSA layers is that phase's cost. */
+    const uint rep_load = (args.dbg_double == 1u) ? 2u : 1u;
+    const uint rep_dot  = (args.dbg_double == 2u) ? 2u : 1u;
+    const uint rep_upd  = (args.dbg_double == 3u) ? 2u : 1u;
+    const uint rep_out  = (args.dbg_double == 4u) ? 2u : 1u;
+
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
+        for (uint rep = 0u; rep < rep_load; rep++) {
         for (uint off = tid; off < rows * kv_vecs; off += 256u) {
             const uint rr = off / kv_vecs;
             const uint vv = off - rr * kv_vecs;
@@ -4003,6 +4021,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
                 rope_shared[off] = float4(0.0f);
             }
         }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint rr = 0u; rr < rows; rr++) {
@@ -4011,28 +4030,52 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
             threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
             threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
             float partial = 0.0f;
-            if (valid_head && valid_row) {
-                partial += dot(low0, (float4)kv_row[lane + 0u]);
-                partial += dot(low1, (float4)kv_row[lane + 32u]);
-                partial += dot(low2, (float4)kv_row[lane + 64u]);
-                partial += dot(low3, (float4)kv_row[lane + 96u]);
-                if (lane < rope_vecs) {
-                    partial += dot(qrope, rope_row[lane]);
+            float sum = 0.0f;
+            /* rep_dot is threadgroup-uniform and so are `rows` and `rr`, so
+             * every lane of the simdgroup executes the same number of
+             * simd_sums; no lane reaches a cross-lane reduction the others
+             * skip. */
+            for (uint rep = 0u; rep < rep_dot; rep++) {
+                partial = 0.0f;
+                if (valid_head && valid_row) {
+                    partial += dot(low0, (float4)kv_row[lane + 0u]);
+                    partial += dot(low1, (float4)kv_row[lane + 32u]);
+                    partial += dot(low2, (float4)kv_row[lane + 64u]);
+                    partial += dot(low3, (float4)kv_row[lane + 96u]);
+                    if (lane < rope_vecs) {
+                        partial += dot(qrope, rope_row[lane]);
+                    }
                 }
+                sum = simd_sum(partial);
             }
-            const float sum = simd_sum(partial);
             const float score =
                 (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
             if (valid_head && valid_row) {
-                const float new_m = max(M, score);
-                const float old_scale = exp(M - new_m);
-                const float row_scale = exp(score - new_m);
-                o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
-                o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
-                o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
-                o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
-                S = S * old_scale + row_scale;
-                M = new_m;
+                /* The online softmax is a running recurrence, so it is NOT
+                 * idempotent under a naive repeat.  The probe therefore runs
+                 * its shadow pass at a score of -FLT_MAX, which makes the
+                 * update the exact identity while executing the identical
+                 * instruction sequence: M is at least -FLT_MAX/2 at every
+                 * point, so new_m = max(M, -FLT_MAX) = M, old_scale =
+                 * exp(0) = 1 exactly, and row_scale = exp(-FLT_MAX - M) =
+                 * exp(-FLT_MAX) underflows to +0 exactly for every M in
+                 * range.  o = o * 1 + kv * (+0) leaves o bit for bit (o is
+                 * never a negative zero: it starts at +0 and +0 + -0 is +0),
+                 * S = S * 1 + 0 leaves S, and M = new_m leaves M.  With
+                 * rep_upd == 1 the loop runs once at rep == 1 and this is
+                 * today's code verbatim. */
+                for (uint rep = rep_upd; rep > 0u; rep--) {
+                    const float sc = (rep == 1u) ? score : -FLT_MAX;
+                    const float new_m = max(M, sc);
+                    const float old_scale = exp(M - new_m);
+                    const float row_scale = exp(sc - new_m);
+                    o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                    o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                    o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                    o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                    S = S * old_scale + row_scale;
+                    M = new_m;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4058,6 +4101,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
             (device float4 *)(partial_lora +
                 ((uint64_t)head * args.n_blocks + block) *
                     args.kv_lora_dim * sizeof(float));
+        for (uint rep = 0u; rep < rep_out; rep++) {
         out4[lane + 0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -4068,6 +4112,7 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
                     ((uint64_t)block * args.n_head + head) * 2u * sizeof(float));
             ms[0] = M;
             ms[1] = S;
+        }
         }
     }
 }

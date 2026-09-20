@@ -7713,6 +7713,7 @@ typedef struct {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
+    uint32_t dbg_double;          /* §19 attn_probe; 0 in production */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -20890,6 +20891,29 @@ static int ds4_gpu_glm_topk_fused_lever(void) {
         last = v;
     }
     return v;
+}
+
+/* §19 attn_probe: 0 in production, 1..4 select a Tier-1 doubling probe inside
+ * the DSA attention partial (1 the staged tile load, 2 the dot products and
+ * their simd_sum, 3 the online-softmax update, 4 the output writes).  Every
+ * probe writes the same values to the same addresses, so the token text is
+ * identical; the A/B delta over the eleven DSA layers is that phase's cost.
+ * This NEVER ships non-zero, and exact mode clamps it off like every other
+ * lever. */
+static uint32_t ds4_gpu_glm_attn_probe(void) {
+    glm_levers_init_from_env();
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_probe;
+    if (v < 0 || v > 4) v = 0;
+    static int last = -1;
+    if (v != last) {
+        static const char *const what[5] = {
+            "production", "double staged load", "double dots + simd_sum",
+            "double softmax update", "double output writes"
+        };
+        fprintf(stderr, "[T2] attn_probe=%d (%s)\n", v, what[v]);
+        last = v;
+    }
+    return (uint32_t)v;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
@@ -41261,6 +41285,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
+            .dbg_double = ds4_gpu_glm_attn_probe(),
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;
