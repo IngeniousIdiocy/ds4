@@ -778,23 +778,12 @@ typedef struct {
      * the kill switch, exact mode clamps it off, and /debug/levers moves it
      * live.
      *
-     * DIAGNOSTIC VALUES 10-13 (§17) are TIER 1 DOUBLING PROBES: each runs one
-     * phase of the fused kernel TWICE, writing the same values to the same
-     * addresses, so the output stays byte-identical and each probe can be
-     * measured in-graph rather than under a serialised ledger.  The delta
-     * against value 1 is that phase's cost.  10 = cut scan, 11 = acceptance
-     * plus pool expansion plus output/grid/ctrl writes (the ctrl telemetry
-     * counters are guarded so they do not double-count), 12 = histogram clear
-     * plus histogram scan, 13 = the bitonic sort (a sorting network is
-     * idempotent on sorted input).
-     *
-     * 14-16 (§18) are Tier-1 REPLACEMENTS, not probes: 14 runs the fifteen
-     * cross-simdgroup bitonic stages in place in one buffer with nth/2 threads
-     * owning a pair each, 15 replaces the cut scan's ten-round Hillis-Steele
-     * with a three-barrier reduce-then-scan over all 1,024 threads, and 16 is
-     * both.  The results are integer and unique, so any correct algorithm
-     * yields the same sequence and the same bin_lo.  Any other value runs
-     * production. */
+     * Value 17 (§18.4) replaces the 55-stage bitonic sort with a RANK SORT:
+     * the composites are unique, so each element's final position is exactly
+     * the number of composites ordering before it, which two barriers and one
+     * broadcast pass compute directly.  Tier 1 by the same argument - a unique
+     * total order has a unique rank per element, so the sequence is the one
+     * any correct sort produces.  Any other value runs production. */
     int topk_fused;
 } glm_levers;
 

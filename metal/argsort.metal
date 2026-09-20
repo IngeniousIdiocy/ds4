@@ -593,7 +593,7 @@ struct ds4_metal_args_glm53_topk_fast {
     uint32_t output_width;    // 2051
     uint32_t pos0;
     uint32_t fb_count;        // fallback dispatches whose grid this path gates
-    uint32_t dbg_double;      // 0 = production; 1..4 = §17 doubling probes
+    uint32_t rank_sort;       // lever topk_fused=17 (§18.4)
     uint32_t fb_grid[16];     // (x,y) per fallback dispatch, in encode order
 };
 
@@ -777,74 +777,45 @@ static inline void ds4_topk_fast_tail(
         device int32_t     * out_idx,
         device uint32_t    * raw,
         device uint32_t    * indirect,
-        uint dbg,
+        uint rank_sort,
         uint tid,
         uint nth) {
     threadgroup uint2 *buf0 = sortbuf;
     threadgroup uint2 *buf1 = sortbuf + nth;
     bool use_buf1 = false;
-    /* §17 probe 4 (lever topk_fused=13): run the sorting network TWICE.  A
-     * sorting network applied to an already-sorted sequence reproduces it
-     * exactly - every compare-exchange finds its pair already in the wanted
-     * order - so the second pass changes no value and the delta against value
-     * 1 is the network's cost.  Tier 1. */
-    /* §18 value 14 (and 16): the fifteen CROSS-SIMDGROUP stages run in place
-     * in a SINGLE buffer instead of the double-buffered round trip.  nth/2
-     * threads each own one compare-exchange pair, read both slots, write the
-     * wanted order back to both, and one barrier per stage suffices because no
-     * other thread touches either slot in that stage.  The forty j < 32 stages
-     * stay as shuffles.  Same network, same order, every call - no
-     * special-casing on count.
-     *
-     * Tier 1: the comparator is the same total order on (key, index) and each
-     * stage performs the same set of compare-exchanges, so the sequence after
-     * every stage is identical to the double-buffered form.
-     *
-     * Barrier arithmetic, stated so the result is readable either way: today
-     * is one barrier per cross stage, 15.  This form is 15 plus one publish
-     * and one read-back at each of the five k-levels that have cross stages,
-     * so 25 - but it halves the sort's threadgroup working set from two 8 KB
-     * buffers to one, and the per-stage slot traffic is unchanged (1,024 reads
-     * and 1,024 writes either way).  If it wins, the footprint was the cost;
-     * if it loses, the barrier was. */
-    const bool inplace = (dbg == 5u || dbg == 7u);
-    for (uint pass = 0u; pass < ((dbg == 4u) ? 2u : 1u); pass++)
-    if (inplace) {
-        for (uint k = 2u; k <= nth; k <<= 1) {
-            bool published = false;
-            for (uint j = k >> 1; j >= 32u; j >>= 1) {
-                if (!published) { buf0[tid] = cur; published = true; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (tid < (nth >> 1)) {
-                    const uint lo = ((tid & ~(j - 1u)) << 1) | (tid & (j - 1u));
-                    const uint hi = lo | j;
-                    uint2 a = buf0[lo];
-                    uint2 b = buf0[hi];
-                    const bool a_greater = (a.x != b.x) ? (a.x > b.x)
-                                                        : (a.y < b.y);
-                    if (a_greater != ((lo & k) == 0u)) {
-                        const uint2 t = a; a = b; b = t;
-                    }
-                    buf0[lo] = a;
-                    buf0[hi] = b;
-                }
-            }
-            if (published) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                cur = buf0[tid];
-            }
-            for (uint j = min(k >> 1, 16u); j > 0u; j >>= 1) {
-                uint2 other;
-                other.x = simd_shuffle_xor(cur.x, (ushort)j);
-                other.y = simd_shuffle_xor(cur.y, (ushort)j);
-                const uint partner = tid ^ j;
-                const bool cur_greater = (cur.x != other.x) ? (cur.x > other.x)
-                                                            : (cur.y < other.y);
-                const bool want_greater = ((tid & k) == 0u) == (tid < partner);
-                if (cur_greater != want_greater) cur = other;
-            }
+    threadgroup uint2 *s;
+    if (rank_sort != 0u) {
+        /* §18.4, lever topk_fused=17.  RANK SORT.  The composites are unique,
+         * so each element's final position is exactly the number of
+         * composites that order before it.  Every thread reads the whole array
+         * from threadgroup memory - the address is uniform across the
+         * threadgroup at each step, so the load is a broadcast - counts the
+         * ones that order before its own, and writes itself to out[rank].
+         * Two barriers, against fifteen cross-simdgroup round trips and forty
+         * shuffle stages.
+         *
+         * Tier 1: a unique total order assigns a unique rank to each element,
+         * so the sequence this produces is the sequence ANY correct sort of
+         * the same comparator produces.  Padding lanes hold
+         * uint2(0u, 0xffffffffu) - the smallest key with the largest index,
+         * which orders after every real candidate under this comparator - and
+         * they do not write, so slots at or above `have` are left untouched.
+         * Nothing reads them: the acceptance predicate reads s[i] only for
+         * i + 1 < min(count, top_k + 1) and for i < top_k, and both bounds are
+         * at most `have` whenever the row is accepted. */
+        const uint have = min(count, args.cand_cap);
+        buf0[tid] = cur;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint rank = 0u;
+        for (uint i = 0u; i < nth; i++) {
+            const uint2 o = buf0[i];
+            const bool before = (o.x != cur.x) ? (o.x > cur.x) : (o.y < cur.y);
+            rank += before ? 1u : 0u;
         }
-    } else
+        if (tid < have) buf1[rank] = cur;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        s = buf1;
+    } else {
     for (uint k = 2u; k <= nth; k <<= 1) {
         for (uint j = k >> 1; j > 0u; j >>= 1) {
             const uint partner = tid ^ j;
@@ -867,7 +838,8 @@ static inline void ds4_topk_fast_tail(
     }
     buf0[tid] = cur;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup uint2 *s = buf0;
+    s = buf0;
+    }
 
     /* Acceptance predicate over the ordered candidates.
      *
@@ -882,13 +854,6 @@ static inline void ds4_topk_fast_tail(
      * ONE uniform value and both causes survive.  The bits are the same
      * DS4_TOPK_FAST_FLAG_* values used device-side, so the OR composes with
      * `flags` directly.  No floating-point operation changes. */
-    /* §17 probe 2 (lever topk_fused=11): run the acceptance reduction, the
-     * output writes, the pool expansion, the fallback grids and the histogram
-     * clear TWICE.  Every write is the same value to the same address, so the
-     * buffers stay byte-identical; only the ctrl TELEMETRY COUNTERS would
-     * double-count, and they are guarded to the last pass.  Tier 1. */
-    const uint tail_reps = (dbg == 2u) ? 2u : 1u;
-    for (uint rep = 0u; rep < tail_reps; rep++) {
     if (tid == 0u) atomic_store_explicit(bad_bits, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint ncheck = min(count, args.top_k + 1u);   // covers the cut tie at 511/512
@@ -948,10 +913,7 @@ static inline void ds4_topk_fast_tail(
         atomic_store_explicit(&ctrl[1], 0u, memory_order_relaxed);
         atomic_store_explicit(&ctrl[2], accept ? 1u : 0u, memory_order_relaxed);
         atomic_store_explicit(&ctrl[3], count, memory_order_relaxed);
-        if (rep + 1u < tail_reps) {
-            /* probe 11 only: the four stores above are idempotent, the
-             * counters below are not */
-        } else if (accept) {
+        if (accept) {
             atomic_fetch_add_explicit(&ctrl[5], 1u, memory_order_relaxed);
             atomic_store_explicit(&ctrl[7], 0u, memory_order_relaxed);   // run ends
         } else {
@@ -964,7 +926,6 @@ static inline void ds4_topk_fast_tail(
             if (run > atomic_load_explicit(&ctrl[14], memory_order_relaxed))
                 atomic_store_explicit(&ctrl[14], run, memory_order_relaxed);
         }
-    }
     }
 }
 
@@ -1058,7 +1019,6 @@ kernel void kernel_glm53_topk_fast_fused(
     const uint nbins = 1u << args.hist_bits;
     const uint shift = 32u - args.hist_bits;
     const uint hwords = nbins >> 1;     // packed: two 16-bit counters per word
-    const uint dbg = args.dbg_double;   // §17 doubling probes; 0 in production
 
     threadgroup uint  *sc    = shm;                       // [0,16) scalars
     threadgroup uint  *hpack = shm + 16u;                 // phases 1-2
@@ -1074,12 +1034,8 @@ kernel void kernel_glm53_topk_fast_fused(
     if (tid < 16u) sc[tid] = 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* ---- phase 1: histogram (kernel_glm53_topk_fast_hist, one TG) ------
-     * §17 probe 3 (lever topk_fused=12): re-clear and re-scan, so the same
-     * counts land in the same bins a second time.  Byte-identical by
-     * construction; the delta against value 1 is the clear plus the scan. */
+    /* ---- phase 1: histogram (kernel_glm53_topk_fast_hist, one TG) ------ */
     uint nonfinite = 0u;
-    for (uint hrep = 0u; ; hrep++) {
     for (uint i = tid; i < args.n_comp; i += nth) {
         const float v = scores[i];
         const uint  b = as_type<uint>(v);
@@ -1091,11 +1047,6 @@ kernel void kernel_glm53_topk_fast_fused(
         atomic_fetch_add_explicit((threadgroup atomic_uint *)&hpack[bin >> 1],
                                   (bin & 1u) ? 0x10000u : 1u,
                                   memory_order_relaxed);
-    }
-    if (dbg != 3u || hrep == 1u) break;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint w = tid; w < hwords; w += nth) hpack[w] = 0u;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (nonfinite)
         atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_NONFINITE,
@@ -1112,92 +1063,51 @@ kernel void kernel_glm53_topk_fast_fused(
      * identical arithmetic on the identical integer counts, read back out of
      * the packed words.  With one threadgroup `per` is the same value the
      * chain uses, because the chain's threadgroups each scanned all nbins. */
-    /* §17 probe 1 (lever topk_fused=10): run the whole cut scan twice.  The
-     * second pass recomputes sscan from the unchanged histogram and finds the
-     * same bin_lo, so nothing downstream can differ; the delta against value 1
-     * is the scan's ten rounds and twenty barriers plus the block search. */
+    /* REDUCE-THEN-SCAN (tkalg-62k, +0.06 t/s over the ten-round Hillis-Steele
+     * it replaces, text identical in all three pairs).  Each thread sums its
+     * own `per` bins; each simdgroup carries an inclusive suffix over its 32
+     * lanes with shuffles and lane 0 publishes the simdgroup total; one
+     * simdgroup takes an exclusive suffix over the 32 totals; every thread
+     * adds its simdgroup's offset back.  THREE barriers instead of twenty-odd,
+     * with all nth threads working.
+     *
+     * Tier 1.  `above_block` must be the exact integer sum of `mine` over
+     * every thread with a higher index, and `mine` is the exact integer count
+     * of that thread's bins.  This shape and the ladder it replaces compute
+     * that same sum, differing only in the association order of an integer
+     * addition, which is exact and associative.  So every thread sees the
+     * identical above_block, the entry predicate admits the same threads, and
+     * the descending in-block search finds the same unique bin b - unique
+     * because the running count is non-decreasing as b falls, so once
+     * acc + c >= top_k holds, acc < top_k fails for every lower bin. */
     const uint per = (nbins + nth - 1u) / nth;
-    const uint b0 = tid * per;
-    if (dbg == 6u || dbg == 7u) {
-        /* §18 value 15 (and 16): the same cut, by REDUCE-THEN-SCAN instead of
-         * a ten-round, twenty-barrier Hillis-Steele over all nth entries.
-         * Each thread sums its own `per` bins; each simdgroup carries an
-         * inclusive suffix over its 32 lanes with shuffles and publishes its
-         * total; one simdgroup takes an exclusive suffix over the 32
-         * simdgroup totals; every thread adds its simdgroup's offset back.
-         * THREE barriers, all 1,024 threads working - this is not value 9's
-         * 32-lane serial walk.
-         *
-         * Tier 1.  `above_block` must be the exact integer sum of `mine` over
-         * every thread with a higher index, and `mine` is the exact integer
-         * count of that thread's bins.  Both shapes compute that same sum;
-         * they differ only in the association order of an integer addition,
-         * which is exact and associative, so every thread sees the identical
-         * above_block.  The entry predicate then admits the same threads and
-         * the descending in-block search finds the same unique bin b - unique
-         * because the running count is non-decreasing as b falls, so once
-         * acc + c >= top_k holds, acc < top_k fails for every lower bin.  Same
-         * bin_lo, same candidate set, same output. */
-        const uint nsg = nth >> 5;
-        uint mine = 0u;
-        for (uint b = b0; b < b0 + per && b < nbins; b++)
-            mine += (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
-        uint inc = mine;                       // inclusive suffix over 32 lanes
-        for (uint off = 1u; off < 32u; off <<= 1) {
-            const uint up = simd_shuffle_down(inc, (ushort)off);
-            if ((uint)tiisg + off < 32u) inc += up;
-        }
-        const uint nxt = simd_shuffle_down(inc, (ushort)1);
-        const uint suf_excl = ((uint)tiisg + 1u < 32u) ? nxt : 0u;
-        if (tiisg == 0u) sscan[sgitg] = inc;   // this simdgroup's total
-        if (tid == 0u) { sscan[nth] = 0xffffffffu; sscan[nth + 1u] = 0u; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgitg == 0u) {                     // exclusive suffix over totals
-            uint t = ((uint)tiisg < nsg) ? sscan[tiisg] : 0u;
-            uint inc2 = t;
-            for (uint off = 1u; off < 32u; off <<= 1) {
-                const uint up = simd_shuffle_down(inc2, (ushort)off);
-                if ((uint)tiisg + off < 32u) inc2 += up;
-            }
-            const uint nxt2 = simd_shuffle_down(inc2, (ushort)1);
-            if ((uint)tiisg < nsg)
-                sscan[tiisg] = ((uint)tiisg + 1u < 32u) ? nxt2 : 0u;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint above_block = sscan[sgitg] + suf_excl;
-        if (above_block < args.top_k && b0 < nbins) {
-            uint acc = above_block;
-            const uint hi = min(b0 + per, nbins);
-            for (uint b = hi; b-- > b0; ) {
-                const uint c = (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
-                if (acc < args.top_k && acc + c >= args.top_k) {
-                    sscan[nth]      = b;
-                    sscan[nth + 1u] = acc;
-                    break;
-                }
-                acc += c;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    } else
-    for (uint crep = 0u; crep < ((dbg == 1u) ? 2u : 1u); crep++) {
+    const uint b0  = tid * per;
+    const uint nsg = nth >> 5;
     uint mine = 0u;
     for (uint b = b0; b < b0 + per && b < nbins; b++)
         mine += (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
-    sscan[tid] = mine;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // inclusive SUFFIX sum over sscan[0..nth) (Hillis-Steele, reversed)
-    for (uint off = 1u; off < nth; off <<= 1) {
-        const uint add = (tid + off < nth) ? sscan[tid + off] : 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        sscan[tid] += add;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint inc = mine;                            // inclusive suffix, 32 lanes
+    for (uint off = 1u; off < 32u; off <<= 1) {
+        const uint up = simd_shuffle_down(inc, (ushort)off);
+        if ((uint)tiisg + off < 32u) inc += up;
     }
+    const uint nxt = simd_shuffle_down(inc, (ushort)1);
+    const uint suf_excl = ((uint)tiisg + 1u < 32u) ? nxt : 0u;
+    if (tiisg == 0u) sscan[sgitg] = inc;        // this simdgroup's total
     if (tid == 0u) { sscan[nth] = 0xffffffffu; sscan[nth + 1u] = 0u; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint above_block = (tid + 1u < nth) ? sscan[tid + 1u] : 0u;
+    if (sgitg == 0u) {                          // exclusive suffix over totals
+        uint inc2 = ((uint)tiisg < nsg) ? sscan[tiisg] : 0u;
+        for (uint off = 1u; off < 32u; off <<= 1) {
+            const uint up = simd_shuffle_down(inc2, (ushort)off);
+            if ((uint)tiisg + off < 32u) inc2 += up;
+        }
+        const uint nxt2 = simd_shuffle_down(inc2, (ushort)1);
+        if ((uint)tiisg < nsg)
+            sscan[tiisg] = ((uint)tiisg + 1u < 32u) ? nxt2 : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint above_block = sscan[sgitg] + suf_excl;
     if (above_block < args.top_k && b0 < nbins) {
         uint acc = above_block;
         const uint hi = min(b0 + per, nbins);
@@ -1212,7 +1122,6 @@ kernel void kernel_glm53_topk_fast_fused(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     const uint bin_lo = sscan[nth];
     if (bin_lo == 0xffffffffu && tid == 0u)
         atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_NOBIN,
@@ -1244,6 +1153,6 @@ kernel void kernel_glm53_topk_fast_fused(
     const uint have  = min(count, args.cand_cap);
     uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
     ds4_topk_fast_tail(args, cur, flags, count, sortbuf, &bad_bits,
-                       ctrl, hist, out_idx, raw, indirect, args.dbg_double,
+                       ctrl, hist, out_idx, raw, indirect, args.rank_sort,
                        tid, nth);
 }
