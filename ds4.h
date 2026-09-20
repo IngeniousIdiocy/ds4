@@ -776,16 +776,11 @@ typedef struct {
      * is byte-identical.  Default ON since fused-62k (+0.127 t/s at 62k over
      * three interleaved reps, identical text); DS4_GLM_DISABLE_TOPK_FUSED is
      * the kill switch, exact mode clamps it off, and /debug/levers moves it
-     * live. */
+     * live.  A COUNTED lever: the value is the number of histogram-scan
+     * threadgroups, so 2..4 split the 62 KB scan over that many producers and
+     * merge their published packed histograms through the router fold's ticket
+     * (§14).  Same integers, same selection, same ctrl codes. */
     int topk_fused;
-    /* Fused top-k as a third level of the DSA concurrent group: 1 moves
-     * qk_low out of the scorer's level and into a new level beside the fused
-     * top-k, whose single threadgroup leaves 79 of 80 cores idle for ~34 us.
-     * The group is closed by an encoder boundary before the indirect fallback
-     * dispatches, so their contract is unchanged.  No dispatch's inputs or
-     * arithmetic change.  Default off pending its A/B; DS4_GLM_TOPK_OVERLAP=1
-     * turns it on at startup and /debug/levers moves it live. */
-    int topk_overlap;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
