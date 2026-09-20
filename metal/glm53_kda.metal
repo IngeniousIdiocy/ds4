@@ -701,6 +701,10 @@ struct glm53_kda_glue_args {
     uint lr_q8;
     uint do_prologue;
     uint do_out;
+    /* §21 diagnostic, lever kda_glue_probe; 0 in production.  1 doubles the
+     * f_b/g_b prologue, 2 the conv prep, 3 the recurrent row loop, 4 the
+     * epilogue.  Appended, so every field above keeps its offset. */
+    uint dbg_double;
 };
 
 kernel void kernel_glm53_kda_decode_glue(
@@ -752,9 +756,24 @@ kernel void kernel_glm53_kda_decode_glue(
     const ulong conv_row_stride = 3ul * HISTORY * projection;
     const uint n_sg = (uint)ntid.x >> 5;
 
+    /* §21 doubling probes, lever kda_glue_probe, diagnostic only.  Each
+     * repeat count is a RUNTIME uniform, so the compiler cannot unroll and
+     * common-subexpression the second pass away, and each count is uniform
+     * across the threadgroup, so every barrier is still reached by every
+     * thread the same number of times.  Two of the four phases are
+     * recurrences and are handled by a `commit` flag rather than by being
+     * repeated blindly; see each site. */
+    const uint rep_pro  = (args.dbg_double == 1u) ? 2u : 1u;
+    const uint rep_conv = (args.dbg_double == 2u) ? 2u : 1u;
+    const uint rep_row  = (args.dbg_double == 3u) ? 2u : 1u;
+    const uint rep_out  = (args.dbg_double == 4u) ? 2u : 1u;
+
     /* prologue: this head's 128 rows of f_b and 128 rows of g_b, one row per
-     * simdgroup, striding so any threadgroup width works. */
+     * simdgroup, striding so any threadgroup width works.  Doubling is Tier 1
+     * outright: the row body is a pure function of the weights and x, so the
+     * second pass writes the same words to the same addresses. */
     if (args.do_prologue != 0u) {
+        for (uint rep = 0u; rep < rep_pro; rep++)
         for (uint r = sg; r < 2u * D; r += n_sg) {
             const bool second = r >= D;
             device const char  *w = second ? lowrank_w_g : lowrank_w_f;
@@ -777,7 +796,18 @@ kernel void kernel_glm53_kda_decode_glue(
     }
 
     /* prep phase 1, verbatim -- conv shift included: this threadgroup is the
-     * only reader of the head's conv_state, so the shift is safe here. */
+     * only reader of the head's conv_state, so the shift is safe here.
+     *
+     * The three-deep history shift is a RECURRENCE and is not idempotent, so
+     * the probe does not repeat it blindly: the three stores per tensor take
+     * their value through `conv_commit`, which on a shadow pass writes each
+     * slot the value it already holds.  That is a no-op store of the same
+     * bytes to the same address, so the phase's nine device stores are still
+     * priced while the history is left exactly where it was.  With
+     * rep_conv == 1 the loop runs once with conv_commit true and the three
+     * assignments reduce to today's shift. */
+    for (uint rep = 0u; rep < rep_conv; rep++) {
+    const bool conv_commit = (rep + 1u == rep_conv);
     if (tid < D) {
         float q_acc = 0.0f;
         float k_acc = 0.0f;
@@ -801,15 +831,24 @@ kernel void kernel_glm53_kda_decode_glue(
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
 
-        q_state[channel] = q_state[projection + channel];
-        q_state[projection + channel] = q_state[2ul * projection + channel];
-        q_state[2ul * projection + channel] = q_new;
-        k_state[channel] = k_state[projection + channel];
-        k_state[projection + channel] = k_state[2ul * projection + channel];
-        k_state[2ul * projection + channel] = k_new;
-        v_state[channel] = v_state[projection + channel];
-        v_state[projection + channel] = v_state[2ul * projection + channel];
-        v_state[2ul * projection + channel] = v_new;
+        const float qs0 = q_state[channel];
+        const float qs1 = q_state[projection + channel];
+        const float qs2 = q_state[2ul * projection + channel];
+        const float ks0 = k_state[channel];
+        const float ks1 = k_state[projection + channel];
+        const float ks2 = k_state[2ul * projection + channel];
+        const float vs0 = v_state[channel];
+        const float vs1 = v_state[projection + channel];
+        const float vs2 = v_state[2ul * projection + channel];
+        q_state[channel] = conv_commit ? qs1 : qs0;
+        q_state[projection + channel] = conv_commit ? qs2 : qs1;
+        q_state[2ul * projection + channel] = conv_commit ? q_new : qs2;
+        k_state[channel] = conv_commit ? ks1 : ks0;
+        k_state[projection + channel] = conv_commit ? ks2 : ks1;
+        k_state[2ul * projection + channel] = conv_commit ? k_new : ks2;
+        v_state[channel] = conv_commit ? vs1 : vs0;
+        v_state[projection + channel] = conv_commit ? vs2 : vs1;
+        v_state[2ul * projection + channel] = conv_commit ? v_new : vs2;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -817,6 +856,7 @@ kernel void kernel_glm53_kda_decode_glue(
         const float gate = raw_gate[input_base + tid] + dt_bias[channel];
         sd[tid] = exp(args.lower_bound *
                       (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
+    }
     }
     if (tid == 0u) {
         beta_shared[0] =
@@ -864,21 +904,37 @@ kernel void kernel_glm53_kda_decode_glue(
     const ulong state_head =
         ((ulong)row * args.n_heads + head) * D * D;
 
+    /* The recurrent state update is a RECURRENCE in device memory, so a blind
+     * repeat would decay the state twice.  The shadow pass runs the identical
+     * instruction sequence on the identical operands - `h0` is what `*hptr`
+     * held, and the shadow puts it back - and only the committed word
+     * differs; `so[value]` is overwritten by the committing pass and nothing
+     * reads it in between.  With rep_row == 1 the loop runs once with
+     * row_commit true, `*hptr = h` is today's store and `h0 * decay4` is a
+     * rename of `*hptr * decay4`. */
     for (uint value = sg; value < D; value += n_sg) {
         device float4 *hptr =
             (device float4 *)(state + state_head + (ulong)value * D + k0);
-        float4 h = *hptr * decay4;
-        float hk = dot(h, k4);
-        hk = simd_sum(hk);
-        const float delta_v = (sv[value] - hk) * beta;
-        h = fma(k4, float4(delta_v), h);
-        *hptr = h;
-        float hq = simd_sum(dot(h, q4));
-        if (lane == 0u) so[value] = hq;
+        for (uint rep = 0u; rep < rep_row; rep++) {
+            const bool row_commit = (rep + 1u == rep_row);
+            const float4 h0 = *hptr;
+            float4 h = h0 * decay4;
+            float hk = dot(h, k4);
+            hk = simd_sum(hk);
+            const float delta_v = (sv[value] - hk) * beta;
+            h = fma(k4, float4(delta_v), h);
+            *hptr = row_commit ? h : h0;
+            float hq = simd_sum(dot(h, q4));
+            if (lane == 0u) so[value] = hq;
+        }
     }
 
     /* epilogue: kernel_glm53_kda_decode_out's body on simdgroups 0..3. */
     if (args.do_out != 0u) {
+        /* Doubling is Tier 1 outright - every store rewrites its own value -
+         * and the leading barrier is inside the repeat so the second pass
+         * cannot overwrite reduce_o while a simdgroup is still reading it. */
+        for (uint rep = 0u; rep < rep_out; rep++) {
         threadgroup_barrier(mem_flags::mem_threadgroup |
                            mem_flags::mem_device);
         if (sg < 4u) {
@@ -897,6 +953,7 @@ kernel void kernel_glm53_kda_decode_glue(
                     1.0f / (1.0f + exp(-output_gate[index]));
                 out[index] = so[tid] * o_scale * output_norm[tid] * gate;
             }
+        }
         }
     }
 }

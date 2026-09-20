@@ -781,9 +781,8 @@ typedef struct {
      * Any value other than 0 runs the fused kernel. */
     int topk_fused;
 
-
-    /* attn_kv_regs (§19.6), DEFAULT ON: 0 = the kill switch, each lane reads its row's four staged
-     * half4 from threadgroup memory in the dots and reads the same four
+    /* attn_kv_regs (§19.6), DEFAULT ON: 0 = the kill switch, each lane reads
+     * its row's four staged half4 from threadgroup memory in the dots and reads the same four
      * addresses again in the online-softmax update; 1 = read them once into
      * registers and use those for both.  Tier 1: the same threadgroup words,
      * the same half-to-float conversions on the same inputs, the same
@@ -792,6 +791,14 @@ typedef struct {
      * is what leaves the doubled shared-memory traffic as the suspect. */
     int attn_kv_regs;
 
+    /* kda_glue_probe (§21): a NEVER-SHIP Tier-1 doubling probe inside the KDA
+     * decode glue, one value per phase.  0 = production.  1 doubles the
+     * f_b/g_b prologue, 2 the conv prep, 3 the recurrent row loop, 4 the
+     * epilogue.  The prologue and epilogue double outright; the conv history
+     * shift and the recurrent state update are recurrences, so a shadow pass
+     * rewrites each slot the value it already holds and the state is left
+     * where it was.  Every value leaves the token text identical. */
+    int kda_glue_probe;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
