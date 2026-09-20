@@ -1621,43 +1621,73 @@ static int dflash2_layer_forward_gpu(
         DFLASH2_STEP("attn_v", dflash2_gpu_gemm(
             tvp, m, l->attn_v, attn_input, L));
     }
+    /* Wave D (D3): the new context row's
+     * K/V are produced into the cache rows themselves instead of into
+     * scratch that is then blitted.  Same kernels on the same data, only the
+     * destination moves, so the arithmetic is unchanged; what goes is the
+     * pair of ds4_gpu_tensor_copy blits, each of which closes the batch
+     * compute encoder and opens a blit encoder (two encoder breaks/layer). */
+    ds4_gpu_tensor *kc_dst = tkc;
+    ds4_gpu_tensor *vc_dst = tvc;
+    ds4_gpu_tensor *kc_view = NULL;
+    ds4_gpu_tensor *vc_view = NULL;
+    const uint64_t kv_row_bytes = (uint64_t)kv_dim * sizeof(float);
+    if (ok && cache) {
+        kc_view = ds4_gpu_tensor_view(
+            cache->k, (uint64_t)cache->len * kv_row_bytes,
+            (uint64_t)n_ctx_new * kv_row_bytes);
+        vc_view = ds4_gpu_tensor_view(
+            cache->v, (uint64_t)cache->len * kv_row_bytes,
+            (uint64_t)n_ctx_new * kv_row_bytes);
+        if (kc_view && vc_view) {
+            kc_dst = kc_view;
+            vc_dst = vc_view;
+        } else {
+            ds4_gpu_tensor_free(kc_view);
+            ds4_gpu_tensor_free(vc_view);
+            kc_view = NULL;
+            vc_view = NULL;
+        }
+    }
     int fused_ctx_kv = 0;
     if (ok && l->attn_k->type == DS4_TENSOR_Q4_K &&
         l->attn_v->type == DS4_TENSOR_Q4_K &&
         0 && ds4_gpu_matmul_q4_k_pair_unavailable(
-            tkc, tvc, m->map, m->size,
+            kc_dst, vc_dst, m->map, m->size,
             l->attn_k->abs_offset, l->attn_v->abs_offset,
             DS4_TENSOR_Q4_K, H, kv_dim, thctx, n_ctx_new)) {
         fused_ctx_kv = 1;
     }
     if (!fused_ctx_kv) {
         DFLASH2_STEP("ctx_k", dflash2_gpu_gemm(
-            tkc, m, l->attn_k, thctx, n_ctx_new));
+            kc_dst, m, l->attn_k, thctx, n_ctx_new));
         DFLASH2_STEP("ctx_v", dflash2_gpu_gemm(
-            tvc, m, l->attn_v, thctx, n_ctx_new));
+            vc_dst, m, l->attn_v, thctx, n_ctx_new));
     }
     DFLASH2_STEP("q_rms", l->attn_q_norm && ds4_gpu_rms_norm_weight_rows_tensor(tq, tq, m->map, m->size, l->attn_q_norm->abs_offset, hd, L * n_head, cfg->rms_eps));
     DFLASH2_STEP("k_rms", l->attn_k_norm && ds4_gpu_rms_norm_weight_rows_tensor(tkp, tkp, m->map, m->size, l->attn_k_norm->abs_offset, hd, L * n_kv, cfg->rms_eps));
     DFLASH2_STEP("kc_rms", l->attn_k_norm && ds4_gpu_rms_norm_weight_rows_tensor(
-        tkc, tkc, m->map, m->size, l->attn_k_norm->abs_offset,
+        kc_dst, kc_dst, m->map, m->size, l->attn_k_norm->abs_offset,
         hd, n_ctx_new * n_kv, cfg->rms_eps));
     DFLASH2_STEP("q_rope", ds4_gpu_qwen_rope_rotate_half_rows_tensor(
         tq, L, n_head, hd, noise_pos, cfg->rope_freq_base));
     DFLASH2_STEP("k_rope", ds4_gpu_qwen_rope_rotate_half_rows_tensor(
         tkp, L, n_kv, hd, noise_pos, cfg->rope_freq_base));
     DFLASH2_STEP("kc_rope", ds4_gpu_qwen_rope_rotate_half_rows_tensor(
-        tkc, n_ctx_new, n_kv, hd, noise_pos - n_ctx_new, cfg->rope_freq_base));
+        kc_dst, n_ctx_new, n_kv, hd, noise_pos - n_ctx_new, cfg->rope_freq_base));
     ds4_gpu_tensor *attn_k_ctx = tkc;
     ds4_gpu_tensor *attn_v_ctx = tvc;
     uint32_t n_ctx = n_ctx_new;
     if (cache && ok) {
-        const uint64_t row_bytes = (uint64_t)kv_dim * sizeof(float);
-        DFLASH2_STEP("cache_k", ds4_gpu_tensor_copy(
-            cache->k, (uint64_t)cache->len * row_bytes,
-            tkc, 0, (uint64_t)n_ctx_new * row_bytes));
-        DFLASH2_STEP("cache_v", ds4_gpu_tensor_copy(
-            cache->v, (uint64_t)cache->len * row_bytes,
-            tvc, 0, (uint64_t)n_ctx_new * row_bytes));
+        const uint64_t row_bytes = kv_row_bytes;
+        if (!kc_view) {
+            DFLASH2_STEP("cache_k", ds4_gpu_tensor_copy(
+                cache->k, (uint64_t)cache->len * row_bytes,
+                tkc, 0, (uint64_t)n_ctx_new * row_bytes));
+            DFLASH2_STEP("cache_v", ds4_gpu_tensor_copy(
+                cache->v, (uint64_t)cache->len * row_bytes,
+                tvc, 0, (uint64_t)n_ctx_new * row_bytes));
+        }
         if (ok) {
             cache->len += n_ctx_new;
             n_ctx = cache->len;
@@ -1665,6 +1695,13 @@ static int dflash2_layer_forward_gpu(
             attn_v_ctx = cache->v;
         }
     }
+    /* The views only name a slice of cache->k/v; the command buffer retains
+     * the underlying Metal buffers, so releasing the wrappers here is the
+     * same lifetime dflash2_gpu_gemm's row views already use. */
+    ds4_gpu_tensor_free(kc_view);
+    ds4_gpu_tensor_free(vc_view);
+    kc_view = NULL;
+    vc_view = NULL;
     const bool causal = cfg->classic && layer_index != cfg->full_attention_layer;
     const uint32_t window = causal ? cfg->sliding_window : 0u;
     DFLASH2_STEP("sdpa", ds4_gpu_dflash2_sdpa(
