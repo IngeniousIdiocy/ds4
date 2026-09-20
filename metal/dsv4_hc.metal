@@ -3771,11 +3771,6 @@ kernel void kernel_glm53_hc_rms_splitk_alg(
 
     device const ushort *w = weights + (ulong)out_row * args.in_dim;
     device const float *xr = x + (ulong)token * args.in_dim;
-    /* §22 doubling probe, lever hc_pre_probe=1.  A runtime uniform, so the
-     * compiler cannot unroll and common-subexpression the second pass away.
-     * Tier 1 outright: this whole body is a pure function of the weights and
-     * x, so the second pass writes the same words to the same addresses. */
-    for (uint rep = 0u; rep < ((args.dbg_double == 1u) ? 2u : 1u); rep++) {
     float sum = 0.0f;
     uint k = k0 + lane;
     for (; k + 224u < kend; k += 256u) {
@@ -3839,7 +3834,6 @@ kernel void kernel_glm53_hc_rms_splitk_alg(
         }
         ss = simd_sum(ss);
         if (lane == 0u) sumsq[slice] = ss;
-    }
     }
 }
 
@@ -4109,15 +4103,6 @@ static __attribute__((always_inline)) inline void glm53_hc_tail_sliced_body(
     threadgroup float *tree      = ctrl + 4;
     threadgroup float *fb        = tree + 32;
 
-    /* §22 doubling probe, lever hc_pre_probe=2.  A runtime uniform.  It
-     * covers this kernel's WORK - the mix reduce, the comb, the collapse and
-     * the RMS - and deliberately NOT the cross-threadgroup ticket: the atomic
-     * publication, the counter, the two seq_cst fences, the spin and the
-     * watchdog are synchronisation, not work, and doubling them would
-     * deadlock.  Every phase it does cover rewrites the same values to the
-     * same addresses. */
-    const uint rep_b = (args.dbg_double == 2u) ? 2u : 1u;
-    for (uint rep = 0u; rep < rep_b; rep++)
     if (sgitg == 0) {
         glm53_hc_alg_mix_reduce<ALG_A>(args, norm_args, partials, mixes,
                                        mix_shmem, tgx, tid, tiisg);
@@ -4160,7 +4145,6 @@ static __attribute__((always_inline)) inline void glm53_hc_tail_sliced_body(
     // slice and never touches the counter.
     if (tgx == 0u) {
         if (tid == 0) {
-            for (uint rep = 0u; rep < rep_b; rep++)
             ds4_hc_comb_weights4_exact(
                 split_args, (device volatile const float *)mixes,
                 hc_scale, hc_base, out);
@@ -4184,12 +4168,6 @@ static __attribute__((always_inline)) inline void glm53_hc_tail_sliced_body(
 
     // Preserve the standalone HC collapse's explicit accumulation order.
     float4 v = 0.0f;
-    float slice_ss = 0.0f;
-    for (uint rep = 0u; rep < rep_b; rep++) {
-    // rep is threadgroup-uniform, so this barrier is uniform too; at rep_b == 1
-    // it never executes and the production text below is unchanged.
-    if (rep != 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
-    v = 0.0f;
     v += x0[i] * p0;
     v += x1[i] * p1;
     v += x2[i] * p2;
@@ -4203,9 +4181,8 @@ static __attribute__((always_inline)) inline void glm53_hc_tail_sliced_body(
     sumf = simd_sum(sumf);
     if (tiisg == 0) tree[sgitg] = sumf;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    slice_ss = (tiisg < NSG_T) ? tree[tiisg] : 0.0f;
+    float slice_ss = (tiisg < NSG_T) ? tree[tiisg] : 0.0f;
     slice_ss = simd_sum(slice_ss);
-    }
 
     // ---- publish, count, wait -------------------------------------------
     device atomic_uint *ss_slot = counters + 32u;   // own 128-byte line
@@ -4292,7 +4269,6 @@ static __attribute__((always_inline)) inline void glm53_hc_tail_sliced_body(
 
     device const float4 *w4 = (device const float4 *)norm_weight;
     device float4 *norm4 = (device float4 *)norm_dst;
-    for (uint rep = 0u; rep < rep_b; rep++)
     norm4[i] = (v * norm_scale) * w4[i];
 }
 

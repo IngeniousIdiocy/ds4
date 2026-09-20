@@ -800,14 +800,6 @@ typedef struct {
      * where it was.  Every value leaves the token text identical. */
     int kda_glue_probe;
 
-    /* hc_pre_probe (§22): a NEVER-SHIP Tier-1 doubling probe across the hc_pre
-     * pair.  0 = production.  1 doubles kernel A's split-K dot and its partial
-     * sum-of-squares; 2 doubles kernel B's mix reduce, comb, collapse and RMS.
-     * Value 2 excludes the cross-threadgroup ticket, which is synchronisation
-     * rather than work and would deadlock if repeated.  Both values rewrite
-     * the same values to the same addresses, so the token text is
-     * identical. */
-    int hc_pre_probe;
 
     /* kda_prologue_pipe (§21.8): 0 = today, where the prologue computes and
      * stores one row before issuing the next row's loads; 1 = four rows'
