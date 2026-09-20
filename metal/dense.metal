@@ -4,6 +4,22 @@ constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 constant short FC_mul_mv_ntok  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_nrow  [[function_constant(FC_MUL_MV + 3)]];
+/* Chunks per thread per K iteration in the mul_mv_ext kernels.  It was a
+ * hardcoded 4; as a function constant the host picks it per caller (see
+ * ds4_gpu_mv_ext_geom: 2 for the target's 8-row projections, 4 for the drafter).  It
+ * does NOT change the summation order - a lane still visits chunks tx,
+ * tx+nxpsg, tx+2*nxpsg, ... in that order whatever chpt is - it changes only
+ * how many float4 of dequantised weight are live at once, i.e. the register
+ * footprint (lx[chpt], or lg[chpt]+lu[chpt] in the pair kernel).  FC_MUL_MV+2
+ * and +3 are already taken by the mul_mm tile factors, so this is +4. */
+constant short FC_mul_mv_chpt  [[function_constant(FC_MUL_MV + 4)]];
+/* MSL refuses a function constant as an array size, so the chunk buffers are
+ * declared at the maximum and the loop is unrolled by the literal maximum with
+ * a compile-time break: after specialisation only chpt iterations survive, the
+ * indices are constants, and the slots above chpt are dead.  Raising this
+ * maximum costs registers in every specialisation, so keep it at the largest
+ * chpt any shape is measured at. */
+#define DS4_MVEXT_CHPT_MAX 8
 
 struct ds4_metal_args_mul_mv {
     int ne00;
@@ -2811,7 +2827,7 @@ void kernel_mul_mv_ext_q4_f32_impl(
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
-    const short chpt = 4; // chunks per thread
+    const short chpt = FC_mul_mv_chpt; // chunks per thread (was a hardcoded 4)
 
     const short nypsg = (32/nxpsg);
 
@@ -2841,10 +2857,11 @@ void kernel_mul_mv_ext_q4_f32_impl(
     short cch = tx%chpb; // current chunk index
 
     for (int ich = tx; 4*ich < args.ne00; ich += chpt*nxpsg) {
-        float4 lx[chpt];
+        float4 lx[DS4_MVEXT_CHPT_MAX];
 
-#pragma unroll(chpt)
-        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(DS4_MVEXT_CHPT_MAX)
+        for (short ch = 0; ch < DS4_MVEXT_CHPT_MAX; ++ch) {
+            if (ch >= chpt) break;
             deq_t4(xq, cch, lx[ch]);
 
             cch += nxpsg;
@@ -2854,8 +2871,9 @@ void kernel_mul_mv_ext_q4_f32_impl(
             }
         }
 
-#pragma unroll(chpt)
-        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(DS4_MVEXT_CHPT_MAX)
+        for (short ch = 0; ch < DS4_MVEXT_CHPT_MAX; ++ch) {
+            if (ch >= chpt) break;
 #pragma unroll(r1ptg)
             for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
                 sumf[ir1] += dot(lx[ch], y4[ir1][ch*nxpsg]);
@@ -2938,7 +2956,7 @@ void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
-    const short chpt = 4;
+    const short chpt = FC_mul_mv_chpt;   // was a hardcoded 4
     const short chpb = 8;
     const short nypsg = (32/nxpsg);
 
@@ -2974,11 +2992,12 @@ void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
 
     short cch = tx%chpb;
     for (int ich = tx; 4*ich < args.ne00; ich += chpt*nxpsg) {
-        float4 lg[chpt];
-        float4 lu[chpt];
+        float4 lg[DS4_MVEXT_CHPT_MAX];
+        float4 lu[DS4_MVEXT_CHPT_MAX];
 
-#pragma unroll(chpt)
-        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(DS4_MVEXT_CHPT_MAX)
+        for (short ch = 0; ch < DS4_MVEXT_CHPT_MAX; ++ch) {
+            if (ch >= chpt) break;
             dequantize_q8_0_t4(xq_gate, cch, lg[ch]);
             dequantize_q8_0_t4(xq_up,   cch, lu[ch]);
 
@@ -2990,8 +3009,9 @@ void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
             }
         }
 
-#pragma unroll(chpt)
-        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(DS4_MVEXT_CHPT_MAX)
+        for (short ch = 0; ch < DS4_MVEXT_CHPT_MAX; ++ch) {
+            if (ch >= chpt) break;
 #pragma unroll(r1ptg)
             for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
                 const float4 y = y4[ir1][ch*nxpsg];

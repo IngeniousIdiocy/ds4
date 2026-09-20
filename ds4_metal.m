@@ -4252,10 +4252,15 @@ int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void) {
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
         const char *function_name,
         int16_t     nsg,
-        int16_t     nxpsg) {
+        int16_t     nxpsg,
+        int16_t     chpt) {
+    /* The decode fast table keys on (name, nsg, nxpsg) only and holds the
+     * chpt 4 pipelines; chpt 2 (the target's 8-row verify projections) goes
+     * through the keyed dictionary, which is how it was measured. */
     uint16_t fast_name_len = 0;
     uint64_t fast_hash = 0;
     const bool fast_key_valid =
+        chpt == 4 &&
         g_decode_pipeline_fast_lookup_active &&
         ds4_gpu_decode_pipeline_fast_key(
             function_name, nsg, nxpsg, &fast_name_len, &fast_hash);
@@ -4266,8 +4271,11 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
         if (fast_cached) return fast_cached;
     }
 
-    NSString *key = [NSString stringWithFormat:@"%s_nsg=%d_nxpsg=%d",
-                     function_name, (int)nsg, (int)nxpsg];
+    NSString *key = chpt == 4
+        ? [NSString stringWithFormat:@"%s_nsg=%d_nxpsg=%d",
+                     function_name, (int)nsg, (int)nxpsg]
+        : [NSString stringWithFormat:@"%s_nsg=%d_nxpsg=%d_chpt=%d",
+                     function_name, (int)nsg, (int)nxpsg, (int)chpt];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         if (fast_key_valid) {
@@ -4280,6 +4288,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg   type:MTLDataTypeShort atIndex:600];
     [constants setConstantValue:&nxpsg type:MTLDataTypeShort atIndex:601];
+    [constants setConstantValue:&chpt  type:MTLDataTypeShort atIndex:604];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -6497,6 +6506,42 @@ static int16_t ds4_gpu_mv_ext_r1ptg(uint64_t n_tok) {
     case 5: return 5;
     default: return n_tok > 8 ? 4 : 0;
     }
+}
+
+
+/* ---- mul_mv_ext Q8_0 threadgroup geometry --------------------------------
+ * Every Q8_0 mul_mv_ext dispatch (the plain entry point and the fused gate/up
+ * pair_swiglu one) takes four numbers: nsg (simdgroups per threadgroup),
+ * nxpsg (lanes along K per row), r1ptg (x rows per threadgroup) and chpt
+ * (four-element chunks each lane holds per K pass).  The first three keep the
+ * upstream selection.  chpt was a hardcoded 4; measured on the GLM-5.3-Flash
+ * shapes (Sep 2026, 64-point grid plus fine scans, every point byte-identical
+ * by construction because chpt only changes how many dequantised float4 are
+ * live at once, not the order a lane visits its chunks), the target's 8-row
+ * verify projections run 0.76 ms per cycle faster at chpt 2 (+0.28 t/s at 8k,
+ * +0.18 at 62k, three paired reps), while the drafter's fused gate/up kernel,
+ * which shares the constant, is 0.2-0.35 ms per draft slower at anything but
+ * 4.  So the two callers get different values: the drafter (already a scoped
+ * caller via ds4_gpu_mv_ext_r1_8_scope_set) keeps 4, everything else takes 2.
+ *
+ * One pass of the K loop consumes chpt*nxpsg chunks and tests its bound once
+ * per pass, so in_dim % (4*chpt*nxpsg) must be 0; chpt 2 needs in_dim % 64
+ * at nxpsg 8 and % 128 at nxpsg 16, both implied by the path's entry gates.
+ * The clamp below is kept as a guard for any shape that ever reaches here
+ * without them. */
+static void ds4_gpu_mv_ext_geom(uint64_t in_dim, uint64_t n_tok,
+                                int16_t *out_nsg, int16_t *out_nxpsg,
+                                int16_t *out_r1ptg, int16_t *out_chpt) {
+    int16_t nsg = 2;
+    int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
+    int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
+    int16_t chpt = g_mv_ext_r1_8_scope ? 4 : 2;
+    while (in_dim % ((uint64_t)4 * (uint64_t)chpt * (uint64_t)nxpsg) != 0) {
+        if (chpt > 1) chpt = (int16_t)(chpt - 1);
+        else if (nxpsg > 1) nxpsg = (int16_t)(nxpsg >> 1);
+        else break;
+    }
+    *out_nsg = nsg; *out_nxpsg = nxpsg; *out_r1ptg = r1ptg; *out_chpt = chpt;
 }
 
 static const char *ds4_gpu_mv_ext_name(int q8, int16_t r1ptg) {
@@ -22211,12 +22256,11 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         const uint64_t mv_ext_max_tokens =
             ds4_gpu_env_u64("DS4_METAL_Q8_MV_EXT_MAX_TOKENS", 16u, 2u, 128u);
         if (n_tok <= mv_ext_max_tokens && (in_dim % 128u) == 0) {
-            const int16_t nsg = 2;
-            const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
-            const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
+            int16_t nsg = 2, nxpsg = 8, r1ptg = 4, chpt = 4;
+            ds4_gpu_mv_ext_geom(in_dim, n_tok, &nsg, &nxpsg, &r1ptg, &chpt);
             const char *fn_name = ds4_gpu_mv_ext_name(1, r1ptg);
             id<MTLComputePipelineState> pipeline =
-                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg, chpt) : nil;
             if (!pipeline) return 0;
 
             const int16_t nypsg = 32 / nxpsg;
@@ -23543,7 +23587,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL) {
             const int16_t nsg = 2;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8);
+                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8, 4);
             if (pipeline) {
                 ds4_gpu_q8_0_matvec_args args = {
                     .ne00 = (int32_t)in_dim,
@@ -23592,7 +23636,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             const int16_t r1ptg = (n_tok == 1u) ? 1 : ds4_gpu_mv_ext_r1ptg(n_tok);
             const char *fn_name = ds4_gpu_q4_mv_ext_name(weight_type, r1ptg);
             id<MTLComputePipelineState> pipeline =
-                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg, 4) : nil;
             if (pipeline) {
                 const int16_t nypsg = 32 / nxpsg;
                 const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
@@ -24452,12 +24496,11 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
             ds4_gpu_wrap_model_range(model_map, model_size, up_offset, weight_bytes, &up_inner);
         if (!gate_wbuf || !up_wbuf) return 0;
 
-        const int16_t nsg = 2;
-        const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
-        const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
+        int16_t nsg = 2, nxpsg = 8, r1ptg = 4, chpt = 4;
+        ds4_gpu_mv_ext_geom(in_dim, n_tok, &nsg, &nxpsg, &r1ptg, &chpt);
         const char *fn_name = ds4_gpu_mv_ext_q8_pair_swiglu_name(r1ptg);
         id<MTLComputePipelineState> pipeline =
-            fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+            fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg, chpt) : nil;
         if (!pipeline) return 0;
 
         const int16_t nypsg = 32 / nxpsg;
@@ -24700,7 +24743,7 @@ int ds4_gpu_matmul_f16_tensor(
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
             const char *fn_name = ds4_gpu_mv_ext_name(0, r1ptg);
             id<MTLComputePipelineState> pipeline =
-                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg, 4) : nil;
             if (!pipeline) return 0;
 
             const int16_t nypsg = 32 / nxpsg;
@@ -25734,7 +25777,7 @@ int ds4_gpu_matmul_f32_tensor(
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
             const char *fn_name = ds4_gpu_mv_ext_f32_name(r1ptg);
             id<MTLComputePipelineState> pipeline =
-                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg, 4) : nil;
             if (!pipeline) return 0;
 
             const int16_t nypsg = 32 / nxpsg;
@@ -30519,7 +30562,7 @@ int ds4_gpu_matmul_quant_kslice_tensor(
             getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL) {
             const int16_t nsg = 2;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8);
+                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8, 4);
             if (pipeline) {
                 ds4_gpu_q8_0_matvec_args args = {
                     .ne00 = (int32_t)k_cnt,
