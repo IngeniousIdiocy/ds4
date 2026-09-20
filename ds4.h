@@ -809,14 +809,16 @@ typedef struct {
      * identical. */
     int hc_pre_probe;
 
-    /* kda_prologue_wide (§21.5): 0 = today, the Q8_0 prologue row body reads
-     * its eight x floats and eight int8 quants one scalar at a time and then
-     * runs a second, structurally redundant simd_sum; 1 = two float4 and two
-     * packed_char4 loads of the same bytes in the same lane, feeding the same
-     * eight products in the same order, with the redundant reduction dropped.
-     * Tier 1: no arithmetic and no order changes, and the dropped reduction
-     * returns its own input because its other 31 slots are +0.0. */
-    int kda_prologue_wide;
+    /* kda_prologue_pipe (§21.8): 0 = today, where the prologue computes and
+     * stores one row before issuing the next row's loads; 1 = four rows'
+     * loads, products and reductions are issued before any of their four
+     * stores.  wide-62k measured the load widening flat, which leaves the
+     * dependent chain as the limit: MSL cannot prove the store to raw_gate /
+     * output_gate does not overlap the f_b / g_b weights the next row reads,
+     * so it may not hoist them above the store.  Tier 1: identical products in
+     * identical order per row and the same words to the same addresses; only
+     * the store timing moves. */
+    int kda_prologue_pipe;
 
     /* topk_fused_min_comp (§23): the minimum candidate-row width at which the
      * top-k fast path is admitted at all.  Default 12,288, the value the

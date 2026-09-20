@@ -644,21 +644,29 @@ kernel void kernel_glm53_kda_decode_prep_state(
  * in_dim is a multiple of QK8_0 and nb <= NQ, which is what makes the argument
  * above hold; GLM-5.3's f_b/g_b rank is 128, i.e. nb = 4.
  * -------------------------------------------------------------------------*/
-static inline void glm53_mul_mv_q8_0_f32_row_at(
+/* §21.8.  The row body returns its total instead of storing it, so the caller
+ * can issue several rows' loads before any of their stores.  wide-62k measured
+ * the load widening FLAT (-0.007), which rules out both load issue and the
+ * reduction tail as the prologue's limit and leaves the dependent chain: as
+ * written, each row's `device float *out` store sits between that row's loads
+ * and the next row's, and MSL's alias analysis cannot prove `out`
+ * (raw_gate / output_gate) does not overlap `weights` (f_b / g_b), so it may
+ * not hoist row r+1's loads above row r's store.  Eight rows per simdgroup
+ * therefore cost eight dependent memory round trips.  Splitting the value from
+ * the store is what lets the batched caller break that chain. */
+static inline float glm53_mul_mv_q8_0_f32_row_value(
         uint                             in_dim,
         uint                             out_dim,
         uint                             n_rows,
         device const char               *weights,
         device const float              *x,
-        device float                    *out,
         uint                             out_row,
         uint                             token,
         ushort                           lane,
-        bool                             wide,
         bool                             lanes) {
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
-    if (out_row >= out_dim || token >= n_rows) return;
+    if (out_row >= out_dim || token >= n_rows) return 0.0f;
 
     const int nb = (int)(in_dim / QK8_0);
     device const block_q8_0 *ax = (device const block_q8_0 *)
@@ -719,8 +727,7 @@ static inline void glm53_mul_mv_q8_0_f32_row_at(
         part += simd_shuffle_xor(part, (ushort)4);
         part += simd_shuffle_xor(part, (ushort)2);
         part += simd_shuffle_xor(part, (ushort)1);
-        if (lane == 0u) out[(ulong)token * out_dim + out_row] = part;
-        return;
+        return part;
     }
 
     const short ix = (short)lane / (NW / NQ);
@@ -731,61 +738,38 @@ static inline void glm53_mul_mv_q8_0_f32_row_at(
     float yl[NQ];
     device const float *yb = y + ib0 * QK8_0 + il * NQ;
     for (int ib = ib0; ib < nb; ib += NQ) {
-        /* §21.5.  `wide` folds the eight scalar x loads into two float4 and
-         * the eight scalar int8 quant loads into two packed_char4 -- the same
-         * bytes, in the same lane, feeding the same eight products in the same
-         * order, so every `sumq` is bit-identical.  `yb` is the tensor base
-         * plus ib0 * QK8_0 + il * NQ floats, both multiples of eight floats,
-         * so the float4 loads are 16-byte aligned.  `packed_char4` has 1-byte
-         * alignment, which matters because a Q8_0 block is 34 bytes and `qs`
-         * lands at 2 mod 4 for even blocks -- an ordinary char4 would be
-         * misaligned.  This is the widening metal/t2screen.metal already
-         * ships, where it took the routed gate+up matvec from 657 to
-         * 687 GB/s. */
-        if (wide) {
-            device const float4 *yv = (device const float4 *)yb;
-            const float4 v0 = yv[0];
-            const float4 v1 = yv[1];
-            yl[0] = v0.x; yl[1] = v0.y; yl[2] = v0.z; yl[3] = v0.w;
-            yl[4] = v1.x; yl[5] = v1.y; yl[6] = v1.z; yl[7] = v1.w;
-        } else {
-            for (short i = 0; i < NQ; ++i) {
-                yl[i] = yb[i];
-            }
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
         }
         device const int8_t *qs = ax[ib].qs + il * NQ;
         float sumq = 0.f;
-        if (wide) {
-            device const packed_char4 *q4 = (device const packed_char4 *)qs;
-            const packed_char4 a0 = q4[0];
-            const packed_char4 a1 = q4[1];
-            sumq += a0[0] * yl[0];
-            sumq += a0[1] * yl[1];
-            sumq += a0[2] * yl[2];
-            sumq += a0[3] * yl[3];
-            sumq += a1[0] * yl[4];
-            sumq += a1[1] * yl[5];
-            sumq += a1[2] * yl[6];
-            sumq += a1[3] * yl[7];
-        } else {
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
-            }
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            sumq += qs[i] * yl[i];
         }
         sumf += sumq * ax[ib].d;
         yb += NQ * QK8_0;
     }
 
     sumf = simd_sum(sumf);
-    /* §21.5.  The second reduction emulates the standalone kernel's
-     * cross-simdgroup stage, whose other slots are structurally +0.0 (see the
-     * nb <= NQ argument above).  After the first simd_sum every lane holds the
-     * complete row sum, so the second reduces (sumf, +0.0 x 31) and returns
-     * sumf exactly: +0.0 is the additive identity under every association, and
-     * `sumf` can never be -0.0 because it starts at +0.0 and +0.0 + x is +0.0
-     * even for x == -0.0.  At `wide` the reduction is dropped and lane 0
-     * writes `sumf`, which is the same word. */
-    const float tot = wide ? sumf : simd_sum(lane == 0u ? sumf : 0.0f);
+    return simd_sum(lane == 0u ? sumf : 0.0f);
+}
+
+/* The storing form, unchanged in behaviour: the value body above followed by
+ * lane 0's store. */
+static inline void glm53_mul_mv_q8_0_f32_row_at(
+        uint                             in_dim,
+        uint                             out_dim,
+        uint                             n_rows,
+        device const char               *weights,
+        device const float              *x,
+        device float                    *out,
+        uint                             out_row,
+        uint                             token,
+        ushort                           lane,
+        bool                             lanes) {
+    if (out_row >= out_dim || token >= n_rows) return;
+    const float tot = glm53_mul_mv_q8_0_f32_row_value(
+            in_dim, out_dim, n_rows, weights, x, out_row, token, lane, lanes);
     if (lane == 0u) out[(ulong)token * out_dim + out_row] = tot;
 }
 
@@ -806,11 +790,10 @@ struct glm53_kda_glue_args {
      * f_b/g_b prologue, 2 the conv prep, 3 the recurrent row loop, 4 the
      * epilogue.  Appended, so every field above keeps its offset. */
     uint dbg_double;
-    /* §21.5 lever kda_prologue_wide: 0 = today's scalar loads and the
-     * redundant second simd_sum; 1 = packed_char4 / float4 loads of the same
-     * bytes in the same lane feeding the same products in the same order, and
-     * the redundant reduction dropped. */
-    uint lr_wide;
+    /* §21.8 lever kda_prologue_pipe: 0 = today, one row computed and stored
+     * before the next row's loads are issued; 1 = four rows' loads and
+     * reductions issued before any of their four stores. */
+    uint lr_pipe;
     /* §21.7 lever kda_prologue_lanes, TIER 2: 0 = today's half-idle
      * simdgroup; 1 = all 32 lanes, four elements each, with a hand-written
      * butterfly.  The same 128 products in a different addition tree. */
@@ -883,8 +866,63 @@ kernel void kernel_glm53_kda_decode_glue(
      * outright: the row body is a pure function of the weights and x, so the
      * second pass writes the same words to the same addresses. */
     if (args.do_prologue != 0u) {
-        for (uint rep = 0u; rep < rep_pro; rep++)
-        for (uint r = sg; r < 2u * D; r += n_sg) {
+      /* §21.8, lever kda_prologue_pipe.  wide-62k measured the load widening
+       * flat, which rules out load issue and the reduction tail and leaves the
+       * dependent chain: each row's store to raw_gate / output_gate sits
+       * between that row's loads and the next row's, and MSL cannot prove that
+       * store does not overlap the f_b / g_b weights it is about to read, so
+       * it may not hoist the next row's loads above it.  Eight rows per
+       * simdgroup is eight dependent memory round trips, and at 64
+       * threadgroups on 80 cores there is no other resident work to hide them.
+       *
+       * The pipe form computes FOUR rows - their loads, their products and
+       * their reductions - before issuing any of their four stores, so the
+       * four rows' loads can be in flight together and the chain is a quarter
+       * as deep.  Tier 1: identical products in identical order per row,
+       * identical reductions, the same four words to the same four addresses;
+       * only the store timing moves.  The remainder loop handles any rows the
+       * batch does not cover and is today's body verbatim. */
+      for (uint rep = 0u; rep < rep_pro; rep++) {
+        uint rbase = sg;
+        if (args.lr_q8 != 0u && args.lr_pipe != 0u) {
+            const bool lanes_on = args.lr_lanes != 0u;
+            for (; rbase + 3u * n_sg < 2u * D; rbase += 4u * n_sg) {
+                const uint ra = rbase;
+                const uint rb = rbase + n_sg;
+                const uint rc = rbase + 2u * n_sg;
+                const uint rd = rbase + 3u * n_sg;
+                const bool sa = ra >= D, sb = rb >= D;
+                const bool sc = rc >= D, sd2 = rd >= D;
+                const float ta = glm53_mul_mv_q8_0_f32_row_value(
+                    args.lr_in_dim, projection, args.n_rows,
+                    sa ? lowrank_w_g : lowrank_w_f,
+                    sa ? lowrank_x_g : lowrank_x_f,
+                    head * D + (sa ? ra - D : ra), row, lane, lanes_on);
+                const float tb = glm53_mul_mv_q8_0_f32_row_value(
+                    args.lr_in_dim, projection, args.n_rows,
+                    sb ? lowrank_w_g : lowrank_w_f,
+                    sb ? lowrank_x_g : lowrank_x_f,
+                    head * D + (sb ? rb - D : rb), row, lane, lanes_on);
+                const float tc = glm53_mul_mv_q8_0_f32_row_value(
+                    args.lr_in_dim, projection, args.n_rows,
+                    sc ? lowrank_w_g : lowrank_w_f,
+                    sc ? lowrank_x_g : lowrank_x_f,
+                    head * D + (sc ? rc - D : rc), row, lane, lanes_on);
+                const float td = glm53_mul_mv_q8_0_f32_row_value(
+                    args.lr_in_dim, projection, args.n_rows,
+                    sd2 ? lowrank_w_g : lowrank_w_f,
+                    sd2 ? lowrank_x_g : lowrank_x_f,
+                    head * D + (sd2 ? rd - D : rd), row, lane, lanes_on);
+                if (lane == 0u) {
+                    const ulong base = (ulong)row * projection + head * D;
+                    (sa ? output_gate : raw_gate)[base + (sa ? ra - D : ra)] = ta;
+                    (sb ? output_gate : raw_gate)[base + (sb ? rb - D : rb)] = tb;
+                    (sc ? output_gate : raw_gate)[base + (sc ? rc - D : rc)] = tc;
+                    (sd2 ? output_gate : raw_gate)[base + (sd2 ? rd - D : rd)] = td;
+                }
+            }
+        }
+        for (uint r = rbase; r < 2u * D; r += n_sg) {
             const bool second = r >= D;
             device const char  *w = second ? lowrank_w_g : lowrank_w_f;
             device const float *x = second ? lowrank_x_g : lowrank_x_f;
@@ -894,7 +932,6 @@ kernel void kernel_glm53_kda_decode_glue(
                 glm53_mul_mv_q8_0_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows, w, x, o,
                                              head * D + local, row, lane,
-                                             args.lr_wide != 0u,
                                              args.lr_lanes != 0u);
             } else {
                 glm53_mul_mv_bf16_f32_row_at(args.lr_in_dim, projection,
@@ -903,6 +940,7 @@ kernel void kernel_glm53_kda_decode_glue(
                                              head * D + local, row, lane);
             }
         }
+      }
         threadgroup_barrier(mem_flags::mem_threadgroup |
                            mem_flags::mem_device);
     }
