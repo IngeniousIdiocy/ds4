@@ -7714,7 +7714,7 @@ typedef struct {
     float    beta_slow;
     uint32_t value_type;
     uint32_t kv_regs;             /* §19.6 attn_kv_regs; 0 in production */
-    uint32_t sm2;                 /* §19.11 attn_softmax_2pass; 0 = today */
+    uint32_t sm2;                 /* §19.11 attn_softmax_2pass; 0 = off */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -20916,37 +20916,37 @@ static uint32_t ds4_gpu_glm_attn_kv_regs(void) {
     return (uint32_t)v;
 }
 
-/* §19.11 attn_softmax_2pass, TIER 2.  0 is the shipped running online
- * softmax: every row takes new_m = max(M, score), rescales the accumulator by
- * exp(M - new_m), adds its term and updates M, which is sixteen rescales and
- * thirty-two exps per staged tile.  1 scores the whole tile first, takes one
- * tile max, rescales once and then adds sixteen terms against that common
- * maximum - the textbook block-wise form.  It is Tier 2 rather than Tier 1
- * because the exponent arguments and the order of the scalings change; both
- * forms subtract a running maximum, so neither accumulates error faster than
- * the other, but the last bits differ and the text diverges.  That is why the
- * arm is measured at 8k, where the graph does not flip to the alternate
- * attention path. */
+/* §19.11 attn_softmax_2pass, TIER 2, DEFAULT ON since sm3-62k / sm23-8k.
+ *
+ * 0 is the kill switch: a running online softmax where every row takes
+ * new_m = max(M, score), rescales the whole accumulator by exp(M - new_m),
+ * adds its term and updates M.  1 takes rows in PAIRS - both scores first,
+ * one shared maximum, one rescale, both terms added against it - which halves
+ * the rescales and removes a quarter of the exps.  The pair is the largest
+ * group that costs nothing to form: two rows of staged kv is thirty-two
+ * registers and stays live across the split, where four rows would be
+ * sixty-four and eight a hundred and twenty-eight, and any group that spills
+ * has to re-read kv_shared, which is exactly the traffic attn_kv_regs
+ * removed.  sm23-8k measured the ordering directly: group 16 +0.085, group 8
+ * +0.045, group 2 +0.145.
+ *
+ * Tier 2, and narrowly: both forms subtract a running maximum, so neither
+ * accumulates error faster, but the two rows of a pair now share a maximum,
+ * so the exponent arguments and the order of the scalings differ in the last
+ * bits.  Registered as entry 6 of this file's exact-mode registry, and the
+ * clamp is here at the read site so no lever value escapes the umbrella. */
 static uint32_t ds4_gpu_glm_attn_softmax_2pass(void) {
     glm_levers_init_from_env();
     int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_softmax_2pass;
-    if (v < 0 || v > 3) v = 0;
+    if (v != 1) v = 0;
     static int last = -1;
     if (v != last) {
         fprintf(stderr, "[T2] attn_softmax_2pass=%d (%s)\n", v,
-                v == 1 ? "group 16, fixed 16 trips, reloads kv" :
-                v == 2 ? "group 8, live groups, reloads kv" :
-                v == 3 ? "group 2, live groups, kv held in registers"
+                v == 1 ? "row pairs share one max, kv held in registers"
                        : "running max, rescale per row");
         last = v;
     }
     return (uint32_t)v;
-}
-
-/* The group size each arm encodes, for the announcement.  0 means the shipped
- * running softmax, which has no group. */
-static uint32_t ds4_gpu_glm_attn_sm2_group(uint32_t v) {
-    return v == 1u ? 16u : v == 2u ? 8u : v == 3u ? 2u : 0u;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
@@ -41325,10 +41325,8 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                         " (group=%u, trips=%s, partial=%s, reduce=%s,"
                         " n_blocks=%u, block_rows=%u, stage_rows=16)\n",
                         enc_kv_regs, enc_sm2,
-                        ds4_gpu_glm_attn_sm2_group(enc_sm2),
-                        enc_sm2 == 1u ? "fixed16" :
-                        (enc_sm2 == 2u || enc_sm2 == 3u) ? "live-groups"
-                                                         : "per-row",
+                        enc_sm2 ? 2u : 0u,
+                        enc_sm2 ? "live-pairs" : "per-row",
                         use_prefix_fullheads ?
                             "group8_partial_prefix_fullheads" : "group8_partial",
                         t2s_vplane ? "t2s_reduce_vplane" :
@@ -54439,6 +54437,26 @@ static int glm53_exact_mode(void) {
  *      substitutes the bit-exact production kernel for a Tier 2 one, so it
  *      cannot weaken this umbrella, and it does not change what any selected
  *      kernel computes.
+ *
+ *   6. Paired online softmax in the SERIAL-decode sparse DSA attention kernel
+ *      (this file, ds4_gpu_glm_attn_softmax_2pass();
+ *      metal/dsv4_misc.metal
+ *      kernel_glm_attention_indexed_decode_split_group8_partial_impl),
+ *      lever attn_softmax_2pass, DEFAULT ON, kill switch
+ *      DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS, and this umbrella forces it off at
+ *      the read site so no lever value can escape it.  Rows are taken in
+ *      PAIRS: both scores are computed, the pair shares one maximum and one
+ *      rescale of the accumulator, and both terms are added against it,
+ *      instead of each row rescaling the accumulator by itself.  Same dots,
+ *      same scale, same kv words in the same order, same max-stabilised
+ *      softmax -- only the GROUPING of the maximum changes, so the exponent
+ *      arguments and the order of the scalings differ in the last bits.  It is
+ *      the same transformation entry 3 registers for the BATCHED kernel, at a
+ *      group of two instead of a block of twenty-four.  Measured +0.145 t/s at
+ *      8k and +0.126 at 62k over interleaved reps, with the 62k continuation
+ *      BYTE-IDENTICAL; at 0k the continuation moves (see the commit message
+ *      for why short context is the near-tie regime) and the shape reads
+ *      +0.024, flat.
  */
 
 /* The hc_pre algebra lever's half A moves this optimum; see below. */

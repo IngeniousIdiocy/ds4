@@ -369,13 +369,11 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
      * update; 1 = read once into registers and reused for both.  Same values,
      * same conversions, same operation order. */
     uint32_t kv_regs;
-    /* §19.11 lever attn_softmax_2pass, TIER 2.  0 = today's running online
-     * softmax, one row at a time.  1 = all sixteen of the tile's scores
-     * first, one tile max, one rescale, then sixteen accumulations, with a
-     * fixed sixteen-trip score pass.  2 = the same in groups of EIGHT, and
-     * the group loop stops at the tile's live rows.  3 = groups of TWO, where
-     * the two rows' staged kv fits in registers and the accumulate pass does
-     * not re-read threadgroup memory at all. */
+    /* §19.11 lever attn_softmax_2pass, TIER 2, DEFAULT ON: 0 = the kill
+     * switch, a running online softmax that rescales the whole accumulator
+     * once per row; 1 = row PAIRS share one maximum and one rescale, with the
+     * pair's eight staged half4 held in registers so the accumulate pass
+     * reads no threadgroup memory. */
     uint32_t sm2;
 };
 
@@ -3899,83 +3897,6 @@ kernel void kernel_glm_value_project_q8_0_batch_heads_mma(
  * conversions on the same inputs, the same operands in the same order.  At
  * GROUP 8 or 16 the hold would need 128 or 256 registers and is not available,
  * so those values re-read and only the rescale count improves. */
-/* The hold array is sized 1 when HOLD is 0, so its index is clamped to 0 in
- * that case too: the `if (HOLD)` branches are dead there, but a constant
- * out-of-range index on a local array is not something to hand to a compiler
- * that only runs at server boot. */
-#define GLM_SM2_KI(HOLD, t, n) ((HOLD) ? ((t) * 4u + (n)) : 0u)
-
-#define GLM_SM2_TILE(GROUP, HOLD)                                              \
-    for (uint g = 0u; g < stage_rows; g += (GROUP)) {                          \
-        if (g >= rows) break;                                                  \
-        float sc[(GROUP)];                                                     \
-        float4 kk[(HOLD) ? (GROUP) * 4u : 1u];                                 \
-        uint vmask = 0u;                                                       \
-        for (uint t = 0u; t < (GROUP); t++) {                                  \
-            const uint rr = g + t;                                             \
-            const bool inr = rr < rows;                                        \
-            const uint row = selected[base + (inr ? rr : 0u)];                 \
-            const bool live = valid_head && inr &&                             \
-                              (rows_all_valid || row < args.cache_cap);        \
-            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;        \
-            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs; \
-            if (HOLD) {                                                        \
-                kk[GLM_SM2_KI(HOLD, t, 0u)] = (float4)kv_row[lane + 0u];       \
-                kk[GLM_SM2_KI(HOLD, t, 1u)] = (float4)kv_row[lane + 32u];      \
-                kk[GLM_SM2_KI(HOLD, t, 2u)] = (float4)kv_row[lane + 64u];      \
-                kk[GLM_SM2_KI(HOLD, t, 3u)] = (float4)kv_row[lane + 96u];      \
-            }                                                                  \
-            float partial = 0.0f;                                              \
-            if (live) {                                                        \
-                if (HOLD) {                                                    \
-                    partial += dot(low0, kk[GLM_SM2_KI(HOLD, t, 0u)]);         \
-                    partial += dot(low1, kk[GLM_SM2_KI(HOLD, t, 1u)]);         \
-                    partial += dot(low2, kk[GLM_SM2_KI(HOLD, t, 2u)]);         \
-                    partial += dot(low3, kk[GLM_SM2_KI(HOLD, t, 3u)]);         \
-                } else {                                                       \
-                    partial += dot(low0, (float4)kv_row[lane + 0u]);           \
-                    partial += dot(low1, (float4)kv_row[lane + 32u]);          \
-                    partial += dot(low2, (float4)kv_row[lane + 64u]);          \
-                    partial += dot(low3, (float4)kv_row[lane + 96u]);          \
-                }                                                              \
-                if (lane < rope_vecs) {                                        \
-                    partial += dot(qrope, rope_row[lane]);                     \
-                }                                                              \
-            }                                                                  \
-            const float sum = simd_sum(partial);                               \
-            sc[t] = live ? sum * args.scale : -FLT_MAX / 2.0f;                 \
-            if (live) vmask |= (1u << t);                                      \
-        }                                                                      \
-        float gm = -FLT_MAX / 2.0f;                                            \
-        for (uint t = 0u; t < (GROUP); t++) { gm = max(gm, sc[t]); }           \
-        const float new_m = max(M, gm);                                        \
-        const float old_scale = exp(M - new_m);                                \
-        o0 = o0 * old_scale;                                                   \
-        o1 = o1 * old_scale;                                                   \
-        o2 = o2 * old_scale;                                                   \
-        o3 = o3 * old_scale;                                                   \
-        S = S * old_scale;                                                     \
-        for (uint t = 0u; t < (GROUP); t++) {                                  \
-            if (((vmask >> t) & 1u) == 0u) continue;                           \
-            const float w = exp(sc[t] - new_m);                                \
-            if (HOLD) {                                                        \
-                o0 = o0 + kk[GLM_SM2_KI(HOLD, t, 0u)] * w;                     \
-                o1 = o1 + kk[GLM_SM2_KI(HOLD, t, 1u)] * w;                     \
-                o2 = o2 + kk[GLM_SM2_KI(HOLD, t, 2u)] * w;                     \
-                o3 = o3 + kk[GLM_SM2_KI(HOLD, t, 3u)] * w;                     \
-            } else {                                                           \
-                threadgroup const half4 *kv_row =                              \
-                    kv_shared + (g + t) * kv_vecs;                             \
-                o0 = o0 + (float4)kv_row[lane + 0u] * w;                       \
-                o1 = o1 + (float4)kv_row[lane + 32u] * w;                      \
-                o2 = o2 + (float4)kv_row[lane + 64u] * w;                      \
-                o3 = o3 + (float4)kv_row[lane + 96u] * w;                      \
-            }                                                                  \
-            S = S + w;                                                         \
-        }                                                                      \
-        M = new_m;                                                             \
-    }
-
 template <bool assume_valid_rows, bool assume_valid_heads,
           bool prefix_checked = false>
 kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
@@ -4067,10 +3988,8 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
      * switch, it reads the same four addresses twice, as the kernel did until
      * 2026-09-19.  Measured +0.110 t/s at 62k (kvregs-62k), text identical. */
     const bool kv_regs = (args.kv_regs != 0u);
-    /* §19.11 lever attn_softmax_2pass; threadgroup-uniform.  1 = groups of
-     * sixteen with a fixed sixteen-trip score pass, 2 = groups of eight,
-     * 3 = groups of two with the group's kv held in registers. */
-    const uint sm2 = args.sm2;
+    /* §19.11 lever attn_softmax_2pass; threadgroup-uniform. */
+    const bool sm2 = (args.sm2 != 0u);
 
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
@@ -4127,97 +4046,107 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sm2 == 2u) {
-            /* §19.11 value 2: groups of eight, live-group trip
-             * count.  Same reload as value 1 - eight rows of staged kv
-             * will not fit in registers - so only the rescale count and
-             * the masked trips change. */
-            GLM_SM2_TILE(8u, 0)
-        } else if (sm2 == 3u) {
-            /* §19.11 value 3: groups of two, and the group's eight
-             * staged half4 stay in thirty-two registers, so the
-             * accumulate pass reads no threadgroup memory.  Half the
-             * rescales go and nothing is paid back. */
-            GLM_SM2_TILE(2u, 1)
-        } else if (sm2 == 1u) {
-            /* §19.11 value 1, TIER 2.  The shipped form is a RUNNING online softmax:
-             * each row takes new_m = max(M, score), rescales the whole
-             * accumulator by exp(M - new_m), adds its own term and updates M.
-             * That is sixteen rescales and thirty-two exps per tile, and every
-             * one of them sits on the dependent chain.
+        if (sm2) {
+            /* §19.11, TIER 2, DEFAULT ON since sm3-62k / sm23-8k.
              *
-             * This form computes all of the tile's scores first, takes ONE
-             * tile max, rescales the accumulator ONCE, and then adds sixteen
-             * terms against a common new_m.  Fifteen of the sixteen rescales
-             * and fifteen of the thirty-two exps disappear.  It is the
-             * standard block-wise online softmax and is mathematically the
-             * same function; it is TIER 2 because the exponent arguments and
-             * the order of the scalings change, so the last bits move.  Both
-             * forms are max-stabilised, so the error is of the same order and
-             * neither grows.
+             * The shipped form below is a RUNNING online softmax: every row
+             * takes new_m = max(M, score), multiplies the whole accumulator by
+             * exp(M - new_m), adds its own term and updates M.  One rescale and
+             * two exps per row, all of it on a serial chain.
              *
-             * The cost is that the accumulate pass must read kv_shared again -
-             * the scores and the terms are now sixteen rows apart, so the
-             * registers kv_regs saved cannot bridge them.  That is the exact
-             * traffic kvregs-62k priced at +0.110, and it is why this arm is
-             * expected to be close to a wash.
+             * This form takes rows in PAIRS.  Both scores are computed, the
+             * pair shares one maximum and one rescale of the accumulator, and
+             * both terms are added against it.  Half the rescales and a
+             * quarter of the exps disappear.
              *
-             * The score pass runs a CONSTANT sixteen trips so `sc` stays in
-             * registers; trips past `rows` are masked out of `vmask`, take no
-             * threadgroup load (the dots sit inside the guard) and contribute
-             * nothing, exactly as the shipped loop's shorter trip count does.
+             * The pair is the largest group that costs nothing to form.  A
+             * two-row group's eight staged half4 are thirty-two registers, so
+             * the accumulate pass reuses them and reads no threadgroup memory
+             * at all; at four rows that would be sixty-four registers, at eight
+             * a hundred and twenty-eight, and every larger group has to re-read
+             * kv_shared - which is exactly the traffic attn_kv_regs removed for
+             * +0.110.  sm23-8k measured all three: group 16 +0.085, group 8
+             * +0.045, group 2 +0.145.  The ordering is the reload, not the
+             * rescale count, and only the pair escapes it.
+             *
+             * The register reuse itself is bit-identical, for the same reason
+             * attn_kv_regs is: the same threadgroup words, the same
+             * half-to-float conversions on the same inputs, the same operands
+             * in the same order.  The Tier 2 content is the grouping of the
+             * maximum and nothing else.
+             *
+             * The loads sit outside the live guards because the staging loop
+             * fills invalid rows with half4(0) and `g < rows` keeps row A
+             * staged; when the tile has an odd row count the last pair points
+             * B at A, so both addresses are always inside what was staged.
              */
-            float sc[stage_rows];
-            uint vmask = 0u;
-            for (uint rr = 0u; rr < stage_rows; rr++) {
-                const bool inr = rr < rows;
-                const uint row = selected[base + (inr ? rr : 0u)];
-                const bool valid_row =
-                    inr && (rows_all_valid || row < args.cache_cap);
-                const bool live = valid_head && valid_row;
-                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
-                threadgroup const float4 *rope_row =
-                    rope_shared + rr * rope_vecs;
-                float partial = 0.0f;
-                if (live) {
-                    partial += dot(low0, (float4)kv_row[lane + 0u]);
-                    partial += dot(low1, (float4)kv_row[lane + 32u]);
-                    partial += dot(low2, (float4)kv_row[lane + 64u]);
-                    partial += dot(low3, (float4)kv_row[lane + 96u]);
-                    if (lane < rope_vecs) {
-                        partial += dot(qrope, rope_row[lane]);
-                    }
+            for (uint g = 0u; g < rows; g += 2u) {
+                const bool has_b = (g + 1u) < rows;
+                const uint b_off = has_b ? 1u : 0u;
+                const uint row_a = selected[base + g];
+                const uint row_b = selected[base + g + b_off];
+                const bool live_a =
+                    valid_head && (rows_all_valid || row_a < args.cache_cap);
+                const bool live_b = valid_head && has_b &&
+                    (rows_all_valid || row_b < args.cache_cap);
+                threadgroup const half4 *kv_a = kv_shared + g * kv_vecs;
+                threadgroup const half4 *kv_b =
+                    kv_shared + (g + b_off) * kv_vecs;
+                threadgroup const float4 *rope_a = rope_shared + g * rope_vecs;
+                threadgroup const float4 *rope_b =
+                    rope_shared + (g + b_off) * rope_vecs;
+
+                const float4 a0 = (float4)kv_a[lane + 0u];
+                const float4 a1 = (float4)kv_a[lane + 32u];
+                const float4 a2 = (float4)kv_a[lane + 64u];
+                const float4 a3 = (float4)kv_a[lane + 96u];
+                const float4 b0 = (float4)kv_b[lane + 0u];
+                const float4 b1 = (float4)kv_b[lane + 32u];
+                const float4 b2 = (float4)kv_b[lane + 64u];
+                const float4 b3 = (float4)kv_b[lane + 96u];
+
+                float pa = 0.0f, pb = 0.0f;
+                if (live_a) {
+                    pa += dot(low0, a0); pa += dot(low1, a1);
+                    pa += dot(low2, a2); pa += dot(low3, a3);
+                    if (lane < rope_vecs) { pa += dot(qrope, rope_a[lane]); }
                 }
-                const float sum = simd_sum(partial);
-                sc[rr] = live ? sum * args.scale : -FLT_MAX / 2.0f;
-                if (live) vmask |= (1u << rr);
+                if (live_b) {
+                    pb += dot(low0, b0); pb += dot(low1, b1);
+                    pb += dot(low2, b2); pb += dot(low3, b3);
+                    if (lane < rope_vecs) { pb += dot(qrope, rope_b[lane]); }
+                }
+                const float sum_a = simd_sum(pa);
+                const float sum_b = simd_sum(pb);
+                const float score_a =
+                    live_a ? sum_a * args.scale : -FLT_MAX / 2.0f;
+                const float score_b =
+                    live_b ? sum_b * args.scale : -FLT_MAX / 2.0f;
+
+                /* With neither row live both scores are -FLT_MAX/2, new_m is M
+                 * (M never drops below it), old_scale is exp(0) and nothing
+                 * moves - what the shipped loop does when a row is masked. */
+                const float new_m = max(M, max(score_a, score_b));
+                const float old_scale = exp(M - new_m);
+                o0 = o0 * old_scale;
+                o1 = o1 * old_scale;
+                o2 = o2 * old_scale;
+                o3 = o3 * old_scale;
+                S = S * old_scale;
+                if (live_a) {
+                    const float w = exp(score_a - new_m);
+                    o0 = o0 + a0 * w; o1 = o1 + a1 * w;
+                    o2 = o2 + a2 * w; o3 = o3 + a3 * w;
+                    S = S + w;
+                }
+                if (live_b) {
+                    const float w = exp(score_b - new_m);
+                    o0 = o0 + b0 * w; o1 = o1 + b1 * w;
+                    o2 = o2 + b2 * w; o3 = o3 + b3 * w;
+                    S = S + w;
+                }
+                M = new_m;
             }
-            float tile_m = -FLT_MAX / 2.0f;
-            for (uint rr = 0u; rr < stage_rows; rr++) {
-                tile_m = max(tile_m, sc[rr]);
-            }
-            /* With no live row in the tile, tile_m is -FLT_MAX/2, new_m is M
-             * (M never drops below -FLT_MAX/2), old_scale is exp(0) = 1 and
-             * nothing accumulates - the shipped loop's behaviour when every
-             * row is masked. */
-            const float new_m = max(M, tile_m);
-            const float old_scale = exp(M - new_m);
-            o0 = o0 * old_scale;
-            o1 = o1 * old_scale;
-            o2 = o2 * old_scale;
-            o3 = o3 * old_scale;
-            S = S * old_scale;
-            for (uint rr = 0u; rr < stage_rows; rr++) {
-                if (((vmask >> rr) & 1u) == 0u) continue;
-                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
-                const float w = exp(sc[rr] - new_m);
-                o0 = o0 + (float4)kv_row[lane + 0u] * w;
-                o1 = o1 + (float4)kv_row[lane + 32u] * w;
-                o2 = o2 + (float4)kv_row[lane + 64u] * w;
-                o3 = o3 + (float4)kv_row[lane + 96u] * w;
-                S = S + w;
-            }
-            M = new_m;
         } else {
             for (uint rr = 0u; rr < rows; rr++) {
                 const uint row = selected[base + rr];

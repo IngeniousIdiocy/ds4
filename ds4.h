@@ -792,22 +792,16 @@ typedef struct {
      * is what leaves the doubled shared-memory traffic as the suspect. */
     int attn_kv_regs;
 
-    /* attn_softmax_2pass (§19.11), TIER 2: 0 = the shipped running online
-     * softmax, which rescales the whole accumulator once per row; 1 = the
-     * block-wise form, which scores all sixteen rows of the staged tile
-     * first, takes one tile max, rescales once and then adds sixteen terms
-     * against a common maximum.  Fifteen of sixteen rescales and fifteen of
-     * thirty-two exps go away; in exchange the accumulate pass must read
-     * kv_shared a second time, which is exactly the traffic attn_kv_regs
-     * removed for +0.110, so the two effects very nearly cancel.  Tier 2
-     * because both forms are max-stabilised but the exponent arguments and
-     * the order of the scalings differ, so the last bits move.
-     *
-     * 2 = the same in groups of EIGHT, with the group loop stopping at the
-     * tile's live rows instead of running a fixed sixteen trips.  3 = groups
-     * of TWO, where the group's eight staged half4 fit in thirty-two
-     * registers, so the accumulate pass reads no threadgroup memory at all
-     * and the split costs no extra traffic - half the rescales for nothing. */
+    /* attn_softmax_2pass (§19.11), TIER 2, DEFAULT ON: 0 = the kill switch,
+     * the running online softmax that rescales the whole accumulator once per
+     * row; 1 = row PAIRS share one maximum and one rescale, with the pair's
+     * eight staged half4 held in registers so the accumulate pass reads no
+     * threadgroup memory.  Half the rescales and a quarter of the exps go and
+     * nothing is paid back: the pair is the largest group whose kv fits in
+     * registers, and every larger group has to re-read kv_shared, which is the
+     * traffic attn_kv_regs removed.  Tier 2 because the two rows now share a
+     * maximum, so the exponent arguments and the order of the scalings differ
+     * from the per-row form; registered under DS4_GLM_EXACT. */
     int attn_softmax_2pass;
 
 } glm_levers;

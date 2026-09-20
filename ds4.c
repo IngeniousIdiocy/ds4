@@ -56121,7 +56121,7 @@ glm_levers g_glm_levers = {
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .attn_kv_regs          = 1,  /* on: +0.110 t/s at 62k, identical text */
-    .attn_softmax_2pass    = 0,  /* 0 = the shipped running online softmax */
+    .attn_softmax_2pass    = 1,  /* on: +0.145 at 8k, +0.126 at 62k, Tier 2 */
 };
 static int g_glm_levers_ready;
 
@@ -56132,8 +56132,6 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
     /* topk_fused: 0 = the three-dispatch chain, 1 = the fused kernel. */
     if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 1; return 1; }
-    /* attn_softmax_2pass: 0 shipped, 1 group 16, 2 group 8, 3 group 2. */
-    if (!strcmp(name, "attn_softmax_2pass")) { *lo = 0; *hi = 3; return 1; }
     return 0;
 }
 
@@ -56146,7 +56144,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_DISABLE_ATTN_KV_REGS" },
-    { "attn_softmax_2pass",    offsetof(glm_levers, attn_softmax_2pass),    "DS4_GLM_ATTN_SOFTMAX_2PASS" },
+    { "attn_softmax_2pass",    offsetof(glm_levers, attn_softmax_2pass),    "DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56194,12 +56192,11 @@ void glm_levers_init_from_env(void) {
      * levers above: the variable is the only way to take it off at startup,
      * and exact mode clamps it off at the read site. */
     g_glm_levers.attn_kv_regs = getenv("DS4_GLM_DISABLE_ATTN_KV_REGS") == NULL;
-    {   const char *v = getenv("DS4_GLM_ATTN_SOFTMAX_2PASS");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            g_glm_levers.attn_softmax_2pass = (n >= 0 && n <= 3) ? n : 0;
-        }
-    }
+    /* Default ON since sm3-62k / sm23-8k.  Same DISABLE_ inversion as the
+     * levers above: the variable is the only way to take it off at startup,
+     * and DS4_GLM_EXACT clamps it off at the read site (registry entry 6). */
+    g_glm_levers.attn_softmax_2pass =
+        getenv("DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS") == NULL;
     g_glm_levers_ready = 1;
 }
 
