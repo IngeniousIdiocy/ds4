@@ -369,6 +369,10 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
      * update; 1 = read once into registers and reused for both.  Same values,
      * same conversions, same operation order. */
     uint32_t kv_regs;
+    /* §19.11 lever attn_softmax_2pass, TIER 2: 0 = today's running online
+     * softmax, one row at a time; 1 = all of the tile's scores first, one tile
+     * max, one rescale of the accumulator, then the sixteen accumulations. */
+    uint32_t sm2;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -3961,6 +3965,8 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
      * switch, it reads the same four addresses twice, as the kernel did until
      * 2026-09-19.  Measured +0.110 t/s at 62k (kvregs-62k), text identical. */
     const bool kv_regs = (args.kv_regs != 0u);
+    /* §19.11 lever attn_softmax_2pass; threadgroup-uniform. */
+    const bool sm2 = (args.sm2 != 0u);
 
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
@@ -4017,64 +4023,145 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint rr = 0u; rr < rows; rr++) {
-            const uint row = selected[base + rr];
-            const bool valid_row = rows_all_valid || row < args.cache_cap;
-            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
-            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
-            /* §19.6.  The four staged half4 of this row are wanted twice: once
-             * by the dots and once by the update's rescale.  At kv_regs they
-             * are read once into registers and used for both - the same
-             * threadgroup words, the same half-to-float conversions on the
-             * same inputs, the same operands in the same order, so the result
-             * is bit-identical to the twice-read form below it.  The load sits
-             * outside the `valid_row` guard, which is safe because the staging
-             * loop fills invalid rows with half4(0): the address is always in
-             * bounds and the value is unused when the row is masked out. */
-            float4 k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
-            if (kv_regs) {
-                k0 = (float4)kv_row[lane + 0u];
-                k1 = (float4)kv_row[lane + 32u];
-                k2 = (float4)kv_row[lane + 64u];
-                k3 = (float4)kv_row[lane + 96u];
-            }
-            float partial = 0.0f;
-            if (valid_head && valid_row) {
-                if (kv_regs) {
-                    partial += dot(low0, k0);
-                    partial += dot(low1, k1);
-                    partial += dot(low2, k2);
-                    partial += dot(low3, k3);
-                } else {
+        if (sm2) {
+            /* §19.11, TIER 2.  The shipped form is a RUNNING online softmax:
+             * each row takes new_m = max(M, score), rescales the whole
+             * accumulator by exp(M - new_m), adds its own term and updates M.
+             * That is sixteen rescales and thirty-two exps per tile, and every
+             * one of them sits on the dependent chain.
+             *
+             * This form computes all of the tile's scores first, takes ONE
+             * tile max, rescales the accumulator ONCE, and then adds sixteen
+             * terms against a common new_m.  Fifteen of the sixteen rescales
+             * and fifteen of the thirty-two exps disappear.  It is the
+             * standard block-wise online softmax and is mathematically the
+             * same function; it is TIER 2 because the exponent arguments and
+             * the order of the scalings change, so the last bits move.  Both
+             * forms are max-stabilised, so the error is of the same order and
+             * neither grows.
+             *
+             * The cost is that the accumulate pass must read kv_shared again -
+             * the scores and the terms are now sixteen rows apart, so the
+             * registers kv_regs saved cannot bridge them.  That is the exact
+             * traffic kvregs-62k priced at +0.110, and it is why this arm is
+             * expected to be close to a wash.
+             *
+             * The score pass runs a CONSTANT sixteen trips so `sc` stays in
+             * registers; trips past `rows` are masked out of `vmask`, take no
+             * threadgroup load (the dots sit inside the guard) and contribute
+             * nothing, exactly as the shipped loop's shorter trip count does.
+             */
+            float sc[stage_rows];
+            uint vmask = 0u;
+            for (uint rr = 0u; rr < stage_rows; rr++) {
+                const bool inr = rr < rows;
+                const uint row = selected[base + (inr ? rr : 0u)];
+                const bool valid_row =
+                    inr && (rows_all_valid || row < args.cache_cap);
+                const bool live = valid_head && valid_row;
+                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                threadgroup const float4 *rope_row =
+                    rope_shared + rr * rope_vecs;
+                float partial = 0.0f;
+                if (live) {
                     partial += dot(low0, (float4)kv_row[lane + 0u]);
                     partial += dot(low1, (float4)kv_row[lane + 32u]);
                     partial += dot(low2, (float4)kv_row[lane + 64u]);
                     partial += dot(low3, (float4)kv_row[lane + 96u]);
+                    if (lane < rope_vecs) {
+                        partial += dot(qrope, rope_row[lane]);
+                    }
                 }
-                if (lane < rope_vecs) {
-                    partial += dot(qrope, rope_row[lane]);
-                }
+                const float sum = simd_sum(partial);
+                sc[rr] = live ? sum * args.scale : -FLT_MAX / 2.0f;
+                if (live) vmask |= (1u << rr);
             }
-            const float sum = simd_sum(partial);
-            const float score =
-                (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
-            if (valid_head && valid_row) {
-                const float new_m = max(M, score);
-                const float old_scale = exp(M - new_m);
-                const float row_scale = exp(score - new_m);
+            float tile_m = -FLT_MAX / 2.0f;
+            for (uint rr = 0u; rr < stage_rows; rr++) {
+                tile_m = max(tile_m, sc[rr]);
+            }
+            /* With no live row in the tile, tile_m is -FLT_MAX/2, new_m is M
+             * (M never drops below -FLT_MAX/2), old_scale is exp(0) = 1 and
+             * nothing accumulates - the shipped loop's behaviour when every
+             * row is masked. */
+            const float new_m = max(M, tile_m);
+            const float old_scale = exp(M - new_m);
+            o0 = o0 * old_scale;
+            o1 = o1 * old_scale;
+            o2 = o2 * old_scale;
+            o3 = o3 * old_scale;
+            S = S * old_scale;
+            for (uint rr = 0u; rr < stage_rows; rr++) {
+                if (((vmask >> rr) & 1u) == 0u) continue;
+                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                const float w = exp(sc[rr] - new_m);
+                o0 = o0 + (float4)kv_row[lane + 0u] * w;
+                o1 = o1 + (float4)kv_row[lane + 32u] * w;
+                o2 = o2 + (float4)kv_row[lane + 64u] * w;
+                o3 = o3 + (float4)kv_row[lane + 96u] * w;
+                S = S + w;
+            }
+            M = new_m;
+        } else {
+            for (uint rr = 0u; rr < rows; rr++) {
+                const uint row = selected[base + rr];
+                const bool valid_row = rows_all_valid || row < args.cache_cap;
+                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+                /* §19.6.  The four staged half4 of this row are wanted twice: once
+                 * by the dots and once by the update's rescale.  At kv_regs they
+                 * are read once into registers and used for both - the same
+                 * threadgroup words, the same half-to-float conversions on the
+                 * same inputs, the same operands in the same order, so the result
+                 * is bit-identical to the twice-read form below it.  The load sits
+                 * outside the `valid_row` guard, which is safe because the staging
+                 * loop fills invalid rows with half4(0): the address is always in
+                 * bounds and the value is unused when the row is masked out. */
+                float4 k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
                 if (kv_regs) {
-                    o0 = o0 * old_scale + k0 * row_scale;
-                    o1 = o1 * old_scale + k1 * row_scale;
-                    o2 = o2 * old_scale + k2 * row_scale;
-                    o3 = o3 * old_scale + k3 * row_scale;
-                } else {
-                    o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
-                    o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
-                    o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
-                    o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                    k0 = (float4)kv_row[lane + 0u];
+                    k1 = (float4)kv_row[lane + 32u];
+                    k2 = (float4)kv_row[lane + 64u];
+                    k3 = (float4)kv_row[lane + 96u];
                 }
-                S = S * old_scale + row_scale;
-                M = new_m;
+                float partial = 0.0f;
+                if (valid_head && valid_row) {
+                    if (kv_regs) {
+                        partial += dot(low0, k0);
+                        partial += dot(low1, k1);
+                        partial += dot(low2, k2);
+                        partial += dot(low3, k3);
+                    } else {
+                        partial += dot(low0, (float4)kv_row[lane + 0u]);
+                        partial += dot(low1, (float4)kv_row[lane + 32u]);
+                        partial += dot(low2, (float4)kv_row[lane + 64u]);
+                        partial += dot(low3, (float4)kv_row[lane + 96u]);
+                    }
+                    if (lane < rope_vecs) {
+                        partial += dot(qrope, rope_row[lane]);
+                    }
+                }
+                const float sum = simd_sum(partial);
+                const float score =
+                    (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+                if (valid_head && valid_row) {
+                    const float new_m = max(M, score);
+                    const float old_scale = exp(M - new_m);
+                    const float row_scale = exp(score - new_m);
+                    if (kv_regs) {
+                        o0 = o0 * old_scale + k0 * row_scale;
+                        o1 = o1 * old_scale + k1 * row_scale;
+                        o2 = o2 * old_scale + k2 * row_scale;
+                        o3 = o3 * old_scale + k3 * row_scale;
+                    } else {
+                        o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                        o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                        o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                        o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                    }
+                    S = S * old_scale + row_scale;
+                    M = new_m;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

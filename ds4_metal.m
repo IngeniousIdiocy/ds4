@@ -7714,6 +7714,7 @@ typedef struct {
     float    beta_slow;
     uint32_t value_type;
     uint32_t kv_regs;             /* §19.6 attn_kv_regs; 0 in production */
+    uint32_t sm2;                 /* §19.11 attn_softmax_2pass; 0 = today */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -20910,6 +20911,31 @@ static uint32_t ds4_gpu_glm_attn_kv_regs(void) {
         fprintf(stderr, "[T2] attn_kv_regs=%d (%s)\n", v,
                 v == 1 ? "row staged once into registers"
                        : "re-read from threadgroup memory");
+        last = v;
+    }
+    return (uint32_t)v;
+}
+
+/* §19.11 attn_softmax_2pass, TIER 2.  0 is the shipped running online
+ * softmax: every row takes new_m = max(M, score), rescales the accumulator by
+ * exp(M - new_m), adds its term and updates M, which is sixteen rescales and
+ * thirty-two exps per staged tile.  1 scores the whole tile first, takes one
+ * tile max, rescales once and then adds sixteen terms against that common
+ * maximum - the textbook block-wise form.  It is Tier 2 rather than Tier 1
+ * because the exponent arguments and the order of the scalings change; both
+ * forms subtract a running maximum, so neither accumulates error faster than
+ * the other, but the last bits differ and the text diverges.  That is why the
+ * arm is measured at 8k, where the graph does not flip to the alternate
+ * attention path. */
+static uint32_t ds4_gpu_glm_attn_softmax_2pass(void) {
+    glm_levers_init_from_env();
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_softmax_2pass;
+    if (v != 1) v = 0;
+    static int last = -1;
+    if (v != last) {
+        fprintf(stderr, "[T2] attn_softmax_2pass=%d (%s)\n", v,
+                v == 1 ? "tile max, one rescale"
+                       : "running max, rescale per row");
         last = v;
     }
     return (uint32_t)v;
@@ -41282,20 +41308,22 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
          * it.  A read buried in a designated initializer cannot be confirmed
          * from a log, so no probe family in this tree does that again. */
         const uint32_t enc_kv_regs = ds4_gpu_glm_attn_kv_regs();
+        const uint32_t enc_sm2 = ds4_gpu_glm_attn_softmax_2pass();
         {
             static uint32_t last_enc = 0xffffffffu;
-            if (enc_kv_regs != last_enc) {
+            if ((enc_kv_regs | (enc_sm2 << 1)) != last_enc) {
                 fprintf(stderr,
-                        "[T2] encoded attn_kv_regs=%u"
-                        " (partial=%s, reduce=%s, n_blocks=%u)\n",
-                        enc_kv_regs,
+                        "[T2] encoded attn_kv_regs=%u attn_softmax_2pass=%u"
+                        " (partial=%s, reduce=%s, n_blocks=%u,"
+                        " block_rows=%u, stage_rows=16)\n",
+                        enc_kv_regs, enc_sm2,
                         use_prefix_fullheads ?
                             "group8_partial_prefix_fullheads" : "group8_partial",
                         t2s_vplane ? "t2s_reduce_vplane" :
                         use_reduce16 ? "group8_reduce16" :
                         use_reduce_u16 ? "group8_reduce_u16" : "group8_reduce",
-                        (unsigned)n_blocks);
-                last_enc = enc_kv_regs;
+                        (unsigned)n_blocks, (unsigned)block_rows);
+                last_enc = enc_kv_regs | (enc_sm2 << 1);
             }
         }
         ds4_gpu_glm_attention_indexed_decode_split_args args = {
@@ -41321,6 +41349,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
             .kv_regs = enc_kv_regs,
+            .sm2 = enc_sm2,
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;

@@ -792,6 +792,18 @@ typedef struct {
      * is what leaves the doubled shared-memory traffic as the suspect. */
     int attn_kv_regs;
 
+    /* attn_softmax_2pass (§19.11), TIER 2: 0 = the shipped running online
+     * softmax, which rescales the whole accumulator once per row; 1 = the
+     * block-wise form, which scores all sixteen rows of the staged tile
+     * first, takes one tile max, rescales once and then adds sixteen terms
+     * against a common maximum.  Fifteen of sixteen rescales and fifteen of
+     * thirty-two exps go away; in exchange the accumulate pass must read
+     * kv_shared a second time, which is exactly the traffic attn_kv_regs
+     * removed for +0.110, so the two effects very nearly cancel.  Tier 2
+     * because both forms are max-stabilised but the exponent arguments and
+     * the order of the scalings differ, so the last bits move. */
+    int attn_softmax_2pass;
+
 } glm_levers;
 
 extern glm_levers g_glm_levers;
