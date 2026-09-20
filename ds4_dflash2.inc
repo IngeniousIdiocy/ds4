@@ -101,7 +101,11 @@ static bool dflash2_fast_default(const ds4_model *dm,
         DS4_N_LAYER - DS4_N_NEXTN_PREDICT == 45u &&
         DS4_N_EMBD == 4096u && DS4_N_VOCAB == 154880u &&
         tm->size == UINT64_C(185299232064) &&
-        dm->size == UINT64_C(2342595168) &&
+        /* BF16 drafter (2,342,595,168 B) or the incoai Q8_0 drafter
+         * (1,438,198,656 B) shipped in production since Sep 7: the FC
+         * stays BF16 and the head reads the target's Q8_0 output in both. */
+        (dm->size == UINT64_C(2342595168) ||
+         dm->size == UINT64_C(1438198656)) &&
         tw->output && tw->output->type == DS4_TENSOR_Q8_0 &&
         dw->fc && dw->fc->type == DS4_TENSOR_BF16 && dw->fc->ndim == 2u &&
         dw->fc->dim[0] == 20480u && dw->fc->dim[1] == 4096u &&
