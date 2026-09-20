@@ -20889,6 +20889,24 @@ static int ds4_gpu_glm_topk_fused_lever(void) {
     return on;
 }
 
+/* Lever topk_overlap (glm_levers, ds4.h).  The DSA decode path may leave its
+ * concurrent group OPEN across this function so the fused top-k shares a level
+ * with qk_low; this function is then responsible for closing it, because
+ * everything below the fused dispatch -- the legacy chain's mutually dependent
+ * dispatches, and the indirect fallback grids, which are read as INDIRECT
+ * ARGUMENTS by the command processor rather than by shader cores -- needs an
+ * encoder boundary, not a memory barrier, to be correctly ordered. */
+static int ds4_gpu_glm_topk_overlap_lever(void) {
+    glm_levers_init_from_env();
+    const int on = g_glm_levers.topk_overlap != 0;
+    static int last = -1;
+    if (on != last) {
+        fprintf(stderr, "[T2] topk_overlap=%d\n", on);
+        last = on;
+    }
+    return on;
+}
+
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
  * words, then whichever of the two overlaid phases is larger - the packed
  * histogram (two 16-bit counters per word) plus the cut scan, or the candidate
@@ -21127,6 +21145,12 @@ static int ds4_gpu_indexer_topk_fused(
     if (use_fast)
         fast_fused = ds4_gpu_glm_topk_fused_lever() &&
                      ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
+    /* Lever topk_overlap: if the caller left the DSA concurrent group open and
+     * the fused single dispatch is NOT being taken, close it here, before the
+     * legacy chain's mutually dependent dispatches are encoded.  A group that
+     * was never opened makes this a no-op. */
+    if (!fast_fused && ds4_gpu_glm_topk_overlap_lever())
+        (void)ds4_gpu_concurrent_group_end();
     if (fast_fused) {
         /* Lever topk_fused=1: the whole chain as one dispatch of one
          * threadgroup.  The fallback dispatches below are encoded exactly as
@@ -21146,6 +21170,12 @@ static int ds4_gpu_indexer_topk_fused(
         [fenc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(fast_nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, fenc);
+        /* Lever topk_overlap: the fused dispatch was the group's last member.
+         * Close it HERE, before the indirect fallback dispatches below: their
+         * grids are the fused kernel's own output, read as indirect arguments,
+         * and only an encoder boundary is guaranteed to order that fetch. */
+        if (ds4_gpu_glm_topk_overlap_lever())
+            (void)ds4_gpu_concurrent_group_end();
     } else if (use_fast) {
         id<MTLComputeCommandEncoder> fenc = ds4_gpu_compute_encoder(cb);
         [fenc setComputePipelineState:g_topk_fast_hist_pipeline];

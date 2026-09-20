@@ -56191,6 +56191,7 @@ glm_levers g_glm_levers = {
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .sdn_concurrent        = 0,  /* off until measured */
+    .topk_overlap          = 0,  /* off until measured */
 };
 static int g_glm_levers_ready;
 
@@ -56211,6 +56212,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "sdn_concurrent",        offsetof(glm_levers, sdn_concurrent),        "DS4_GLM_SDN_CONCURRENT" },
+    { "topk_overlap",          offsetof(glm_levers, topk_overlap),          "DS4_GLM_TOPK_OVERLAP" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56257,6 +56259,9 @@ void glm_levers_init_from_env(void) {
      * ds4_gpu_glm53_sdn_concurrent_arm() falls back to today's fused
      * shared-down consumer with nothing skipped. */
     g_glm_levers.sdn_concurrent = getenv("DS4_GLM_SDN_CONCURRENT") != NULL;
+    /* Default off, a plain ENABLE variable; with it off the DSA group keeps
+     * today's two levels and closes before the top-k exactly as it does now. */
+    g_glm_levers.topk_overlap = getenv("DS4_GLM_TOPK_OVERLAP") != NULL;
     g_glm_levers_ready = 1;
 }
 
@@ -57142,12 +57147,20 @@ static bool glm_graph_forward_token_sel(
                      * are all complete past this point.  If the barrier is
                      * refused the group ends here and the encoder boundary
                      * provides the same ordering. */
+                    /* Lever topk_overlap: qk_low is independent of the
+                     * scorer and its only consumer is the attention partial
+                     * after the group, so with the lever on it is held back
+                     * out of level B and encoded in a third level beside the
+                     * fused top-k, whose single threadgroup leaves 79 of 80
+                     * cores idle.  Level B then holds the scorer alone. */
+                    const int topk_overlap_level =
+                        g_glm_levers.topk_overlap != 0;
                     if (dsa_cg) {
                         if (!ds4_gpu_concurrent_group_barrier()) {
                             (void)ds4_gpu_concurrent_group_end();
                             dsa_cg = 0;
                         }
-                        if (ok) {
+                        if (ok && !(dsa_cg && topk_overlap_level)) {
                             DS4_GLM_FT_STAGE("DSA qk low-rank projection");
                             ok = glm53_decode_encode_qk_low(g, model, l, il, pos,
                                                             false, g->qk_low,
@@ -57200,8 +57213,34 @@ static bool glm_graph_forward_token_sel(
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
                     /* C3: close before the top-k chain, whose internal
                      * dispatches depend on each other and rely on the serial
-                     * encoder for their ordering. */
-                    if (dsa_cg) {
+                     * encoder for their ordering.
+                     *
+                     * Lever topk_overlap: keep the group open for one more
+                     * level instead -- { fused top-k, qk_low } -- and let
+                     * ds4_gpu_indexer_topk_fused close it, which it does
+                     * immediately after the fused dispatch and before the
+                     * indirect fallback dispatches, or immediately if the
+                     * fused single dispatch is not being taken.  That keeps
+                     * the same encoder boundary the legacy chain and the
+                     * fallback grids rely on today, and the boundary rather
+                     * than a memory barrier is what orders the indirect
+                     * argument fetch. */
+                    if (dsa_cg && topk_overlap_level) {
+                        if (ds4_gpu_concurrent_group_barrier()) {
+                            if (ok) {
+                                DS4_GLM_FT_STAGE("DSA qk low-rank projection");
+                                ok = glm53_decode_encode_qk_low(
+                                        g, model, l, il, pos, false,
+                                        g->qk_low, g->q, DS4_N_HEAD);
+                                qk_low_encoded = ok;
+                            }
+                        } else {
+                            /* no barrier: fall back to today's shape, with
+                             * qk_low on the serial encoder below */
+                            (void)ds4_gpu_concurrent_group_end();
+                            dsa_cg = 0;
+                        }
+                    } else if (dsa_cg) {
                         (void)ds4_gpu_concurrent_group_end();
                         dsa_cg = 0;
                     }
@@ -57239,6 +57278,16 @@ static bool glm_graph_forward_token_sel(
                                 DS4_GLM53_INDEX_POOL_SIZE,
                                 glm53_graph_indexer_selected_limit()) != 0;
                         if (!ok) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                            /* The fused entry point refused before reaching
+                             * its own group close, and the two-call fallback
+                             * below is a DEPENDENT pair, so the group has to
+                             * end on an encoder boundary first. */
+                            if (dsa_cg) {
+                                (void)ds4_gpu_concurrent_group_end();
+                                dsa_cg = 0;
+                            }
+#endif
                             ok = ds4_gpu_indexer_topk_tensor(
                                     g->indexer_pool_selected,
                                     g->indexer_scores,
@@ -57256,6 +57305,14 @@ static bool glm_graph_forward_token_sel(
                                     glm53_graph_indexer_selected_limit()) != 0;
                         }
                     } else if (ok) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                        /* non-glm53 selection: this chain orders itself on the
+                         * serial encoder, so close any open group first. */
+                        if (dsa_cg) {
+                            (void)ds4_gpu_concurrent_group_end();
+                            dsa_cg = 0;
+                        }
+#endif
                         ok = ds4_gpu_indexer_topk_tensor(g->indexer_selected,
                                                          g->indexer_scores,
                                                          visible,
