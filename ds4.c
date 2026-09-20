@@ -56122,6 +56122,7 @@ glm_levers g_glm_levers = {
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .attn_probe            = 0,  /* diagnostic only; never ships non-zero */
     .attn_row_pair         = 1,  /* 1 = today's row loop; 2 pairs the scores */
+    .reduce_probe          = 0,  /* diagnostic only; never ships non-zero */
 };
 static int g_glm_levers_ready;
 
@@ -56136,6 +56137,8 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "attn_probe")) { *lo = 0; *hi = 4; return 1; }
     /* attn_row_pair: 1 = today, 2 = two rows scored before either update. */
     if (!strcmp(name, "attn_row_pair")) { *lo = 1; *hi = 2; return 1; }
+    /* reduce_probe: 0 = production, 1..4 = the §20 doubling probes. */
+    if (!strcmp(name, "reduce_probe")) { *lo = 0; *hi = 4; return 1; }
     return 0;
 }
 
@@ -56149,6 +56152,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "attn_probe",            offsetof(glm_levers, attn_probe),            "DS4_GLM_ATTN_PROBE" },
     { "attn_row_pair",         offsetof(glm_levers, attn_row_pair),         "DS4_GLM_ATTN_ROW_PAIR" },
+    { "reduce_probe",          offsetof(glm_levers, reduce_probe),          "DS4_GLM_REDUCE_PROBE" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56203,6 +56207,12 @@ void glm_levers_init_from_env(void) {
         if (v && v[0]) {
             const int n = atoi(v);
             g_glm_levers.attn_row_pair = (n == 2) ? 2 : 1;
+        }
+    }
+    {   const char *v = getenv("DS4_GLM_REDUCE_PROBE");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            g_glm_levers.reduce_probe = (n >= 0 && n <= 4) ? n : 0;
         }
     }
     g_glm_levers_ready = 1;

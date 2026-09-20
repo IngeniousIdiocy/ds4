@@ -7715,6 +7715,7 @@ typedef struct {
     uint32_t value_type;
     uint32_t dbg_double;          /* §19 attn_probe; 0 in production */
     uint32_t row_pair;            /* §19.5 attn_row_pair; 1 in production */
+    uint32_t dbg_reduce;          /* §20 reduce_probe; 0 in production */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -20912,6 +20913,28 @@ static uint32_t ds4_gpu_glm_attn_probe(void) {
             "double softmax update", "double output writes"
         };
         fprintf(stderr, "[T2] attn_probe=%d (%s)\n", v, what[v]);
+        last = v;
+    }
+    return (uint32_t)v;
+}
+
+/* §20 reduce_probe: 0 in production, 1..4 select a Tier-1 doubling probe
+ * inside the DSA reduce (1 the softmax rescale prologue over partial_ms and
+ * its two shuffle trees, 2 the lora blend over partial_lora, 3 the value
+ * projection, 4 the output stores).  Every probe rewrites the same values to
+ * the same addresses, so the token text is identical.  NEVER ships non-zero;
+ * exact mode clamps it off. */
+static uint32_t ds4_gpu_glm_reduce_probe(void) {
+    glm_levers_init_from_env();
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.reduce_probe;
+    if (v < 0 || v > 4) v = 0;
+    static int last = -1;
+    if (v != last) {
+        static const char *const what[5] = {
+            "production", "double ms prologue", "double lora blend",
+            "double value projection", "double output stores"
+        };
+        fprintf(stderr, "[T2] reduce_probe=%d (%s)\n", v, what[v]);
         last = v;
     }
     return (uint32_t)v;
@@ -41319,6 +41342,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .value_type = value_weight_type,
             .dbg_double = ds4_gpu_glm_attn_probe(),
             .row_pair = ds4_gpu_glm_attn_row_pair(),
+            .dbg_reduce = ds4_gpu_glm_reduce_probe(),
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;

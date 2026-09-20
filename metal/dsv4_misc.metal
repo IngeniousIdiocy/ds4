@@ -372,6 +372,9 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
      * 2 = score two rows before applying either update.  Appended, same
      * reasoning as dbg_double. */
     uint32_t row_pair;
+    /* §20 diagnostic, lever reduce_probe; 0 in production.  Appended for the
+     * same reason as the two above. */
+    uint32_t dbg_reduce;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -4233,6 +4236,20 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
     threadgroup float *block_scale = scratch + nth;
     threadgroup float *lora_sum = block_scale + 64u;
 
+    /* §20 doubling probes, lever reduce_probe, diagnostic only.  Same
+     * construction as the partial's §19 probes: each repeat count is a RUNTIME
+     * uniform, so the compiler cannot unroll and common-subexpression the
+     * second pass away, and every phase rewrites the same values to the same
+     * addresses, so the token text is identical and the A/B delta over the
+     * eleven DSA layers is that phase's cost.  The counts are uniform across
+     * the threadgroup, so the barriers inside phase 1 are still reached by
+     * every thread the same number of times. */
+    const uint rep_ms    = (args.dbg_reduce == 1u) ? 2u : 1u;
+    const uint rep_blend = (args.dbg_reduce == 2u) ? 2u : 1u;
+    const uint rep_proj  = (args.dbg_reduce == 3u) ? 2u : 1u;
+    const uint rep_store = (args.dbg_reduce == 4u) ? 2u : 1u;
+
+    for (uint rep = 0u; rep < rep_ms; rep++) {
     float local_m = -FLT_MAX / 2.0f;
     if (tid < n_blocks) {
         device const float *ms =
@@ -4308,8 +4325,10 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+    }
     const float denom = max(red[0], 1.0e-20f);
 
+    for (uint rep = 0u; rep < rep_blend; rep++)
     for (uint j = tid; j < args.kv_lora_dim; j += nth) {
         float acc = 0.0f;
         for (uint b = 0u; b < n_blocks; b++) {
@@ -4339,12 +4358,15 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
-            const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
-                                                         args.kv_lora_dim,
-                                                         (ushort)vp_lane);
-            const float sum = simd_sum(part);
+            float sum = 0.0f;
+            for (uint rep = 0u; rep < rep_proj; rep++) {
+                const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
+                                                             args.kv_lora_dim,
+                                                             (ushort)vp_lane);
+                sum = simd_sum(part);
+            }
             if (vp_lane == 0u) {
-                out[d] = sum;
+                for (uint rep = 0u; rep < rep_store; rep++) out[d] = sum;
             }
         }
     } else {
@@ -4352,11 +4374,15 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
             /* Q8_U16 reads the same row as ushort pairs in the same order. */
-            out[d] = (Q8_U16 && args.value_type == DS4_METAL_GGUF_Q8_0 &&
-                      args.kv_lora_dim == 512u)
-                         ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
-                         : glm_quant_dot_row_tg_f32(args.value_type, row,
-                                                    lora_sum, args.kv_lora_dim);
+            float v = 0.0f;
+            for (uint rep = 0u; rep < rep_proj; rep++) {
+                v = (Q8_U16 && args.value_type == DS4_METAL_GGUF_Q8_0 &&
+                     args.kv_lora_dim == 512u)
+                        ? glm_q8_0_dot_row_tg_f32_512_u16(row, lora_sum)
+                        : glm_quant_dot_row_tg_f32(args.value_type, row,
+                                                   lora_sum, args.kv_lora_dim);
+            }
+            for (uint rep = 0u; rep < rep_store; rep++) out[d] = v;
         }
     }
 }

@@ -800,6 +800,14 @@ typedef struct {
      * unchanged; this is instruction-level parallelism, not a different
      * arithmetic. */
     int attn_row_pair;
+
+    /* reduce_probe (§20): a NEVER-SHIP Tier-1 doubling probe inside the DSA
+     * reduce, one value per phase.  0 = production.  1 doubles the softmax
+     * rescale prologue (both partial_ms passes and their shuffle trees), 2 the
+     * lora blend over partial_lora, 3 the value projection, 4 the output
+     * stores.  Every value rewrites the same values to the same addresses, so
+     * the token text is identical. */
+    int reduce_probe;
 } glm_levers;
 
 extern glm_levers g_glm_levers;
