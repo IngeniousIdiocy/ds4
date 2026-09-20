@@ -1453,12 +1453,41 @@ static int ds4_gpu_matmul_q4_k_pair_unavailable(
     return 0;
 }
 
+/* Wave E: which shape family this call site belongs to, for the
+ * dflash_draft_q8_nt bitmask.  Named at the call site rather than inferred
+ * from the dimensions so each family is priced alone and no target shape can
+ * ever match by accident. */
+#define DFLASH2_NT_NONE 0
+#define DFLASH2_NT_QO   1
+#define DFLASH2_NT_KV   2
+#define DFLASH2_NT_DOWN 3
+
 static int dflash2_gpu_gemm(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
-                            const ds4_gpu_tensor *x, uint32_t n_tok) {
+                            const ds4_gpu_tensor *x, uint32_t n_tok, int nt_family) {
     if (!w || w->ndim < 2 || w->dim[0] == 0) return 0;
     if (w->type == DS4_TENSOR_Q5_K) return 0;
     const uint64_t in_dim = w->dim[0];
     const uint64_t out_dim = w->elements / in_dim;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Wave E: the drafter's 8-row Q8_0 projections on the token-tile kernel.
+     * Returns 0 without encoding when the shape does not fit, so the call
+     * falls through to today's mul_mv_ext path. */
+    if (w->type == DS4_TENSOR_Q8_0 && n_tok == 8u && nt_family != DFLASH2_NT_NONE) {
+        /* (NSG, NR) per family, measured over the full 28-point grid
+         * (NSG 1/2/4/6/8/12/16 x NR 1/2/4/8; see WAVE-E-REPORT.md).  The grid
+         * is jagged, not a curve with an optimum to interpolate: NSG 1->2
+         * improves, 2->4 regresses, 6->8 is flat, 12->16 regresses, and NR=1
+         * (no weight reuse) and NR=8 (register spill) lose everywhere.  The
+         * winner is NSG=2 -- 64 threads per threadgroup, the same width as
+         * mul_mv_ext -- with NR=4 for q/o and ffn_down and NR=2 for k/v. */
+        const int nt_nr = (nt_family == DFLASH2_NT_KV) ? 2 : 4;
+        const int nt_nsg = 2;
+        if (ds4_gpu_dflash_q8_rows_nt_tensor(out, m->map, m->size, w->abs_offset,
+                                             in_dim, out_dim, x, n_tok, nt_nr, nt_nsg)) {
+            return 1;
+        }
+    }
+#endif
     if (w->type == DS4_TENSOR_BF16) {
         /* The bf16 mm kernel is fastest at row counts that are multiples of
          * 32 (no boundary-checked variant); the mv path re-reads the full
@@ -1600,12 +1629,12 @@ static int dflash2_layer_forward_gpu(
     } while (0)
     DFLASH2_STEP("attn_rms", ds4_gpu_rms_norm_weight_rows_tensor(txn, th, m->map, m->size, l->attn_norm->abs_offset, H, L, cfg->rms_eps));
     if (!cfg->classic) {
-        DFLASH2_STEP("attn_dyn", dflash2_gpu_gemm(tdyn, m, l->attn_conv_proj, txn, L));
+        DFLASH2_STEP("attn_dyn", dflash2_gpu_gemm(tdyn, m, l->attn_conv_proj, txn, L, DFLASH2_NT_NONE));
         DFLASH2_STEP("attn_conv0", ds4_gpu_dflash2_grouped_conv(tprep, txn, tdyn, m->map, m->size, l->attn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 0));
     }
     const ds4_gpu_tensor *attn_input = cfg->classic ? txn : tprep;
     DFLASH2_STEP("attn_q", dflash2_gpu_gemm(
-        tq, m, l->attn_q, attn_input, L));
+        tq, m, l->attn_q, attn_input, L, DFLASH2_NT_QO));
     int fused_prop_kv = 0;
     if (ok && l->attn_k->type == DS4_TENSOR_Q4_K &&
         l->attn_v->type == DS4_TENSOR_Q4_K &&
@@ -1617,9 +1646,9 @@ static int dflash2_layer_forward_gpu(
     }
     if (!fused_prop_kv) {
         DFLASH2_STEP("attn_k", dflash2_gpu_gemm(
-            tkp, m, l->attn_k, attn_input, L));
+            tkp, m, l->attn_k, attn_input, L, DFLASH2_NT_NONE));
         DFLASH2_STEP("attn_v", dflash2_gpu_gemm(
-            tvp, m, l->attn_v, attn_input, L));
+            tvp, m, l->attn_v, attn_input, L, DFLASH2_NT_NONE));
     }
     /* Wave D (D3): the new context row's
      * K/V are produced into the cache rows themselves instead of into
@@ -1660,9 +1689,9 @@ static int dflash2_layer_forward_gpu(
     }
     if (!fused_ctx_kv) {
         DFLASH2_STEP("ctx_k", dflash2_gpu_gemm(
-            kc_dst, m, l->attn_k, thctx, n_ctx_new));
+            kc_dst, m, l->attn_k, thctx, n_ctx_new, DFLASH2_NT_NONE));
         DFLASH2_STEP("ctx_v", dflash2_gpu_gemm(
-            vc_dst, m, l->attn_v, thctx, n_ctx_new));
+            vc_dst, m, l->attn_v, thctx, n_ctx_new, DFLASH2_NT_NONE));
     }
     DFLASH2_STEP("q_rms", l->attn_q_norm && ds4_gpu_rms_norm_weight_rows_tensor(tq, tq, m->map, m->size, l->attn_q_norm->abs_offset, hd, L * n_head, cfg->rms_eps));
     DFLASH2_STEP("k_rms", l->attn_k_norm && ds4_gpu_rms_norm_weight_rows_tensor(tkp, tkp, m->map, m->size, l->attn_k_norm->abs_offset, hd, L * n_kv, cfg->rms_eps));
@@ -1707,14 +1736,14 @@ static int dflash2_layer_forward_gpu(
     DFLASH2_STEP("sdpa", ds4_gpu_dflash2_sdpa(
         theads, tq, attn_k_ctx, attn_v_ctx, tkp, tvp,
         L, n_ctx, n_head, n_kv, hd, causal, window));
-    DFLASH2_STEP("attn_o", dflash2_gpu_gemm(tattn, m, l->attn_output, theads, L));
+    DFLASH2_STEP("attn_o", dflash2_gpu_gemm(tattn, m, l->attn_output, theads, L, DFLASH2_NT_QO));
     if (!cfg->classic) {
         DFLASH2_STEP("attn_conv1", ds4_gpu_dflash2_grouped_conv(tfin, tattn, tdyn, m->map, m->size, l->attn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 1));
     }
     DFLASH2_STEP("attn_add", ds4_gpu_add_tensor(th, th, cfg->classic ? tattn : tfin, L * H));
     DFLASH2_STEP("ffn_rms", ds4_gpu_rms_norm_weight_rows_tensor(txn, th, m->map, m->size, l->ffn_norm->abs_offset, H, L, cfg->rms_eps));
     if (!cfg->classic) {
-        DFLASH2_STEP("ffn_dyn", dflash2_gpu_gemm(tdyn, m, l->ffn_conv_proj, txn, L));
+        DFLASH2_STEP("ffn_dyn", dflash2_gpu_gemm(tdyn, m, l->ffn_conv_proj, txn, L, DFLASH2_NT_NONE));
         DFLASH2_STEP("ffn_conv0", ds4_gpu_dflash2_grouped_conv(tprep, txn, tdyn, m->map, m->size, l->ffn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 0));
     }
     const ds4_gpu_tensor *ffn_input = cfg->classic ? txn : tprep;
@@ -1750,14 +1779,14 @@ static int dflash2_layer_forward_gpu(
     }
     if (!fused_ffn) {
         DFLASH2_STEP("ffn_gate", dflash2_gpu_gemm(
-            tgate, m, l->ffn_gate, ffn_input, L));
+            tgate, m, l->ffn_gate, ffn_input, L, DFLASH2_NT_NONE));
         DFLASH2_STEP("ffn_up", dflash2_gpu_gemm(
-            tup, m, l->ffn_up, ffn_input, L));
+            tup, m, l->ffn_up, ffn_input, L, DFLASH2_NT_NONE));
         DFLASH2_STEP("swiglu", ds4_gpu_swiglu_tensor(
             tmid, tgate, tup, L * ff, 0.0f, 1.0f));
     }
     DFLASH2_STEP("ffn_down", dflash2_gpu_gemm(
-        tffn, m, l->ffn_down, tmid, L));
+        tffn, m, l->ffn_down, tmid, L, DFLASH2_NT_NONE));
     if (!cfg->classic) {
         DFLASH2_STEP("ffn_conv1", ds4_gpu_dflash2_grouped_conv(tfin, tffn, tdyn, m->map, m->size, l->ffn_conv_base->abs_offset, L, H, cfg->conv_kernel, cfg->conv_group, 1));
     }

@@ -1014,6 +1014,22 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
  * kernel family and identical per-row arithmetic. */
 void ds4_gpu_mv_ext_r1_8_scope_set(int on);
 
+/* Wave E: the DFlash drafter's 8-row Q8_0 projections on the token-tile
+ * kernel (NT=8 draft rows x NR=2|4 weight rows per threadgroup, the weight
+ * read once).  Returns 0 and encodes nothing when the shape does not fit, so
+ * the caller falls through to mul_mv_ext. */
+int ds4_gpu_dflash_q8_rows_nt_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows,
+        int                     nr,
+        int                     nsg);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

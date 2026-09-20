@@ -296,6 +296,115 @@ kernel void kernel_dflash_q8_0_head_nt4(
     }
 }
 
+/* Wave E: the same token tile for the DFlash drafter's own Q8_0 projections,
+ * generalised from NT=4 to any NT.  NT draft rows reuse each group of NR
+ * weight rows, the weight is read once for all of them, and the dispatch is
+ * (out_dim/NR, n_rows/NT) threadgroups of 32*NSG threads -- out_dim*32*NSG/NR
+ * threads, against mul_mv_ext's out_dim*8 whatever the K length, which is
+ * what the drafter's narrow projections are short of (E0: ffn_down streams
+ * 50 MB per dispatch through 32,768 threads at 95 GB/s, while the gate/up
+ * pair at out_dim 12288 reaches 393 GB/s on the same draft).
+ * Arithmetic is the head's, not mul_mv_ext's strided float4 dot + shuffle
+ * tree: int8 x float products summed NQ=8 at a time, the row's block scale
+ * applied after the sumq, two simd_sum stages.  That is a change to the
+ * DRAFTER's summation order, which is why wave E is gated statistically on
+ * acceptance rather than on a byte-identical acceptance profile. */
+template<short NT, short NR>
+void kernel_dflash_q8_0_rows_nt_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0,
+        device const char *src1,
+        device float *dst,
+        threadgroup float *sh,
+        uint3 tg,
+        ushort lane,
+        ushort sg) {
+    /* Any NSG in 1..32 is legal and needs no tail guard: ib0 is a bijection
+     * from (sg, lane/(NW/NQ)) onto [0, NSG*NQ) and the loop strides by
+     * NSG*NQ, so the blocks are partitioned exactly for any nb, divisible or
+     * not; 32 is the ceiling because the second reduction stage sums the
+     * NW=32 threadgroup slots the simdgroups write into. */
+    constexpr short NQ = 8, NW = 32;
+    const short NSG = FC_mul_mv_nsg;
+    const uint r0 = tg.x * NR, token0 = tg.y * NT;
+    const int ib0 = sg * NQ + lane / (NW / NQ);
+    const short il = lane % (NW / NQ);
+    const int nb = args.ne00 / QK8_0;
+    float sums[NT][NR];
+    FOR_UNROLL (short t = 0; t < NT; t++) {
+        FOR_UNROLL (short r = 0; r < NR; r++) sums[t][r] = 0.0f;
+    }
+    /* Scalar loads and a per-token dequantise, exactly as the NT4 head does.
+     * A vectorised variant (weights dequantised once per block into float4,
+     * activation as two float4, hoisted row pointers) was built and measured
+     * on the step profile: it issues 4x fewer loads but pushes live state past
+     * ~64 registers per thread, and at 32*NSG threads per threadgroup the
+     * occupancy it costs is worth more than the instructions it saves
+     * (ffn_down +25%, q/o +38% against this form).  Keep this one. */
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        int8_t qs[NR][NQ];
+        float scales[NR];
+        FOR_UNROLL (short r = 0; r < NR; r++) {
+            device const block_q8_0 *w = (device const block_q8_0 *)(
+                src0 + (uint64_t)(r0 + r) * args.nb01);
+            scales[r] = w[ib].d;
+            FOR_UNROLL (short i = 0; i < NQ; i++) qs[r][i] = w[ib].qs[il * NQ + i];
+        }
+        FOR_UNROLL (short t = 0; t < NT; t++) {
+            device const float *y = (device const float *)(
+                src1 + (uint64_t)(token0 + t) * args.nb11);
+            float yl[NQ];
+            FOR_UNROLL (short i = 0; i < NQ; i++) yl[i] = y[ib * QK8_0 + il * NQ + i];
+            FOR_UNROLL (short r = 0; r < NR; r++) {
+                float sumq = 0.0f;
+                FOR_UNROLL (short i = 0; i < NQ; i++) sumq += qs[r][i] * yl[i];
+                sums[t][r] += sumq * scales[r];
+            }
+        }
+    }
+    FOR_UNROLL (short t = 0; t < NT; t++) {
+        FOR_UNROLL (short r = 0; r < NR; r++) {
+            if (sg == 0) sh[NW * (t * NR + r) + lane] = 0.0f;
+            sums[t][r] = simd_sum(sums[t][r]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short t = 0; t < NT; t++) {
+        FOR_UNROLL (short r = 0; r < NR; r++) {
+            if (lane == 0) sh[NW * (t * NR + r) + sg] = sums[t][r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        FOR_UNROLL (short t = 0; t < NT; t++) {
+            FOR_UNROLL (short r = 0; r < NR; r++) {
+                const float total = simd_sum(sh[NW * (t * NR + r) + lane]);
+                if (lane == 0) dst[(uint64_t)(token0 + t) * args.ne0 + r0 + r] = total;
+            }
+        }
+    }
+}
+
+template<short NT, short NR>
+kernel void kernel_dflash_q8_0_rows_nt_disp(
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]],
+        device const char *src0 [[buffer(1)]],
+        device const char *src1 [[buffer(2)]],
+        device float *dst [[buffer(3)]],
+        threadgroup float *sh [[threadgroup(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    kernel_dflash_q8_0_rows_nt_impl<NT, NR>(args, src0, src1, dst, sh, tg, lane, sg);
+}
+
+typedef decltype(kernel_dflash_q8_0_rows_nt_disp<8, 2>) dflash_q8_0_rows_nt_t;
+
+template [[host_name("kernel_dflash_q8_0_rows_nt8_nr2")]]
+kernel dflash_q8_0_rows_nt_t kernel_dflash_q8_0_rows_nt_disp<8, 2>;
+template [[host_name("kernel_dflash_q8_0_rows_nt8_nr4")]]
+kernel dflash_q8_0_rows_nt_t kernel_dflash_q8_0_rows_nt_disp<8, 4>;
+
 // Fused decode-time Q8_0 matvec over three same-shaped weights sharing one
 // input (GLM-5.3 KDA q/k/v): threadgroup z selects the matrix, so the three
 // projections cost one dispatch instead of three. Per-row math is identical

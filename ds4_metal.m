@@ -23332,6 +23332,59 @@ int ds4_gpu_dflash_head_nt4_tensor(
     }
 }
 
+/* Wave E: the drafter's own 8-row Q8_0 projections on the token-tile kernel.
+ * Same entry shape as the NT4 head above, with the row group NR chosen by the
+ * caller (2 or 4) and no vocabulary-specific shape gate: the drafter's
+ * families are 4096->4096 (q, o), 4096->1024 (k, v) and 12288->4096 (down).
+ * The grid is (out_dim/NR, n_rows/NT) with 32*nsg threads per threadgroup. */
+int ds4_gpu_dflash_q8_rows_nt_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows, int nr, int nsg_in) {
+    if (!out || !x || !model_map || n_rows != 8u) return 0;
+    if (nr != 2 && nr != 4) return 0;
+    if (nsg_in < 1 || nsg_in > 32) return 0;
+    if (in_dim == 0u || (in_dim % 32u) != 0u) return 0;
+    if (out_dim == 0u || (out_dim % (uint64_t)nr) != 0u) return 0;
+    if (in_dim > (uint64_t)INT32_MAX || out_dim > (uint64_t)INT32_MAX) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t weight_bytes = out_dim * (in_dim / 32u) * 34u;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) return 0;
+    @autoreleasepool {
+        uint64_t inner = 0;
+        id<MTLBuffer> weights = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &inner);
+        /* (NSG, NR) is a measured pair per shape family, not a default: see
+         * the sweep table in WAVE-E-REPORT.md.  NSG is a function constant,
+         * so every point in the sweep shares one binary. */
+        const int16_t nsg = (int16_t)nsg_in;
+        const char *fn = nr == 4 ? "kernel_dflash_q8_0_rows_nt8_nr4"
+                                 : "kernel_dflash_q8_0_rows_nt8_nr2";
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(fn, nsg);
+        if (!weights || !pipeline) return 0;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.ne11 = args.ne1 = (int32_t)n_rows;
+        args.nb12 = args.nb13 = (uint64_t)n_rows * in_dim * sizeof(float);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:32u * 8u * (NSUInteger)nr * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / (NSUInteger)nr, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(32u, (NSUInteger)nsg, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DFlash NT8 drafter projection");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
