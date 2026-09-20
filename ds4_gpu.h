@@ -4113,33 +4113,6 @@ typedef struct {
 
 void ds4_t2s_hit(ds4_t2s_slot *slot, const char *fmt, ...);
 
-/* Lever sdn_concurrent: arm the shared-expert down matvec so the routed MoE
- * dispatch encodes it into the concurrent group's first level, then encode the
- * standalone epilogue after the group ends.  Arming is a one-shot per layer;
- * _fired() reports whether the matvec was actually encoded, so a routed path
- * that never reached the hook leaves the caller on today's fused consumer. */
-int  ds4_gpu_glm53_sdn_concurrent_arm(
-        ds4_gpu_tensor       *shared_out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *shared_mid);
-void ds4_gpu_glm53_sdn_concurrent_disarm(void);
-int  ds4_gpu_glm53_sdn_concurrent_fired(void);
-int  ds4_gpu_glm53_sdn_epilogue_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *shared_out,
-        const ds4_gpu_tensor *routed_partials,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        uint32_t              n_embd,
-        uint32_t              n_hc,
-        uint32_t              n_slots);
-
 int ds4_gpu_concurrent_group_begin(void);
 int ds4_gpu_concurrent_group_barrier(void);
 int ds4_gpu_concurrent_group_end(void);

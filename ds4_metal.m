@@ -43389,19 +43389,6 @@ typedef struct {
  * every body it absorbs, so any knob that would have moved one of them makes
  * this path refuse and the five-dispatch ladder runs instead. */
 static int ds4_gpu_glm_routed_down_split_enabled(void);
-typedef struct {
-    int                   armed;
-    int                   fired;
-    ds4_gpu_tensor       *shared_out;
-    const ds4_gpu_tensor *shared_mid;
-    const void           *model_map;
-    uint64_t              model_size;
-    uint64_t              weight_offset;
-    uint64_t              in_dim;
-    uint64_t              out_dim;
-} ds4_gpu_sdn_concurrent_req;
-static ds4_gpu_sdn_concurrent_req g_sdn_concurrent;
-static int ds4_gpu_glm53_sdn_concurrent_encode_level1(id<MTLCommandBuffer> cb);
 static int ds4_gpu_glm_routed_gateup_wide_variant(void);
 
 int ds4_gpu_glm53_moe_block_dataflow_enabled(void) {
@@ -44570,20 +44557,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         double glm_stream_split_missing_load_ms = 0.0;
         double glm_stream_split_missing_wait_ms = 0.0;
 
-        /* Lever sdn_concurrent.  The group is opened HERE, not by the caller,
-         * because dispatches in a concurrent encoder carry no implicit
-         * ordering: only this branch emits the barrier between the routed
-         * gate/up and the routed down, so only this branch may open a group.
-         * The deferred-stream path commits the command buffer in the middle of
-         * level one, which a group cannot survive, so it is excluded. */
-        int sdn_group = 0;
-        if (g_sdn_concurrent.armed && !use_stream_split_deferred) {
-            sdn_group = ds4_gpu_concurrent_group_begin();
-            if (!sdn_group) g_sdn_concurrent.armed = 0;
-        } else {
-            g_sdn_concurrent.armed = 0;
-        }
-
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pair_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -44732,17 +44705,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
 
         if (!ok) return 0;
 
-        /* Lever sdn_concurrent: level one of the routed concurrent group is
-         * complete here, so the shared-expert down matvec joins it and the
-         * group barrier orders the routed down behind both.  A no-op when the
-         * lever is off or nothing was armed; a hard failure only if a barrier
-         * was owed and could not be emitted, since the down would then race
-         * the gate/up that produced its input. */
-        if (!ds4_gpu_glm53_sdn_concurrent_encode_level1(cb)) {
-            if (sdn_group) (void)ds4_gpu_concurrent_group_end();
-            return 0;
-        }
-
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:split_pipeline ? split_pipeline : down_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -44779,11 +44741,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE("down");
-
-        /* End before anything else is encoded: the encoder boundary this
-         * closes is what publishes shared_out (level one) and routed_partials
-         * (level two) to the epilogue dispatch the caller encodes next. */
-        if (sdn_group) (void)ds4_gpu_concurrent_group_end();
 
         if (!ok) return 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) return 0;
@@ -53075,245 +53032,6 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(
     (void)out_hc; (void)block_out; (void)block_add_h; (void)residual_hc;
     (void)split; (void)n_embd; (void)n_hc;
     return 0;
-}
-
-/* ---------------------------------------------------------------------------
- * Lever sdn_concurrent (glm_levers, ds4.h).
- *
- * The shared expert's down projection depends only on shared_mid, which the
- * router+shared fold has already written before the routed experts start; only
- * the slot sum and the HC expand depend on the routed down.  Today it runs
- * LAST, as kernel_dsv4_shared_down_hc_expand4_slots_q8_0: 9 MB of Q8 weights
- * in 23.6 us = 380 GB/s, a single-wave dispatch leaving about half the DRAM
- * rate idle.  With the lever on, the matvec instead rides inside the routed
- * concurrent group's first level, beside the 75 MB routed gate/up stream that
- * is already DRAM-bound, and what remains is a small epilogue dispatch.
- *
- * The caller ARMS the request, opens the concurrent group, runs the routed
- * dispatch (which encodes the matvec into level one and emits the group
- * barrier before the routed down), ends the group, and then encodes the
- * epilogue.  Arming is a one-shot: `fired` says whether the matvec was
- * actually encoded, so a routed path that never reached the hook leaves the
- * caller on today's fused consumer with nothing skipped.
- *
- * The matvec is the SHIPPED kernel_mul_mv_q8_0_f32, specialised from the same
- * ds4_gpu_make_q8_0_mv_dispatch_fam("SDN") and the same
- * ds4_gpu_make_q8_0_mv_args() the fused kernel uses, on the same grid with the
- * same threadgroup allocation.  kernel_mul_mv_q8_0_f32_impl plus
- * helper_mv_reduce_and_write IS the text the fused kernel's matvec half was
- * copied from -- same ix/il/ib0, same yb walk, same eight-product sumq with
- * the block scale applied after, same two-stage simd_sum reduction, same
- * writer lane -- so shared_out receives the identical float.
- * ------------------------------------------------------------------------ */
-
-void ds4_gpu_glm53_sdn_concurrent_disarm(void) {
-    memset(&g_sdn_concurrent, 0, sizeof(g_sdn_concurrent));
-}
-
-int ds4_gpu_glm53_sdn_concurrent_fired(void) {
-    return g_sdn_concurrent.fired;
-}
-
-int ds4_gpu_glm53_sdn_concurrent_arm(
-        ds4_gpu_tensor       *shared_out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *shared_mid) {
-    ds4_gpu_glm53_sdn_concurrent_disarm();
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    glm_levers_init_from_env();
-    {
-        const int on = g_glm_levers.sdn_concurrent != 0 && !glm53_exact_mode();
-        static int last = -1;
-        if (on != last) { fprintf(stderr, "[T2] sdn_concurrent=%d\n", on); last = on; }
-        if (!on) return 0;
-    }
-    /* The routed down must be taking the expert-parallel split, because the
-     * standalone epilogue is what sums its per-slot partials. */
-    if (!ds4_gpu_glm_routed_down_split_enabled()) return 0;
-    if (!shared_out || !shared_mid || !model_map) return 0;
-    if (out_dim == 0u || (in_dim & 31u) != 0u ||
-        in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
-    {
-        const uint64_t row_bytes = (in_dim / 32u) * 34u;
-        const uint64_t weight_bytes = out_dim * row_bytes;
-        if (weight_offset > model_size ||
-            weight_bytes > model_size - weight_offset) return 0;
-        if (ds4_gpu_tensor_bytes(shared_mid) < in_dim * sizeof(float)) return 0;
-        if (ds4_gpu_tensor_bytes(shared_out) < out_dim * sizeof(float)) return 0;
-    }
-    if (!ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32",
-                                     ds4_gpu_make_q8_0_mv_dispatch_fam("SDN").nsg)) {
-        return 0;
-    }
-    g_sdn_concurrent.armed = 1;
-    g_sdn_concurrent.shared_out = shared_out;
-    g_sdn_concurrent.shared_mid = shared_mid;
-    g_sdn_concurrent.model_map = model_map;
-    g_sdn_concurrent.model_size = model_size;
-    g_sdn_concurrent.weight_offset = weight_offset;
-    g_sdn_concurrent.in_dim = in_dim;
-    g_sdn_concurrent.out_dim = out_dim;
-    return 1;
-}
-
-/* Encoded from inside ds4_gpu_glm_routed_moe_one_tensor, after the routed
- * gate/up dispatch and before the routed down: the matvec joins level one and
- * the group barrier then orders level two behind both.  Returns 1 if the
- * barrier was emitted (or was not needed because nothing was armed), 0 only if
- * a barrier was required and could not be emitted, which the caller treats as
- * a hard failure because the routed down would otherwise race the gate/up. */
-static int ds4_gpu_glm53_sdn_concurrent_encode_level1(id<MTLCommandBuffer> cb) {
-    if (!g_sdn_concurrent.armed || g_sdn_concurrent.fired) return 1;
-
-    uint64_t inner_offset = 0;
-    const uint64_t row_bytes = (g_sdn_concurrent.in_dim / 32u) * 34u;
-    const uint64_t weight_bytes = g_sdn_concurrent.out_dim * row_bytes;
-    id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(g_sdn_concurrent.model_map,
-                                                  g_sdn_concurrent.model_size,
-                                                  g_sdn_concurrent.weight_offset,
-                                                  weight_bytes,
-                                                  &inner_offset);
-    id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(g_sdn_concurrent.shared_mid);
-    id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(g_sdn_concurrent.shared_out);
-    ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_fam("SDN");
-    id<MTLComputePipelineState> pipeline =
-        ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
-    if (!wbuf || !midbuf || !outbuf || !pipeline) {
-        /* Nothing encoded: leave `fired` at 0 so the caller runs today's fused
-         * consumer, which recomputes the matvec itself. */
-        g_sdn_concurrent.armed = 0;
-        return 1;
-    }
-
-    ds4_gpu_q8_0_matvec_args mv_args =
-        ds4_gpu_make_q8_0_mv_args(g_sdn_concurrent.in_dim, g_sdn_concurrent.out_dim);
-    mv_args.nr0 = mv_dispatch.nr0;
-
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:pipeline];
-    [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
-    [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-    [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(g_sdn_concurrent.shared_mid) atIndex:2];
-    [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(g_sdn_concurrent.shared_out) atIndex:3];
-    [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)g_sdn_concurrent.out_dim +
-                                           (NSUInteger)mv_dispatch.nr0 - 1u) /
-                                          (NSUInteger)mv_dispatch.nr0,
-                                          1,
-                                          1)
-         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
-    g_sdn_concurrent.fired = 1;
-    return ds4_gpu_concurrent_group_barrier();
-}
-
-/* The standalone epilogue, encoded after the concurrent group has ENDED: the
- * encoder boundary end() emits is what makes shared_out (level one) and
- * routed_partials (level two) visible to it. */
-int ds4_gpu_glm53_sdn_epilogue_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *shared_out,
-        const ds4_gpu_tensor *routed_partials,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        uint32_t              n_embd,
-        uint32_t              n_hc,
-        uint32_t              n_slots) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!out_hc || !shared_out || !routed_partials || !residual_hc || !split ||
-        n_embd == 0u || n_hc != 4u || out_dim != n_embd ||
-        n_slots == 0u || n_slots > 32u ||
-        in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
-        return 0;
-    }
-
-    @autoreleasepool {
-        id<MTLBuffer> sharedbuf = ds4_gpu_tensor_buffer(shared_out);
-        id<MTLBuffer> partbuf = ds4_gpu_tensor_buffer(routed_partials);
-        id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
-        id<MTLBuffer> splitbuf = ds4_gpu_tensor_buffer(split);
-        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
-
-        const uint64_t embd_bytes = out_dim * sizeof(float);
-        const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
-        const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-        const uint64_t split_bytes = mix_hc * sizeof(float);
-        if (!sharedbuf || !partbuf || !resbuf || !splitbuf || !outbuf ||
-            ds4_gpu_tensor_bytes(shared_out) < embd_bytes ||
-            ds4_gpu_tensor_bytes(routed_partials) <
-                (uint64_t)n_slots * out_dim * sizeof(float) ||
-            ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
-            ds4_gpu_tensor_bytes(split) < split_bytes ||
-            ds4_gpu_tensor_bytes(out_hc) < hc_bytes) {
-            fprintf(stderr, "ds4: Metal shared-down HC epilogue received undersized buffers\n");
-            return 0;
-        }
-
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
-                "kernel_dsv4_shared_down_hc_expand4_slots_epilogue");
-        if (!pipeline) return 0;
-
-        /* mv carries only ne00/ne01 here; the epilogue reads ne01 as the row
-         * bound.  Built by the same helper so the bound is the same integer
-         * the fused kernel compares against. */
-        ds4_gpu_q8_0_matvec_args mv_args =
-            ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-        ds4_gpu_hc_expand_args hc_args = {
-            .n_embd = n_embd,
-            .n_hc = n_hc,
-            .n_tokens = 1,
-            .nb_block0 = sizeof(float),
-            .nb_block1 = (uint64_t)n_embd * sizeof(float),
-            .nb_add0 = sizeof(float),
-            .nb_add1 = (uint64_t)n_embd * sizeof(float),
-            .nb_res0 = sizeof(float),
-            .nb_res1 = (uint64_t)n_embd * sizeof(float),
-            .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
-            .nb_post0 = sizeof(float),
-            .nb_post1 = mix_hc * sizeof(float),
-            .nb_comb0 = sizeof(float),
-            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb2 = mix_hc * sizeof(float),
-            .nb0 = sizeof(float),
-            .nb1 = (uint64_t)n_embd * sizeof(float),
-            .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
-            .has_add = 1,
-        };
-        const ds4_metal_dsv4_routed_slots_args slot_args = {
-            .n_slots = n_slots,
-            .pad0 = 0,
-        };
-
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        if (!cb) return 0;
-
-        const NSUInteger threads = 256;
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
-        [enc setBytes:&hc_args length:sizeof(hc_args) atIndex:1];
-        [enc setBuffer:sharedbuf offset:ds4_gpu_tensor_offset(shared_out) atIndex:2];
-        [enc setBuffer:partbuf offset:ds4_gpu_tensor_offset(routed_partials) atIndex:3];
-        [enc setBytes:&slot_args length:sizeof(slot_args) atIndex:4];
-        [enc setBuffer:resbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:5];
-        [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float) atIndex:6];
-        [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:7];
-        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + threads - 1u) / threads, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "shared-down HC epilogue")) return 0;
-    }
-
-    return 1;
 }
 
 static int ds4_gpu_shared_down_hc_expand_q8_0_impl(
