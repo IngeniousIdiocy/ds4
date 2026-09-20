@@ -792,6 +792,16 @@ typedef struct {
      * is what leaves the doubled shared-memory traffic as the suspect. */
     int attn_kv_regs;
 
+    /* kda_epilogue_merge (§21.10): 0 = today, where the KDA glue's epilogue
+     * re-reads from device memory the 128 `so` values its own row loop wrote
+     * moments earlier, and its leading barrier must carry mem_device; 1 = the
+     * row loop mirrors each value into threadgroup memory, the epilogue reads
+     * it there and the barrier narrows to threadgroup scope.  The device store
+     * stays because split_so is the kernel's output in the do_out == 0
+     * configuration.  Tier 1: the same words and the same reduction tree, only
+     * the address space of the load moves. */
+    int kda_epilogue_merge;
+
 } glm_levers;
 
 extern glm_levers g_glm_levers;
