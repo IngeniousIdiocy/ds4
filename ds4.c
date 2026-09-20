@@ -56122,6 +56122,7 @@ glm_levers g_glm_levers = {
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .attn_kv_regs          = 1,  /* on: +0.110 t/s at 62k, identical text */
     .kda_glue_probe        = 0,  /* diagnostic only; never ships non-zero */
+    .hc_pre_probe          = 0,  /* diagnostic only; never ships non-zero */
 };
 static int g_glm_levers_ready;
 
@@ -56134,6 +56135,8 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 1; return 1; }
     /* kda_glue_probe: 0 = production, 1..4 = the §21 doubling probes. */
     if (!strcmp(name, "kda_glue_probe")) { *lo = 0; *hi = 4; return 1; }
+    /* hc_pre_probe: 0 = production, 1 = kernel A, 2 = kernel B. */
+    if (!strcmp(name, "hc_pre_probe")) { *lo = 0; *hi = 2; return 1; }
     return 0;
 }
 
@@ -56147,6 +56150,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_DISABLE_ATTN_KV_REGS" },
     { "kda_glue_probe",        offsetof(glm_levers, kda_glue_probe),        "DS4_GLM_KDA_GLUE_PROBE" },
+    { "hc_pre_probe",          offsetof(glm_levers, hc_pre_probe),          "DS4_GLM_HC_PRE_PROBE" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56200,6 +56204,12 @@ void glm_levers_init_from_env(void) {
         if (v && v[0]) {
             const int n = atoi(v);
             g_glm_levers.kda_glue_probe = (n >= 0 && n <= 4) ? n : 0;
+        }
+    }
+    {   const char *v = getenv("DS4_GLM_HC_PRE_PROBE");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            g_glm_levers.hc_pre_probe = (n >= 0 && n <= 2) ? n : 0;
         }
     }
     g_glm_levers_ready = 1;

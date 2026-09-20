@@ -53578,6 +53578,7 @@ typedef struct {
     uint32_t out_dim;
     uint32_t n_rows;
     uint32_t n_slices;
+    uint32_t dbg_double;          /* §22 hc_pre_probe; 0 in production */
 } glm53_gpu_bf16_splitk_args;
 
 int ds4_gpu_glm53_embedding_bf16(
@@ -54400,6 +54401,21 @@ static int glm53_exact_mode(void) {
  *      kernel computes.
  */
 
+/* §22 hc_pre_probe: 0 in production, 1 doubles kernel A's split-K dot and
+ * partial sum-of-squares, 2 doubles kernel B's mix reduce, comb, collapse and
+ * RMS.  Value 2 deliberately does NOT cover the cross-threadgroup ticket - the
+ * atomic publication, the counter, the two seq_cst fences, the spin and the
+ * watchdog are synchronisation, not work, and doubling them would deadlock.
+ * Every phase both values do cover rewrites the same values to the same
+ * addresses, so the token text is identical.  NEVER ships non-zero; exact mode
+ * clamps it off. */
+static uint32_t ds4_gpu_glm53_hc_pre_probe(void) {
+    glm_levers_init_from_env();
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.hc_pre_probe;
+    if (v < 0 || v > 2) v = 0;
+    return (uint32_t)v;
+}
+
 /* The hc_pre algebra lever's half A moves this optimum; see below. */
 static int ds4_gpu_glm53_hc_alg_active(int half);
 
@@ -54975,11 +54991,30 @@ static int ds4_gpu_glm53_hc_pre_splitk_impl(
             .out_dim = (int32_t)mix_dim,
             .eps = eps,
         };
+        /* §20.4's rule: announce the value ENCODED, beside the pipelines that
+         * were bound.  Read as an ordinary statement, never in the
+         * initializer. */
+        const uint32_t enc_hc_probe = ds4_gpu_glm53_hc_pre_probe();
+        {
+            static uint32_t last_enc = 0xffffffffu;
+            if (enc_hc_probe != last_enc) {
+                fprintf(stderr,
+                        "[T2] encoded hc_pre_probe=%u (A=%s, B=%s, slices=%u,"
+                        " nsg=%u, alg_a=%d, alg_b=%d)\n",
+                        enc_hc_probe,
+                        alg_a ? DS4_GLM53_HC_ALG_A_KERNEL
+                              : "kernel_glm53_hc_rms_splitk_fused",
+                        tail_name, (unsigned)slices, (unsigned)sel_nsg,
+                        alg_a, alg_b);
+                last_enc = enc_hc_probe;
+            }
+        }
         glm53_gpu_bf16_splitk_args splitk = {
             .in_dim = n,
             .out_dim = mix_dim,
             .n_rows = 1u,
             .n_slices = slices,
+            .dbg_double = enc_hc_probe,
         };
         ds4_gpu_hc_split_weighted_sum_norm_args split_args = {
             .n_embd = (int64_t)n_embd,

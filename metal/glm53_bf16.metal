@@ -492,6 +492,11 @@ struct glm53_bf16_splitk_args {
     uint out_dim;
     uint n_rows;
     uint n_slices;
+    /* §22 diagnostic, lever hc_pre_probe; 0 in production.  1 doubles kernel
+     * A's split-K dot and partial sum-of-squares, 2 doubles kernel B's mix
+     * reduce, comb, collapse and RMS.  Appended, so every field above keeps
+     * its offset and the split-K matvecs that ignore it are unaffected. */
+    uint dbg_double;
 };
 
 kernel void kernel_glm53_mul_mv_bf16_f32_splitk(
