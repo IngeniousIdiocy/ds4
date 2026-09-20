@@ -2073,7 +2073,7 @@ static int dflash2_propose_confident(
             !proposer_head_killed && dflash2_proposer_head_diagnostic();
         const bool proposer_head_use = !proposer_head_compare &&
             dflash_fast_path_enabled(
-                proposer_head_shape, false,
+                proposer_head_shape, dflash2_fast_default(dm, dw, tm, tw),
                 getenv("DS4_DFLASH_PROPOSER_HEAD_NT4"),
                 getenv("DS4_DFLASH_DISABLE_PROPOSER_HEAD_NT4"),
                 getenv("DS4_GLM_EXACT"));
