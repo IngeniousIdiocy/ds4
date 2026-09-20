@@ -20768,7 +20768,7 @@ typedef struct {
     uint32_t output_width;
     uint32_t pos0;
     uint32_t fb_count;
-    uint32_t pad0;
+    uint32_t dbg_skip;
     uint32_t fb_grid[16];
 } ds4_gpu_kargs_topk_fast;
 
@@ -20880,13 +20880,30 @@ static int ds4_gpu_glm_topk_fast_pipelines(void) {
  * resident server with --debug-levers can move it between requests. */
 static int ds4_gpu_glm_topk_fused_lever(void) {
     glm_levers_init_from_env();
-    const int on = g_glm_levers.topk_fused != 0 && !glm53_exact_mode();
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.topk_fused;
+    if (v < 0 || v > 9) v = 0;
+    if (v >= 2 && v <= 4) v = 1;        /* retired split-scan values */
     static int last = -1;
-    if (on != last) {
-        fprintf(stderr, "[T2] topk_fused=%d\n", on);
-        last = on;
+    if (v != last) {
+        static const char *what[10] = {
+            "three-dispatch chain", "fused", "", "", "",
+            "PROBE: no bitonic sort", "PROBE: no gather pass",
+            "PROBE: no out_idx or pool expansion",
+            "PROBE: histogram and cut scan only",
+            "fused + shuffle cut scan (byte-identical)" };
+        fprintf(stderr, "[T2] topk_fused=%d (%s)%s\n", v, what[v],
+                (v >= 5 && v <= 8) ?
+                "  *** NEVER-SHIP DIAGNOSTIC: OUTPUT IS WRONG ***" : "");
+        last = v;
     }
-    return on;
+    return v;
+}
+
+/* 0 in production; 1..5 select a §16 phase probe inside the fused kernel. */
+static uint32_t ds4_gpu_glm_topk_fused_dbg(int lever) {
+    if (lever >= 5 && lever <= 8) return (uint32_t)(lever - 4);
+    if (lever == 9) return 5u;
+    return 0u;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
@@ -21123,10 +21140,11 @@ static int ds4_gpu_indexer_topk_fused(
         }
         fast_args.fb_count = fb;
     }
-    int fast_fused = 0;
-    if (use_fast)
-        fast_fused = ds4_gpu_glm_topk_fused_lever() &&
-                     ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
+    int fast_lever = use_fast ? ds4_gpu_glm_topk_fused_lever() : 0;
+    const int fast_fused =
+        fast_lever &&
+        ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
+    if (fast_fused) fast_args.dbg_skip = ds4_gpu_glm_topk_fused_dbg(fast_lever);
     if (fast_fused) {
         /* Lever topk_fused=1: the whole chain as one dispatch of one
          * threadgroup.  The fallback dispatches below are encoded exactly as

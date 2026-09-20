@@ -776,7 +776,18 @@ typedef struct {
      * is byte-identical.  Default ON since fused-62k (+0.127 t/s at 62k over
      * three interleaved reps, identical text); DS4_GLM_DISABLE_TOPK_FUSED is
      * the kill switch, exact mode clamps it off, and /debug/levers moves it
-     * live. */
+     * live.
+     *
+     * DIAGNOSTIC VALUES 5-8 ARE NEVER-SHIP (§16).  Each skips exactly one
+     * phase of the fused kernel and is otherwise identical, so the kernel
+     * ledger prices that phase; the OUTPUT IS WRONG BY CONSTRUCTION and the
+     * divergent text is the tripwire.  5 = no bitonic sort, 6 = no second
+     * pass in the gather, 7 = no out_idx writes and no pool expansion,
+     * 8 = histogram and cut scan only.  Value 9 is NOT a probe: it is value 1
+     * with the cut scan's ten-round threadgroup suffix sum replaced by a
+     * single-simdgroup shuffle scan, which is byte-identical (see the
+     * identity argument in metal/argsort.metal) and removes twenty barriers.
+     * 2-4 are retired and refuse to 1. */
     int topk_fused;
 } glm_levers;
 
