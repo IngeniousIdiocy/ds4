@@ -801,7 +801,13 @@ typedef struct {
      * kv_shared a second time, which is exactly the traffic attn_kv_regs
      * removed for +0.110, so the two effects very nearly cancel.  Tier 2
      * because both forms are max-stabilised but the exponent arguments and
-     * the order of the scalings differ, so the last bits move. */
+     * the order of the scalings differ, so the last bits move.
+     *
+     * 2 = the same in groups of EIGHT, with the group loop stopping at the
+     * tile's live rows instead of running a fixed sixteen trips.  3 = groups
+     * of TWO, where the group's eight staged half4 fit in thirty-two
+     * registers, so the accumulate pass reads no threadgroup memory at all
+     * and the split costs no extra traffic - half the rescales for nothing. */
     int attn_softmax_2pass;
 
 } glm_levers;

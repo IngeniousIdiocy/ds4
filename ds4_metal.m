@@ -20930,15 +20930,23 @@ static uint32_t ds4_gpu_glm_attn_kv_regs(void) {
 static uint32_t ds4_gpu_glm_attn_softmax_2pass(void) {
     glm_levers_init_from_env();
     int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_softmax_2pass;
-    if (v != 1) v = 0;
+    if (v < 0 || v > 3) v = 0;
     static int last = -1;
     if (v != last) {
         fprintf(stderr, "[T2] attn_softmax_2pass=%d (%s)\n", v,
-                v == 1 ? "tile max, one rescale"
+                v == 1 ? "group 16, fixed 16 trips, reloads kv" :
+                v == 2 ? "group 8, live groups, reloads kv" :
+                v == 3 ? "group 2, live groups, kv held in registers"
                        : "running max, rescale per row");
         last = v;
     }
     return (uint32_t)v;
+}
+
+/* The group size each arm encodes, for the announcement.  0 means the shipped
+ * running softmax, which has no group. */
+static uint32_t ds4_gpu_glm_attn_sm2_group(uint32_t v) {
+    return v == 1u ? 16u : v == 2u ? 8u : v == 3u ? 2u : 0u;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
@@ -41314,9 +41322,13 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             if ((enc_kv_regs | (enc_sm2 << 1)) != last_enc) {
                 fprintf(stderr,
                         "[T2] encoded attn_kv_regs=%u attn_softmax_2pass=%u"
-                        " (partial=%s, reduce=%s, n_blocks=%u,"
-                        " block_rows=%u, stage_rows=16)\n",
+                        " (group=%u, trips=%s, partial=%s, reduce=%s,"
+                        " n_blocks=%u, block_rows=%u, stage_rows=16)\n",
                         enc_kv_regs, enc_sm2,
+                        ds4_gpu_glm_attn_sm2_group(enc_sm2),
+                        enc_sm2 == 1u ? "fixed16" :
+                        (enc_sm2 == 2u || enc_sm2 == 3u) ? "live-groups"
+                                                         : "per-row",
                         use_prefix_fullheads ?
                             "group8_partial_prefix_fullheads" : "group8_partial",
                         t2s_vplane ? "t2s_reduce_vplane" :

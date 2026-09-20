@@ -369,9 +369,13 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
      * update; 1 = read once into registers and reused for both.  Same values,
      * same conversions, same operation order. */
     uint32_t kv_regs;
-    /* §19.11 lever attn_softmax_2pass, TIER 2: 0 = today's running online
-     * softmax, one row at a time; 1 = all of the tile's scores first, one tile
-     * max, one rescale of the accumulator, then the sixteen accumulations. */
+    /* §19.11 lever attn_softmax_2pass, TIER 2.  0 = today's running online
+     * softmax, one row at a time.  1 = all sixteen of the tile's scores
+     * first, one tile max, one rescale, then sixteen accumulations, with a
+     * fixed sixteen-trip score pass.  2 = the same in groups of EIGHT, and
+     * the group loop stops at the tile's live rows.  3 = groups of TWO, where
+     * the two rows' staged kv fits in registers and the accumulate pass does
+     * not re-read threadgroup memory at all. */
     uint32_t sm2;
 };
 
@@ -3874,6 +3878,104 @@ kernel void kernel_glm_value_project_q8_0_batch_heads_mma(
  * single final block of at most 3 rows -- pay the per-row bounds test.  A pad
  * row is then masked out of the softmax entirely (score -FLT_MAX/2, no
  * accumulator update), never admitted as a zero-valued member. */
+/* §19.11 attn_softmax_2pass, values 2 and 3: the block-wise softmax with the
+ * group size as a parameter.  This is a macro rather than a helper because the
+ * loop needs twenty-odd names from the kernel's own scope, and inlining it
+ * textually is the form that cannot be mis-plumbed.  Value 1 keeps its own
+ * copy below, unchanged, so the nine reps already measured on it stay valid.
+ *
+ * GROUP is a compile-time constant in every instantiation, so both inner loops
+ * unroll and `sc` and `kk` are indexed by constants and live in registers.
+ * Only the OUTER loop's bound is dynamic, at group granularity: a tile with
+ * three live rows runs one group of two or one group of eight, not the fixed
+ * sixteen trips value 1 runs.  Each masked trip still costs a `simd_sum`, so
+ * at the shallow shape - block_rows 32, a ragged last block - that is real.
+ *
+ * HOLD is the register form.  At GROUP 2 the group's eight staged half4 fit in
+ * thirty-two registers, so the accumulate pass reuses them instead of reading
+ * threadgroup memory a second time, and the two-pass split costs NO extra
+ * traffic at all.  It is the same bit-identical reuse kv_regs makes inside the
+ * shipped row loop: the same threadgroup words, the same half-to-float
+ * conversions on the same inputs, the same operands in the same order.  At
+ * GROUP 8 or 16 the hold would need 128 or 256 registers and is not available,
+ * so those values re-read and only the rescale count improves. */
+/* The hold array is sized 1 when HOLD is 0, so its index is clamped to 0 in
+ * that case too: the `if (HOLD)` branches are dead there, but a constant
+ * out-of-range index on a local array is not something to hand to a compiler
+ * that only runs at server boot. */
+#define GLM_SM2_KI(HOLD, t, n) ((HOLD) ? ((t) * 4u + (n)) : 0u)
+
+#define GLM_SM2_TILE(GROUP, HOLD)                                              \
+    for (uint g = 0u; g < stage_rows; g += (GROUP)) {                          \
+        if (g >= rows) break;                                                  \
+        float sc[(GROUP)];                                                     \
+        float4 kk[(HOLD) ? (GROUP) * 4u : 1u];                                 \
+        uint vmask = 0u;                                                       \
+        for (uint t = 0u; t < (GROUP); t++) {                                  \
+            const uint rr = g + t;                                             \
+            const bool inr = rr < rows;                                        \
+            const uint row = selected[base + (inr ? rr : 0u)];                 \
+            const bool live = valid_head && inr &&                             \
+                              (rows_all_valid || row < args.cache_cap);        \
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;        \
+            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs; \
+            if (HOLD) {                                                        \
+                kk[GLM_SM2_KI(HOLD, t, 0u)] = (float4)kv_row[lane + 0u];       \
+                kk[GLM_SM2_KI(HOLD, t, 1u)] = (float4)kv_row[lane + 32u];      \
+                kk[GLM_SM2_KI(HOLD, t, 2u)] = (float4)kv_row[lane + 64u];      \
+                kk[GLM_SM2_KI(HOLD, t, 3u)] = (float4)kv_row[lane + 96u];      \
+            }                                                                  \
+            float partial = 0.0f;                                              \
+            if (live) {                                                        \
+                if (HOLD) {                                                    \
+                    partial += dot(low0, kk[GLM_SM2_KI(HOLD, t, 0u)]);         \
+                    partial += dot(low1, kk[GLM_SM2_KI(HOLD, t, 1u)]);         \
+                    partial += dot(low2, kk[GLM_SM2_KI(HOLD, t, 2u)]);         \
+                    partial += dot(low3, kk[GLM_SM2_KI(HOLD, t, 3u)]);         \
+                } else {                                                       \
+                    partial += dot(low0, (float4)kv_row[lane + 0u]);           \
+                    partial += dot(low1, (float4)kv_row[lane + 32u]);          \
+                    partial += dot(low2, (float4)kv_row[lane + 64u]);          \
+                    partial += dot(low3, (float4)kv_row[lane + 96u]);          \
+                }                                                              \
+                if (lane < rope_vecs) {                                        \
+                    partial += dot(qrope, rope_row[lane]);                     \
+                }                                                              \
+            }                                                                  \
+            const float sum = simd_sum(partial);                               \
+            sc[t] = live ? sum * args.scale : -FLT_MAX / 2.0f;                 \
+            if (live) vmask |= (1u << t);                                      \
+        }                                                                      \
+        float gm = -FLT_MAX / 2.0f;                                            \
+        for (uint t = 0u; t < (GROUP); t++) { gm = max(gm, sc[t]); }           \
+        const float new_m = max(M, gm);                                        \
+        const float old_scale = exp(M - new_m);                                \
+        o0 = o0 * old_scale;                                                   \
+        o1 = o1 * old_scale;                                                   \
+        o2 = o2 * old_scale;                                                   \
+        o3 = o3 * old_scale;                                                   \
+        S = S * old_scale;                                                     \
+        for (uint t = 0u; t < (GROUP); t++) {                                  \
+            if (((vmask >> t) & 1u) == 0u) continue;                           \
+            const float w = exp(sc[t] - new_m);                                \
+            if (HOLD) {                                                        \
+                o0 = o0 + kk[GLM_SM2_KI(HOLD, t, 0u)] * w;                     \
+                o1 = o1 + kk[GLM_SM2_KI(HOLD, t, 1u)] * w;                     \
+                o2 = o2 + kk[GLM_SM2_KI(HOLD, t, 2u)] * w;                     \
+                o3 = o3 + kk[GLM_SM2_KI(HOLD, t, 3u)] * w;                     \
+            } else {                                                           \
+                threadgroup const half4 *kv_row =                              \
+                    kv_shared + (g + t) * kv_vecs;                             \
+                o0 = o0 + (float4)kv_row[lane + 0u] * w;                       \
+                o1 = o1 + (float4)kv_row[lane + 32u] * w;                      \
+                o2 = o2 + (float4)kv_row[lane + 64u] * w;                      \
+                o3 = o3 + (float4)kv_row[lane + 96u] * w;                      \
+            }                                                                  \
+            S = S + w;                                                         \
+        }                                                                      \
+        M = new_m;                                                             \
+    }
+
 template <bool assume_valid_rows, bool assume_valid_heads,
           bool prefix_checked = false>
 kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
@@ -3965,8 +4067,10 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
      * switch, it reads the same four addresses twice, as the kernel did until
      * 2026-09-19.  Measured +0.110 t/s at 62k (kvregs-62k), text identical. */
     const bool kv_regs = (args.kv_regs != 0u);
-    /* §19.11 lever attn_softmax_2pass; threadgroup-uniform. */
-    const bool sm2 = (args.sm2 != 0u);
+    /* §19.11 lever attn_softmax_2pass; threadgroup-uniform.  1 = groups of
+     * sixteen with a fixed sixteen-trip score pass, 2 = groups of eight,
+     * 3 = groups of two with the group's kv held in registers. */
+    const uint sm2 = args.sm2;
 
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
@@ -4023,8 +4127,20 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sm2) {
-            /* §19.11, TIER 2.  The shipped form is a RUNNING online softmax:
+        if (sm2 == 2u) {
+            /* §19.11 value 2: groups of eight, live-group trip
+             * count.  Same reload as value 1 - eight rows of staged kv
+             * will not fit in registers - so only the rescale count and
+             * the masked trips change. */
+            GLM_SM2_TILE(8u, 0)
+        } else if (sm2 == 3u) {
+            /* §19.11 value 3: groups of two, and the group's eight
+             * staged half4 stay in thirty-two registers, so the
+             * accumulate pass reads no threadgroup memory.  Half the
+             * rescales go and nothing is paid back. */
+            GLM_SM2_TILE(2u, 1)
+        } else if (sm2 == 1u) {
+            /* §19.11 value 1, TIER 2.  The shipped form is a RUNNING online softmax:
              * each row takes new_m = max(M, score), rescales the whole
              * accumulator by exp(M - new_m), adds its own term and updates M.
              * That is sixteen rescales and thirty-two exps per tile, and every

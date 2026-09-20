@@ -56132,6 +56132,8 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
     /* topk_fused: 0 = the three-dispatch chain, 1 = the fused kernel. */
     if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 1; return 1; }
+    /* attn_softmax_2pass: 0 shipped, 1 group 16, 2 group 8, 3 group 2. */
+    if (!strcmp(name, "attn_softmax_2pass")) { *lo = 0; *hi = 3; return 1; }
     return 0;
 }
 
@@ -56193,7 +56195,10 @@ void glm_levers_init_from_env(void) {
      * and exact mode clamps it off at the read site. */
     g_glm_levers.attn_kv_regs = getenv("DS4_GLM_DISABLE_ATTN_KV_REGS") == NULL;
     {   const char *v = getenv("DS4_GLM_ATTN_SOFTMAX_2PASS");
-        if (v && v[0]) g_glm_levers.attn_softmax_2pass = atoi(v) == 1 ? 1 : 0;
+        if (v && v[0]) {
+            const int n = atoi(v);
+            g_glm_levers.attn_softmax_2pass = (n >= 0 && n <= 3) ? n : 0;
+        }
     }
     g_glm_levers_ready = 1;
 }
