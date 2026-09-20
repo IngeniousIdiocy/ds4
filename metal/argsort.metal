@@ -593,7 +593,6 @@ struct ds4_metal_args_glm53_topk_fast {
     uint32_t output_width;    // 2051
     uint32_t pos0;
     uint32_t fb_count;        // fallback dispatches whose grid this path gates
-    uint32_t rank_sort;       // lever topk_fused=17 (§18.4)
     uint32_t fb_grid[16];     // (x,y) per fallback dispatch, in encode order
 };
 
@@ -784,45 +783,11 @@ static inline void ds4_topk_fast_tail(
         device int32_t     * out_idx,
         device uint32_t    * raw,
         device uint32_t    * indirect,
-        uint rank_sort,
         uint tid,
         uint nth) {
     threadgroup uint2 *buf0 = sortbuf;
     threadgroup uint2 *buf1 = sortbuf + nth;
     bool use_buf1 = false;
-    threadgroup uint2 *s;
-    if (rank_sort != 0u) {
-        /* §18.4, lever topk_fused=17.  RANK SORT.  The composites are unique,
-         * so each element's final position is exactly the number of
-         * composites that order before it.  Every thread reads the whole array
-         * from threadgroup memory - the address is uniform across the
-         * threadgroup at each step, so the load is a broadcast - counts the
-         * ones that order before its own, and writes itself to out[rank].
-         * Two barriers, against fifteen cross-simdgroup round trips and forty
-         * shuffle stages.
-         *
-         * Tier 1: a unique total order assigns a unique rank to each element,
-         * so the sequence this produces is the sequence ANY correct sort of
-         * the same comparator produces.  Padding lanes hold
-         * uint2(0u, 0xffffffffu) - the smallest key with the largest index,
-         * which orders after every real candidate under this comparator - and
-         * they do not write, so slots at or above `have` are left untouched.
-         * Nothing reads them: the acceptance predicate reads s[i] only for
-         * i + 1 < min(count, top_k + 1) and for i < top_k, and both bounds are
-         * at most `have` whenever the row is accepted. */
-        const uint have = min(count, args.cand_cap);
-        buf0[tid] = cur;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint rank = 0u;
-        for (uint i = 0u; i < nth; i++) {
-            const uint2 o = buf0[i];
-            const bool before = (o.x != cur.x) ? (o.x > cur.x) : (o.y < cur.y);
-            rank += before ? 1u : 0u;
-        }
-        if (tid < have) buf1[rank] = cur;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        s = buf1;
-    } else {
     for (uint k = 2u; k <= nth; k <<= 1) {
         for (uint j = k >> 1; j > 0u; j >>= 1) {
             const uint partner = tid ^ j;
@@ -845,8 +810,7 @@ static inline void ds4_topk_fast_tail(
     }
     buf0[tid] = cur;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    s = buf0;
-    }
+    threadgroup uint2 *s = buf0;
 
     /* Acceptance predicate over the ordered candidates.
      *
@@ -973,7 +937,7 @@ kernel void kernel_glm53_topk_fast_finish(
     uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
     threadgroup atomic_uint bad_bits;
     ds4_topk_fast_tail(args, cur, flags, count, shmem, &bad_bits,
-                       ctrl, hist, out_idx, raw, indirect, 0u, tid, nth);
+                       ctrl, hist, out_idx, raw, indirect, tid, nth);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1174,6 +1138,5 @@ kernel void kernel_glm53_topk_fast_fused(
     const uint have  = min(count, args.cand_cap);
     uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
     ds4_topk_fast_tail(args, cur, flags, count, sortbuf, &bad_bits,
-                       ctrl, hist, out_idx, raw, indirect, args.rank_sort,
-                       tid, nth);
+                       ctrl, hist, out_idx, raw, indirect, tid, nth);
 }

@@ -20768,7 +20768,6 @@ typedef struct {
     uint32_t output_width;
     uint32_t pos0;
     uint32_t fb_count;
-    uint32_t rank_sort;
     uint32_t fb_grid[16];
 } ds4_gpu_kargs_topk_fast;
 
@@ -20881,24 +20880,16 @@ static int ds4_gpu_glm_topk_fast_pipelines(void) {
 static int ds4_gpu_glm_topk_fused_lever(void) {
     glm_levers_init_from_env();
     int v = glm53_exact_mode() ? 0 : g_glm_levers.topk_fused;
-    /* 0 = chain, 1 = fused, 10..13 = the §17 doubling probes.  Nothing else is
-     * a defined value; anything else runs the production fused kernel. */
-    if (v != 0 && v != 17) v = 1;
+    /* 0 = chain, 1 = fused.  Nothing else is a defined value; anything else
+     * runs the production fused kernel. */
+    if (v != 0) v = 1;
     static int last = -1;
     if (v != last) {
         fprintf(stderr, "[T2] topk_fused=%d (%s)\n", v,
-                v == 0  ? "three-dispatch chain" :
-                v == 17 ? "fused + rank sort" : "fused");
+                v == 0 ? "three-dispatch chain" : "fused");
         last = v;
     }
     return v;
-}
-
-/* 0 in production; 1..4 select a §17 doubling probe inside the fused kernel.
- * Every probe is Tier 1: the doubled phase writes the same values to the same
- * addresses, so the output is byte-identical and the delta is pure cost. */
-static uint32_t ds4_gpu_glm_topk_fused_rank_sort(int lever) {
-    return lever == 17 ? 1u : 0u;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
@@ -21153,8 +21144,6 @@ static int ds4_gpu_indexer_topk_fused(
     const int fast_fused =
         fast_lever &&
         ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
-    if (fast_fused)
-        fast_args.rank_sort = ds4_gpu_glm_topk_fused_rank_sort(fast_lever);
     if (fast_fused) {
         /* Lever topk_fused=1: the whole chain as one dispatch of one
          * threadgroup.  The fallback dispatches below are encoded exactly as
