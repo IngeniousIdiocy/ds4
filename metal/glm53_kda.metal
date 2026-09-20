@@ -644,91 +644,24 @@ kernel void kernel_glm53_kda_decode_prep_state(
  * in_dim is a multiple of QK8_0 and nb <= NQ, which is what makes the argument
  * above hold; GLM-5.3's f_b/g_b rank is 128, i.e. nb = 4.
  * -------------------------------------------------------------------------*/
-/* §21.8.  The row body returns its total instead of storing it, so the caller
- * can issue several rows' loads before any of their stores.  wide-62k measured
- * the load widening FLAT (-0.007), which rules out both load issue and the
- * reduction tail as the prologue's limit and leaves the dependent chain: as
- * written, each row's `device float *out` store sits between that row's loads
- * and the next row's, and MSL's alias analysis cannot prove `out`
- * (raw_gate / output_gate) does not overlap `weights` (f_b / g_b), so it may
- * not hoist row r+1's loads above row r's store.  Eight rows per simdgroup
- * therefore cost eight dependent memory round trips.  Splitting the value from
- * the store is what lets the batched caller break that chain. */
-static inline float glm53_mul_mv_q8_0_f32_row_value(
+static inline void glm53_mul_mv_q8_0_f32_row_at(
         uint                             in_dim,
         uint                             out_dim,
         uint                             n_rows,
         device const char               *weights,
         device const float              *x,
+        device float                    *out,
         uint                             out_row,
         uint                             token,
-        ushort                           lane,
-        bool                             lanes) {
+        ushort                           lane) {
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
-    if (out_row >= out_dim || token >= n_rows) return 0.0f;
+    if (out_row >= out_dim || token >= n_rows) return;
 
     const int nb = (int)(in_dim / QK8_0);
     device const block_q8_0 *ax = (device const block_q8_0 *)
         (weights + (ulong)out_row * (ulong)nb * sizeof(block_q8_0));
     device const float *y = x + (ulong)token * in_dim;
-
-    /* §21.7, lever kda_prologue_lanes.  TIER 2 - this is the only change in
-     * the prologue that is not bit-identical, and it is deliberate.
-     *
-     * The shipped partition is ix = lane / 4 over ib0 = ix in 0..NQ-1 with
-     * NQ = 8, while nb = 4 at this shape, so lanes 16..31 never enter the loop
-     * and feed an untouched +0.0 into the reduction: the row is computed by
-     * sixteen lanes out of thirty-two, and glueprobe-62k's 405 GB/s on a
-     * cached pass is what that costs.  Reclaiming them cannot be done at
-     * Tier 1 - any partition that puts work in those lanes changes which
-     * products land in which lane's partial sum, and the reduction's inputs
-     * change with it.
-     *
-     * Here every lane takes FOUR consecutive elements: lane L owns elements
-     * 4L..4L+3, so blk = 4L/32 and the offset inside the block is 4L mod 32.
-     * Thirty-two lanes times four elements is 128, which is in_dim, so the
-     * coverage is exact and each of the 128 products is formed from the same
-     * two operands, with the same int8-to-float conversion, as today.  What
-     * changes is the addition tree: today one lane sums eight products of one
-     * block and multiplies by that block's d once; here two lanes each sum
-     * four and each multiplies by the same d, so (a + b) * d becomes
-     * a * d + b * d, and the cross-lane sum is over thirty-two real partials
-     * instead of sixteen partials and sixteen zeros.
-     *
-     * The reduction is written out as an explicit five-round butterfly rather
-     * than left to simd_sum, whose internal association this tree records as
-     * unspecified (see the hc_pre kernels, which write theirs out for the same
-     * reason).  The tree is therefore documented and reproducible: pairs at
-     * distance 16, then 8, 4, 2, 1.
-     *
-     * Expected perturbation: a sum of 128 terms either way, so the relative
-     * error bound is unchanged at order 128 * eps, about 1e-5 worst case and a
-     * few ULP typically.  The row feeds raw_gate and output_gate, which reach
-     * the state only through exp and sigmoid - smooth and saturating - so the
-     * perturbation neither grows nor cancels.  The text WILL diverge at long
-     * context; this arm is measured at 8k. */
-    if (lanes && in_dim == (uint)(NW * 4)) {
-        const uint e0 = (uint)lane * 4u;
-        const uint blk = e0 >> 5;
-        const uint off = e0 & 31u;
-        const float4 yv = *((device const float4 *)(y + e0));
-        device const packed_char4 *q4 =
-            (device const packed_char4 *)(ax[blk].qs + off);
-        const packed_char4 a0 = q4[0];
-        float sumq = 0.f;
-        sumq += a0[0] * yv.x;
-        sumq += a0[1] * yv.y;
-        sumq += a0[2] * yv.z;
-        sumq += a0[3] * yv.w;
-        float part = sumq * ax[blk].d;
-        part += simd_shuffle_xor(part, (ushort)16);
-        part += simd_shuffle_xor(part, (ushort)8);
-        part += simd_shuffle_xor(part, (ushort)4);
-        part += simd_shuffle_xor(part, (ushort)2);
-        part += simd_shuffle_xor(part, (ushort)1);
-        return part;
-    }
 
     const short ix = (short)lane / (NW / NQ);
     const short il = (short)lane % (NW / NQ);
@@ -751,25 +684,7 @@ static inline float glm53_mul_mv_q8_0_f32_row_value(
     }
 
     sumf = simd_sum(sumf);
-    return simd_sum(lane == 0u ? sumf : 0.0f);
-}
-
-/* The storing form, unchanged in behaviour: the value body above followed by
- * lane 0's store. */
-static inline void glm53_mul_mv_q8_0_f32_row_at(
-        uint                             in_dim,
-        uint                             out_dim,
-        uint                             n_rows,
-        device const char               *weights,
-        device const float              *x,
-        device float                    *out,
-        uint                             out_row,
-        uint                             token,
-        ushort                           lane,
-        bool                             lanes) {
-    if (out_row >= out_dim || token >= n_rows) return;
-    const float tot = glm53_mul_mv_q8_0_f32_row_value(
-            in_dim, out_dim, n_rows, weights, x, out_row, token, lane, lanes);
+    const float tot = simd_sum(lane == 0u ? sumf : 0.0f);
     if (lane == 0u) out[(ulong)token * out_dim + out_row] = tot;
 }
 
@@ -786,18 +701,6 @@ struct glm53_kda_glue_args {
     uint lr_q8;
     uint do_prologue;
     uint do_out;
-    /* §21 diagnostic, lever kda_glue_probe; 0 in production.  1 doubles the
-     * f_b/g_b prologue, 2 the conv prep, 3 the recurrent row loop, 4 the
-     * epilogue.  Appended, so every field above keeps its offset. */
-    uint dbg_double;
-    /* §21.8 lever kda_prologue_pipe: 0 = today, one row computed and stored
-     * before the next row's loads are issued; 1 = four rows' loads and
-     * reductions issued before any of their four stores. */
-    uint lr_pipe;
-    /* §21.7 lever kda_prologue_lanes, TIER 2: 0 = today's half-idle
-     * simdgroup; 1 = all 32 lanes, four elements each, with a hand-written
-     * butterfly.  The same 128 products in a different addition tree. */
-    uint lr_lanes;
 };
 
 kernel void kernel_glm53_kda_decode_glue(
@@ -849,80 +752,10 @@ kernel void kernel_glm53_kda_decode_glue(
     const ulong conv_row_stride = 3ul * HISTORY * projection;
     const uint n_sg = (uint)ntid.x >> 5;
 
-    /* §21 doubling probes, lever kda_glue_probe, diagnostic only.  Each
-     * repeat count is a RUNTIME uniform, so the compiler cannot unroll and
-     * common-subexpression the second pass away, and each count is uniform
-     * across the threadgroup, so every barrier is still reached by every
-     * thread the same number of times.  Two of the four phases are
-     * recurrences and are handled by a `commit` flag rather than by being
-     * repeated blindly; see each site. */
-    const uint rep_pro  = (args.dbg_double == 1u) ? 2u : 1u;
-    const uint rep_conv = (args.dbg_double == 2u) ? 2u : 1u;
-    const uint rep_row  = (args.dbg_double == 3u) ? 2u : 1u;
-    const uint rep_out  = (args.dbg_double == 4u) ? 2u : 1u;
-
     /* prologue: this head's 128 rows of f_b and 128 rows of g_b, one row per
-     * simdgroup, striding so any threadgroup width works.  Doubling is Tier 1
-     * outright: the row body is a pure function of the weights and x, so the
-     * second pass writes the same words to the same addresses. */
+     * simdgroup, striding so any threadgroup width works. */
     if (args.do_prologue != 0u) {
-      /* §21.8, lever kda_prologue_pipe.  wide-62k measured the load widening
-       * flat, which rules out load issue and the reduction tail and leaves the
-       * dependent chain: each row's store to raw_gate / output_gate sits
-       * between that row's loads and the next row's, and MSL cannot prove that
-       * store does not overlap the f_b / g_b weights it is about to read, so
-       * it may not hoist the next row's loads above it.  Eight rows per
-       * simdgroup is eight dependent memory round trips, and at 64
-       * threadgroups on 80 cores there is no other resident work to hide them.
-       *
-       * The pipe form computes FOUR rows - their loads, their products and
-       * their reductions - before issuing any of their four stores, so the
-       * four rows' loads can be in flight together and the chain is a quarter
-       * as deep.  Tier 1: identical products in identical order per row,
-       * identical reductions, the same four words to the same four addresses;
-       * only the store timing moves.  The remainder loop handles any rows the
-       * batch does not cover and is today's body verbatim. */
-      for (uint rep = 0u; rep < rep_pro; rep++) {
-        uint rbase = sg;
-        if (args.lr_q8 != 0u && args.lr_pipe != 0u) {
-            const bool lanes_on = args.lr_lanes != 0u;
-            for (; rbase + 3u * n_sg < 2u * D; rbase += 4u * n_sg) {
-                const uint ra = rbase;
-                const uint rb = rbase + n_sg;
-                const uint rc = rbase + 2u * n_sg;
-                const uint rd = rbase + 3u * n_sg;
-                const bool sa = ra >= D, sb = rb >= D;
-                const bool sc = rc >= D, sd2 = rd >= D;
-                const float ta = glm53_mul_mv_q8_0_f32_row_value(
-                    args.lr_in_dim, projection, args.n_rows,
-                    sa ? lowrank_w_g : lowrank_w_f,
-                    sa ? lowrank_x_g : lowrank_x_f,
-                    head * D + (sa ? ra - D : ra), row, lane, lanes_on);
-                const float tb = glm53_mul_mv_q8_0_f32_row_value(
-                    args.lr_in_dim, projection, args.n_rows,
-                    sb ? lowrank_w_g : lowrank_w_f,
-                    sb ? lowrank_x_g : lowrank_x_f,
-                    head * D + (sb ? rb - D : rb), row, lane, lanes_on);
-                const float tc = glm53_mul_mv_q8_0_f32_row_value(
-                    args.lr_in_dim, projection, args.n_rows,
-                    sc ? lowrank_w_g : lowrank_w_f,
-                    sc ? lowrank_x_g : lowrank_x_f,
-                    head * D + (sc ? rc - D : rc), row, lane, lanes_on);
-                const float td = glm53_mul_mv_q8_0_f32_row_value(
-                    args.lr_in_dim, projection, args.n_rows,
-                    sd2 ? lowrank_w_g : lowrank_w_f,
-                    sd2 ? lowrank_x_g : lowrank_x_f,
-                    head * D + (sd2 ? rd - D : rd), row, lane, lanes_on);
-                if (lane == 0u) {
-                    const ulong base = (ulong)row * projection + head * D;
-                    (sa ? output_gate : raw_gate)[base + (sa ? ra - D : ra)] = ta;
-                    (sb ? output_gate : raw_gate)[base + (sb ? rb - D : rb)] = tb;
-                    (sc ? output_gate : raw_gate)[base + (sc ? rc - D : rc)] = tc;
-                    (sd2 ? output_gate : raw_gate)[base + (sd2 ? rd - D : rd)] = td;
-                }
-            }
-        }
-        for (uint r = rbase; r < 2u * D; r += n_sg) {
+        for (uint r = sg; r < 2u * D; r += n_sg) {
             const bool second = r >= D;
             device const char  *w = second ? lowrank_w_g : lowrank_w_f;
             device const float *x = second ? lowrank_x_g : lowrank_x_f;
@@ -931,8 +764,7 @@ kernel void kernel_glm53_kda_decode_glue(
             if (args.lr_q8 != 0u) {
                 glm53_mul_mv_q8_0_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows, w, x, o,
-                                             head * D + local, row, lane,
-                                             args.lr_lanes != 0u);
+                                             head * D + local, row, lane);
             } else {
                 glm53_mul_mv_bf16_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows,
@@ -940,24 +772,12 @@ kernel void kernel_glm53_kda_decode_glue(
                                              head * D + local, row, lane);
             }
         }
-      }
         threadgroup_barrier(mem_flags::mem_threadgroup |
                            mem_flags::mem_device);
     }
 
     /* prep phase 1, verbatim -- conv shift included: this threadgroup is the
-     * only reader of the head's conv_state, so the shift is safe here.
-     *
-     * The three-deep history shift is a RECURRENCE and is not idempotent, so
-     * the probe does not repeat it blindly: the three stores per tensor take
-     * their value through `conv_commit`, which on a shadow pass writes each
-     * slot the value it already holds.  That is a no-op store of the same
-     * bytes to the same address, so the phase's nine device stores are still
-     * priced while the history is left exactly where it was.  With
-     * rep_conv == 1 the loop runs once with conv_commit true and the three
-     * assignments reduce to today's shift. */
-    for (uint rep = 0u; rep < rep_conv; rep++) {
-    const bool conv_commit = (rep + 1u == rep_conv);
+     * only reader of the head's conv_state, so the shift is safe here. */
     if (tid < D) {
         float q_acc = 0.0f;
         float k_acc = 0.0f;
@@ -981,24 +801,15 @@ kernel void kernel_glm53_kda_decode_glue(
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
 
-        const float qs0 = q_state[channel];
-        const float qs1 = q_state[projection + channel];
-        const float qs2 = q_state[2ul * projection + channel];
-        const float ks0 = k_state[channel];
-        const float ks1 = k_state[projection + channel];
-        const float ks2 = k_state[2ul * projection + channel];
-        const float vs0 = v_state[channel];
-        const float vs1 = v_state[projection + channel];
-        const float vs2 = v_state[2ul * projection + channel];
-        q_state[channel] = conv_commit ? qs1 : qs0;
-        q_state[projection + channel] = conv_commit ? qs2 : qs1;
-        q_state[2ul * projection + channel] = conv_commit ? q_new : qs2;
-        k_state[channel] = conv_commit ? ks1 : ks0;
-        k_state[projection + channel] = conv_commit ? ks2 : ks1;
-        k_state[2ul * projection + channel] = conv_commit ? k_new : ks2;
-        v_state[channel] = conv_commit ? vs1 : vs0;
-        v_state[projection + channel] = conv_commit ? vs2 : vs1;
-        v_state[2ul * projection + channel] = conv_commit ? v_new : vs2;
+        q_state[channel] = q_state[projection + channel];
+        q_state[projection + channel] = q_state[2ul * projection + channel];
+        q_state[2ul * projection + channel] = q_new;
+        k_state[channel] = k_state[projection + channel];
+        k_state[projection + channel] = k_state[2ul * projection + channel];
+        k_state[2ul * projection + channel] = k_new;
+        v_state[channel] = v_state[projection + channel];
+        v_state[projection + channel] = v_state[2ul * projection + channel];
+        v_state[2ul * projection + channel] = v_new;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -1006,7 +817,6 @@ kernel void kernel_glm53_kda_decode_glue(
         const float gate = raw_gate[input_base + tid] + dt_bias[channel];
         sd[tid] = exp(args.lower_bound *
                       (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
-    }
     }
     if (tid == 0u) {
         beta_shared[0] =
@@ -1054,37 +864,21 @@ kernel void kernel_glm53_kda_decode_glue(
     const ulong state_head =
         ((ulong)row * args.n_heads + head) * D * D;
 
-    /* The recurrent state update is a RECURRENCE in device memory, so a blind
-     * repeat would decay the state twice.  The shadow pass runs the identical
-     * instruction sequence on the identical operands - `h0` is what `*hptr`
-     * held, and the shadow puts it back - and only the committed word
-     * differs; `so[value]` is overwritten by the committing pass and nothing
-     * reads it in between.  With rep_row == 1 the loop runs once with
-     * row_commit true, `*hptr = h` is today's store and `h0 * decay4` is a
-     * rename of `*hptr * decay4`. */
     for (uint value = sg; value < D; value += n_sg) {
         device float4 *hptr =
             (device float4 *)(state + state_head + (ulong)value * D + k0);
-        for (uint rep = 0u; rep < rep_row; rep++) {
-            const bool row_commit = (rep + 1u == rep_row);
-            const float4 h0 = *hptr;
-            float4 h = h0 * decay4;
-            float hk = dot(h, k4);
-            hk = simd_sum(hk);
-            const float delta_v = (sv[value] - hk) * beta;
-            h = fma(k4, float4(delta_v), h);
-            *hptr = row_commit ? h : h0;
-            float hq = simd_sum(dot(h, q4));
-            if (lane == 0u) so[value] = hq;
-        }
+        float4 h = *hptr * decay4;
+        float hk = dot(h, k4);
+        hk = simd_sum(hk);
+        const float delta_v = (sv[value] - hk) * beta;
+        h = fma(k4, float4(delta_v), h);
+        *hptr = h;
+        float hq = simd_sum(dot(h, q4));
+        if (lane == 0u) so[value] = hq;
     }
 
     /* epilogue: kernel_glm53_kda_decode_out's body on simdgroups 0..3. */
     if (args.do_out != 0u) {
-        /* Doubling is Tier 1 outright - every store rewrites its own value -
-         * and the leading barrier is inside the repeat so the second pass
-         * cannot overwrite reduce_o while a simdgroup is still reading it. */
-        for (uint rep = 0u; rep < rep_out; rep++) {
         threadgroup_barrier(mem_flags::mem_threadgroup |
                            mem_flags::mem_device);
         if (sg < 4u) {
@@ -1103,7 +897,6 @@ kernel void kernel_glm53_kda_decode_glue(
                     1.0f / (1.0f + exp(-output_gate[index]));
                 out[index] = so[tid] * o_scale * output_norm[tid] * gate;
             }
-        }
         }
     }
 }

@@ -56121,10 +56121,6 @@ glm_levers g_glm_levers = {
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .attn_kv_regs          = 1,  /* on: +0.110 t/s at 62k, identical text */
-    .kda_glue_probe        = 0,  /* diagnostic only; never ships non-zero */
-    .kda_prologue_pipe     = 0,  /* 0 = today's store-between-rows loop */
-    .topk_fused_min_comp   = 12288, /* the pre-fusion crossover; §23 re-opens it */
-    .kda_prologue_lanes    = 0,  /* Tier 2; off until measured at 8k */
 };
 static int g_glm_levers_ready;
 
@@ -56135,10 +56131,6 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
     /* topk_fused: 0 = the three-dispatch chain, 1 = the fused kernel. */
     if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 1; return 1; }
-    /* kda_glue_probe: 0 = production, 1..4 = the §21 doubling probes. */
-    if (!strcmp(name, "kda_glue_probe")) { *lo = 0; *hi = 4; return 1; }
-    /* topk_fused_min_comp is a WIDTH, not a switch: 0 admits every width. */
-    if (!strcmp(name, "topk_fused_min_comp")) { *lo = 0; *hi = 1 << 20; return 1; }
     return 0;
 }
 
@@ -56151,10 +56143,6 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_DISABLE_ATTN_KV_REGS" },
-    { "kda_glue_probe",        offsetof(glm_levers, kda_glue_probe),        "DS4_GLM_KDA_GLUE_PROBE" },
-    { "kda_prologue_pipe",     offsetof(glm_levers, kda_prologue_pipe),     "DS4_GLM_KDA_PROLOGUE_PIPE" },
-    { "topk_fused_min_comp",   offsetof(glm_levers, topk_fused_min_comp),   "DS4_GLM_TOPK_FAST_MIN_COMP" },
-    { "kda_prologue_lanes",    offsetof(glm_levers, kda_prologue_lanes),    "DS4_GLM_KDA_PROLOGUE_LANES" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56202,29 +56190,6 @@ void glm_levers_init_from_env(void) {
      * levers above: the variable is the only way to take it off at startup,
      * and exact mode clamps it off at the read site. */
     g_glm_levers.attn_kv_regs = getenv("DS4_GLM_DISABLE_ATTN_KV_REGS") == NULL;
-    /* Diagnostic, so it reads its value straight: unset or out of range is
-     * production. */
-    {   const char *v = getenv("DS4_GLM_KDA_GLUE_PROBE");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            g_glm_levers.kda_glue_probe = (n >= 0 && n <= 4) ? n : 0;
-        }
-    }
-    {   const char *v = getenv("DS4_GLM_KDA_PROLOGUE_PIPE");
-        if (v && v[0]) g_glm_levers.kda_prologue_pipe = atoi(v) == 1 ? 1 : 0;
-    }
-    {   const char *v = getenv("DS4_GLM_KDA_PROLOGUE_LANES");
-        if (v && v[0]) g_glm_levers.kda_prologue_lanes = atoi(v) == 1 ? 1 : 0;
-    }
-    /* Historical semantics of the getenv this lever replaced in
-     * ds4_gpu_glm_topk_fast_min_comp: any value in [0, 2^30) wins, and 0
-     * restores the ungated behaviour. */
-    {   const char *v = getenv("DS4_GLM_TOPK_FAST_MIN_COMP");
-        if (v && v[0]) {
-            const long n = strtol(v, NULL, 10);
-            if (n >= 0 && n < (1L << 20)) g_glm_levers.topk_fused_min_comp = (int)n;
-        }
-    }
     g_glm_levers_ready = 1;
 }
 

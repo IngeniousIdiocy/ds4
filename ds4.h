@@ -781,8 +781,9 @@ typedef struct {
      * Any value other than 0 runs the fused kernel. */
     int topk_fused;
 
-    /* attn_kv_regs (§19.6), DEFAULT ON: 0 = the kill switch, each lane reads
-     * its row's four staged half4 from threadgroup memory in the dots and reads the same four
+
+    /* attn_kv_regs (§19.6), DEFAULT ON: 0 = the kill switch, each lane reads its row's four staged
+     * half4 from threadgroup memory in the dots and reads the same four
      * addresses again in the online-softmax update; 1 = read them once into
      * registers and use those for both.  Tier 1: the same threadgroup words,
      * the same half-to-float conversions on the same inputs, the same
@@ -791,45 +792,6 @@ typedef struct {
      * is what leaves the doubled shared-memory traffic as the suspect. */
     int attn_kv_regs;
 
-    /* kda_glue_probe (§21): a NEVER-SHIP Tier-1 doubling probe inside the KDA
-     * decode glue, one value per phase.  0 = production.  1 doubles the
-     * f_b/g_b prologue, 2 the conv prep, 3 the recurrent row loop, 4 the
-     * epilogue.  The prologue and epilogue double outright; the conv history
-     * shift and the recurrent state update are recurrences, so a shadow pass
-     * rewrites each slot the value it already holds and the state is left
-     * where it was.  Every value leaves the token text identical. */
-    int kda_glue_probe;
-
-
-    /* kda_prologue_pipe (§21.8): 0 = today, where the prologue computes and
-     * stores one row before issuing the next row's loads; 1 = four rows'
-     * loads, products and reductions are issued before any of their four
-     * stores.  wide-62k measured the load widening flat, which leaves the
-     * dependent chain as the limit: MSL cannot prove the store to raw_gate /
-     * output_gate does not overlap the f_b / g_b weights the next row reads,
-     * so it may not hoist them above the store.  Tier 1: identical products in
-     * identical order per row and the same words to the same addresses; only
-     * the store timing moves. */
-    int kda_prologue_pipe;
-
-    /* topk_fused_min_comp (§23): the minimum candidate-row width at which the
-     * top-k fast path is admitted at all.  Default 12,288, the value the
-     * pre-fusion crossover table fixed for the THREE-DISPATCH chain.  The
-     * fused kernel has since replaced that chain above the threshold and been
-     * made cheaper twice, so the crossover is re-measurable rather than
-     * inherited; 2,048 is the 8k arm.  0 restores the ungated behaviour.
-     * Tier 1 in both directions: whichever path is admitted produces the same
-     * selection, which is what the fused kernel's reject arm guarantees. */
-    int topk_fused_min_comp;
-
-    /* kda_prologue_lanes (§21.7), TIER 2: 0 = today, where lanes 16..31 of
-     * every prologue simdgroup are idle because ib0 = lane/4 ranges to 7 while
-     * nb is 4; 1 = all 32 lanes take four elements each, with a hand-written
-     * five-round butterfly in place of simd_sum so the association is explicit.
-     * The same 128 products from the same operands in a different addition
-     * tree, so the output moves by a few ULP and the text diverges at long
-     * context.  Exact mode clamps it off. */
-    int kda_prologue_lanes;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

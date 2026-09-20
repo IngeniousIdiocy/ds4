@@ -20809,21 +20809,23 @@ static int ds4_gpu_glm_topk_fast_enabled(void) {
  * The default threshold 12,288 sits below the certified-and-measured 62k width
  * (15,543, where three in-graph pairs measured no resolved effect) and above
  * 8,192, the largest width at which the loss is unambiguous on both best and
- * mean.  DS4_GLM_TOPK_FAST_MIN_COMP=0 restores the ungated behaviour.
- *
- * §23.  Every number in that table is the THREE-DISPATCH chain's, measured
- * before the fused kernel existed.  The fused path has since replaced it above
- * the threshold and has been made materially cheaper twice - the fused fold
- * itself (+0.127, fused-62k) and the reduce-then-scan cut (+0.06, tkalg-62k) -
- * so the crossover the table fixes at 13,000-17,000 is a statement about a
- * kernel that no longer runs there.  The threshold is therefore a counted
- * lever now, so the crossover can be re-measured at 8k (n_comp 2,048) instead
- * of inherited.  Nothing changes at zero context, where the row is 32 wide and
- * takes the SHORT reject regardless. */
+ * mean.  DS4_GLM_TOPK_FAST_MIN_COMP=0 restores the ungated behaviour. */
+#ifndef DS4_TOPK_FAST_MIN_COMP_DEFAULT
+#define DS4_TOPK_FAST_MIN_COMP_DEFAULT 12288u
+#endif
 static uint32_t ds4_gpu_glm_topk_fast_min_comp(void) {
-    glm_levers_init_from_env();
-    const int v = g_glm_levers.topk_fused_min_comp;
-    return v < 0 ? 0u : (uint32_t)v;
+    static int initialized;
+    static uint32_t min_comp;
+    if (!initialized) {
+        min_comp = DS4_TOPK_FAST_MIN_COMP_DEFAULT;
+        const char *v = getenv("DS4_GLM_TOPK_FAST_MIN_COMP");
+        if (v && v[0]) {
+            long parsed = strtol(v, NULL, 10);
+            if (parsed >= 0 && parsed < (1L << 30)) min_comp = (uint32_t)parsed;
+        }
+        initialized = 1;
+    }
+    return min_comp;
 }
 
 
@@ -21177,25 +21179,6 @@ static int ds4_gpu_indexer_topk_fused(
     const int fast_fused =
         fast_lever &&
         ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
-    /* §20.4's rule, and the one thing this lever must prove: that the
-     * threshold it admitted actually changed which path ran at this shape.
-     * Keyed on the decision, not on n_comp, which moves every token. */
-    {
-        static uint32_t last_thr = 0xffffffffu;
-        static int last_fast = -1, last_fused = -1;
-        const uint32_t thr = ds4_gpu_glm_topk_fast_min_comp();
-        if (thr != last_thr || use_fast != last_fast ||
-            fast_fused != last_fused) {
-            fprintf(stderr,
-                    "[T2] encoded topk_fused_min_comp=%u (n_comp=%u, path=%s)\n",
-                    thr, (unsigned)n_comp,
-                    fast_fused ? "fused" :
-                    use_fast ? "fast chain" : "legacy chain");
-            last_thr = thr;
-            last_fast = use_fast;
-            last_fused = fast_fused;
-        }
-    }
     if (fast_fused) {
         /* Lever topk_fused=1: the whole chain as one dispatch of one
          * threadgroup.  The fallback dispatches below are encoded exactly as
@@ -56912,55 +56895,7 @@ typedef struct {
     uint32_t lr_q8;
     uint32_t do_prologue;
     uint32_t do_out;
-    uint32_t dbg_double;          /* §21 kda_glue_probe; 0 in production */
-    uint32_t lr_pipe;             /* §21.8 kda_prologue_pipe; 0 = today */
-    uint32_t lr_lanes;            /* §21.7 kda_prologue_lanes, Tier 2 */
 } glm53_gpu_kda_glue_args;
-
-/* §21 kda_glue_probe: 0 in production, 1..4 select a Tier-1 doubling probe
- * inside the KDA decode glue (1 the f_b/g_b prologue, 2 the conv prep, 3 the
- * recurrent row loop, 4 the epilogue).  The prologue and the epilogue double
- * outright; the conv shift and the recurrent state update are recurrences and
- * take a `commit` flag instead, so a shadow pass rewrites each slot the value
- * it already holds and the history is left exactly where it was.  Every value
- * therefore leaves the token text identical.  NEVER ships non-zero; exact mode
- * clamps it off. */
-static uint32_t ds4_gpu_glm53_kda_glue_probe(void) {
-    glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 0 : g_glm_levers.kda_glue_probe;
-    if (v < 0 || v > 4) v = 0;
-    return (uint32_t)v;
-}
-
-/* §21.8 kda_prologue_pipe: 0 = today, where a row is computed and stored
- * before the next row's loads are issued; 1 = four rows' loads, products and
- * reductions are issued before any of their four stores.  wide-62k measured
- * the load widening FLAT (-0.007 t/s), which rules out load issue and the
- * reduction tail and leaves the dependent chain as the prologue's limit: MSL
- * cannot prove the store to raw_gate / output_gate does not overlap the
- * f_b / g_b weights the next row reads, so it may not hoist those loads above
- * the store, and eight rows per simdgroup is eight dependent round trips with
- * only 64 threadgroups on 80 cores to hide them.  Tier 1: identical products
- * in identical order per row, identical reductions, the same words to the same
- * addresses; only the store timing moves. */
-static uint32_t ds4_gpu_glm53_kda_prologue_pipe(void) {
-    glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 0 : g_glm_levers.kda_prologue_pipe;
-    return v == 1 ? 1u : 0u;
-}
-
-/* §21.7 kda_prologue_lanes, TIER 2 (Mark has ruled Tier 2 in scope; only
- * quantization and precision changes are out).  0 = today's half-idle
- * simdgroup; 1 = all 32 lanes, four elements each, with a hand-written
- * five-round butterfly instead of simd_sum.  Same 128 products from the same
- * operands; a different addition tree, so the text diverges at long context
- * and the arm is measured at 8k.  It is registered in exact mode's clamp
- * because it is NOT bit-identical. */
-static uint32_t ds4_gpu_glm53_kda_prologue_lanes(void) {
-    glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 0 : g_glm_levers.kda_prologue_lanes;
-    return v == 1 ? 1u : 0u;
-}
 
 /* KDA decode with the f_b/g_b BF16 expansions folded into the per-head
  * threadgroup's prologue (do_prologue) and kernel_glm53_kda_decode_out folded
@@ -57126,34 +57061,6 @@ int ds4_gpu_glm53_kda_decode_glue(
         threads &= ~(NSUInteger)31u;
         if (threads < 128u) return 0;
 
-        /* §20.4's rule: the arm announces the value it ENCODED, beside the
-         * pipeline that was bound, so a silent arm is impossible to mistake
-         * for a finding.  Read as an ordinary statement, never inside the
-         * initializer. */
-        const uint32_t enc_kda_probe = ds4_gpu_glm53_kda_glue_probe();
-        const uint32_t enc_kda_pipe = ds4_gpu_glm53_kda_prologue_pipe();
-        const uint32_t enc_kda_lanes = ds4_gpu_glm53_kda_prologue_lanes();
-        {
-            static uint32_t last_probe = 0xffffffffu;
-            static uint32_t last_pipe  = 0xffffffffu;
-            static uint32_t last_lanes = 0xffffffffu;
-            if (enc_kda_probe != last_probe || enc_kda_pipe != last_pipe ||
-                enc_kda_lanes != last_lanes) {
-                fprintf(stderr,
-                        "[T2] encoded kda_glue_probe=%u kda_prologue_pipe=%u"
-                        " kda_prologue_lanes=%u (kernel=%s, heads=%u,"
-                        " threads=%u, prologue=%u, out=%u, lr_q8=%u,"
-                        " lr_in_dim=%u)\n",
-                        enc_kda_probe, enc_kda_pipe, enc_kda_lanes,
-                        "kernel_glm53_kda_decode_glue",
-                        (unsigned)n_heads, (unsigned)threads,
-                        do_prologue ? 1u : 0u, do_out ? 1u : 0u,
-                        lr_q8 ? 1u : 0u, (unsigned)lr_in_dim);
-                last_probe = enc_kda_probe;
-                last_pipe = enc_kda_pipe;
-                last_lanes = enc_kda_lanes;
-            }
-        }
         glm53_gpu_kda_glue_args args = {
             .n_heads = n_heads,
             .n_rows = n_rows,
@@ -57165,9 +57072,6 @@ int ds4_gpu_glm53_kda_decode_glue(
             .lr_q8 = lr_q8 ? 1u : 0u,
             .do_prologue = do_prologue ? 1u : 0u,
             .do_out = do_out ? 1u : 0u,
-            .dbg_double = enc_kda_probe,
-            .lr_pipe = enc_kda_pipe,
-            .lr_lanes = enc_kda_lanes,
         };
         glm53_gpu_kda_args out_args = {
             .n_heads = n_heads,
