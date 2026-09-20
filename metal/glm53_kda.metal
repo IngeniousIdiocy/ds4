@@ -701,11 +701,6 @@ struct glm53_kda_glue_args {
     uint lr_q8;
     uint do_prologue;
     uint do_out;
-    /* §21.10 lever kda_epilogue_merge: 0 = today, the epilogue re-reads the
-     * 128 `so` values it just wrote from DEVICE memory; 1 = the row loop
-     * mirrors each value into threadgroup memory and the epilogue reads it
-     * there.  Same words, same reduction tree, same arithmetic. */
-    uint epi_merge;
 };
 
 kernel void kernel_glm53_kda_decode_glue(
@@ -750,10 +745,6 @@ kernel void kernel_glm53_kda_decode_glue(
     threadgroup float *reduce_k = reduce_q + 4u;
     threadgroup float *beta_shared = reduce_k + 4u;
     threadgroup float *reduce_o = beta_shared + 1u;
-    /* §21.10.  The extra D floats are allocated by the host only when the
-     * lever is on, so the production threadgroup allocation is unchanged. */
-    threadgroup float *so_shared = reduce_o + 4u;
-    const bool epi_merge = args.epi_merge != 0u;
 
     const uint projection = args.n_heads * D;
     const uint channel = head * D + tid;
@@ -883,35 +874,15 @@ kernel void kernel_glm53_kda_decode_glue(
         h = fma(k4, float4(delta_v), h);
         *hptr = h;
         float hq = simd_sum(dot(h, q4));
-        if (lane == 0u) {
-            so[value] = hq;
-            /* §21.10.  The device store stays - `split_so` is this kernel's
-             * output in the do_out == 0 configuration and the standalone
-             * kernel_glm53_kda_decode_out reads it there - and the threadgroup
-             * copy is what the epilogue below consumes, so it never pays a
-             * device round trip for a word this same threadgroup wrote
-             * moments earlier. */
-            if (epi_merge) so_shared[value] = hq;
-        }
+        if (lane == 0u) so[value] = hq;
     }
 
     /* epilogue: kernel_glm53_kda_decode_out's body on simdgroups 0..3. */
     if (args.do_out != 0u) {
-        /* §21.10.  At epi_merge the only cross-thread data this barrier has to
-         * order is `so_shared`, so it narrows to threadgroup scope; today it
-         * must carry mem_device because the loads below come from `so`. */
-        if (epi_merge) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        } else {
-            threadgroup_barrier(mem_flags::mem_threadgroup |
-                               mem_flags::mem_device);
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup |
+                           mem_flags::mem_device);
         if (sg < 4u) {
-            /* Same element per lane, the same four contiguous 32-wide
-             * simd_sums and the same four-partial second stage: only the
-             * address space of the load moves. */
-            const float ov = epi_merge ? so_shared[tid] : so[tid];
-            float o_sumsq = ov * ov;
+            float o_sumsq = so[tid] * so[tid];
             o_sumsq = simd_sum(o_sumsq);
             if (lane == 0u) reduce_o[sg] = o_sumsq;
         }
@@ -924,8 +895,7 @@ kernel void kernel_glm53_kda_decode_glue(
                 const ulong index = input_base + tid;
                 const float gate =
                     1.0f / (1.0f + exp(-output_gate[index]));
-                const float ov = epi_merge ? so_shared[tid] : so[tid];
-                out[index] = ov * o_scale * output_norm[tid] * gate;
+                out[index] = so[tid] * o_scale * output_norm[tid] * gate;
             }
         }
     }

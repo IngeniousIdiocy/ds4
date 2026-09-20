@@ -56895,22 +56895,7 @@ typedef struct {
     uint32_t lr_q8;
     uint32_t do_prologue;
     uint32_t do_out;
-    uint32_t epi_merge;           /* §21.10 kda_epilogue_merge; 0 = today */
 } glm53_gpu_kda_glue_args;
-
-/* §21.10 kda_epilogue_merge: 0 = today, where the glue's epilogue re-reads
- * from DEVICE memory the 128 `so` values the row loop wrote moments earlier,
- * and its leading barrier must therefore carry mem_device; 1 = the row loop
- * mirrors each value into threadgroup memory, the epilogue reads it there and
- * the barrier narrows to threadgroup scope.  The device store stays, because
- * split_so is the kernel's output in the do_out == 0 configuration.  Tier 1:
- * the same words, the same four contiguous 32-wide simd_sums and the same
- * four-partial second stage - only the address space of the load moves. */
-static uint32_t ds4_gpu_glm53_kda_epilogue_merge(void) {
-    glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 0 : g_glm_levers.kda_epilogue_merge;
-    return v == 1 ? 1u : 0u;
-}
 
 /* KDA decode with the f_b/g_b BF16 expansions folded into the per-head
  * threadgroup's prologue (do_prologue) and kernel_glm53_kda_decode_out folded
@@ -57075,24 +57060,6 @@ int ds4_gpu_glm53_kda_decode_glue(
         if (threads > 1024u) threads = 1024u;
         threads &= ~(NSUInteger)31u;
         if (threads < 128u) return 0;
-
-        /* §20.4's rule: announce the value ENCODED, beside the bound
-         * pipeline, read as an ordinary statement. */
-        const uint32_t enc_kda_epi = ds4_gpu_glm53_kda_epilogue_merge();
-        {
-            static uint32_t last_enc = 0xffffffffu;
-            if (enc_kda_epi != last_enc) {
-                fprintf(stderr,
-                        "[T2] encoded kda_epilogue_merge=%u (kernel=%s,"
-                        " heads=%u, threads=%u, prologue=%u, out=%u,"
-                        " tg_floats=%u)\n",
-                        enc_kda_epi, "kernel_glm53_kda_decode_glue",
-                        (unsigned)n_heads, (unsigned)threads,
-                        do_prologue ? 1u : 0u, do_out ? 1u : 0u,
-                        enc_kda_epi ? 660u : 532u);
-                last_enc = enc_kda_epi;
-            }
-        }
         glm53_gpu_kda_glue_args args = {
             .n_heads = n_heads,
             .n_rows = n_rows,
@@ -57104,7 +57071,6 @@ int ds4_gpu_glm53_kda_decode_glue(
             .lr_q8 = lr_q8 ? 1u : 0u,
             .do_prologue = do_prologue ? 1u : 0u,
             .do_out = do_out ? 1u : 0u,
-            .epi_merge = enc_kda_epi,
         };
         glm53_gpu_kda_args out_args = {
             .n_heads = n_heads,
@@ -57169,7 +57135,7 @@ int ds4_gpu_glm53_kda_decode_glue(
                 offset:ds4_gpu_tensor_offset(out) atIndex:20];
         /* §21.10: the extra 128 floats of so_shared are allocated only when
          * the lever is on, so the production allocation is unchanged. */
-        [enc setThreadgroupMemoryLength:(enc_kda_epi ? 660u : 532u) * sizeof(float)
+        [enc setThreadgroupMemoryLength:532u * sizeof(float)
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_heads, 1)
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
