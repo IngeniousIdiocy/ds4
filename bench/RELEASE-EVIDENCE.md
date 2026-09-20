@@ -29,7 +29,7 @@ with its lever set, identity verdict, quiet verdict and per-stage timings).
 | DFlash2 conservative, Q8_0 drafter, before vs after the campaign | 8k 45.75 -> **48.62**; 62k 44.70 -> **46.87** t/s (committed tokens over calls 2..N); committed stream byte-identical to the shape reference on every arm; acceptance profile identical on the fixtures and on a 100-prompt manifest (two runs, zero prompts differing) | `ref-62k`, `cons-nt4fc-*` (gate fix), `waveDq-cons-8k`, `waveD-cons-62k`, `e10-cons-*` (final) |
 | DFlash2 drafter choice, same build | Q8_0 48.00 vs BF16 46.50 at 8k; 45.93 vs 45.05 at 62k; the BF16 stream differs from the Q8_0 reference at one near-tie position at 62k | `waveDq-cons-8k`, `bf16-cons-8k`, `waveD-cons-62k`, `bf16-cons-62k` |
 | serial non-regression under the DFlash changes | 39.39 vs 39.36 t/s at 8k, IDENTICAL, 3 reps | `e4-serial-8k`, `e10-serial-8k` |
-| target verify geometry (measured, not shipped) | `mul_mv_ext` chunk count 2 vs shipped 4: 8k 48.43 -> 48.71, 62k 46.70 -> 46.88, 0k flat; byte-identical | `f5-cons-8k`, `f5-cons-62k`, `f5-cons-0k` |
+| target verify chunk count (shipped) | `mul_mv_ext` chunks per lane 2 vs the previous 4 on the target's 8-row projections, 3 interleaved reps: 8k 48.43 -> **48.71**, 62k 46.70 -> **46.88**, 0k flat; byte-identical; the drafter keeps 4 | `f5-cons-8k`, `f5-cons-62k`, `f5-cons-0k` |
 
 The cold-run gates below were not re-run on this build. The DFlash changes do not touch
 the native serial path (the serial control above); the serial path's changes are the

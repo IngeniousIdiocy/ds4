@@ -524,6 +524,7 @@ tokens per arm, cycle stages timed per verified cycle; receipt
 | profile gate fix | `dflash2_fast_default()` keyed the eight-row NT4 verify head and the batched `fc` projection on the BF16 drafter's byte size (2,342,595,168). The Q8_0 drafter (1,438,198,656 bytes) failed the check, so every Q8_0 server since the drafter swap ran the scalar head and the per-row `fc`. The profile now accepts both files. | 47.40 | 45.76 |
 | drafter dispatch structure | proposer head on the NT4 kernel (-0.60 ms per draft); the drafter's FFN on the target's fused Q8 gate/up + SwiGLU kernel (-0.52); the drafter's eight-row Q8 projections share one weight load (`r1_8`, -0.18); context K/V written straight into the drafter cache instead of scratch plus a blit (-0.11) | 48.00 | 45.93 |
 | token-tile Q8 kernel | the drafter's q/o, k/v and ffn_down projections on `kernel_dflash_q8_0_rows_nt8` (derived from the NT4 head; NSG=2 chosen from a 28-point NSG x rows grid; -1.03 ms per draft) | 48.62 | 46.87 |
+| verify chunk count | the target's 8-row Q8 projections take 2 four-element chunks per lane instead of 4 (-0.76 ms per verify cycle); measured as its own pair on the build above: 48.43 -> 48.71 at 8k, 46.70 -> 46.88 at 62k | 48.71 | 46.88 |
 
 The draft stage fell from 12.5 to 9.4 ms per cycle; the verify stage (109 ms per cycle
 at 8k, most of it the target's 8-row forward) was not touched except for the head.
@@ -552,10 +553,11 @@ Findings that generalize:
   byte-identical by construction): the shipped 2 simdgroups / 4 rows / 4 chunks is
   0.76 ms per 109 ms cycle slower than 2 chunks (+0.28 t/s at 8k, +0.18 at 62k over
   three paired reps), while the drafter's fused gate/up kernel, which shares the
-  constants, prefers the shipped 4 chunks. The change needs a per-path constant and is
-  **not in this build**; it is recorded for the next round together with the
-  reduction-order knob (lanes per row: 16 no better than 8, 4 slower with a stream change
-  at one call, 32 a 25% cliff).
+  constant, prefers the shipped 4 chunks. Shipped as a per-caller constant: the chunk
+  count is function constant `FC_MUL_MV+4`, the target's 8-row projections take 2 and
+  the drafter keeps 4 (`ds4_gpu_mv_ext_geom()`). The reduction-order knob (lanes per
+  row) stays as it was: 16 no better than 8, 4 slower with a stream change at one call,
+  32 a 25% cliff.
 
 No new switches. The NT4 head and batched `fc` were already documented controls
 (`DS4_DFLASH_DISABLE_HEAD_NT4`, `DS4_DFLASH_DISABLE_FC_MM`); the profile fix changes which

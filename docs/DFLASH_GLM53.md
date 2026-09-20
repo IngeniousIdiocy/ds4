@@ -652,9 +652,10 @@ replaced; over 200 fixture cycles and 200 manifest prompts it moved zero
 proposals. Swapping the whole drafter (BF16 for Q8_0) is what flips a near-tie
 token at 62k, not any of these dispatch changes.
 
-Two things measured but not shipped: the target verify's `mul_mv_ext` chunk
-count (2 instead of 4 reads 0.76 ms per cycle faster, +0.28 t/s at 8k, but the
-drafter's fused gate/up kernel shares the constant and prefers 4, so it needs a
-per-path constant) and the lanes-per-row split (16 no better than 8, 4 slower and
-a numerics change, 32 a cliff). The verify stage itself, 109 ms against a
-bandwidth floor near 50, is the next campaign.
+One more change on the verify side: the target's eight-row `mul_mv_ext`
+projections take 2 four-element chunks per lane instead of 4 (0.76 ms per verify
+cycle; +0.28 t/s at 8k and +0.18 at 62k as its own interleaved pair, byte-identical),
+while the drafter's fused gate/up kernel, which shares the constant, keeps 4. The
+lanes-per-row split was measured and left alone (16 no better than 8, 4 slower and
+a numerics change, 32 a cliff). The verify stage itself, 109 ms against a bandwidth
+floor near 50, is the next campaign.

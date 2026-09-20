@@ -282,14 +282,15 @@ mechanisms in [CHANGES-GLM53.md](CHANGES-GLM53.md) sections 7 and 8):
 | serial decode, 8,192-token prompt | 38.43 t/s | **39.47 t/s** |
 | serial decode, 62,000-token prompt | 37.84 t/s | **38.98 t/s** |
 | serial decode, 300,000-token prompt | 37.02 t/s | **38.03 t/s** |
-| DFlash2 conservative, Q8_0 drafter, 8,192-token prompt | 45.75 t/s | **48.62 t/s** |
-| DFlash2 conservative, Q8_0 drafter, 62,000-token prompt | 44.70 t/s | **46.87 t/s** |
+| DFlash2 conservative, Q8_0 drafter, 8,192-token prompt | 45.75 t/s | **48.71 t/s** |
+| DFlash2 conservative, Q8_0 drafter, 62,000-token prompt | 44.70 t/s | **46.88 t/s** |
 
 Serial decode: chain decode with a GPU token selector and commit-ahead, concurrent
 DSA decode levels, a fused top-k, kv rows kept in registers, and a paired online
 softmax (the one Tier 2 change, gated on the 1k manifest). DFlash2: a profile gate
 that had left the fast verify head off for the Q8_0 drafter, the drafter's FFN on
-the target's fused gate/up kernel, and a token-tile Q8 kernel for its narrow
+the target's fused gate/up kernel, a token-tile Q8 kernel for its narrow
+projections, and a smaller per-lane chunk count for the target's eight-row verify
 projections. Every serial output above is byte-identical to the previous build at
 8k, 62k and 300k; every DFlash committed stream is byte-identical with the
 acceptance profile unchanged.

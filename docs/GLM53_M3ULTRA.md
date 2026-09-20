@@ -577,6 +577,7 @@ mechanisms in `CHANGES-GLM53.md` sections 7 and 8.
 | serial decode, 300k | 37.02 | **38.03** | byte-identical |
 | DFlash2 conservative, Q8_0 drafter, 8k | 45.75 | **48.62** | committed stream byte-identical, acceptance unchanged |
 | DFlash2 conservative, Q8_0 drafter, 62k | 44.70 | **46.87** | byte-identical |
+| DFlash2 conservative, verify chunk count 4 -> 2 (own pair on the build above) | 48.43 / 46.70 | **48.71 / 46.88** (8k / 62k) | byte-identical |
 
 The cold-run gates of the table above (`524c8a1`) were not re-run on this build; the
 native serial path's changes are the decode-2 set, and the DFlash changes do not touch it
