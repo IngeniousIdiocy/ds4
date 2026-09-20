@@ -20915,8 +20915,22 @@ static NSUInteger ds4_gpu_topk_fast_fused_tgmem(uint32_t bits, NSUInteger nth) {
 /* The fused shape has two requirements the chain does not: the packed 16-bit
  * bin counters must not be able to overflow (the largest count is n_comp), and
  * the whole working set must fit one threadgroup allocation. */
+/* n_comp bound, RAISED 2026-09-19 for the 300k shape (n_comp ~ 75,000).  The
+ * packed histogram's constraint was never n_comp, it was a single BIN passing
+ * 65,535; the kernel now detects that increment and raises
+ * DS4_TOPK_FAST_FLAG_SATURATE, which forces the reject arm and hands the row
+ * to the legacy chain exactly as every other reject cause does.  So the bound
+ * is only about how often the fused work would be wasted, not about
+ * correctness: at 2^17 a single bin would have to hold 87% of all scores
+ * before a row ever falls back.  Nothing else in the kernel depends on n_comp
+ * -- the candidate list is capped at cand_cap, the cut scan works purely in
+ * bin space, the sort works on nth lanes, and the only other uses are the
+ * scan's loop bound and the BADIDX check, both correct at any n_comp.  The
+ * threadgroup budget is unchanged: it depends on nbins, nth and cand_cap
+ * only, so it is still 16 + max(nbins/2 + nth + 2, cand_cap*2 + nth*4) =
+ * 6,160 words = 24,640 B at the certified tuple. */
 static int ds4_gpu_glm_topk_fast_fused_ok(uint32_t n_comp, uint32_t bits, NSUInteger nth) {
-    if (n_comp >= 65536u) return 0;
+    if (n_comp >= (1u << 17)) return 0;
     if (!g_topk_fast_fused_pipeline)
         g_topk_fast_fused_pipeline = ds4_gpu_get_pipeline("kernel_glm53_topk_fast_fused");
     if (!g_topk_fast_fused_pipeline) return 0;

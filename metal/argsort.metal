@@ -603,6 +603,11 @@ struct ds4_metal_args_glm53_topk_fast {
 #define DS4_TOPK_FAST_FLAG_TIE       8u
 #define DS4_TOPK_FAST_FLAG_SHORT     16u
 #define DS4_TOPK_FAST_FLAG_BADIDX    32u
+/* A packed 16-bit half reached 65535 and the next increment would carry into
+ * its neighbour.  Only the fused kernel can raise it, because only the fused
+ * kernel packs two counters per word; the three-dispatch chain counts in
+ * device uint32 and cannot saturate at any n_comp this model produces. */
+#define DS4_TOPK_FAST_FLAG_SATURATE  64u
 
 // ctrl[0] fallback flags, ctrl[1] candidate counter, ctrl[2] accepted (1/0),
 // ctrl[3] candidate count observed by the finisher, ctrl[4] calls, ctrl[5]
@@ -621,6 +626,8 @@ struct ds4_metal_args_glm53_topk_fast {
 //   ctrl[12] ...                                SHORT     (bit 4)
 //   ctrl[13] ...                                BADIDX    (bit 5)
 //   ctrl[14] longest consecutive-rejection run observed
+//   ctrl[15] ... SATURATE (bit 6) - a packed histogram half hit 65535.  It
+//                sits at 15 rather than at 8+6 because ctrl[14] is taken.
 // A call can set more than one cause, so the six per-cause counters sum to at
 // least the rejected-call count; they are per-cause frequencies, not a
 // partition.  The finisher is a single threadgroup and the selector calls are
@@ -921,6 +928,8 @@ static inline void ds4_topk_fast_tail(
             for (uint b = 0u; b < 6u; b++)
                 if (reject & (1u << b))
                     atomic_fetch_add_explicit(&ctrl[8u + b], 1u, memory_order_relaxed);
+            if (reject & DS4_TOPK_FAST_FLAG_SATURATE)
+                atomic_fetch_add_explicit(&ctrl[15], 1u, memory_order_relaxed);
             const uint run = atomic_load_explicit(&ctrl[7], memory_order_relaxed) + 1u;
             atomic_store_explicit(&ctrl[7], run, memory_order_relaxed);
             if (run > atomic_load_explicit(&ctrl[14], memory_order_relaxed))
@@ -1036,6 +1045,7 @@ kernel void kernel_glm53_topk_fast_fused(
 
     /* ---- phase 1: histogram (kernel_glm53_topk_fast_hist, one TG) ------ */
     uint nonfinite = 0u;
+    uint saturated = 0u;
     for (uint i = tid; i < args.n_comp; i += nth) {
         const float v = scores[i];
         const uint  b = as_type<uint>(v);
@@ -1044,12 +1054,23 @@ kernel void kernel_glm53_topk_fast_fused(
         if (e == 0x7f800000u) nonfinite = 1u;                   // Inf or NaN
         if (e == 0u && m != 0u) nonfinite = 1u;                 // subnormal
         const uint bin = ds4_topk_fast_key(v) >> shift;
-        atomic_fetch_add_explicit((threadgroup atomic_uint *)&hpack[bin >> 1],
-                                  (bin & 1u) ? 0x10000u : 1u,
-                                  memory_order_relaxed);
+        /* The returned value is the count BEFORE this increment, so a half
+         * already at 65535 is exactly the increment that would carry into its
+         * neighbour and corrupt both counts.  Flagging it here - rather than
+         * refusing the whole path on an n_comp bound - lets the fused kernel
+         * run at any n_comp and fall back only on the rows that actually
+         * saturate, which is the same contract as every other reject cause. */
+        const uint prev = atomic_fetch_add_explicit(
+                (threadgroup atomic_uint *)&hpack[bin >> 1],
+                (bin & 1u) ? 0x10000u : 1u, memory_order_relaxed);
+        if ((((bin & 1u) ? (prev >> 16) : prev) & 0xffffu) == 0xffffu)
+            saturated = 1u;
     }
     if (nonfinite)
         atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_NONFINITE,
+                                 memory_order_relaxed);
+    if (saturated)
+        atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_SATURATE,
                                  memory_order_relaxed);
     if (tid == 0u) {
         atomic_fetch_add_explicit(&ctrl[4], 1u, memory_order_relaxed);
