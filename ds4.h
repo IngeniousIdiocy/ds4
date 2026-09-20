@@ -790,7 +790,7 @@ typedef struct {
      * layers is that phase's cost. */
     int attn_probe;
 
-    /* attn_kv_regs (§19.6): 0 = today, each lane reads its row's four staged
+    /* attn_kv_regs (§19.6), DEFAULT ON: 0 = the kill switch, each lane reads its row's four staged
      * half4 from threadgroup memory in the dots and reads the same four
      * addresses again in the online-softmax update; 1 = read them once into
      * registers and use those for both.  Tier 1: the same threadgroup words,

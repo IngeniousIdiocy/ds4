@@ -56121,7 +56121,7 @@ glm_levers g_glm_levers = {
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .attn_probe            = 0,  /* diagnostic only; never ships non-zero */
-    .attn_kv_regs          = 0,  /* 0 = today's re-read from threadgroup mem */
+    .attn_kv_regs          = 1,  /* on: +0.110 t/s at 62k, identical text */
     .reduce_probe          = 0,  /* diagnostic only; never ships non-zero */
 };
 static int g_glm_levers_ready;
@@ -56149,7 +56149,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "attn_probe",            offsetof(glm_levers, attn_probe),            "DS4_GLM_ATTN_PROBE" },
-    { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_ATTN_KV_REGS" },
+    { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_DISABLE_ATTN_KV_REGS" },
     { "reduce_probe",          offsetof(glm_levers, reduce_probe),          "DS4_GLM_REDUCE_PROBE" },
 };
 
@@ -56201,9 +56201,11 @@ void glm_levers_init_from_env(void) {
             g_glm_levers.attn_probe = (n >= 0 && n <= 4) ? n : 0;
         }
     }
-    {   const char *v = getenv("DS4_GLM_ATTN_KV_REGS");
-        if (v && v[0]) g_glm_levers.attn_kv_regs = atoi(v) == 1 ? 1 : 0;
-    }
+    /* Default ON since kvregs-62k (+0.110 t/s over three interleaved reps,
+     * every pair positive, identical text).  Same DISABLE_ inversion as the
+     * levers above: the variable is the only way to take it off at startup,
+     * and exact mode clamps it off at the read site. */
+    g_glm_levers.attn_kv_regs = getenv("DS4_GLM_DISABLE_ATTN_KV_REGS") == NULL;
     {   const char *v = getenv("DS4_GLM_REDUCE_PROBE");
         if (v && v[0]) {
             const int n = atoi(v);

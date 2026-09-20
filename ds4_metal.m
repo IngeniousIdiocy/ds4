@@ -20940,12 +20940,14 @@ static uint32_t ds4_gpu_glm_reduce_probe(void) {
     return (uint32_t)v;
 }
 
-/* §19.6 attn_kv_regs: 0 = today, where each lane reads its row's four staged
- * half4 from threadgroup memory in the dots and reads the same four addresses
- * again in the online-softmax update; 1 = read them once into registers and
- * use those for both.  Tier 1 - the same threadgroup words, the same
- * half-to-float conversions on the same inputs, the same operands in the same
- * order - so the claim is bit-identical output. */
+/* §19.6 attn_kv_regs, DEFAULT ON since kvregs-62k (+0.110 t/s over three
+ * interleaved reps, every pair positive, identical text).  At 1 each lane
+ * reads its row's four staged half4 from threadgroup memory ONCE and uses the
+ * registers in both the dots and the online-softmax update; at 0, the kill
+ * switch, it reads the same four addresses twice as the kernel did until
+ * 2026-09-19.  Tier 1 - the same threadgroup words, the same half-to-float
+ * conversions on the same inputs, the same operands in the same order - so
+ * the output is bit-identical and the 0 arm exists only as an escape. */
 static uint32_t ds4_gpu_glm_attn_kv_regs(void) {
     glm_levers_init_from_env();
     int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_kv_regs;
@@ -41319,6 +41321,40 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
+        /* The three diagnostic/lever values are read HERE, as ordinary
+         * statements, rather than inside the designated initializer below.
+         * redprobe-62k ran five arms of reduce_probe and the server logged one
+         * "reduce_probe=0" and nothing else, so every arm measured production
+         * and the run said nothing.  The wiring was correct by inspection and
+         * the format strings are in the binary, so the value never reached
+         * g_glm_levers on that process -- but a read buried in an initializer
+         * is not something you can confirm from a log, and that is the part
+         * worth fixing.  Read them into named locals, encode those, and then
+         * announce THE ENCODED VALUE next to the reduce kernel the shape
+         * actually bound, so an arm is either confirmed by one line or known
+         * bad before any number is read from it. */
+        const uint32_t probe_attn   = ds4_gpu_glm_attn_probe();
+        const uint32_t probe_kvregs = ds4_gpu_glm_attn_kv_regs();
+        const uint32_t probe_reduce = ds4_gpu_glm_reduce_probe();
+        {
+            static uint32_t last_enc[3] = { 0xffffffffu, 0xffffffffu, 0xffffffffu };
+            if (probe_attn != last_enc[0] || probe_kvregs != last_enc[1] ||
+                probe_reduce != last_enc[2]) {
+                fprintf(stderr,
+                        "[T2] encoded attn_probe=%u attn_kv_regs=%u reduce_probe=%u"
+                        " (partial=%s, reduce=%s, n_blocks=%u)\n",
+                        probe_attn, probe_kvregs, probe_reduce,
+                        use_prefix_fullheads ?
+                            "group8_partial_prefix_fullheads" : "group8_partial",
+                        t2s_vplane ? "t2s_reduce_vplane" :
+                        use_reduce16 ? "group8_reduce16" :
+                        use_reduce_u16 ? "group8_reduce_u16" : "group8_reduce",
+                        (unsigned)n_blocks);
+                last_enc[0] = probe_attn;
+                last_enc[1] = probe_kvregs;
+                last_enc[2] = probe_reduce;
+            }
+        }
         ds4_gpu_glm_attention_indexed_decode_split_args args = {
             .guaranteed_prefix = use_prefix_fullheads ? guaranteed_prefix : 0u,
             .n_selected = n_selected,
@@ -41341,9 +41377,9 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
-            .dbg_double = ds4_gpu_glm_attn_probe(),
-            .kv_regs = ds4_gpu_glm_attn_kv_regs(),
-            .dbg_reduce = ds4_gpu_glm_reduce_probe(),
+            .dbg_double = probe_attn,
+            .kv_regs = probe_kvregs,
+            .dbg_reduce = probe_reduce,
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;
