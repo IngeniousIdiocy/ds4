@@ -808,6 +808,15 @@ typedef struct {
      * the same values to the same addresses, so the token text is
      * identical. */
     int hc_pre_probe;
+
+    /* kda_prologue_wide (§21.5): 0 = today, the Q8_0 prologue row body reads
+     * its eight x floats and eight int8 quants one scalar at a time and then
+     * runs a second, structurally redundant simd_sum; 1 = two float4 and two
+     * packed_char4 loads of the same bytes in the same lane, feeding the same
+     * eight products in the same order, with the redundant reduction dropped.
+     * Tier 1: no arithmetic and no order changes, and the dropped reduction
+     * returns its own input because its other 31 slots are +0.0. */
+    int kda_prologue_wide;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

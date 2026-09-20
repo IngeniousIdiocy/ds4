@@ -56931,6 +56931,7 @@ typedef struct {
     uint32_t do_prologue;
     uint32_t do_out;
     uint32_t dbg_double;          /* §21 kda_glue_probe; 0 in production */
+    uint32_t lr_wide;             /* §21.5 kda_prologue_wide; 0 = today */
 } glm53_gpu_kda_glue_args;
 
 /* §21 kda_glue_probe: 0 in production, 1..4 select a Tier-1 doubling probe
@@ -56946,6 +56947,22 @@ static uint32_t ds4_gpu_glm53_kda_glue_probe(void) {
     int v = glm53_exact_mode() ? 0 : g_glm_levers.kda_glue_probe;
     if (v < 0 || v > 4) v = 0;
     return (uint32_t)v;
+}
+
+/* §21.5 kda_prologue_wide: 0 = today, the Q8_0 prologue row body reads its
+ * eight x floats and its eight int8 quants one scalar at a time and then runs
+ * a second, structurally redundant simd_sum; 1 = two float4 and two
+ * packed_char4 loads of the same bytes in the same lane feeding the same
+ * products in the same order, with the redundant reduction dropped.  Tier 1:
+ * the arithmetic and its order are untouched and the dropped reduction
+ * returns its own input.  glueprobe-62k priced the prologue's cached second
+ * pass at 5.5 us per site for 2.23 MB, 405 GB/s, which is below even the
+ * first-read rate and far below the 1.4 TB/s other second passes reach - it is
+ * bound by load issue and by half the simdgroup being idle, not by bytes. */
+static uint32_t ds4_gpu_glm53_kda_prologue_wide(void) {
+    glm_levers_init_from_env();
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.kda_prologue_wide;
+    return v == 1 ? 1u : 0u;
 }
 
 /* KDA decode with the f_b/g_b BF16 expansions folded into the per-head
@@ -57117,17 +57134,22 @@ int ds4_gpu_glm53_kda_decode_glue(
          * for a finding.  Read as an ordinary statement, never inside the
          * initializer. */
         const uint32_t enc_kda_probe = ds4_gpu_glm53_kda_glue_probe();
+        const uint32_t enc_kda_wide = ds4_gpu_glm53_kda_prologue_wide();
         {
-            static uint32_t last_enc = 0xffffffffu;
-            if (enc_kda_probe != last_enc) {
+            static uint32_t last_probe = 0xffffffffu;
+            static uint32_t last_wide  = 0xffffffffu;
+            if (enc_kda_probe != last_probe || enc_kda_wide != last_wide) {
                 fprintf(stderr,
-                        "[T2] encoded kda_glue_probe=%u (kernel=%s, heads=%u,"
-                        " threads=%u, prologue=%u, out=%u, lr_q8=%u)\n",
-                        enc_kda_probe, "kernel_glm53_kda_decode_glue",
+                        "[T2] encoded kda_glue_probe=%u kda_prologue_wide=%u"
+                        " (kernel=%s, heads=%u, threads=%u, prologue=%u,"
+                        " out=%u, lr_q8=%u, lr_in_dim=%u)\n",
+                        enc_kda_probe, enc_kda_wide,
+                        "kernel_glm53_kda_decode_glue",
                         (unsigned)n_heads, (unsigned)threads,
                         do_prologue ? 1u : 0u, do_out ? 1u : 0u,
-                        lr_q8 ? 1u : 0u);
-                last_enc = enc_kda_probe;
+                        lr_q8 ? 1u : 0u, (unsigned)lr_in_dim);
+                last_probe = enc_kda_probe;
+                last_wide = enc_kda_wide;
             }
         }
         glm53_gpu_kda_glue_args args = {
@@ -57142,6 +57164,7 @@ int ds4_gpu_glm53_kda_decode_glue(
             .do_prologue = do_prologue ? 1u : 0u,
             .do_out = do_out ? 1u : 0u,
             .dbg_double = enc_kda_probe,
+            .lr_wide = enc_kda_wide,
         };
         glm53_gpu_kda_args out_args = {
             .n_heads = n_heads,

@@ -653,7 +653,8 @@ static inline void glm53_mul_mv_q8_0_f32_row_at(
         device float                    *out,
         uint                             out_row,
         uint                             token,
-        ushort                           lane) {
+        ushort                           lane,
+        bool                             wide) {
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
     if (out_row >= out_dim || token >= n_rows) return;
@@ -671,20 +672,61 @@ static inline void glm53_mul_mv_q8_0_f32_row_at(
     float yl[NQ];
     device const float *yb = y + ib0 * QK8_0 + il * NQ;
     for (int ib = ib0; ib < nb; ib += NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
+        /* §21.5.  `wide` folds the eight scalar x loads into two float4 and
+         * the eight scalar int8 quant loads into two packed_char4 -- the same
+         * bytes, in the same lane, feeding the same eight products in the same
+         * order, so every `sumq` is bit-identical.  `yb` is the tensor base
+         * plus ib0 * QK8_0 + il * NQ floats, both multiples of eight floats,
+         * so the float4 loads are 16-byte aligned.  `packed_char4` has 1-byte
+         * alignment, which matters because a Q8_0 block is 34 bytes and `qs`
+         * lands at 2 mod 4 for even blocks -- an ordinary char4 would be
+         * misaligned.  This is the widening metal/t2screen.metal already
+         * ships, where it took the routed gate+up matvec from 657 to
+         * 687 GB/s. */
+        if (wide) {
+            device const float4 *yv = (device const float4 *)yb;
+            const float4 v0 = yv[0];
+            const float4 v1 = yv[1];
+            yl[0] = v0.x; yl[1] = v0.y; yl[2] = v0.z; yl[3] = v0.w;
+            yl[4] = v1.x; yl[5] = v1.y; yl[6] = v1.z; yl[7] = v1.w;
+        } else {
+            for (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
+            }
         }
         device const int8_t *qs = ax[ib].qs + il * NQ;
         float sumq = 0.f;
-        FOR_UNROLL (short i = 0; i < NQ; ++i) {
-            sumq += qs[i] * yl[i];
+        if (wide) {
+            device const packed_char4 *q4 = (device const packed_char4 *)qs;
+            const packed_char4 a0 = q4[0];
+            const packed_char4 a1 = q4[1];
+            sumq += a0[0] * yl[0];
+            sumq += a0[1] * yl[1];
+            sumq += a0[2] * yl[2];
+            sumq += a0[3] * yl[3];
+            sumq += a1[0] * yl[4];
+            sumq += a1[1] * yl[5];
+            sumq += a1[2] * yl[6];
+            sumq += a1[3] * yl[7];
+        } else {
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
         }
         sumf += sumq * ax[ib].d;
         yb += NQ * QK8_0;
     }
 
     sumf = simd_sum(sumf);
-    const float tot = simd_sum(lane == 0u ? sumf : 0.0f);
+    /* §21.5.  The second reduction emulates the standalone kernel's
+     * cross-simdgroup stage, whose other slots are structurally +0.0 (see the
+     * nb <= NQ argument above).  After the first simd_sum every lane holds the
+     * complete row sum, so the second reduces (sumf, +0.0 x 31) and returns
+     * sumf exactly: +0.0 is the additive identity under every association, and
+     * `sumf` can never be -0.0 because it starts at +0.0 and +0.0 + x is +0.0
+     * even for x == -0.0.  At `wide` the reduction is dropped and lane 0
+     * writes `sumf`, which is the same word. */
+    const float tot = wide ? sumf : simd_sum(lane == 0u ? sumf : 0.0f);
     if (lane == 0u) out[(ulong)token * out_dim + out_row] = tot;
 }
 
@@ -705,6 +747,11 @@ struct glm53_kda_glue_args {
      * f_b/g_b prologue, 2 the conv prep, 3 the recurrent row loop, 4 the
      * epilogue.  Appended, so every field above keeps its offset. */
     uint dbg_double;
+    /* §21.5 lever kda_prologue_wide: 0 = today's scalar loads and the
+     * redundant second simd_sum; 1 = packed_char4 / float4 loads of the same
+     * bytes in the same lane feeding the same products in the same order, and
+     * the redundant reduction dropped. */
+    uint lr_wide;
 };
 
 kernel void kernel_glm53_kda_decode_glue(
@@ -783,7 +830,8 @@ kernel void kernel_glm53_kda_decode_glue(
             if (args.lr_q8 != 0u) {
                 glm53_mul_mv_q8_0_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows, w, x, o,
-                                             head * D + local, row, lane);
+                                             head * D + local, row, lane,
+                                             args.lr_wide != 0u);
             } else {
                 glm53_mul_mv_bf16_f32_row_at(args.lr_in_dim, projection,
                                              args.n_rows,

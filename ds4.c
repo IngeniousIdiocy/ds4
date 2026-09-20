@@ -56123,6 +56123,7 @@ glm_levers g_glm_levers = {
     .attn_kv_regs          = 1,  /* on: +0.110 t/s at 62k, identical text */
     .kda_glue_probe        = 0,  /* diagnostic only; never ships non-zero */
     .hc_pre_probe          = 0,  /* diagnostic only; never ships non-zero */
+    .kda_prologue_wide     = 0,  /* 0 = today's scalar prologue loads */
 };
 static int g_glm_levers_ready;
 
@@ -56151,6 +56152,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "attn_kv_regs",          offsetof(glm_levers, attn_kv_regs),          "DS4_GLM_DISABLE_ATTN_KV_REGS" },
     { "kda_glue_probe",        offsetof(glm_levers, kda_glue_probe),        "DS4_GLM_KDA_GLUE_PROBE" },
     { "hc_pre_probe",          offsetof(glm_levers, hc_pre_probe),          "DS4_GLM_HC_PRE_PROBE" },
+    { "kda_prologue_wide",     offsetof(glm_levers, kda_prologue_wide),     "DS4_GLM_KDA_PROLOGUE_WIDE" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56211,6 +56213,9 @@ void glm_levers_init_from_env(void) {
             const int n = atoi(v);
             g_glm_levers.hc_pre_probe = (n >= 0 && n <= 2) ? n : 0;
         }
+    }
+    {   const char *v = getenv("DS4_GLM_KDA_PROLOGUE_WIDE");
+        if (v && v[0]) g_glm_levers.kda_prologue_wide = atoi(v) == 1 ? 1 : 0;
     }
     g_glm_levers_ready = 1;
 }
