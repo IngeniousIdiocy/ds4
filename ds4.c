@@ -56128,11 +56128,10 @@ static int g_glm_levers_ready;
 static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "decode_flush_interval")) { *lo = -1; *hi = 256; return 1; }
     if (!strcmp(name, "decode_ablate")) { *lo = 0; *hi = 524287; return 1; }
-    /* topk_fused: 0 = the three-dispatch chain, 1 = the fused kernel, 9 = the
-     * fused kernel with the shuffle cut scan (byte-identical), and 5-8 are the
-     * NEVER-SHIP §16 phase probes whose output is deliberately wrong.  2-4 are
-     * retired and refuse to 1. */
-    if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 9; return 1; }
+    /* topk_fused: 0 = the three-dispatch chain, 1 = the fused kernel, and
+     * 10-13 are the §17 Tier-1 doubling probes, which run one phase twice and
+     * leave the output byte-identical so each can be measured in-graph. */
+    if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 13; return 1; }
     return 0;
 }
 

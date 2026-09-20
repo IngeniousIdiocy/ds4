@@ -20768,7 +20768,7 @@ typedef struct {
     uint32_t output_width;
     uint32_t pos0;
     uint32_t fb_count;
-    uint32_t dbg_skip;
+    uint32_t dbg_double;
     uint32_t fb_grid[16];
 } ds4_gpu_kargs_topk_fast;
 
@@ -20881,29 +20881,29 @@ static int ds4_gpu_glm_topk_fast_pipelines(void) {
 static int ds4_gpu_glm_topk_fused_lever(void) {
     glm_levers_init_from_env();
     int v = glm53_exact_mode() ? 0 : g_glm_levers.topk_fused;
-    if (v < 0 || v > 9) v = 0;
-    if (v >= 2 && v <= 4) v = 1;        /* retired split-scan values */
+    /* 0 = chain, 1 = fused, 10..13 = the §17 doubling probes.  Nothing else is
+     * a defined value; anything else runs the production fused kernel. */
+    if (v != 0 && (v < 10 || v > 13)) v = 1;
     static int last = -1;
     if (v != last) {
-        static const char *what[10] = {
-            "three-dispatch chain", "fused", "", "", "",
-            "PROBE: no bitonic sort", "PROBE: no gather pass",
-            "PROBE: no out_idx or pool expansion",
-            "PROBE: histogram and cut scan only",
-            "fused + shuffle cut scan (byte-identical)" };
-        fprintf(stderr, "[T2] topk_fused=%d (%s)%s\n", v, what[v],
-                (v >= 5 && v <= 8) ?
-                "  *** NEVER-SHIP DIAGNOSTIC: OUTPUT IS WRONG ***" : "");
+        static const char *what[4] = {
+            "PROBE x2: cut scan",
+            "PROBE x2: acceptance, expansion, output and grid writes",
+            "PROBE x2: histogram clear and scan",
+            "PROBE x2: bitonic sort" };
+        fprintf(stderr, "[T2] topk_fused=%d (%s)\n", v,
+                v == 0 ? "three-dispatch chain" :
+                v == 1 ? "fused" : what[v - 10]);
         last = v;
     }
     return v;
 }
 
-/* 0 in production; 1..5 select a §16 phase probe inside the fused kernel. */
+/* 0 in production; 1..4 select a §17 doubling probe inside the fused kernel.
+ * Every probe is Tier 1: the doubled phase writes the same values to the same
+ * addresses, so the output is byte-identical and the delta is pure cost. */
 static uint32_t ds4_gpu_glm_topk_fused_dbg(int lever) {
-    if (lever >= 5 && lever <= 8) return (uint32_t)(lever - 4);
-    if (lever == 9) return 5u;
-    return 0u;
+    return (lever >= 10 && lever <= 13) ? (uint32_t)(lever - 9) : 0u;
 }
 
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
@@ -21144,7 +21144,7 @@ static int ds4_gpu_indexer_topk_fused(
     const int fast_fused =
         fast_lever &&
         ds4_gpu_glm_topk_fast_fused_ok(n_comp, fast_bits, fast_nth);
-    if (fast_fused) fast_args.dbg_skip = ds4_gpu_glm_topk_fused_dbg(fast_lever);
+    if (fast_fused) fast_args.dbg_double = ds4_gpu_glm_topk_fused_dbg(fast_lever);
     if (fast_fused) {
         /* Lever topk_fused=1: the whole chain as one dispatch of one
          * threadgroup.  The fallback dispatches below are encoded exactly as

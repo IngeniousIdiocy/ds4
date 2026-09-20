@@ -593,7 +593,7 @@ struct ds4_metal_args_glm53_topk_fast {
     uint32_t output_width;    // 2051
     uint32_t pos0;
     uint32_t fb_count;        // fallback dispatches whose grid this path gates
-    uint32_t dbg_skip;        // 0 = production; 1..5 = §16 phase probes
+    uint32_t dbg_double;      // 0 = production; 1..4 = §17 doubling probes
     uint32_t fb_grid[16];     // (x,y) per fallback dispatch, in encode order
 };
 
@@ -783,11 +783,13 @@ static inline void ds4_topk_fast_tail(
     threadgroup uint2 *buf0 = sortbuf;
     threadgroup uint2 *buf1 = sortbuf + nth;
     bool use_buf1 = false;
-    /* §16 probe 1 (lever topk_fused=5): the 55-stage bitonic sort is skipped
-     * and the candidates stay in arrival order.  NEVER SHIP - the selection is
-     * wrong by construction; this exists only to price the sort in the
-     * kernel ledger. */
-    for (uint k = 2u; dbg != 1u && k <= nth; k <<= 1) {
+    /* §17 probe 4 (lever topk_fused=13): run the sorting network TWICE.  A
+     * sorting network applied to an already-sorted sequence reproduces it
+     * exactly - every compare-exchange finds its pair already in the wanted
+     * order - so the second pass changes no value and the delta against value
+     * 1 is the network's cost.  Tier 1. */
+    for (uint pass = 0u; pass < ((dbg == 4u) ? 2u : 1u); pass++)
+    for (uint k = 2u; k <= nth; k <<= 1) {
         for (uint j = k >> 1; j > 0u; j >>= 1) {
             const uint partner = tid ^ j;
             uint2 other;
@@ -824,6 +826,13 @@ static inline void ds4_topk_fast_tail(
      * ONE uniform value and both causes survive.  The bits are the same
      * DS4_TOPK_FAST_FLAG_* values used device-side, so the OR composes with
      * `flags` directly.  No floating-point operation changes. */
+    /* §17 probe 2 (lever topk_fused=11): run the acceptance reduction, the
+     * output writes, the pool expansion, the fallback grids and the histogram
+     * clear TWICE.  Every write is the same value to the same address, so the
+     * buffers stay byte-identical; only the ctrl TELEMETRY COUNTERS would
+     * double-count, and they are guarded to the last pass.  Tier 1. */
+    const uint tail_reps = (dbg == 2u) ? 2u : 1u;
+    for (uint rep = 0u; rep < tail_reps; rep++) {
     if (tid == 0u) atomic_store_explicit(bad_bits, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint ncheck = min(count, args.top_k + 1u);   // covers the cut tie at 511/512
@@ -839,11 +848,6 @@ static inline void ds4_topk_fast_tail(
     uint reject = flags | atomic_load_explicit(bad_bits, memory_order_relaxed);
     if (count < args.top_k || count > args.cand_cap || nth != args.cand_cap)
         reject |= DS4_TOPK_FAST_FLAG_SHORT;
-    /* §16 probe 3 (lever topk_fused=7): force the reject arm, which skips the
-     * out_idx writes and the 2,051-slot pool expansion entirely and reinstates
-     * the real fallback grids, so the legacy chain still produces the output
-     * and nothing downstream reads a stale selection.  NEVER SHIP. */
-    if (dbg == 3u) reject |= DS4_TOPK_FAST_FLAG_SHORT;
     const bool accept = (reject == 0u);
 
     if (accept) {
@@ -888,7 +892,10 @@ static inline void ds4_topk_fast_tail(
         atomic_store_explicit(&ctrl[1], 0u, memory_order_relaxed);
         atomic_store_explicit(&ctrl[2], accept ? 1u : 0u, memory_order_relaxed);
         atomic_store_explicit(&ctrl[3], count, memory_order_relaxed);
-        if (accept) {
+        if (rep + 1u < tail_reps) {
+            /* probe 11 only: the four stores above are idempotent, the
+             * counters below are not */
+        } else if (accept) {
             atomic_fetch_add_explicit(&ctrl[5], 1u, memory_order_relaxed);
             atomic_store_explicit(&ctrl[7], 0u, memory_order_relaxed);   // run ends
         } else {
@@ -901,6 +908,7 @@ static inline void ds4_topk_fast_tail(
             if (run > atomic_load_explicit(&ctrl[14], memory_order_relaxed))
                 atomic_store_explicit(&ctrl[14], run, memory_order_relaxed);
         }
+    }
     }
 }
 
@@ -992,7 +1000,7 @@ kernel void kernel_glm53_topk_fast_fused(
     const uint nbins = 1u << args.hist_bits;
     const uint shift = 32u - args.hist_bits;
     const uint hwords = nbins >> 1;     // packed: two 16-bit counters per word
-    const uint dbg = args.dbg_skip;     // §16 phase probes; 0 in production
+    const uint dbg = args.dbg_double;   // §17 doubling probes; 0 in production
 
     threadgroup uint  *sc    = shm;                       // [0,16) scalars
     threadgroup uint  *hpack = shm + 16u;                 // phases 1-2
@@ -1008,8 +1016,12 @@ kernel void kernel_glm53_topk_fast_fused(
     if (tid < 16u) sc[tid] = 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* ---- phase 1: histogram (kernel_glm53_topk_fast_hist, one TG) ------ */
+    /* ---- phase 1: histogram (kernel_glm53_topk_fast_hist, one TG) ------
+     * §17 probe 3 (lever topk_fused=12): re-clear and re-scan, so the same
+     * counts land in the same bins a second time.  Byte-identical by
+     * construction; the delta against value 1 is the clear plus the scan. */
     uint nonfinite = 0u;
+    for (uint hrep = 0u; ; hrep++) {
     for (uint i = tid; i < args.n_comp; i += nth) {
         const float v = scores[i];
         const uint  b = as_type<uint>(v);
@@ -1021,6 +1033,11 @@ kernel void kernel_glm53_topk_fast_fused(
         atomic_fetch_add_explicit((threadgroup atomic_uint *)&hpack[bin >> 1],
                                   (bin & 1u) ? 0x10000u : 1u,
                                   memory_order_relaxed);
+    }
+    if (dbg != 3u || hrep == 1u) break;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint w = tid; w < hwords; w += nth) hpack[w] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (nonfinite)
         atomic_fetch_or_explicit(fl, DS4_TOPK_FAST_FLAG_NONFINITE,
@@ -1037,56 +1054,14 @@ kernel void kernel_glm53_topk_fast_fused(
      * identical arithmetic on the identical integer counts, read back out of
      * the packed words.  With one threadgroup `per` is the same value the
      * chain uses, because the chain's threadgroups each scanned all nbins. */
-    if (dbg == 5u) {
-        /* Lever topk_fused=9.  The SAME cut, found by one simdgroup walking 32
-         * chunks of nbins/32 bins, with the suffix sum carried by
-         * simd_shuffle_down instead of a ten-round threadgroup scan - which
-         * removes twenty of this kernel's threadgroup_barriers.
-         *
-         * Identity: bin_lo is the unique bin b for which the number of items
-         * in bins STRICTLY GREATER than b is < top_k and that number plus
-         * count(b) is >= top_k.  It is unique because that running count is
-         * non-decreasing as b decreases, so once the second condition holds
-         * the first fails for every lower bin.  Both shapes compute exactly
-         * that running count as an integer sum over disjoint sets of bins;
-         * only the blocking differs (1024 blocks of 8 against 32 blocks of
-         * 256), and integer sums of a partition do not depend on the
-         * partition.  So the same b, hence the same candidate set, hence the
-         * same output.  This value is byte-identical to 1, not a probe. */
-        if (tid == 0u) { sscan[nth] = 0xffffffffu; sscan[nth + 1u] = 0u; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < 32u) {
-            const uint per9 = (nbins + 31u) / 32u;
-            const uint b09  = tid * per9;
-            const uint hi9  = min(b09 + per9, nbins);
-            uint mine9 = 0u;
-            for (uint b = b09; b < hi9; b++)
-                mine9 += (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
-            uint suf = mine9;                    // inclusive suffix over lanes
-            for (uint off = 1u; off < 32u; off <<= 1) {
-                const uint up = simd_shuffle_down(suf, (ushort)off);
-                if (tid + off < 32u) suf += up;
-            }
-            const uint nxt = simd_shuffle_down(suf, (ushort)1);
-            const uint above_block9 = (tid + 1u < 32u) ? nxt : 0u;
-            if (above_block9 < args.top_k && b09 < nbins) {
-                uint acc = above_block9;
-                for (uint b = hi9; b-- > b09; ) {
-                    const uint c = (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
-                    if (acc < args.top_k && acc + c >= args.top_k) {
-                        sscan[nth]      = b;
-                        sscan[nth + 1u] = acc;
-                        break;
-                    }
-                    acc += c;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    } else {
+    /* §17 probe 1 (lever topk_fused=10): run the whole cut scan twice.  The
+     * second pass recomputes sscan from the unchanged histogram and finds the
+     * same bin_lo, so nothing downstream can differ; the delta against value 1
+     * is the scan's ten rounds and twenty barriers plus the block search. */
     const uint per = (nbins + nth - 1u) / nth;
-    uint mine = 0u;
     const uint b0 = tid * per;
+    for (uint crep = 0u; crep < ((dbg == 1u) ? 2u : 1u); crep++) {
+    uint mine = 0u;
     for (uint b = b0; b < b0 + per && b < nbins; b++)
         mine += (hpack[b >> 1] >> ((b & 1u) * 16u)) & 0xffffu;
     sscan[tid] = mine;
@@ -1128,35 +1103,8 @@ kernel void kernel_glm53_topk_fast_fused(
      * which reaches the same reject through the same predicate. */
     threadgroup_barrier(mem_flags::mem_threadgroup);   // last read of sscan
 
-    /* §16 probe 4 (lever topk_fused=8): histogram and cut scan only.  NEVER
-     * SHIP.  The real fallback grids are reinstated so the legacy chain writes
-     * the output and nothing downstream reads a stale selection. */
-    if (dbg == 4u) {
-        for (uint d = tid; d < args.fb_count && d < 8u; d += nth) {
-            indirect[d * 3u + 0u] = args.fb_grid[d * 2u + 0u];
-            indirect[d * 3u + 1u] = args.fb_grid[d * 2u + 1u];
-            indirect[d * 3u + 2u] = 1u;
-        }
-        if (tid == 0u) {
-            atomic_store_explicit(&ctrl[0], 0u, memory_order_relaxed);
-            atomic_store_explicit(&ctrl[1], 0u, memory_order_relaxed);
-            atomic_store_explicit(&ctrl[2], 0u, memory_order_relaxed);
-            atomic_store_explicit(&ctrl[3], 0u, memory_order_relaxed);
-        }
-        return;
-    }
-
     /* ---- phase 3: gather into threadgroup memory ----------------------- */
-    if (dbg == 2u) {
-        /* §16 probe 2 (lever topk_fused=6): no second pass over n_comp and no
-         * candidate filter - the first cand_cap positions become the candidate
-         * list.  NEVER SHIP; the selection is wrong, but every index is a
-         * valid row so nothing downstream faults. */
-        const uint n = min(args.cand_cap, args.n_comp);
-        for (uint i = tid; i < n; i += nth)
-            cand[i] = uint2(ds4_topk_fast_key(scores[i]), i);
-        if (tid == 0u) atomic_store_explicit(nc, n, memory_order_relaxed);
-    } else if (bin_lo != 0xffffffffu) {
+    if (bin_lo != 0xffffffffu) {
         for (uint i = tid; i < args.n_comp; i += nth) {
             const uint key = ds4_topk_fast_key(scores[i]);
             if ((key >> shift) >= bin_lo) {
@@ -1176,6 +1124,6 @@ kernel void kernel_glm53_topk_fast_fused(
     const uint have  = min(count, args.cand_cap);
     uint2 cur = (tid < have) ? cand[tid] : uint2(0u, 0xffffffffu);
     ds4_topk_fast_tail(args, cur, flags, count, sortbuf, &bad_bits,
-                       ctrl, hist, out_idx, raw, indirect, args.dbg_skip,
+                       ctrl, hist, out_idx, raw, indirect, args.dbg_double,
                        tid, nth);
 }
