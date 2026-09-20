@@ -14554,6 +14554,7 @@ typedef struct {
     double               prefill_sec;
     int                  prefill_tokens;
     bool                 from_disk;
+    uint64_t             last_used;   /* for LRU reuse; 0 = never */
 } bench_fixture;
 
 #define BENCH_FIXTURES 4
@@ -14612,19 +14613,33 @@ static char *bench_read_file(const char *path, size_t *len_out) {
 static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
                                         int ctx_start, int ctx_alloc, bool fresh,
                                         bool *created, char *err, size_t errlen) {
+    static uint64_t tick;
     if (created) *created = false;
     bench_fixture *free_slot = NULL;
     for (int i = 0; i < BENCH_FIXTURES; i++) {
         bench_fixture *f = &g_bench_fix[i];
         if (f->path && !strcmp(f->path, path) && f->ctx_start == ctx_start) {
-            if (!fresh) return f;
+            if (!fresh) { f->last_used = ++tick; return f; }
             bench_fixture_reset(f);
             free_slot = f;
             break;
         }
         if (!f->path && !free_slot) free_slot = f;
     }
-    if (!free_slot) { snprintf(err, errlen, "no free bench fixture slot"); return NULL; }
+    /* A breadth battery (wave E spec 2.3) walks 100 prompt files through the
+     * same resident server, so the four slots have to rotate.  Reuse the
+     * least recently used one: its prefix is already persisted as a session
+     * snapshot on disk, so the eviction costs a re-tokenise and a restore,
+     * never a re-prefill, and a later arm on the same prompt still restores
+     * the identical prefix. */
+    if (!free_slot) {
+        bench_fixture *lru = &g_bench_fix[0];
+        for (int i = 1; i < BENCH_FIXTURES; i++) {
+            if (g_bench_fix[i].last_used < lru->last_used) lru = &g_bench_fix[i];
+        }
+        bench_fixture_reset(lru);
+        free_slot = lru;
+    }
     if (created) *created = true;
 
     size_t text_len = 0;
@@ -14642,6 +14657,7 @@ static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
     f->path = xstrdup(path);
     f->ctx_start = ctx_start;
     f->ctx_alloc = ctx_alloc;
+    f->last_used = ++tick;
     if (ds4_session_create(&f->session, e, ctx_alloc) != 0) {
         snprintf(err, errlen, "session create failed");
         bench_fixture_reset(f);
