@@ -1009,6 +1009,11 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
         const ds4_gpu_tensor *x,
         float                   clamp);
 
+/* Wave D: while set, 8-row Q8_0 mul_mv_ext dispatches take the r1_8 kernel
+ * (one row group, the weight read once) instead of r1_4's two groups.  Same
+ * kernel family and identical per-row arithmetic. */
+void ds4_gpu_mv_ext_r1_8_scope_set(int on);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

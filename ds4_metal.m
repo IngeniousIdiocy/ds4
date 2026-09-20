@@ -6472,13 +6472,21 @@ static int16_t ds4_gpu_mv_ext_nxpsg(uint64_t in_dim, uint64_t n_tok) {
     return 4;
 }
 
+/* Wave D (D7): the drafter's own 8-row shape, scoped the way
+ * ds4_gpu_glm53_bf16_mv_max_set scopes the BF16 row cap -- the earlier
+ * "r1_8 is slower" measurement was the target's verify projections, which
+ * are a different shape stack from the drafter's five layers. */
+static int g_mv_ext_r1_8_scope;
+void ds4_gpu_mv_ext_r1_8_scope_set(int on) { g_mv_ext_r1_8_scope = on ? 1 : 0; }
+
 static int16_t ds4_gpu_mv_ext_r1ptg(uint64_t n_tok) {
     /* r1_8 reads weights once at n=8 (vs r1_4 x 2 groups) but measured
      * SLOWER on M3 Ultra (register pressure beats the bandwidth saving;
      * the small-projection stack is dispatch-latency bound anyway).
      * Kernels kept for future experiments, opt-in only. */
-    static int r1_8 = -1;
-    if (r1_8 < 0) r1_8 = getenv("DS4_MV_EXT_R1_8") != NULL;
+    static int r1_8_env = -1;
+    if (r1_8_env < 0) r1_8_env = getenv("DS4_MV_EXT_R1_8") != NULL;
+    const int r1_8 = r1_8_env || g_mv_ext_r1_8_scope;
     switch (n_tok) {
     case 2: return 2;
     case 3:

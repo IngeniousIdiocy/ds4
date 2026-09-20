@@ -2049,6 +2049,9 @@ static int dflash2_propose_confident(
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const uint32_t layer_mv_max = ds4_gpu_glm53_bf16_mv_max_get();
     ds4_gpu_glm53_bf16_mv_max_set(1);
+    /* Wave D (D7): the drafter's 8-row Q8_0 projections on r1_8 while the
+     * draft runs; the target's own shapes are untouched. */
+    ds4_gpu_mv_ext_r1_8_scope_set(1);
     if (cache && !dflash_cache_make_room(cache, dw, target_rows)) {
         ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
         free(h); free(fc_out); free(h_ctx);
@@ -2094,6 +2097,7 @@ static int dflash2_propose_confident(
 #endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     ds4_gpu_glm53_bf16_mv_max_set(layer_mv_max);
+    ds4_gpu_mv_ext_r1_8_scope_set(0);
 #endif
     if (!gpu_all) {
         if (cache) {
