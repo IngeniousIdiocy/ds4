@@ -1646,9 +1646,9 @@ static int dflash2_layer_forward_gpu(
     }
     if (!fused_prop_kv) {
         DFLASH2_STEP("attn_k", dflash2_gpu_gemm(
-            tkp, m, l->attn_k, attn_input, L, DFLASH2_NT_NONE));
+            tkp, m, l->attn_k, attn_input, L, DFLASH2_NT_KV));
         DFLASH2_STEP("attn_v", dflash2_gpu_gemm(
-            tvp, m, l->attn_v, attn_input, L, DFLASH2_NT_NONE));
+            tvp, m, l->attn_v, attn_input, L, DFLASH2_NT_KV));
     }
     /* Wave D (D3): the new context row's
      * K/V are produced into the cache rows themselves instead of into
