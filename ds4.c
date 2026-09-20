@@ -56121,6 +56121,7 @@ glm_levers g_glm_levers = {
     .chain_commit_ahead    = 1,  /* on: part of the same measured stack */
     .topk_fused            = 1,  /* on: +0.127 t/s at 62k, identical text */
     .attn_probe            = 0,  /* diagnostic only; never ships non-zero */
+    .attn_row_pair         = 1,  /* 1 = today's row loop; 2 pairs the scores */
 };
 static int g_glm_levers_ready;
 
@@ -56133,6 +56134,8 @@ static int glm_lever_range(const char *name, int *lo, int *hi) {
     if (!strcmp(name, "topk_fused")) { *lo = 0; *hi = 1; return 1; }
     /* attn_probe: 0 = production, 1..4 = the §19 doubling probes. */
     if (!strcmp(name, "attn_probe")) { *lo = 0; *hi = 4; return 1; }
+    /* attn_row_pair: 1 = today, 2 = two rows scored before either update. */
+    if (!strcmp(name, "attn_row_pair")) { *lo = 1; *hi = 2; return 1; }
     return 0;
 }
 
@@ -56145,6 +56148,7 @@ static const struct { const char *name; size_t off; const char *env; } g_glm_lev
     { "chain_commit_ahead",    offsetof(glm_levers, chain_commit_ahead),    "DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD" },
     { "topk_fused",            offsetof(glm_levers, topk_fused),            "DS4_GLM_DISABLE_TOPK_FUSED" },
     { "attn_probe",            offsetof(glm_levers, attn_probe),            "DS4_GLM_ATTN_PROBE" },
+    { "attn_row_pair",         offsetof(glm_levers, attn_row_pair),         "DS4_GLM_ATTN_ROW_PAIR" },
 };
 
 void glm_levers_init_from_env(void) {
@@ -56193,6 +56197,12 @@ void glm_levers_init_from_env(void) {
         if (v && v[0]) {
             const int n = atoi(v);
             g_glm_levers.attn_probe = (n >= 0 && n <= 4) ? n : 0;
+        }
+    }
+    {   const char *v = getenv("DS4_GLM_ATTN_ROW_PAIR");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            g_glm_levers.attn_row_pair = (n == 2) ? 2 : 1;
         }
     }
     g_glm_levers_ready = 1;

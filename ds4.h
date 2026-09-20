@@ -789,6 +789,17 @@ typedef struct {
      * the token text is identical and the A/B delta over the eleven DSA
      * layers is that phase's cost. */
     int attn_probe;
+
+    /* attn_row_pair (§19.5): 1 = today, the row loop scores one row and
+     * applies its online-softmax update before moving on; 2 = score two rows
+     * before applying either update.  Tier 1: the score depends only on the
+     * query and the staged cache row, never on M, S or o, so the two
+     * dot-and-simd_sum chains are independent and may overlap, while the two
+     * updates are applied in the original order with the original values.
+     * Every floating-point operation, its operands and its order are
+     * unchanged; this is instruction-level parallelism, not a different
+     * arithmetic. */
+    int attn_row_pair;
 } glm_levers;
 
 extern glm_levers g_glm_levers;

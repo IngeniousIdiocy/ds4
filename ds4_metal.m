@@ -7714,6 +7714,7 @@ typedef struct {
     float    beta_slow;
     uint32_t value_type;
     uint32_t dbg_double;          /* §19 attn_probe; 0 in production */
+    uint32_t row_pair;            /* §19.5 attn_row_pair; 1 in production */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -20916,6 +20917,25 @@ static uint32_t ds4_gpu_glm_attn_probe(void) {
     return (uint32_t)v;
 }
 
+/* §19.5 attn_row_pair: 1 = today (score a row, apply its update, move on),
+ * 2 = score two rows before applying either update.  Tier 1 - the score
+ * depends only on the query and the staged cache row and never on M, S or o,
+ * so the two chains are independent and may overlap, while the two updates
+ * are applied in the original order with the original values; every floating
+ * point operation, its operands and its order are unchanged. */
+static uint32_t ds4_gpu_glm_attn_row_pair(void) {
+    glm_levers_init_from_env();
+    int v = glm53_exact_mode() ? 1 : g_glm_levers.attn_row_pair;
+    if (v != 2) v = 1;
+    static int last = -1;
+    if (v != last) {
+        fprintf(stderr, "[T2] attn_row_pair=%d (%s)\n", v,
+                v == 2 ? "two rows scored before either update" : "one row at a time");
+        last = v;
+    }
+    return (uint32_t)v;
+}
+
 /* Threadgroup bytes for the fused kernel, in its own layout order: 16 scalar
  * words, then whichever of the two overlaid phases is larger - the packed
  * histogram (two 16-bit counters per word) plus the cut scan, or the candidate
@@ -20930,22 +20950,34 @@ static NSUInteger ds4_gpu_topk_fast_fused_tgmem(uint32_t bits, NSUInteger nth) {
 /* The fused shape has two requirements the chain does not: the packed 16-bit
  * bin counters must not be able to overflow (the largest count is n_comp), and
  * the whole working set must fit one threadgroup allocation. */
-/* n_comp bound, RAISED 2026-09-19 for the 300k shape (n_comp ~ 75,000).  The
- * packed histogram's constraint was never n_comp, it was a single BIN passing
- * 65,535; the kernel now detects that increment and raises
+/* n_comp bound, 65,536.  It was raised to 2^17 on 2026-09-19 to reach the 300k
+ * shape (n_comp ~ 75,000) and RESTORED the same day by measurement:
+ * fused-300k, three interleaved reps with identical texts, gave topk_fused=0
+ * 37.958/37.920/37.875 against =1 37.579/37.573/37.526, -0.36 t/s.  The fused
+ * kernel is one threadgroup on one core, so its histogram pass walks all
+ * n_comp scores single-file; at 75,000 that is a 300 KB scan on one core,
+ * which loses to the three-dispatch chain's eight-threadgroup histogram.  The
+ * crossover is somewhere between 15,542 (62k, where the fused kernel wins by
+ * 0.127) and 75,000, and the old bound happens to sit inside it, so the bound
+ * goes back where it was rather than being tuned on two points.
+ *
+ * The saturation guard added with the raise STAYS, as belt and braces.  The
+ * packed histogram's real constraint was never n_comp, it was a single BIN
+ * passing 65,535; the kernel detects that increment and raises
  * DS4_TOPK_FAST_FLAG_SATURATE, which forces the reject arm and hands the row
- * to the legacy chain exactly as every other reject cause does.  So the bound
- * is only about how often the fused work would be wasted, not about
- * correctness: at 2^17 a single bin would have to hold 87% of all scores
- * before a row ever falls back.  Nothing else in the kernel depends on n_comp
- * -- the candidate list is capped at cand_cap, the cut scan works purely in
- * bin space, the sort works on nth lanes, and the only other uses are the
- * scan's loop bound and the BADIDX check, both correct at any n_comp.  The
- * threadgroup budget is unchanged: it depends on nbins, nth and cand_cap
- * only, so it is still 16 + max(nbins/2 + nth + 2, cand_cap*2 + nth*4) =
+ * to the legacy chain exactly as every other reject cause does.  With the
+ * bound back at 65,536 that flag can no longer fire from a full-range bin --
+ * n_comp itself is below the counter's range -- so it costs one comparison
+ * per increment and removes a whole class of silent wrongness if the bound is
+ * ever moved again.  Nothing else in the kernel depends on n_comp: the
+ * candidate list is capped at cand_cap, the cut scan works purely in bin
+ * space, the sort works on nth lanes, and the only other uses are the scan's
+ * loop bound and the BADIDX check, both correct at any n_comp.  The
+ * threadgroup budget is unchanged either way: it depends on nbins, nth and
+ * cand_cap only, so it is 16 + max(nbins/2 + nth + 2, cand_cap*2 + nth*4) =
  * 6,160 words = 24,640 B at the certified tuple. */
 static int ds4_gpu_glm_topk_fast_fused_ok(uint32_t n_comp, uint32_t bits, NSUInteger nth) {
-    if (n_comp >= (1u << 17)) return 0;
+    if (n_comp >= 65536u) return 0;
     if (!g_topk_fast_fused_pipeline)
         g_topk_fast_fused_pipeline = ds4_gpu_get_pipeline("kernel_glm53_topk_fast_fused");
     if (!g_topk_fast_fused_pipeline) return 0;
@@ -41286,6 +41318,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
             .dbg_double = ds4_gpu_glm_attn_probe(),
+            .row_pair = ds4_gpu_glm_attn_row_pair(),
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
         const NSUInteger stage_bufs = t2s_split8 ? t2s_bufs : 1u;
