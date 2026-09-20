@@ -272,6 +272,28 @@ horizon; see
 | serial decode, short prompt, 512 tokens | 29.2 t/s | **40.9 t/s** |
 | DFlash2 conservative, SQL / JSON 512-token fixtures | — | **62.2 / 49.4 t/s**, output byte-identical to serial |
 
+Two campaigns since that build, measured as same-server interleaved pairs on one
+machine rather than as cold runs (receipt
+[campaigns-20260920.json](bench/receipts/glm53-m3ultra/campaigns-20260920.json);
+mechanisms in [CHANGES-GLM53.md](CHANGES-GLM53.md) sections 7 and 8):
+
+| measurement (512 greedy tokens continuing an `ds4.c` slice) | before | 2026-09-20 build |
+|---|---:|---:|
+| serial decode, 8,192-token prompt | 38.43 t/s | **39.47 t/s** |
+| serial decode, 62,000-token prompt | 37.84 t/s | **38.98 t/s** |
+| serial decode, 300,000-token prompt | 37.02 t/s | **38.03 t/s** |
+| DFlash2 conservative, Q8_0 drafter, 8,192-token prompt | 45.75 t/s | **48.62 t/s** |
+| DFlash2 conservative, Q8_0 drafter, 62,000-token prompt | 44.70 t/s | **46.87 t/s** |
+
+Serial decode: chain decode with a GPU token selector and commit-ahead, concurrent
+DSA decode levels, a fused top-k, kv rows kept in registers, and a paired online
+softmax (the one Tier 2 change, gated on the 1k manifest). DFlash2: a profile gate
+that had left the fast verify head off for the Q8_0 drafter, the drafter's FFN on
+the target's fused gate/up kernel, and a token-tile Q8 kernel for its narrow
+projections. Every serial output above is byte-identical to the previous build at
+8k, 62k and 300k; every DFlash committed stream is byte-identical with the
+acceptance profile unchanged.
+
 Weights: everything above was measured on one file, a Q4 conversion produced by
 upstream's own `gguf-tools/glm53_quantize.py --artifact q4` at `9ab7053` from the
 pinned FP8 snapshot (sha256 `828f413c…`, 185,299,232,064 bytes). The published
@@ -286,7 +308,8 @@ drafter; no drafter weights are redistributed. The
 `incoai/GLM-5.3-Flash-DFlash2` revision and checksums (section 2), the
 `gguf-tools/dflash2_to_gguf.py` conversion to the BF16 GGUF (section 3), and the
 `llama-quantize` steps for the Q8_0 drafter the numbers above were measured with
-(section 9). On a real coding-agent workload the default conservative profile
+(section 9; it is also the faster of the two files, by 1.5 t/s at 8k on the
+2026-09-20 build, section 10). On a real coding-agent workload the default conservative profile
 measured +4.3% output throughput over serial, while unfavorable prose fixtures
 lose 2-3%. These are single cold runs on one machine, not averages
 over workloads or run-to-run variance. See the

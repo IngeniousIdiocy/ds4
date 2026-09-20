@@ -358,7 +358,7 @@ change (Tier 2) that ships behind its own kill switch, is registered in
 `glm53_exact_mode_c()` in `ds4.c:42329`), and may default on only after the
 teacher-forced scorer shows it indistinguishable from the same-build control within a
 cumulative 3e-4 avg_nll budget against clean upstream. `DS4_GLM_EXACT=1` clamps all
-eleven registered entries at once. Its role is to isolate registered FP-order changes;
+twelve registered entries at once. Its role is to isolate registered FP-order changes;
 it does not undo the corrected DSA pad-row semantics and does not promise universal
 byte identity with upstream (`bench/EXACT-MODE-PLAN.md`).
 
@@ -447,3 +447,116 @@ constraints and steered priorities.
 The existing commit authors and contributor trailers preserve the original record; the
 curated history does not invent per-commit identities. Performance and fidelity claims
 stand on the measured evidence rather than on any contributor's assessment.
+
+### 7.1 Second half of the decode-2 campaign (2026-09-20)
+
+The chain stack left the campaign short of its +1.0 t/s goal at 62k, so the second half
+went after the serial DSA decode attention and top-k with per-phase probes (Tier 1
+"doubling" probes that run one phase twice and price it by the difference). Five more
+changes ship; four are bit-identical and one is a registered Tier 2 change. Numbers are
+same-server interleaved arms, three repetitions each, tokens per second after the first
+token, on 512-token continuations of `ds4.c` slices (receipt
+`bench/receipts/glm53-m3ultra/campaigns-20260920.json`).
+
+- **Fused top-k** (`DS4_GLM_DISABLE_TOPK_FUSED`): the DSA selector's histogram, gather
+  and finish dispatches become one kernel for 12,288 <= n_comp < 65,536 selected
+  candidates. Both admission bounds are measured: below the floor the fused path lost
+  0.037 t/s at 8k, above the ceiling (300k, n_comp 75k) it lost 0.36 because its
+  single-core 300 KB scan loses to the eight-threadgroup chain. +0.127 t/s at 62k
+  (`fused-62k`, 38.69 -> 38.82).
+- **Reduce-then-scan cut** inside the fused top-k: a three-barrier reduce-then-scan
+  replaces a 20-barrier Hillis-Steele scan. +0.061 at 62k (`tkalg-62k`). No switch; it
+  replaced its predecessor outright.
+- **DSA reduce blend**: the partial writes head-planed partials and the reduce sums them
+  with a 32-leaf tree instead of a sequential loop. Two-kernel layout contract, no switch.
+  +0.047 at 62k over five interleaved pairs (`redblend5-62k`), every pair positive.
+- **`attn_kv_regs`** (`DS4_GLM_DISABLE_ATTN_KV_REGS`): each row's four staged `half4`
+  are read from threadgroup memory once into registers and used for both the dots and
+  the online-softmax update instead of being read twice. +0.110 at 62k (`kvregs-62k`,
+  38.72 -> 38.83), every pair positive; the sixteen extra live registers did not cost
+  residency.
+- **Paired online softmax** (`attn_softmax_2pass`, `DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS`,
+  exact-mode registry entry 6): the serial-decode sparse attention takes rows two at a
+  time; the pair shares one maximum and one rescale of the accumulator. Same dots, same
+  scale, same kv words in the same order; only the grouping of the maximum changes, so it
+  is Tier 2. Group sizes 2, 8 and 16 were all measured: the pair wins at every shape
+  because two rows' staged kv (eight `half4`, 32 registers) survive in registers while
+  larger groups have to re-read threadgroup memory. +0.23 t/s at 8k over four interleaved
+  reps on the shipped binary (`sm5-8k`, 39.27 -> 39.50), +0.13 at 62k (`sm3-62k`), +0.16
+  at 300k (`sm3-300k`), flat at 0k. Tier 2 gate (`bench/tier2-gate.sh`, 1k manifest,
+  paired): delta +2.06e-5 NLL, SE 2.51e-5, sign test p 0.546, first-token matches
+  unchanged; 100-prompt reference set 0.300791 average NLL against upstream's 0.300804.
+  At 62k and 300k the continuations are byte-identical; at 0k (128-token prompt, the
+  near-tie regime) the 512-token continuation differs at equal length.
+
+Final off-versus-on of every campaign switch on the shipped build (`final-*`, three
+interleaved reps per shape, every pair disjoint; the two switchless changes sit in both
+arms, so 62k understates the campaign by about 0.1):
+
+| shape | switches off | switches on | delta |
+|---|---:|---:|---:|
+| 0k (128-token prompt) | 40.56 | 41.08 | **+0.52** |
+| 8k | 38.43 | 39.47 | **+1.04** |
+| 62k | 37.84 | 38.98 | **+1.14** |
+| 300k | 37.02 | 38.03 | **+1.01** |
+
+| `DS4_GLM_DISABLE_TOPK_FUSED` | kill switch | `=1` runs the DSA selector's histogram, gather and finish as three dispatches instead of the fused kernel (default on where 12,288 <= n_comp < 65,536; the chain is used outside that band and under `DS4_GLM_EXACT=1`). | `ds4.c:56189` |
+| `DS4_GLM_DISABLE_ATTN_KV_REGS` | kill switch | `=1` re-reads each row's staged kv from threadgroup memory for the softmax update instead of keeping it in registers. | `ds4.c:56194` |
+| `DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS` | kill switch (Tier 2, exact-mode entry 6) | `=1` restores the per-row online softmax in the serial-decode sparse attention; `DS4_GLM_EXACT=1` forces it off. | `ds4_metal.m:20948` |
+
+## 8. DFlash2 speculative-decode campaign (2026-09-20)
+
+Goal: +2 t/s of DFlash conservative-mode decode on a code fixture at 8k and 62k
+context, with the committed token stream byte-identical and the acceptance profile
+unchanged. Result: **+2.9 t/s at 8k (45.75 -> 48.62) and +2.2 at 62k (44.70 -> 46.87)**,
+tokens byte-identical at both shapes on every arm, acceptance identical to four decimals
+on the fixtures and on a 100-prompt manifest (two runs, zero prompts differing), serial
+decode untouched (39.39 vs 39.36, IDENTICAL). Scope was the DFlash implementation only:
+drafter forward, verify, KV handling, dispatch. Drafter weights, numerics and the
+controller were not changed. Measurement: the resident A/B harness of section 7, drafter
+loaded, `DS4_DFLASH_NO_ADAPTIVE` off (the shipped conservative controller), 512 committed
+tokens per arm, cycle stages timed per verified cycle; receipt
+`bench/receipts/glm53-m3ultra/campaigns-20260920.json`.
+
+| step | mechanism | 8k t/s | 62k t/s |
+|---|---|---:|---:|
+| before | previous public build with the Q8_0 drafter | 45.75 | 44.70 |
+| profile gate fix | `dflash2_fast_default()` keyed the eight-row NT4 verify head and the batched `fc` projection on the BF16 drafter's byte size (2,342,595,168). The Q8_0 drafter (1,438,198,656 bytes) failed the check, so every Q8_0 server since the drafter swap ran the scalar head and the per-row `fc`. The profile now accepts both files. | 47.40 | 45.76 |
+| drafter dispatch structure | proposer head on the NT4 kernel (-0.60 ms per draft); the drafter's FFN on the target's fused Q8 gate/up + SwiGLU kernel (-0.52); the drafter's eight-row Q8 projections share one weight load (`r1_8`, -0.18); context K/V written straight into the drafter cache instead of scratch plus a blit (-0.11) | 48.00 | 45.93 |
+| token-tile Q8 kernel | the drafter's q/o, k/v and ffn_down projections on `kernel_dflash_q8_0_rows_nt8` (derived from the NT4 head; NSG=2 chosen from a 28-point NSG x rows grid; -1.03 ms per draft) | 48.62 | 46.87 |
+
+The draft stage fell from 12.5 to 9.4 ms per cycle; the verify stage (109 ms per cycle
+at 8k, most of it the target's 8-row forward) was not touched except for the head.
+
+Findings that generalize:
+
+- The generic `mul_mv_ext` path sizes its grid from the output dimension only, so
+  long-K, narrow-output projections (ffn_down, k/v) ran at 59-95 GB/s while the wide
+  gate/up pair ran at 393. The fix is many small threadgroups (two simdgroups) each
+  carrying two to four weight rows with a small accumulator set, not more threads per
+  group: NSG=16 and a vectorized-load variant both lost to NSG=2. The curve is jagged
+  (NSG 3 worse than 4, 7 worse than 8, 12 worse than 16), so every point was measured.
+- Elementwise dispatches inside the drafter graph cost 2-5 us each; the drafter is
+  kernel-shape and bandwidth bound, not launch bound.
+- The Q8_0 drafter beats the BF16 one on the same build by 1.5 t/s at 8k and 0.9 at
+  62k (`waveDq-cons-8k` 48.00 vs `bf16-cons-8k` 46.50; `waveD-cons-62k` 45.93 vs
+  `bf16-cons-62k` 45.05); swapping the whole drafter flips one near-tie token at 62k,
+  while a drafter summation-order change moved zero proposals over 200 fixture cycles and
+  200 manifest prompts.
+- The DFlash committed stream is not exactly serial greedy at 8k: one late position
+  differs from the serial reference (batch-composition numerics in the eight-row verify).
+  Pre-existing and unchanged by the campaign; every arm is compared with the DFlash
+  reference of the same build family.
+- `mul_mv_ext` geometry on the target's eight-row verify was swept afterwards (64-point
+  grid over simdgroups x rows-per-threadgroup x K-chunks, then fine scans, all
+  byte-identical by construction): the shipped 2 simdgroups / 4 rows / 4 chunks is
+  0.76 ms per 109 ms cycle slower than 2 chunks (+0.28 t/s at 8k, +0.18 at 62k over
+  three paired reps), while the drafter's fused gate/up kernel, which shares the
+  constants, prefers the shipped 4 chunks. The change needs a per-path constant and is
+  **not in this build**; it is recorded for the next round together with the
+  reduction-order knob (lanes per row: 16 no better than 8, 4 slower with a stream change
+  at one call, 32 a 25% cliff).
+
+No new switches. The NT4 head and batched `fc` were already documented controls
+(`DS4_DFLASH_DISABLE_HEAD_NT4`, `DS4_DFLASH_DISABLE_FC_MM`); the profile fix changes which
+drafter file enables them by default.

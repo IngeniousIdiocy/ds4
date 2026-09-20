@@ -6,6 +6,35 @@ This ledger records the final build of the `glm53-m3ultra` branch (release commi
 source-receipt hashes preserve the link to the full logs without machine-local paths.
 The earlier `538c37c` and `b723dfa` receipts are retained below as history.
 
+## 2026-09-20 build: decode-2 and DFlash campaigns (relative evidence)
+
+Two campaigns after `524c8a1` shipped on the `glm53-m3ultra` branch: the decode-2
+serial-path set (`CHANGES-GLM53.md` section 7: chain decode with commit-ahead,
+concurrent DSA decode levels, fused top-k with reduce-then-scan cut, DSA reduce blend,
+kv-in-registers, paired online softmax) and the DFlash2 dispatch campaign (section 8:
+profile gate fix, drafter FFN on the fused gate/up kernel, token-tile Q8 kernel).
+Their evidence is a resident-server A/B, not the cold-run gates above: one server per
+binary, the prompt prefix restored from a session snapshot before every arm, 512 greedy
+tokens per arm, arms interleaved base/candidate, three or more repetitions, the machine
+quiet-checked (GPU utilization, WindowServer, busy daemons) before each arm. Fixtures are
+slices of `ds4.c` (8,192 and 62,000 tokens), a 128-token prompt (0k) and the
+300,000-token prompt above. Receipt:
+[campaigns-20260920.json](receipts/glm53-m3ultra/campaigns-20260920.json) (every arm,
+with its lever set, identity verdict, quiet verdict and per-stage timings).
+
+| gate | result | receipt tags |
+|---|---|---|
+| serial decode, every decode-2 switch off vs on, 3 interleaved reps per shape | 0k 40.56 -> **41.08**; 8k 38.43 -> **39.47**; 62k 37.84 -> **38.98**; 300k 37.02 -> **38.03** t/s (after the first token); byte-identical text at 8k, 62k, 300k; the 0k continuation differs (near-tie regime of the paired softmax) | `final-0k`, `final-8k`, `final-62k`, `final-300k` |
+| paired softmax Tier 2 gate (`bench/tier2-gate.sh`, 1k manifest, paired against the same binary with the switch off) | delta +2.06e-5 NLL, SE 2.51e-5, sign test p 0.546, first-token matches unchanged; 100-prompt reference set 0.300791 average NLL (upstream `9ab7053` 0.300804, this branch before the change 0.300766) | campaign log; `sm5-8k` +0.23 t/s over four interleaved reps on the shipped binary |
+| DFlash2 conservative, Q8_0 drafter, before vs after the campaign | 8k 45.75 -> **48.62**; 62k 44.70 -> **46.87** t/s (committed tokens over calls 2..N); committed stream byte-identical to the shape reference on every arm; acceptance profile identical on the fixtures and on a 100-prompt manifest (two runs, zero prompts differing) | `ref-62k`, `cons-nt4fc-*` (gate fix), `waveDq-cons-8k`, `waveD-cons-62k`, `e10-cons-*` (final) |
+| DFlash2 drafter choice, same build | Q8_0 48.00 vs BF16 46.50 at 8k; 45.93 vs 45.05 at 62k; the BF16 stream differs from the Q8_0 reference at one near-tie position at 62k | `waveDq-cons-8k`, `bf16-cons-8k`, `waveD-cons-62k`, `bf16-cons-62k` |
+| serial non-regression under the DFlash changes | 39.39 vs 39.36 t/s at 8k, IDENTICAL, 3 reps | `e4-serial-8k`, `e10-serial-8k` |
+| target verify geometry (measured, not shipped) | `mul_mv_ext` chunk count 2 vs shipped 4: 8k 48.43 -> 48.71, 62k 46.70 -> 46.88, 0k flat; byte-identical | `f5-cons-8k`, `f5-cons-62k`, `f5-cons-0k` |
+
+The cold-run gates below were not re-run on this build. The DFlash changes do not touch
+the native serial path (the serial control above); the serial path's changes are the
+decode-2 set, whose 62k and 300k continuations are byte-identical to the switch-off arms.
+
 ## Bound identities
 
 | input | identity |

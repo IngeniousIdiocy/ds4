@@ -609,5 +609,52 @@ local copy for personal, non-commercial use; do not distribute it.
 
 The BF16 drafter works with every control on this page. The Q8_0 drafter is
 what the real-agent result in section 7 was measured with and what the
-fixture receipts in `bench/RELEASE-EVIDENCE.md` name; a BF16 drafter with the
-same controller was not re-measured on the real agent.
+fixture receipts in `bench/RELEASE-EVIDENCE.md` name. On the 2026-09-20 build
+the two were compared on the same server and fixtures (section 10): the Q8_0
+drafter decodes 1.5 t/s faster at 8k and 0.9 at 62k, so it is the recommended
+file. Any drafter file must pass `dflash2_fast_default()` in `ds4_dflash2.inc`,
+which keys the fast verify head and batched `fc` on the drafter's byte size;
+both the BF16 and the Q8_0 sizes above are accepted. A drafter of any other
+size runs the scalar head and per-row `fc` and loses about 1.6 t/s; the force
+controls of section 5 (`DS4_DFLASH_HEAD_NT4`, `DS4_DFLASH_FC_MM`) turn the fast
+paths on for an eligible drafter of another size.
+
+## 10. Drafter dispatch structure (2026-09-20 campaign)
+
+The DFlash implementation was re-measured stage by stage on the resident A/B
+harness (`CHANGES-GLM53.md` section 8; receipt
+`bench/receipts/glm53-m3ultra/campaigns-20260920.json`). Conservative decode on
+512-token continuations of `ds4.c` slices went from 45.75 to 48.62 t/s at 8k and
+from 44.70 to 46.87 at 62k, with the committed token stream byte-identical and the
+acceptance profile unchanged on the fixtures and on a 100-prompt manifest. What
+changed, per draft cycle at 8k (draft stage 12.5 -> 9.4 ms; verify stage 109 ms,
+untouched except for the head):
+
+- **Profile gate.** The eight-row NT4 verify head and the batched `fc` projection
+  were keyed on the BF16 drafter's byte size and silently off for the Q8_0 file.
+  Fixed; +1.65 t/s at 8k on its own.
+- **Proposer head** on the NT4 kernel instead of the scalar path (-0.60 ms).
+- **Drafter FFN** on the target's fused Q8 gate/up + SwiGLU kernel (-0.52 ms).
+- **Eight-row projections share one weight load** (`r1_8`, -0.18 ms), scoped to
+  the drafter's five-layer loop.
+- **Context K/V written straight into the drafter cache** instead of scratch plus
+  a blit that closed the batch encoder (-0.11 ms).
+- **Token-tile Q8 kernel** (`kernel_dflash_q8_0_rows_nt8`, `metal/dense.metal`)
+  for the drafter's q/o, k/v and ffn_down projections: two simdgroups per
+  threadgroup, each carrying two to four weight rows across eight token columns.
+  The generic path sized its grid from the output dimension only, so ffn_down ran
+  at 95 GB/s and k/v at 59; -1.03 ms per draft. The NSG x rows grid was measured at
+  28 points; the curve is jagged and NSG=2 wins.
+
+Every change is bit-identical on the drafter's own outputs except the fused
+gate/up kernel, whose summation order differs from the two-kernel form it
+replaced; over 200 fixture cycles and 200 manifest prompts it moved zero
+proposals. Swapping the whole drafter (BF16 for Q8_0) is what flips a near-tie
+token at 62k, not any of these dispatch changes.
+
+Two things measured but not shipped: the target verify's `mul_mv_ext` chunk
+count (2 instead of 4 reads 0.76 ms per cycle faster, +0.28 t/s at 8k, but the
+drafter's fused gate/up kernel shares the constant and prefers 4, so it needs a
+per-path constant) and the lanes-per-row split (16 no better than 8, 4 slower and
+a numerics change, 32 a cliff). The verify stage itself, 109 ms against a
+bandwidth floor near 50, is the next campaign.

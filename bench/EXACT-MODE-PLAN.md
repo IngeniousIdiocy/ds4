@@ -36,12 +36,13 @@ its index. "Default" is the fast-mode default of the shipped build.
 | 3 | Blocked online softmax in the batched sparse DSA attention kernel | `DS4_GLM_DISABLE_DSA_BLOCKED_SOFTMAX` | ON (stage 24, sub-block 4, one-pass) | off |
 | 4 | Bounds-checked ragged tail (`TAILCHK`) | `DS4_GLM_DSA_TAIL_CHECKED=0`, `DS4_GLM_DISABLE_DSA_TAIL_CHECKED=1` | ON | off — exact mode keeps the *legacy* unchecked tail by explicit contract, because exact mode reproduces upstream main and upstream main has the same unchecked tail |
 | 5 | DSA indexer scorer, transposed butterfly across heads (`xr*`, shipped shape `xr8`), with the depth gate | on `DS4_GLM_ENABLE_SCORER_XREDUCE=1`; shape `DS4_GLM_SCORER_XREDUCE_SHAPE`; gate `DS4_GLM_SCORER_XREDUCE_MIN_ROWS` (default 37500, 0 disables); kill `DS4_GLM_DISABLE_SCORER_XREDUCE=1` | **OFF (opt-in)** | off unconditionally (the clamp is in `ds4_gpu_glm_scorer_variant_index()`, so even an explicit `DS4_GLM_SCORER_VARIANT=xr*` cannot escape it) |
-| 6 | hc_pre algebra halves A / B | `DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A`, `..._B` | A ON, B OFF | off |
-| 7 | split_group8 softmax block rows | `DS4_GLM_SPLIT8_BLOCK_ROWS_SHALLOW`, `..._DEEP` | 32 / 128 | pins 32 / 128 |
-| 8 | Q8_0 matvec simdgroup count (`Q8NSG`), globally and per family | `DS4_METAL_Q8_MV_NSG` (upstream knob), `DS4_GLM_T2S_Q8NSG_<FAM>` | shipped default (4, or 2 under TP2) | pins the shipped default |
-| 9 | BF16 matvec simdgroup count | `DS4_GLM_T2S_BF16_NSG` | shipped default | pins the shipped default |
-| 10 | split8 double-buffered staging | `DS4_GLM_ENABLE_SPLIT8_DBLBUF=1` | OFF (opt-in) | off |
-| 11 | split8 reduce v-plane simd_sum | `DS4_GLM_ENABLE_SPLIT8_VPLANE=1` | OFF (opt-in) | off |
+| 6 | Paired online softmax in the serial-decode sparse DSA attention kernel (rows taken two at a time share one maximum and one accumulator rescale) | `DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS`; lever `attn_softmax_2pass` | ON | off at the read site, so no lever value can escape it |
+| 7 | hc_pre algebra halves A / B | `DS4_GLM_DISABLE_HC_PRE_ALGEBRA_A`, `..._B` | A ON, B OFF | off |
+| 8 | split_group8 softmax block rows | `DS4_GLM_SPLIT8_BLOCK_ROWS_SHALLOW`, `..._DEEP` | 32 / 128 | pins 32 / 128 |
+| 9 | Q8_0 matvec simdgroup count (`Q8NSG`), globally and per family | `DS4_METAL_Q8_MV_NSG` (upstream knob), `DS4_GLM_T2S_Q8NSG_<FAM>` | shipped default (4, or 2 under TP2) | pins the shipped default |
+| 10 | BF16 matvec simdgroup count | `DS4_GLM_T2S_BF16_NSG` | shipped default | pins the shipped default |
+| 11 | split8 double-buffered staging | `DS4_GLM_ENABLE_SPLIT8_DBLBUF=1` | OFF (opt-in) | off |
+| 12 | split8 reduce v-plane simd_sum | `DS4_GLM_ENABLE_SPLIT8_VPLANE=1` | OFF (opt-in) | off |
 
 Entry 5 in more detail: `xr8` computes the same real-valued score as the production
 scorer (same heads, same F32 query, same F16 pooled keys, same head weights, same

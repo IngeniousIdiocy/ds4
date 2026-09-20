@@ -77,7 +77,7 @@ clamps the model's memory guard so other work on a 512 GB machine stays safe (28
 leaves room for a 400k context; 400 GB is used for scorer runs).
 
 Kernel defaults are the "fast mode" of `bench/FIDELITY.md`: every adopted kernel
-change on, including the eleven registered floating-point-order changes. On the exact
+change on, including the twelve registered floating-point-order changes. On the exact
 M3 Ultra/public-Q4 profile described below, the final release also resolves untracked
 model views and the guarded expert-bank, fused command-buffer and fixed eight-layer
 pipeline defaults. The earlier `b723dfa` capability receipts used explicit bank and
@@ -142,16 +142,17 @@ are deliberately separate.
 | feature | implemented / default | validated on the merged branch with the public artifact |
 |---|---|---|
 | Decode kernel set (HC-pre single dispatch and wide tail, hc-mix split-K, KDA low-rank pack/fold and glue, DSA indexer fold and pair, routed-down split, router shared fold and tail fold, top-k radix fast path, epilogue fusions) | implemented, default on, each with a kill switch | final `538c37c`: complete native blocks at 37.868944 t/s at 62k and 37.187023 t/s at 300k |
+| Decode-2 set (chain decode with commit-ahead, concurrent DSA decode levels, fused top-k with reduce-then-scan cut, DSA reduce blend, kv-in-registers, paired online softmax) | implemented, default on, each switchable change with a kill switch; the paired softmax is Tier 2 and registered | 2026-09-20 build, same-server interleaved arms, every campaign switch off vs on: 0k 40.56 -> 41.08, 8k 38.43 -> 39.47, 62k 37.84 -> 38.98, 300k 37.02 -> 38.03 t/s; text byte-identical at 8k/62k/300k (`bench/receipts/glm53-m3ultra/campaigns-20260920.json`, CHANGES-GLM53.md section 7) |
 | Prefill kernel set (KDA prefill fast path, BF16 low-rank split-K, blocked DSA softmax, checked DSA tail, token-tiled router and qk low-rank, dense half copy/ring, indexer causal grid, prefill folds) | implemented, default on, each with a kill switch | final `538c37c`: 550.27 t/s at 62,174 and 473.64 t/s at 300,000 |
 | Long-prompt expert bank | implemented with guarded defaults | AUTO is limited to exactly M3 Ultra with at least 500 GiB RAM and the full unsliced, non-SSD, non-TP 185,299,232,064-byte Q4_K profile; final 33,148-token AUTO 556.73 vs bank-off 540.64 t/s, same 77 output bytes |
 | `ptail` HC-expand epilogue (kernel in `metal/t2screen.metal`) | implemented, default on (`DS4_GLM_DISABLE_HCX_PTAIL=1` off) | Tier 1 receipt on the pre-merge tree; dispatch confirmed in the E1 log (`T2SCREEN first-dispatch HCXTAIL`) |
-| `DS4_GLM_EXACT` umbrella, 11 registry entries | implemented | three long-context diagnostics within 0.0042 total NLL per case; full public-artifact diagnostic remains pending |
+| `DS4_GLM_EXACT` umbrella, 12 registry entries | implemented | three long-context diagnostics within 0.0042 total NLL per case; full public-artifact diagnostic remains pending |
 | MoE block dataflow kernel, hc_pre algebra half B, one-dispatch hc_pre, `xr8` scorer, split8 opt-ins | implemented, **opt-in** (measured slower, or unexplained divergence in the case of `xr8`) | not part of the validated defaults |
 | All-Q8 KDA projection fusion (`DS4_GLM_ENABLE_KDA_PROJ_FUSE`) | implemented, opt-in; the first path written for this file's all-Q8 KDA layout | **not validated**; needs an identity check against the default before it can be recommended |
 | Server: Anthropic default effort, KV checkpoint / eviction policy, streaming guard, slot scoring, GLM tool-result reorder | implemented, default on | final `538c37c`: 16/16 affected runtime checks, pipelined routed cancellation, connected-client SIGTERM and substantial recovery comparator v3 passed |
 | Multimodal (vision) requests | upstream's newer behaviour (session reused when the vision state matches) adopted in the merge, plus two branch fixes: images nested in Anthropic `tool_result` content are parsed (`a0243fb`), and the live prefix hit survives an appended image (`0d568f8`); see `CHANGES-GLM53.md` §4 | validated 2026-09-10 on the served model: user-message and tool-result images (400×400 PNG and 5712×4284 JPEG) described correctly on the OpenAI and Anthropic paths; appended-image continuation reports the reused prefix. Not part of the release evidence numbers |
 | MTP row-boundary KDA snapshot (`--mtp` reject-replay fast path) | compiled but **inert** on real GLM-5.3 graphs: guarded so it fires only when the snapshot covers the whole speculative state (`ds4.c:68578`); otherwise upstream's full restore+replay runs | n/a — the guard makes the path equivalent to upstream's |
-| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to the windowed-confidence policy over the trained seven-position block (four-position minimum prefix, full-block verification, three-attempt cost windows, serial reasoning); `--dflash-mode speculative` selects the full-block policy. Positive temperature decodes serially. | Selected on the real coding agent (+4.3% output throughput over serial on 32 randomized requests with the Q8_0 drafter; `docs/DFLASH_GLM53.md` section 7). Fixture and lifecycle receipts for this branch's final build are in `bench/RELEASE-EVIDENCE.md`. Workload-specific, not a general speedup claim. |
+| DFlash2 speculative decoding (`--dflash`) | optional and greedy-only. Bare startup is serial; a supplied drafter defaults to the windowed-confidence policy over the trained seven-position block (four-position minimum prefix, full-block verification, three-attempt cost windows, serial reasoning); `--dflash-mode speculative` selects the full-block policy. Positive temperature decodes serially. | Selected on the real coding agent (+4.3% output throughput over serial on 32 randomized requests with the Q8_0 drafter; `docs/DFLASH_GLM53.md` section 7). Fixture and lifecycle receipts for this branch's final build are in `bench/RELEASE-EVIDENCE.md`. Workload-specific, not a general speedup claim. 2026-09-20 campaign (CHANGES-GLM53.md section 8): conservative decode on 512-token continuations of `ds4.c` slices 45.75 -> 48.62 t/s at 8k and 44.70 -> 46.87 at 62k with the Q8_0 drafter, committed tokens byte-identical, acceptance unchanged; the Q8_0 drafter is 1.5 t/s faster than BF16 at 8k on the same build. |
 | CUDA / ROCm / tensor parallel / SSD streaming | upstream's, plus small GLM-5.3 additions in `ds4_cuda.cu` and `rocm/ds4_rocm_glm.cuh` (see "Dispositions") | not built or run on this branch |
 
 **How DFlash2's rollback was completed.** Verification snapshots both the KDA
@@ -324,6 +325,9 @@ opt-in, so they matter only when a drafter is loaded.
 | `DS4_GLM_DISABLE_CHAIN` | kill switch | `=1` declines chain decode everywhere and takes the classic per-token loop (default on: the GPU selector picks the next id inside the step that produced the logits, so the next step is encoded before the current one finishes). Also takes commit-ahead with it. | `ds4.c:74750` |
 | `DS4_GLM_DISABLE_CHAIN_COMMIT_AHEAD` | kill switch | `=1` keeps chain decode but commits the whole step after the host confirms the token, instead of handing the step's non-mutating prologue to the GPU at encode time. | `ds4.c:56173` |
 | `DS4_GLM_DISABLE_DECODE_CONCURRENT` | kill switch | `=1` encodes the DSA decode levels serially instead of in one concurrent dispatch group. | `ds4.c:56161` |
+| `DS4_GLM_DISABLE_TOPK_FUSED` | kill switch | `=1` runs the DSA selector's histogram, gather and finish as three dispatches instead of the fused kernel (default on for 12,288 <= n_comp < 65,536 candidates; the three-dispatch chain runs outside that band and under `DS4_GLM_EXACT=1`). | `ds4.c:56189` |
+| `DS4_GLM_DISABLE_ATTN_KV_REGS` | kill switch | `=1` re-reads each row's staged kv from threadgroup memory for the softmax update instead of keeping it in registers. Bit-identical either way. | `ds4.c:56194` |
+| `DS4_GLM_DISABLE_ATTN_SOFTMAX_2PASS` | kill switch (Tier 2, exact-mode entry 6) | `=1` restores the per-row online softmax in the serial-decode sparse DSA attention; default on takes rows in pairs sharing one maximum and one rescale. `DS4_GLM_EXACT=1` forces it off. | `ds4_metal.m:20948` |
 | `DS4_GLM_DISABLE_DENSE_HALF_COPY` | kill switch | Disables the dense-layer half-copy path and its ring (prefill lever 24). | `ds4_metal.m:21155` |
 | `DS4_GLM_DISABLE_DENSE_HALF_RING` | kill switch | Disables the half-copy ring alone. | `ds4_metal.m:21299` |
 | `DS4_GLM_DISABLE_DSA_BATCH_HOIST` | kill switch | Batched DSA prefill attention: no hoisting of the shared loads. | `ds4_metal.m:40884` |
@@ -554,6 +558,29 @@ identity is not assumed.
 The final build is release commit `524c8a1` (compiled sources of `247801c`; `ds4`
 sha256 `11fba996…`, `ds4-server` sha256 `511b7a9a…`). Repository-contained receipts
 are linked from `bench/RELEASE-EVIDENCE.md`.
+
+### 2026-09-20 build: decode-2 and DFlash campaigns
+
+The two campaigns after `524c8a1` were measured on a resident server with interleaved
+arms rather than as cold single runs, so their evidence is relative: every number is a
+same-server pair on the same fixture (512 greedy tokens continuing an `ds4.c` slice of
+8,192 or 62,000 tokens; 0k is a 128-token prompt; 300k the 300,000-token prompt),
+tokens per second after the first token, three or more repetitions, machine quiet-checked
+before each arm. Receipt: `bench/receipts/glm53-m3ultra/campaigns-20260920.json`;
+mechanisms in `CHANGES-GLM53.md` sections 7 and 8.
+
+| measurement | before | after | text |
+|---|---:|---:|---|
+| serial decode, 0k, all decode-2 switches | 40.56 | **41.08** | differs (near-tie regime, paired softmax) |
+| serial decode, 8k | 38.43 | **39.47** | byte-identical |
+| serial decode, 62k | 37.84 | **38.98** | byte-identical |
+| serial decode, 300k | 37.02 | **38.03** | byte-identical |
+| DFlash2 conservative, Q8_0 drafter, 8k | 45.75 | **48.62** | committed stream byte-identical, acceptance unchanged |
+| DFlash2 conservative, Q8_0 drafter, 62k | 44.70 | **46.87** | byte-identical |
+
+The cold-run gates of the table above (`524c8a1`) were not re-run on this build; the
+native serial path's changes are the decode-2 set, and the DFlash changes do not touch it
+(serial control 39.39 vs 39.36 t/s, IDENTICAL, in the DFlash campaign's own harness).
 
 | final measurement (2026-09-09) | result | scope |
 |---|---:|---|
