@@ -790,16 +790,15 @@ typedef struct {
      * layers is that phase's cost. */
     int attn_probe;
 
-    /* attn_row_pair (§19.5): 1 = today, the row loop scores one row and
-     * applies its online-softmax update before moving on; 2 = score two rows
-     * before applying either update.  Tier 1: the score depends only on the
-     * query and the staged cache row, never on M, S or o, so the two
-     * dot-and-simd_sum chains are independent and may overlap, while the two
-     * updates are applied in the original order with the original values.
-     * Every floating-point operation, its operands and its order are
-     * unchanged; this is instruction-level parallelism, not a different
-     * arithmetic. */
-    int attn_row_pair;
+    /* attn_kv_regs (§19.6): 0 = today, each lane reads its row's four staged
+     * half4 from threadgroup memory in the dots and reads the same four
+     * addresses again in the online-softmax update; 1 = read them once into
+     * registers and use those for both.  Tier 1: the same threadgroup words,
+     * the same half-to-float conversions on the same inputs, the same
+     * operands in the same order.  rowpair-62k retired the preceding
+     * hypothesis - the per-row dependent chain - by measuring it flat, which
+     * is what leaves the doubled shared-memory traffic as the suspect. */
+    int attn_kv_regs;
 
     /* reduce_probe (§20): a NEVER-SHIP Tier-1 doubling probe inside the DSA
      * reduce, one value per phase.  0 = production.  1 doubles the softmax

@@ -7714,7 +7714,7 @@ typedef struct {
     float    beta_slow;
     uint32_t value_type;
     uint32_t dbg_double;          /* §19 attn_probe; 0 in production */
-    uint32_t row_pair;            /* §19.5 attn_row_pair; 1 in production */
+    uint32_t kv_regs;             /* §19.6 attn_kv_regs; 0 in production */
     uint32_t dbg_reduce;          /* §20 reduce_probe; 0 in production */
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
@@ -20940,20 +20940,21 @@ static uint32_t ds4_gpu_glm_reduce_probe(void) {
     return (uint32_t)v;
 }
 
-/* §19.5 attn_row_pair: 1 = today (score a row, apply its update, move on),
- * 2 = score two rows before applying either update.  Tier 1 - the score
- * depends only on the query and the staged cache row and never on M, S or o,
- * so the two chains are independent and may overlap, while the two updates
- * are applied in the original order with the original values; every floating
- * point operation, its operands and its order are unchanged. */
-static uint32_t ds4_gpu_glm_attn_row_pair(void) {
+/* §19.6 attn_kv_regs: 0 = today, where each lane reads its row's four staged
+ * half4 from threadgroup memory in the dots and reads the same four addresses
+ * again in the online-softmax update; 1 = read them once into registers and
+ * use those for both.  Tier 1 - the same threadgroup words, the same
+ * half-to-float conversions on the same inputs, the same operands in the same
+ * order - so the claim is bit-identical output. */
+static uint32_t ds4_gpu_glm_attn_kv_regs(void) {
     glm_levers_init_from_env();
-    int v = glm53_exact_mode() ? 1 : g_glm_levers.attn_row_pair;
-    if (v != 2) v = 1;
+    int v = glm53_exact_mode() ? 0 : g_glm_levers.attn_kv_regs;
+    if (v != 1) v = 0;
     static int last = -1;
     if (v != last) {
-        fprintf(stderr, "[T2] attn_row_pair=%d (%s)\n", v,
-                v == 2 ? "two rows scored before either update" : "one row at a time");
+        fprintf(stderr, "[T2] attn_kv_regs=%d (%s)\n", v,
+                v == 1 ? "row staged once into registers"
+                       : "re-read from threadgroup memory");
         last = v;
     }
     return (uint32_t)v;
@@ -41341,7 +41342,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
             .dbg_double = ds4_gpu_glm_attn_probe(),
-            .row_pair = ds4_gpu_glm_attn_row_pair(),
+            .kv_regs = ds4_gpu_glm_attn_kv_regs(),
             .dbg_reduce = ds4_gpu_glm_reduce_probe(),
         };
         const NSUInteger stage_rows = t2s_split8 ? t2s_stage_rows : 16u;
