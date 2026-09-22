@@ -17,6 +17,23 @@ make ds4_test ds4_agent_test test-session-state
 ./ds4_agent_test
 ```
 
+The OpenAI streaming path can be replayed offline against real generations. Run a
+server with `--trace FILE`, then extract every traced generation that contained a tool
+call together with the server's own parse of it, stream each one through the
+`/v1/chat/completions` SSE state machine in pseudo-random chunk sizes, and accumulate
+the deltas the way an OpenAI client does:
+
+```sh
+make openai_replay
+python3 tests/openai_replay_extract.py /path/to/trace.log corpus   # sample_NNN.raw + .expected.json
+./openai_replay corpus 8 1        # max chunk 8 bytes, thinking mode (0 = no thinking)
+python3 tests/openai_replay_check.py corpus
+```
+
+The checker reports any call whose first delta lacks id/type/name, arguments that do not
+accumulate to the parsed JSON, tool tags leaking into `content`, or a wrong
+`finish_reason`. Traces contain your prompts and outputs; keep the corpus private.
+
 On Metal, small GPU tensor tests are available without loading a full GGUF:
 
 ```sh
