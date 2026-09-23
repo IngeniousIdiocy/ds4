@@ -6114,6 +6114,14 @@ static bool parse_glm_generated_message_ex(const char *text,
             char *raw_key = xstrndup(key_start, (size_t)(key_trim_end - key_start));
             char *key = dsml_unescape_text(raw_key);
             free(raw_key);
+            if (!key[0] || strpbrk(key, "<>")) {
+                /* A key that swallowed a tag means a closing tag was missing;
+                 * refuse rather than emit a call with a mangled argument. */
+                free(name);
+                free(key);
+                buf_free(&args);
+                return false;
+            }
 
             p = key_end + strlen(arg_key_end);
             p = skip_ascii_ws(p);
@@ -7639,9 +7647,42 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
+    const bool have_calls = calls && calls->len > 0;
+    if (!have_calls && st->active && st->mode != OPENAI_STREAM_TEXT &&
+        raw && raw_len > st->emit_pos)
+    {
+        /* The stream withheld a tool block (or an unclosed thinking tail)
+         * that the final parse could not turn into an executable call.  The
+         * non-streaming path returns the raw model text as content in that
+         * case; do the same here instead of dropping it, so the client can
+         * see what the model produced. */
+        const char *close = ds4_think_mode_enabled(r->think_mode) ?
+            find_last_substr(raw + st->emit_pos, "</think>") : NULL;
+        if (close) {
+            /* Split the way the parser does: everything up to the last
+             * </think> is reasoning, the rest is the assistant text. */
+            const size_t close_at = (size_t)(close - raw);
+            if (close_at > st->emit_pos &&
+                !sse_chat_delta_n(fd, r, id, "reasoning_content", raw + st->emit_pos,
+                                  close_at - st->emit_pos)) return false;
+            st->sent_reasoning = st->sent_reasoning || close_at > st->emit_pos;
+            st->emit_pos = close_at + strlen("</think>");
+        }
+        if (raw_len > st->emit_pos) {
+            if (!sse_chat_delta_n(fd, r, id, "content", raw + st->emit_pos,
+                                  raw_len - st->emit_pos)) return false;
+            st->sent_content = true;
+        }
+        st->emit_pos = raw_len;
+    }
+    if (!have_calls && finish && !strcmp(finish, "tool_calls")) {
+        /* Protocol invariant: finish_reason "tool_calls" only with a call. */
+        finish = "stop";
+    }
+
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tool.emitted_any) {
+    if (have_calls && !st->tool.emitted_any) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
@@ -8517,6 +8558,8 @@ static bool final_response(int fd, bool enable_cors,
         if (calls && calls->len) {
             buf_puts(&b, ",\"tool_calls\":");
             append_tool_calls_json(&b, calls, id, &r->tool_orders);
+        } else if (finish && !strcmp(finish, "tool_calls")) {
+            finish = "stop";   /* never "tool_calls" without a call */
         }
         buf_puts(&b, "},\"finish_reason\":");
         json_escape(&b, finish);
@@ -17452,6 +17495,67 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     close(sv[1]);
 }
 
+static void test_openai_glm_malformed_tool_call_returns_text_and_stop(void) {
+    /* A GLM tool block the parser rejects must reach the client as content
+     * with finish_reason "stop", never as a bare "tool_calls" finish. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "I'll run it.\n\n"
+        "<tool_call>bash"
+        "<arg_key>command</arg_key><arg_value>pwd"   /* no </arg_value> */
+        "</tool_call>";
+    for (size_t n = 1; n <= strlen(raw); n++) {
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_glm_bad", &st,
+                                             raw, n, false));
+    }
+
+    tool_calls calls = {0};
+    char *content = NULL, *reasoning = NULL;
+    const char *finish = "tool_calls";
+    char err[64] = {0};
+    bool recovered = false;
+    TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, raw, true, true, false, &finish, err, sizeof(err),
+        &content, &reasoning, &calls, &recovered));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    /* Even if a caller hands the finisher "tool_calls" with no call, the
+     * client must not see it. */
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_bad", &st,
+                                       raw, strlen(raw), &calls, "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"content\":\"I'll run it.\"") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>bash") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"tool_calls\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"tool_calls\":[") == NULL);
+
+    free(out);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -22131,6 +22235,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
+    test_openai_glm_malformed_tool_call_returns_text_and_stop();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_holds_partial_dsml_entities();

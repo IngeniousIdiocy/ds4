@@ -349,6 +349,21 @@ timing evidence before any default change.
   threads before the engine and Metal model views are closed. The focused cancellation
   test is part of the final affected runtime set.
 
+**OpenAI streaming and malformed GLM tool blocks (2026-09-22, issue #1).** Three
+things changed on the `/v1/chat/completions` path after a report of `finish_reason:
+"tool_calls"` arriving with no usable call. (1) When the live stream withholds a
+`<tool_call>` block and the final parse cannot turn it into an executable call, the
+withheld text is now sent to the client (as `reasoning_content` up to the last
+`</think>` and `content` after it), matching what the non-streaming path already
+returned; before, it was dropped, so a malformed call showed up as an empty assistant
+turn. (2) `finish_reason` is `"tool_calls"` only when at least one call is emitted, in
+both the streaming and non-streaming responses. (3) The GLM parser refuses an argument
+key containing `<` or `>`: a missing `</arg_key>` used to swallow the following tag into
+the key and produce a call with a mangled argument instead of a parse failure. Offline
+replay (`docs/TESTING.md`): 229 real generations unchanged, 60 synthetically broken
+blocks all return as text with `finish_reason: "stop"`. The `--trace FILE` log records,
+per turn, the raw generated text, the parser's result and the finish reason.
+
 ## 5. Exact mode and the fidelity harness
 
 The rule (`bench/FIDELITY.md`): a change either proves bit-identity in a randomized
