@@ -42573,12 +42573,21 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
     const ds4_dspark_weights *dw = d->w;
     const uint32_t n = d->mh_rows, dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
     if (!n) return true;
-    ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh, 0, (uint64_t)n * d->n_target * dim * sizeof(float));
     ds4_gpu_tensor *mx = ds4_gpu_tensor_view(d->rows_x, 0, (uint64_t)n * dim * sizeof(float));
     ds4_gpu_tensor *tmp = ds4_gpu_tensor_view(d->rows_tmp, 0, (uint64_t)n * dim * sizeof(float));
-    bool ok = mh && mx && tmp &&
-        ds41_matmul_batch(tmp, d->m, dw->stage[0].main_proj, mh, n, false) &&
-        ds4_gpu_rms_norm_weight_rows_tensor(mx, tmp, d->m->map, d->m->size,
+    bool ok = mx && tmp;
+    /* The residual streams' outliers overflow the matrix kernels' half inputs. */
+    for (uint32_t r = 0; ok && r < n; r += DS4_TP_BATCH_MAX_ROWS) {
+        const uint32_t c = n - r < DS4_TP_BATCH_MAX_ROWS ? n - r : DS4_TP_BATCH_MAX_ROWS;
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(d->mh, (uint64_t)r * d->n_target * dim * sizeof(float),
+                                                 (uint64_t)c * d->n_target * dim * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(d->rows_tmp, (uint64_t)r * dim * sizeof(float),
+                                                  (uint64_t)c * dim * sizeof(float));
+        ok = in && out && ds41_matmul_batch(out, d->m, dw->stage[0].main_proj, in, c, false);
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(in);
+    }
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(mx, tmp, d->m->map, d->m->size,
             dw->stage[0].main_norm->abs_offset, dim, n, DS4_RMS_EPS);
     for (uint32_t st = 0; ok && st < d->n_stage; st++) {
         const ds4_layer_weights *l = &dw->stage[st].block;
@@ -42592,7 +42601,6 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
     }
     ds4_gpu_tensor_free(tmp);
     ds4_gpu_tensor_free(mx);
-    ds4_gpu_tensor_free(mh);
     return ok;
 }
 
