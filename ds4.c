@@ -86796,7 +86796,8 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     uint32_t k = 0;
     double propose_s = 0.0;
     /* the block continues the position whose stream the last pass captured */
-    const bool draftable = P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 &&
+    const bool draftable = !e->quality && !e->dspark_strict &&
+        P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 &&
         P1 - 1u < d->mh_pos0 + d->mh_rows && P1 + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
     const bool proposed = draftable && (!d->skip_left || ds41_draft_adapt_off());
     if (draftable && !proposed) {
