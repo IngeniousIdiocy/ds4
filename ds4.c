@@ -43286,9 +43286,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
     /* Layer 20 keeps 1 + (n_layer - 21) * 127 rows and replays the 127 before them. */
-    /* Drafting needs the last window of every layer's stream. */
-    const uint32_t kept = g->draft ? DS41_DRAFT_WINDOW : 1u;
-    const uint32_t suffix_rows = kept + (DS4_N_LAYER - 20u) * 127u;
+    const uint32_t suffix_rows = 1u + (DS4_N_LAYER - 20u) * 127u;
     const bool decoder_suffix = wide && total_count >= suffix_rows &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
@@ -43368,7 +43366,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t needed = kept + (DS4_N_LAYER - 1u - il) * 127u;
+            const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
             first = total_count - needed;
             /* short sweeps prune whole tiles and warm a complete one, keeping
              * the partitions the plain schedule would have used */
@@ -43550,6 +43548,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             DS41_STAGE("hc expand");
 #undef DS41_STAGE
+            /* the next layer may keep fewer rows than the draft window reads */
+            if (ok && g->draft && decoder_suffix && il >= 19u && il + 1u < DS4_N_LAYER)
+                ok = ds41_draft_capture(g, il + 1u, g->batch.residual, start, count);
             if (ok && wide && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
