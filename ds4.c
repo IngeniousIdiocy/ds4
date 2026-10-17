@@ -42824,7 +42824,7 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m, const ds4_
     ok = ok && ds4_gpu_hc_weighted_sum_split_tensor(d->x, g->batch.residual, g->batch.ffn_split, dim, hc) &&
         ds4_gpu_rms_norm_weight_rows_tensor(d->xn, d->x, d->m->map, d->m->size,
             last->norm->abs_offset, dim, B, DS4_RMS_EPS) &&
-        ds41_output_projection(g, d->logits, m, w, d->xn, B) &&
+        ds41_output_projection_rows(g, d->logits, m, w, d->xn, B, true) &&
         ds4_gpu_dsv41_markov_chain(B, vocab, d->rank, dim, d->logits, d->x, d->m->map, d->m->size,
             last->markov_w1->abs_offset, last->markov_w2->abs_offset,
             last->markov_w1->type == DS4_TENSOR_F16, d->conf_proj, d->tokens, d->conf, d->parts, 1024u);
@@ -43880,9 +43880,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
               ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                   active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
               ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16)));
-        /* The second Engram upload reuses the first one's input storage. */
+        /* The second Engram upload reuses the first one's input storage. The
+         * first flush follows layer 0, which runs while the Engram rows load. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
-        else if (ok && g->tp_world != 2 && il + 1u < DS4_N_LAYER && flush_layers && (il + 1u) % flush_layers == 0)
+        else if (ok && g->tp_world != 2 && il + 1u < DS4_N_LAYER && flush_layers &&
+                 (il == 0 || (il + 1u) % flush_layers == 0))
             ok = ds4_gpu_flush_commands() != 0;
     }
     for (int i = 0; i < count; i++)   /* a failure before layer 1 */
@@ -43960,7 +43962,8 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     for (uint32_t i = 0; i < n; i++) graphs[i] = g;
     d->verify_rows = n;
     ds4_gpu_dsv41_verify_rows(1);
-    ds4_gpu_dsv41_mma_rows(1);
+    /* a row-attention verify keeps every row on the decode arithmetic */
+    ds4_gpu_dsv41_mma_rows(g->tp_world == 2 || !ds41_verify_row_attention());
     d->mh_pos0 = g->pos;
     d->mh_rows = n;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
