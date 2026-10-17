@@ -43236,8 +43236,9 @@ static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* Wider encoder tiles amortize weight reads near the next power of two.
-     * Keep two tiles so decoder suffix pruning retains its own partitions. */
-    if (!g->quality && !g->draft && g->tp_world == 1 &&
+     * Keep two tiles so decoder suffix pruning retains its own partitions.
+     * Under TP each tile also crosses fewer partial-sum gates. */
+    if (!g->quality && !g->draft &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         !getenv("DS4_METAL_DISABLE_V41_WIDER_SHORT_CHUNKS")) {
         if (count >= 6144u && count < 8192u && g->prefill_cap >= 4096u) return 4096u;
