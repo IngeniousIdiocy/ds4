@@ -192,8 +192,8 @@ Add `--mtp` for speculative decoding. The larger
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
 
-Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
-support GGUF. It can improve generation, but not every workload benefits.
+Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 and V4.1 Flash DSpark need a
+matching support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
 difference between default opportunistic sampling and `--mtp-exact-sampling`.
 

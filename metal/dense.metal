@@ -3,6 +3,20 @@
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 
+// Round to the nearest bfloat16 value in f32 storage (DeepSeek V4.1 keeps its
+// activations at bf16 precision between operators).
+static inline float ds4_bf16_round(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+static inline float4 ds4_bf16_round(float4 v) {
+    uint4 bits = as_type<uint4>(v);
+    const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+    return as_type<float4>(bits & 0xffff0000u);
+}
+
 struct ds4_metal_args_mul_mv {
     int ne00;
     int ne01;
@@ -70,7 +84,7 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0>
+template<short NR0, bool ROUND = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -107,13 +121,157 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            dst_f32[r0 + row] = ROUND ? ds4_bf16_round(tot) : tot;
         }
     }
 }
 
-template<short NR0, typename args_t>
-void kernel_mul_mv_q8_0_f32_impl(
+// Rope folded into a matvec: the last 64 columns of every `width`-wide head
+// rotate at position `start` (ROPE_IN on the activation as it loads, after
+// rounding it to bf16; ROPE_OUT on the bf16 outputs before they store).
+struct ds4_metal_args_mv_rope {
+    uint  width;
+    uint  start;
+    uint  inverse;
+    float frequencies[32];
+};
+
+template<short NR0>
+static inline void helper_mv_reduce_and_write_rope(
+        device float * dst_f32,
+        float sumf[NR0],
+        const int r0,
+        const int ne01,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem,
+        constant ds4_metal_args_mv_rope & rope) {
+    static_assert(NR0 % 2 == 0, "rope pairs are adjacent output rows");
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0];
+
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *) shmem + NW*row;
+
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float tot[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        tot[row] = ds4_bf16_round(simd_sum(shmem_f32[row][tiisg]));
+    }
+
+    if (tiisg == 0 && sgitg == 0) {
+        for (short p = 0; p < NR0 && r0 + p + 1 < ne01; p += 2) {
+            const uint col = (uint)(r0 + p) % rope.width;
+            if (col >= rope.width - 64u) {
+                const float theta = float(rope.start) * rope.frequencies[(col - (rope.width - 64u)) >> 1u];
+                const float c = precise::cos(theta);
+                const float s = rope.inverse ? -precise::sin(theta) : precise::sin(theta);
+                const float re = tot[p], im = tot[p + 1];
+                dst_f32[r0 + p] = ds4_bf16_round(fma(re, c, -(im * s)));
+                dst_f32[r0 + p + 1] = ds4_bf16_round(fma(im, c, re * s));
+            } else {
+                dst_f32[r0 + p] = tot[p];
+                dst_f32[r0 + p + 1] = tot[p + 1];
+            }
+        }
+    }
+}
+
+// The HC expand (kernel_dsv4_hc_expand4, one token, four streams) applied to
+// each bf16 output as it is written: the row joins `add` when has_add and
+// spreads into the streams with the same per-stream accumulation order.
+struct ds4_metal_args_mv_hc_expand4 {
+    uint n_embd;
+    uint has_add;
+    uint split_stride;   /* floats between the rows' post/comb weights */
+};
+
+template<short NR0>
+static inline void helper_mv_reduce_and_write_hc_expand4(
+        device float * dst_f32,
+        float sumf[NR0],
+        const int r0,
+        const int ne01,
+        ushort tiisg,
+        ushort sgitg,
+        threadgroup char * shmem,
+        constant ds4_metal_args_mv_hc_expand4 & hc,
+        device const float * add,
+        device const float * residual,
+        device const float * post,
+        device const float * comb) {
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0];
+
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *) shmem + NW*row;
+
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+        float block_v = ds4_bf16_round(simd_sum(shmem_f32[row][tiisg]));
+
+        if (tiisg == 0 && sgitg == 0) {
+            const int d = r0 + row;
+            if (hc.has_add) {
+                block_v += add[d];
+                block_v = ds4_bf16_round(block_v);
+            }
+            const float r0v = residual[d];
+            const float r1v = residual[d + hc.n_embd];
+            const float r2v = residual[d + 2*hc.n_embd];
+            const float r3v = residual[d + 3*hc.n_embd];
+
+            for (int dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                float acc = block_v * post[dst_hc];
+
+                acc += comb[dst_hc + 0*4] * r0v;
+                acc += comb[dst_hc + 1*4] * r1v;
+                acc += comb[dst_hc + 2*4] * r2v;
+                acc += comb[dst_hc + 3*4] * r3v;
+
+                dst_f32[d + dst_hc*hc.n_embd] = ds4_bf16_round(acc);
+            }
+        }
+    }
+}
+
+template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false,
+         bool ROPE_IN = false, bool ROPE_OUT = false, bool HC_OUT = false>
+void kernel_mul_mv_q8_0_f32_rope_impl(
         args_t args,
         device const char * src0,
         device const char * src1,
@@ -121,7 +279,13 @@ void kernel_mul_mv_q8_0_f32_impl(
         threadgroup  char * shmem,
         uint3  tgpig,
         ushort tiisg,
-        ushort sgitg) {
+        ushort sgitg,
+        constant ds4_metal_args_mv_rope * rope,
+        constant ds4_metal_args_mv_hc_expand4 * hc = nullptr,
+        device const float * hc_add = nullptr,
+        device const float * hc_residual = nullptr,
+        device const float * hc_post = nullptr,
+        device const float * hc_comb = nullptr) {
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
@@ -160,7 +324,23 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     for (int ib = ib0; ib < nb; ib += NSG*NQ) {
         for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
+            yl[i] = ROUND_IN ? ds4_bf16_round(yb[i]) : yb[i];
+        }
+
+        if (ROPE_IN) {
+            const uint col = (uint)(ib*QK8_0 + il*NQ) % rope->width;
+            if (col >= rope->width - 64u) {
+                const uint pair0 = (col - (rope->width - 64u)) >> 1u;
+                FOR_UNROLL (short p = 0; p < NQ/2; ++p) {
+                    const float theta = float(rope->start) * rope->frequencies[pair0 + p];
+                    float c;
+                    const float sn = precise::sincos(theta, c);
+                    const float s = rope->inverse ? -sn : sn;
+                    const float re = yl[2*p], im = yl[2*p + 1];
+                    yl[2*p] = ds4_bf16_round(fma(re, c, -(im * s)));
+                    yl[2*p + 1] = ds4_bf16_round(fma(im, c, re * s));
+                }
+            }
         }
 
         for (short row = 0; row < NR0; row++) {
@@ -179,7 +359,415 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    if (HC_OUT) {
+        helper_mv_reduce_and_write_hc_expand4<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem,
+                                                   *hc, hc_add, hc_residual, hc_post, hc_comb);
+    } else if (ROPE_OUT) {
+        helper_mv_reduce_and_write_rope<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem, *rope);
+    } else {
+        helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    }
+}
+
+template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false>
+void kernel_mul_mv_q8_0_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    kernel_mul_mv_q8_0_f32_rope_impl<NR0, args_t, ROUND, ROUND_IN>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, (constant ds4_metal_args_mv_rope *)nullptr);
+}
+
+// One simdgroup group per activation row, each running the single-row
+// kernel's walk over the same weight blocks: every row's result matches the
+// one-row kernel, and the rows share the weight loads through the cache.
+template<short NR0, bool ROUND = false>
+static inline void helper_mv_reduce_and_write_rows(
+        device float * dst_f32,
+        float sumf[NR0],
+        const int r0,
+        const int ne01,
+        ushort tiisg,
+        ushort sg,
+        short r1,
+        threadgroup char * shmem) {
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup float * shmem_f32[NR0];
+
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *) shmem + NW*(r1*NR0 + row);
+
+        if (sg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+
+        if (tiisg == 0 && sg == 0) {
+            dst_f32[r0 + row] = ROUND ? ds4_bf16_round(tot) : tot;
+        }
+    }
+}
+
+// A few rows side by side: one simdgroup group per row in the threadgroup,
+// each with the single-row K walk and reduction.
+template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false>
+void kernel_mul_mv_q8_0_f32_rows_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = sgitg/NSG;
+    const ushort sg = sgitg%NSG;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sg*NQ + ix;
+
+    float yl[NQ];
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = ROUND_IN ? ds4_bf16_round(yb[i]) : yb[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write_rows<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sg, (short)r1, shmem);
+}
+
+// The rows one after another on the single-row simdgroup layout: the
+// threadgroup keeps the weight lines hot across rows and runs at the
+// single-row occupancy; every row's result matches the one-row kernel.
+template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false, bool HC_OUT = false>
+void kernel_mul_mv_q8_0_f32_rows_seq_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        constant ds4_metal_args_mv_hc_expand4 * hc = nullptr,
+        device const float * hc_add = nullptr,
+        device const float * hc_residual = nullptr,
+        device const float * hc_post = nullptr,
+        device const float * hc_comb = nullptr) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+    const int im = tgpig.z;
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    for (int r1 = 0; r1 < args.ne11; ++r1) {
+        const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+        device const float * y = (device const float *) (src1 + offset1);
+        float sumf[NR0] = { 0.f };
+        float yl[NQ];
+        device const float * yb = y + ib0*QK8_0 + il*NQ;
+        for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+            for (short i = 0; i < NQ; ++i) {
+                yl[i] = ROUND_IN ? ds4_bf16_round(yb[i]) : yb[i];
+            }
+            for (short row = 0; row < NR0; row++) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[i];
+                }
+                sumf[row] += sumq*ax[row][ib].d;
+            }
+            yb += NSG*NQ*QK8_0;
+        }
+        if (HC_OUT) {
+            const uint64_t hc_dim = 4ull * hc->n_embd, stride = hc->split_stride;
+            helper_mv_reduce_and_write_hc_expand4<NR0>((device float *) dst + r1*hc_dim, sumf, r0, args.ne01,
+                tiisg, sgitg, shmem, *hc, hc_add + r1*hc->n_embd, hc_residual + r1*hc_dim,
+                hc_post + r1*stride, hc_comb + r1*stride);
+        } else {
+            device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+            helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);   /* the reduce scratch is reused */
+    }
+}
+
+#define DS4_MUL_MV_Q8_0_ROWS_SEQ(NAME, NR0, ...) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_f32_rows_seq_impl<NR0, constant ds4_metal_args_mul_mv &, ##__VA_ARGS__>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_MUL_MV_Q8_0_ROWS_SEQ(kernel_mul_mv_q8_0_f32_rows_seq4, 4)
+DS4_MUL_MV_Q8_0_ROWS_SEQ(kernel_mul_mv_q8_0_f32_bf16_rows_seq4, 4, true)
+DS4_MUL_MV_Q8_0_ROWS_SEQ(kernel_mul_mv_q8_0_f32_bf16io_rows_seq4, 4, true, true)
+#undef DS4_MUL_MV_Q8_0_ROWS_SEQ
+
+#define DS4_MUL_MV_Q8_0_HC_ROWS_SEQ(NAME, NR0) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        constant ds4_metal_args_mv_hc_expand4 & hc, \
+        device const float * add, \
+        device const float * residual, \
+        device const float * post, \
+        device const float * comb, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_f32_rows_seq_impl<NR0, constant ds4_metal_args_mul_mv &, true, true, true>( \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, &hc, add, residual, post, comb); \
+}
+DS4_MUL_MV_Q8_0_HC_ROWS_SEQ(kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows_seq4, 4)
+#undef DS4_MUL_MV_Q8_0_HC_ROWS_SEQ
+
+// Two to eight activation rows through simdgroup matrices: the simdgroups
+// of a threadgroup each take a slice of K for the same eight weight rows,
+// dequantize a 32-wide block once and multiply it against the eight
+// (zero-padded) activation rows, then the partial tiles add in a fixed
+// order. The weights are read once whatever the row count.
+template<bool ROUND, bool ROUND_IN, bool HC_OUT = false, short NSG = 4,
+         typename args_t = constant ds4_metal_args_mul_mv &>
+void kernel_mul_mv_q8_0_f32_mma_rows_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        constant ds4_metal_args_mv_hc_expand4 * hc = nullptr,
+        device const float * hc_add = nullptr,
+        device const float * hc_residual = nullptr,
+        device const float * hc_post = nullptr,
+        device const float * hc_comb = nullptr) {
+    constexpr short NR = 8, KC = QK8_0;
+    // per simdgroup: 4 tiles of 8x8 for the activations, 4 for the weights
+    threadgroup float * A = (threadgroup float *) shmem + sgitg * (2 * NR * KC);
+    threadgroup float * W = A + NR * KC;
+    const int r0 = (int)tgpig.x * NR;
+    const int kq = args.ne00 / NSG;                     /* this simdgroup's K slice */
+    const int k_begin = sgitg * kq, k_end = k_begin + kq;
+    const short wr = tiisg / 4, wq = tiisg % 4;         /* row, 8-wide quarter of the block */
+    device const block_q8_0 * wrow = (device const block_q8_0 *)(src0 + (uint64_t)(r0 + wr) * args.nb01);
+    const bool have_row = wr < args.ne11;
+    device const float * y = (device const float *)(src1 + (uint64_t)wr * args.nb11) + wq * 8;
+    threadgroup float * a = A + wq * 64 + wr * 8;
+    threadgroup float * w = W + wq * 64 + wr * 8;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    // the next block's loads are issued before this block's matrix products
+    float av[8];
+    float4 q0, q1;
+    float d;
+    {
+        device const block_q8_0 * b = wrow + k_begin / QK8_0;
+        device const packed_char4 * q4 = (device const packed_char4 *)(b->qs + wq * 8);
+        d = (float)b->d; q0 = float4(q4[0]); q1 = float4(q4[1]);
+        for (short i = 0; i < 8; ++i) av[i] = have_row ? y[k_begin + i] : 0.0f;
+    }
+    for (int k0 = k_begin; k0 < k_end; k0 += KC) {
+        for (short i = 0; i < 8; ++i) a[i] = ROUND_IN ? ds4_bf16_round(av[i]) : av[i];
+        const float4 v0 = d * q0, v1 = d * q1;
+        w[0] = v0.x; w[1] = v0.y; w[2] = v0.z; w[3] = v0.w;
+        w[4] = v1.x; w[5] = v1.y; w[6] = v1.z; w[7] = v1.w;
+        if (k0 + KC < k_end) {
+            device const block_q8_0 * b = wrow + (k0 + KC) / QK8_0;
+            device const packed_char4 * q4 = (device const packed_char4 *)(b->qs + wq * 8);
+            d = (float)b->d; q0 = float4(q4[0]); q1 = float4(q4[1]);
+            for (short i = 0; i < 8; ++i) av[i] = have_row ? y[k0 + KC + i] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (short kt = 0; kt < KC / 8; ++kt) {
+            simdgroup_float8x8 wt, at;
+            simdgroup_load(wt, W + kt * 64, 8, 0, false);
+            simdgroup_load(at, A + kt * 64, 8, 0, true);
+            simdgroup_multiply_accumulate(acc, wt, at, acc);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // the partial tiles, summed in simdgroup order
+    threadgroup float * P = (threadgroup float *) shmem + NSG * 2 * NR * KC + sgitg * 64;
+    simdgroup_store(acc, P, 8, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        threadgroup const float * P0 = (threadgroup const float *) shmem + NSG * 2 * NR * KC;
+        const short j = tiisg / 4;
+        if (j < args.ne11) {
+            device float * o = (device float *) dst + (uint64_t)j * args.ne0 + r0;
+            for (short i = (tiisg % 4) * 2; i < (tiisg % 4) * 2 + 2; ++i) {
+                float v = P0[i * 8 + j];
+                for (short g = 1; g < NSG; ++g) v += P0[g * 64 + i * 8 + j];
+                if (HC_OUT) {
+                    // the rows kernel's expansion, one (row, output) pair per lane step
+                    const uint n_embd = hc->n_embd;
+                    const uint64_t hc_dim = 4ull * n_embd, stride = hc->split_stride;
+                    const int d = r0 + i;
+                    float block_v = ds4_bf16_round(v);
+                    if (hc->has_add) block_v = ds4_bf16_round(block_v + hc_add[(uint64_t)j * n_embd + d]);
+                    device const float * res = hc_residual + (uint64_t)j * hc_dim;
+                    device const float * pj = hc_post + (uint64_t)j * stride;
+                    device const float * cj = hc_comb + (uint64_t)j * stride;
+                    const float r0v = res[d], r1v = res[d + n_embd], r2v = res[d + 2 * n_embd], r3v = res[d + 3 * n_embd];
+                    device float * dj = (device float *) dst + (uint64_t)j * hc_dim;
+                    for (int dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                        float acc = block_v * pj[dst_hc];
+                        acc += cj[dst_hc + 0 * 4] * r0v;
+                        acc += cj[dst_hc + 1 * 4] * r1v;
+                        acc += cj[dst_hc + 2 * 4] * r2v;
+                        acc += cj[dst_hc + 3 * 4] * r3v;
+                        dj[d + dst_hc * n_embd] = ds4_bf16_round(acc);
+                    }
+                } else {
+                    o[i] = ROUND ? ds4_bf16_round(v) : v;
+                }
+            }
+        }
+    }
+}
+#define DS4_MUL_MV_Q8_0_MMA_ROWS(NAME, ...) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_f32_mma_rows_impl<__VA_ARGS__>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_MUL_MV_Q8_0_MMA_ROWS(kernel_mul_mv_q8_0_f32_mma_rows, false, false)
+DS4_MUL_MV_Q8_0_MMA_ROWS(kernel_mul_mv_q8_0_f32_bf16_mma_rows, true, false)
+DS4_MUL_MV_Q8_0_MMA_ROWS(kernel_mul_mv_q8_0_f32_bf16io_mma_rows, true, true)
+DS4_MUL_MV_Q8_0_MMA_ROWS(kernel_mul_mv_q8_0_f32_mma_rows8, false, false, false, 8)
+DS4_MUL_MV_Q8_0_MMA_ROWS(kernel_mul_mv_q8_0_f32_bf16_mma_rows8, true, false, false, 8)
+DS4_MUL_MV_Q8_0_MMA_ROWS(kernel_mul_mv_q8_0_f32_bf16io_mma_rows8, true, true, false, 8)
+#undef DS4_MUL_MV_Q8_0_MMA_ROWS
+[[host_name("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_hc_expand4 & hc,
+        device const float * add,
+        device const float * residual,
+        device const float * post,
+        device const float * comb,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_mma_rows_impl<true, true, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg,
+                                                           &hc, add, residual, post, comb);
+}
+[[host_name("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows8")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_hc_expand4 & hc,
+        device const float * add,
+        device const float * residual,
+        device const float * post,
+        device const float * comb,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_mma_rows_impl<true, true, true, 8>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg,
+                                                              &hc, add, residual, post, comb);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -195,6 +783,105 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_bf16")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_rows8")]]
+kernel void kernel_mul_mv_q8_0_f32_rows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<8, constant ds4_metal_args_mul_mv &, false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_bf16io")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16io(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// The q projection with its rope applied to the bf16 outputs.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_rope")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_rope(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_rope & rope,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true, false, false, true>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, &rope);
+}
+
+// A bf16 in/out matvec whose outputs expand straight into the HC streams.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_hc_expand4 & hc,
+        device const float * add,
+        device const float * residual,
+        device const float * post,
+        device const float * comb,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true, true, false, false, true>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, nullptr, &hc, add, residual, post, comb);
+}
+
+// Two Q8_0 matrices over one activation row in one dispatch: the leading
+// threadgroups take the first matrix's row groups, the rest the second's.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_pair")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_pair(
+        constant ds4_metal_args_mul_mv & args_a,
+        constant ds4_metal_args_mul_mv & args_b,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint groups_a = ((uint)args_a.ne01 + N_R0_Q8_0 - 1u) / N_R0_Q8_0;
+    if (tgpig.x < groups_a) {
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args_a, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    } else {
+        tgpig.x -= groups_a;
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args_b, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
 }
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
@@ -473,7 +1160,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+template<short NR0, bool STORE_GATE_UP, bool ROUND_GATE_UP = false>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -584,8 +1271,8 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
             }
-            float g = gate;
-            float u = up;
+            float g = ROUND_GATE_UP ? ds4_bf16_round(gate) : gate;
+            float u = ROUND_GATE_UP ? ds4_bf16_round(up) : up;
             if (clamp_value > 1.0e-6f) {
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
@@ -1129,6 +1816,159 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0(
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
+// The gate and up sums round to bf16 before the SwiGLU, as the separate
+// bf16 matvecs would have stored them.
+[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_bf16")]]
+kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+// A few rows of the bf16 shared expert: grid x is the row so that the rows'
+// threadgroups for the same weight rows run back to back.
+[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows")]]
+kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, uint3(tgpig.y, tgpig.x, tgpig.z), tiisg, sgitg);
+}
+
+// The matrix rows form of the bf16 shared expert: the gate and up rows
+// ride the same activation tiles, the SwiGLU follows the reduce.
+template<short NSG>
+void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR = 8, KC = QK8_0;
+    threadgroup float * A  = (threadgroup float *) shmem + sgitg * (3 * NR * KC);
+    threadgroup float * Wg = A + NR * KC;
+    threadgroup float * Wu = Wg + NR * KC;
+    const int r0 = (int)tgpig.x * NR;
+    const int kq = args.ne00 / NSG;
+    const int k_begin = sgitg * kq, k_end = k_begin + kq;
+    const short wr = tiisg / 4, wq = tiisg % 4;
+    device const block_q8_0 * grow = (device const block_q8_0 *)(src0_gate + (uint64_t)(r0 + wr) * args.nb01);
+    device const block_q8_0 * urow = (device const block_q8_0 *)(src0_up + (uint64_t)(r0 + wr) * args.nb01);
+    const bool have_row = wr < args.ne11;
+    device const float * y = (device const float *)(src1 + (uint64_t)wr * args.nb11) + wq * 8;
+    threadgroup float * a = A + wq * 64 + wr * 8;
+    threadgroup float * wg = Wg + wq * 64 + wr * 8;
+    threadgroup float * wu = Wu + wq * 64 + wr * 8;
+    simdgroup_float8x8 accg = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 accu = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float av[8];
+    float4 g0, g1, u0, u1;
+    float gd, ud;
+    {
+        device const block_q8_0 * gb = grow + k_begin / QK8_0, * ub = urow + k_begin / QK8_0;
+        device const packed_char4 * gq = (device const packed_char4 *)(gb->qs + wq * 8);
+        device const packed_char4 * uq = (device const packed_char4 *)(ub->qs + wq * 8);
+        gd = (float)gb->d; g0 = float4(gq[0]); g1 = float4(gq[1]);
+        ud = (float)ub->d; u0 = float4(uq[0]); u1 = float4(uq[1]);
+        for (short i = 0; i < 8; ++i) av[i] = have_row ? y[k_begin + i] : 0.0f;
+    }
+    for (int k0 = k_begin; k0 < k_end; k0 += KC) {
+        for (short i = 0; i < 8; ++i) a[i] = av[i];
+        const float4 vg0 = gd * g0, vg1 = gd * g1, vu0 = ud * u0, vu1 = ud * u1;
+        wg[0] = vg0.x; wg[1] = vg0.y; wg[2] = vg0.z; wg[3] = vg0.w;
+        wg[4] = vg1.x; wg[5] = vg1.y; wg[6] = vg1.z; wg[7] = vg1.w;
+        wu[0] = vu0.x; wu[1] = vu0.y; wu[2] = vu0.z; wu[3] = vu0.w;
+        wu[4] = vu1.x; wu[5] = vu1.y; wu[6] = vu1.z; wu[7] = vu1.w;
+        if (k0 + KC < k_end) {
+            device const block_q8_0 * gb = grow + (k0 + KC) / QK8_0, * ub = urow + (k0 + KC) / QK8_0;
+            device const packed_char4 * gq = (device const packed_char4 *)(gb->qs + wq * 8);
+            device const packed_char4 * uq = (device const packed_char4 *)(ub->qs + wq * 8);
+            gd = (float)gb->d; g0 = float4(gq[0]); g1 = float4(gq[1]);
+            ud = (float)ub->d; u0 = float4(uq[0]); u1 = float4(uq[1]);
+            for (short i = 0; i < 8; ++i) av[i] = have_row ? y[k0 + KC + i] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (short kt = 0; kt < KC / 8; ++kt) {
+            simdgroup_float8x8 at, wt;
+            simdgroup_load(at, A + kt * 64, 8, 0, true);
+            simdgroup_load(wt, Wg + kt * 64, 8, 0, false);
+            simdgroup_multiply_accumulate(accg, wt, at, accg);
+            simdgroup_load(wt, Wu + kt * 64, 8, 0, false);
+            simdgroup_multiply_accumulate(accu, wt, at, accu);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float * P = (threadgroup float *) shmem + NSG * 3 * NR * KC;
+    simdgroup_store(accg, P + sgitg * 64, 8, 0, false);
+    simdgroup_store(accu, P + (NSG + sgitg) * 64, 8, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const short j = tiisg / 4;
+        if (j < args.ne11) {
+            device float * mid_f32 = (device float *) dst_mid + (uint64_t)j * args.ne0;
+            for (short i = (tiisg % 4) * 2; i < (tiisg % 4) * 2 + 2; ++i) {
+                float gate = P[i * 8 + j], up = P[NSG * 64 + i * 8 + j];
+                for (short g = 1; g < NSG; ++g) {
+                    gate += P[g * 64 + i * 8 + j];
+                    up += P[(NSG + g) * 64 + i * 8 + j];
+                }
+                float gv = ds4_bf16_round(gate), uv = ds4_bf16_round(up);
+                if (clamp_value > 1.0e-6f) {
+                    gv = min(gv, clamp_value);
+                    uv = clamp(uv, -clamp_value, clamp_value);
+                }
+                const float silu = gv / (1.0f + exp(-gv));
+                mid_f32[r0 + i] = silu * uv;
+            }
+        }
+    }
+}
+[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_rows8")]]
+kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_rows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)dst_gate; (void)dst_up;
+    kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_impl<8>(args, src0_gate, src0_up, src1, dst_mid,
+                                                        clamp_value, shmem, tgpig, tiisg, sgitg);
+}
 
 template<typename T0, typename T1, short NR0, typename args_t>
 void kernel_mul_mv_t_t_impl(
@@ -1244,7 +2084,7 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
-template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t, bool ROUND = false>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,
         device const char * src0,
@@ -1322,10 +2162,10 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-template<typename T0, typename T04, typename T1, typename T14, typename args_t>
+template<typename T0, typename T04, typename T1, typename T14, typename args_t, bool ROUND = false>
 void kernel_mul_mv_t_t_4_disp(
         args_t args,
         device const char * src0,
@@ -1336,9 +2176,9 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 
@@ -1362,6 +2202,150 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+
+// The same matvec with its output rounded to bf16.
+template<typename T0, typename T04, typename T1, typename T14>
+kernel void kernel_mul_mv_t_t_4_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_4_disp<T0, T04, T1, T14, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_t_t_4_bf16<half, half4, half, half4>) mul_mv_t_t_4_bf16;
+
+template [[host_name("kernel_mul_mv_f16_f32_4_bf16")]] kernel mul_mv_t_t_4_bf16 kernel_mul_mv_t_t_4_bf16<half, half4, float, float4>;
+
+// The rows form of the vectorized dense matvec: one simdgroup group per
+// activation row, each with the single-row kernel's K walk and reduction.
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t, bool ROUND = false>
+void kernel_mul_mv_t_t_4_rows_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = sgitg/NSG;
+    const ushort sg = sgitg%NSG;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const T1  * y  = (device const T1  *) (src1 + offset1);
+    device const T14 * y4 = (device const T14 *) (src1 + offset1);
+
+    device const T0  * ax [NR0];
+    device const T04 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax [row] = (device const T0  *) ((device char *) src0 + offset0);
+        ax4[row] = (device const T04 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sg*NF + ix;
+
+    T14 yl4[NF4];
+
+    device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    for (int i = nb*NB + sg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+        for (short row = 0; row < NR0; row++) {
+            sumf[row] += ax[row][i] * y[i];
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write_rows<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sg, (short)r1, shmem);
+}
+
+template<typename T0, typename T04, typename T1, typename T14>
+kernel void kernel_mul_mv_t_t_4_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    switch (args.nr0) {
+        case 1: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 1, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 2, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    };
+}
+
+typedef decltype(kernel_mul_mv_t_t_4_rows<half, half4, half, half4>) mul_mv_t_t_4_rows;
+
+template [[host_name("kernel_mul_mv_f16_f32_4_rows")]] kernel mul_mv_t_t_4_rows kernel_mul_mv_t_t_4_rows<half,  half4,  float, float4>;
+
+template<typename T0, typename T04, typename T1, typename T14>
+kernel void kernel_mul_mv_t_t_4_rows_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    switch (args.nr0) {
+        case 1: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 1, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 2, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 4, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    };
+}
+
+typedef decltype(kernel_mul_mv_t_t_4_rows_bf16<half, half4, half, half4>) mul_mv_t_t_4_rows_bf16;
+
+template [[host_name("kernel_mul_mv_f16_f32_4_rows_bf16")]] kernel mul_mv_t_t_4_rows_bf16 kernel_mul_mv_t_t_4_rows_bf16<half,  half4,  float, float4>;
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
