@@ -239,6 +239,16 @@ int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
                                    uint32_t raw_start, const ds4_gpu_tensor *comp_cache,
                                    const ds4_gpu_tensor *ids, ds4_gpu_tensor *selected,
                                    uint32_t n_comp, uint32_t attended, uint32_t n_head, uint32_t head_dim);
+/* The same attention for consecutive rows in one pass, each row's window read
+ * from a linear raw copy; _ok says whether rows of that shape are taken. */
+int ds4_gpu_dsv41_attention_decode_rows_ok(uint32_t n_raw, uint32_t attended,
+                                           uint32_t n_head, uint32_t head_dim);
+int ds4_gpu_dsv41_attention_decode_rows(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+                                        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+                                        const ds4_gpu_tensor *raw, uint32_t n_raw,
+                                        const ds4_gpu_tensor *comp_cache, const ds4_gpu_tensor *ids,
+                                        uint32_t ids_stride, uint32_t n_comp, uint32_t attended,
+                                        uint32_t rows, uint32_t n_head, uint32_t head_dim);
 /* The Q8_0 q projection of one row with the layer's rope on its outputs. */
 int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
