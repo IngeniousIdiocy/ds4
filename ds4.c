@@ -46519,6 +46519,71 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+/* Position-keyed Gumbel-max sampling: the token at position pos is the
+ * argmax over the filtered support of log p + Gumbel(seed, pos, id).  It
+ * depends only on the logits, the knobs, the seed and the position, so a
+ * speculative verify row draws the token plain decode draws there. */
+typedef struct {
+    float    temperature;
+    int      top_k;
+    float    top_p;
+    float    min_p;
+    uint64_t seed;
+} sample_key;
+
+static uint64_t sample_key_mix(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static int sample_keyed(const float *logits, uint32_t n_vocab, const sample_key *k,
+                        uint32_t pos, float *probs) {
+    const bool full = k->top_k <= 0 && (k->top_p <= 0.0f || k->top_p >= 1.0f) &&
+                      k->min_p <= 0.0f;
+    if (k->temperature <= 0.0f ||
+        (!full && !sample_build_probabilities(logits, n_vocab, k->temperature, k->top_k,
+                                              k->top_p, k->min_p, probs))) {
+        return sample_argmax(logits, n_vocab);
+    }
+    const uint64_t key = sample_key_mix(k->seed ^ sample_key_mix((uint64_t)pos + 1u));
+    /* over the full vocabulary the argmax row draws first, and a row whose
+     * logit plus the bound -log(-log(u)) <= (1 + clz53(1 - u)) ln 2 stays
+     * below the best draw cannot win, so its logarithms are skipped */
+    const uint32_t first = full ? (uint32_t)sample_argmax(logits, n_vocab) : 0u;
+    int best = -1;
+    double best_v = 0.0, bar = 0.0;
+    for (uint32_t j = 0; j <= n_vocab; j++) {
+        const uint32_t i = j == 0 ? first : j - 1u;
+        if ((j > 0 && i == first) || (full ? !isfinite(logits[i]) : !(probs[i] > 0.0f))) continue;
+        const uint64_t h = sample_key_mix(key + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+        const uint64_t y = (UINT64_C(1) << 53) - 1u - (h >> 11);
+        if (full && best >= 0 && y != 0 &&
+            (double)logits[i] / k->temperature + (double)(__builtin_clzll(y) - 10) * 0.6931471805599453 < bar) {
+            continue;
+        }
+        const double v = (full ? (double)logits[i] / k->temperature : log((double)probs[i])) -
+                         log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+        if (best < 0 || v > best_v || (v == best_v && (int)i < best)) {
+            best = (int)i;
+            best_v = v;
+            bar = v - 1e-6 - 1e-9 * fabs(v);
+        }
+    }
+    return best >= 0 ? best : sample_argmax(logits, n_vocab);
+}
+
+/* DS4_V41_KEYED_SAMPLING: V4.1 samples with sample_keyed (not under TP), and
+ * DSpark drafts are kept only when they equal the keyed sample, so sampled
+ * output is the same with or without drafting. */
+static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, const uint64_t *rng) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_V41_KEYED_SAMPLING") != NULL;
+    return cached != 0 && temperature > 0.0f && rng && !e->tp.active;
+}
+
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
@@ -64107,7 +64172,10 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 }
 
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
-    return e && e->dspark_exact_sampling;
+    /* keyed V4.1 sampling, like exact sampling, keeps only drafts it would sample */
+    const uint64_t seed = 0;
+    return e && (e->dspark_exact_sampling ||
+                 (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds41_keyed_sampling(e, 1.0f, &seed)));
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
@@ -78842,6 +78910,10 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (ds4_session_is_ds41(s) && ds41_keyed_sampling(s->engine, temperature, rng)) {
+        const sample_key key = { temperature, top_k, top_p, min_p, *rng };
+        return sample_keyed(s->logits, DS4_N_VOCAB, &key, (uint32_t)s->checkpoint.len, s->sample_probs);
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -86983,7 +87055,13 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     }
     uint32_t j = 0;
     int replacement = -1;
-    if (exact) {
+    if (exact && ds41_keyed_sampling(e, temperature, rng)) {
+        /* a draft stays while it is its row's keyed sample; the caller then
+         * draws the first rejected row's keyed sample as plain decode would */
+        const sample_key key = { temperature, top_k, top_p, min_p, *rng };
+        while (j < k && sample_keyed(rows + (size_t)j * vocab, vocab, &key, P1 + 1u + j,
+                                     s->sample_probs) == drafts[j]) j++;
+    } else if (exact) {
         while (j < k && sample_build_probabilities(rows + (size_t)j * vocab, vocab, temperature,
                                                    top_k, top_p, min_p, s->sample_probs)) {
             if (!speculative_point_accept(s->sample_probs[drafts[j]], 1.0f, rng)) {
@@ -87949,7 +88027,8 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s) && s->ds41_graph.draft) {
-        const bool exact = s->engine->dspark_exact_sampling;
+        const bool exact = s->engine->dspark_exact_sampling ||
+                           ds41_keyed_sampling(s->engine, temperature, rng);
         return ds41_session_spec(s, first_token, max_tokens, eos_token, false, DS4_THINK_HIGH,
                                  exact ? temperature : 0.0f, top_k, top_p, min_p,
                                  exact ? rng : NULL, accepted, accepted_cap, err, errlen);
