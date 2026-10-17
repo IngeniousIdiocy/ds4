@@ -10621,6 +10621,11 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
 static void *ds4_gpu_tp_service_thread(void *arg) {
     (void)arg;
     const bool profile = getenv("DS4_TP_GATE_PROFILE") != NULL;
+    /* DS4_TP_STALL_TRACE=MS: report each gate that waits more than MS (default
+     * 200) for the GPU or MS/4 in its exchange, to locate prefill stalls. */
+    const bool stall_trace = getenv("DS4_TP_STALL_TRACE") != NULL;
+    double stall_ms = stall_trace ? atof(getenv("DS4_TP_STALL_TRACE")) : 0.0;
+    if (stall_ms <= 0.0 || stall_ms == 1.0) stall_ms = 200.0;
     while (1) {
         pthread_mutex_lock(&g_tp_mutex);
         while (g_tp_queue_count == 0 && !g_tp_shutdown)
@@ -10637,7 +10642,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         /* Wait for the GPU to reach this gate.  Tight spin: gate arrival is
          * on the decode critical path and normally tens of microseconds
          * out; yielding here measurably delays the release wake-up. */
-        const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
+        const double t0 = (profile || stall_trace) ? ds4_gpu_now_ms() : 0.0;
         uint32_t spins = 0;
         if (req.big_bytes > 0) {
             /* Big gates always signal arrival through the batch shared
@@ -10737,6 +10742,15 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             g_tp_failed_flag = 1;
         }
         const double t_ex = ds4_gpu_now_ms();
+        if (stall_trace && (t1 - t0 > stall_ms || t_ex - t1 > stall_ms / 4.0)) {
+            fprintf(stderr, "ds4-tp: stall l=%u g=%u rows=%u big=%llu seq=%llu kind=%s gpu-wait=%.1f ms exchange=%.1f ms at=%.1f ms\n",
+                    req.layer, req.gate, req.rows, (unsigned long long)req.big_bytes,
+                    (unsigned long long)req.seq,
+                    req.big_bytes ? "big" : req.rows ? (req.poll ? "batch-poll" : "batch-event") :
+                    req.spin ? "decode-spin" : req.poll ? "decode-poll" :
+                    req.event_arrival ? "decode-event" : "decode-flag",
+                    t1 - t0, t_ex - t1, t_ex);
+        }
         if (req.rows == 0 && req.big_bytes == 0 && req.gate < 2u) {
             /* Sized the gate-time prefetch: how long this rank typically
              * waits for the peer at this gate kind (flag seen -> exchange done). */
@@ -10940,6 +10954,23 @@ int ds4_gpu_tp_init(uint32_t rank,
         fprintf(stderr, "ds4: failed to create TP shared events\n");
         return 0;
     }
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        /* With the model residency set attached to the queue, TP prefill on
+         * 512 GB M3 Ultras hit sporadic submit-time stalls in the V4.1
+         * decoder suffix: a command buffer started ~2-2.6 s after commit, the
+         * cost of a full residency request for the 285 GB of model views,
+         * while the peer rank waited at the next gate.  The views were made
+         * resident at load; keep the committed set but detach it from the
+         * queue.  DS4_METAL_TP_QUEUE_RESIDENCY_SET=1 keeps it attached. */
+        if (getenv("DS4_METAL_TP_QUEUE_RESIDENCY_SET") == NULL &&
+            g_model_residency_set && g_model_residency_added_to_queue &&
+            [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
+            [g_queue removeResidencySet:g_model_residency_set];
+            g_model_residency_added_to_queue = 0;
+        }
+    }
+#endif
     g_tp_exchange_fn = fn;
     g_tp_exchange_ud = ud;
     g_tp_seq = 0;
