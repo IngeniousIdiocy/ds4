@@ -44349,7 +44349,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
             n_expert == 6 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
@@ -44379,7 +44378,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_mxfp4_mm_id_pair_swiglu_compact_tile =
             use_mm_id_pair_swiglu &&
             resident_tile_types &&
-            g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_pair_swiglu_compact_tile_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE) != 0u);
         /*
@@ -44396,7 +44394,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             resident_tile_types &&
             n_expert == 6 &&
             !g_ssd_streaming_mode &&
-            g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_map_scatter_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_MAP_SCATTER) != 0u);
         /*
@@ -44414,7 +44411,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_mxfp4_mm_id_pair_tail_simdgroup_cull =
             use_mm_id_pair_swiglu &&
             resident_tile_types &&
-            g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL) != 0u);
         const bool use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default =
@@ -44426,7 +44422,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             request_mid_f16 &&
             resident_tile_types &&
-            g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL) != 0u);
         /*
@@ -44445,7 +44440,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_type == DS4_METAL_TENSOR_MXFP4 &&
             n_expert == 6 &&
             !g_ssd_streaming_mode &&
-            g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_down_half_lut_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT) != 0u);
         if (use_mm_id) {
@@ -44576,8 +44570,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                     ds4_gpu_device_is_pre_m5_apple_silicon() &&
                     getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MM_ID_PAIR_HALF_SCALE") == NULL &&
                     !g_quality_mode &&
-                    !g_ssd_streaming_mode &&
-                    g_tp_split_world == 1;
+                    !g_ssd_streaming_mode;
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
