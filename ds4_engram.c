@@ -7,14 +7,13 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
-#else
-#include <pthread.h>
 #endif
 
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
@@ -144,6 +143,27 @@ static float e4m3(uint8_t byte) {
     return byte & 128 ? -value : value;
 }
 
+/* All code/scale pairs fit in 128 KiB; this is a format lookup, not a cache
+ * of model rows. Preserve the reference's F32 scaling and BF16 rounding. */
+static uint16_t engram_bf16[256][256];
+static pthread_once_t engram_bf16_once = PTHREAD_ONCE_INIT;
+
+static void init_engram_bf16(void) {
+    for (unsigned scale = 0; scale < 256; scale++) {
+        for (unsigned code = 0; code < 256; code++) {
+            uint16_t result = UINT16_MAX;
+            if ((code & 127u) != 127u && scale != 255u) {
+                float value = ldexpf(e4m3((uint8_t)code), (int)scale - 127);
+                uint32_t bits;
+                memcpy(&bits, &value, sizeof(bits));
+                bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+                if ((bits & 0x7f800000u) != 0x7f800000u) result = (uint16_t)(bits >> 16);
+            }
+            engram_bf16[scale][code] = result;
+        }
+    }
+}
+
 bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
                      size_t count, float *out) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||
@@ -157,25 +177,18 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
             return false;
         }
     }
+    pthread_once(&engram_bf16_once, init_engram_bf16);
     uint8_t raw[DS4_ENGRAM_ROW_BYTES];
     for (size_t i = 0; i < count; i++) {
         if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
-            uint8_t code = raw[j], scale = raw[DS4_ENGRAM_DIM + j / 32];
-            if ((code & 127) == 127 || scale == 255) {
+            const uint16_t value = engram_bf16[raw[DS4_ENGRAM_DIM + j / 32]][raw[j]];
+            if (value == UINT16_MAX) {
                 errno = EDOM;
                 return false;
             }
-            float value = ldexpf(e4m3(code), (int)scale - 127);
-            uint32_t bits;
-            memcpy(&bits, &value, sizeof(bits));
-            bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
-            memcpy(&value, &bits, sizeof(value));
-            if (!isfinite(value)) {
-                errno = EDOM;
-                return false;
-            }
-            out[i * DS4_ENGRAM_DIM + j] = value;
+            const uint32_t bits = (uint32_t)value << 16;
+            memcpy(out + i * DS4_ENGRAM_DIM + j, &bits, sizeof(bits));
         }
     }
     return true;

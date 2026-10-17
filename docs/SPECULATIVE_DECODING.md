@@ -37,13 +37,19 @@ V4.1 Flash takes the same flags with its own support GGUF, which
 checkpoint. On Metal it also runs across two Macs: give both ranks `--dspark`
 and `--mtp-model`, and the worker verifies each block beside the coordinator.
 
-The support file adds about 5.6 GiB of weights plus runtime state. On Metal,
-the main model can be resident or SSD-streamed. DSpark replaces the legacy
-one-stage MTP drafter for that run; the two are not stacked.
+The support file adds about 5.6 GiB of weights plus runtime state. The main
+model must be resident; external DSpark is not supported with SSD streaming.
+DSpark replaces the legacy one-stage MTP drafter for that run; the two are
+not stacked.
 
 Resident M5 paths batch supported verifier expert rows, including two-Mac TP.
-On DGX Spark, resident Q2 also batches the seed with longer drafts and uses
-small-batch Q8 and expert kernels. No extra flags are needed.
+On DGX Spark, resident Flash 0731 Q2 and two-Spark MXFP4 also batch the seed
+with longer drafts and use small-batch Q8 and expert kernels. No extra flags
+are needed.
+Single-Spark Q2 uses a confidence-pruning threshold of 0.4. Two-Spark
+Flash 0731 Q2 and MXFP4 leave confidence pruning off and split the drafter
+over RDMA when both peers load its support file. `--dspark-confidence`
+overrides the threshold. Exact sampling keeps its default threshold of 0.8.
 The scheduler can back off when drafting is unproductive. Defaults select the
 fast paths; diagnostic environment variables are not needed for normal use.
 Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
