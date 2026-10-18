@@ -6692,6 +6692,60 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_f32(
     (void)tiitg;
 }
 
+/* kernel_mul_mv_id_mxfp4_sum6_f32 with the grid transposed: x walks the
+ * tokens of a small verify batch, y the row groups.  Threadgroups launch in
+ * x-major order, so every token's walk over the same output rows runs back to
+ * back and an expert chosen by several rows is fetched from DRAM once.  The
+ * per-lane K walk, the slot order and the simd_sum tree are those of the
+ * token-minor kernel, so each row's output is bit-identical. */
+kernel void kernel_mul_mv_id_mxfp4_sum6_tokmajor_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        device const char *src0s,
+        device const char *src1,
+        device char *dst,
+        device const char *ids,
+        device const char *add_in,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const uint32_t first_row = (uint32_t)((tgpig.y * NSG + sgitg) * N_R0_MXFP4);
+    const uint32_t token = tgpig.x;
+    device const int32_t *token_ids =
+        (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
+    device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float2 sumf = 0.0f;
+    for (int slot = 0; slot < args.nei0; slot++) {
+        const int32_t expert = token_ids[slot];
+        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        device const char *expert_base = src0s +
+            (int64_t)(expert - args.tp_expert_base) * args.nb02;
+        device const float *y =
+            (device const float *)(token_src1 + (uint64_t)slot * args.nb11);
+        sumf += ds4_mxfp4_accumulate_rows(expert_base, args.nb01, y,
+                                           args.ne00, first_row, args.ne0,
+                                           lut, tiisg);
+    }
+
+    device float *out = (device float *)(dst + (uint64_t)token * args.nb1);
+    FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+        if (first_row + row < (uint32_t)args.ne0) {
+            const float value = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                out[first_row + row] = value +
+                    (args.tp_addend ? ((device const float *)add_in)[first_row + row] : 0.0f);
+            }
+        }
+    }
+    (void)tiitg;
+}
+
 kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_f32(
         constant ds4_metal_args_mul_mv_id &args,
         device const char *src0s,

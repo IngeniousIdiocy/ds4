@@ -33417,6 +33417,47 @@ static int ds4_gpu_encode_mul_mv_id_sum6(
     return 1;
 }
 
+/* A few verify rows' MXFP4 down projections, token-major so the rows that
+ * share an expert read it back to back (kernel_mul_mv_id_mxfp4_sum6_tokmajor_f32). */
+static bool ds4_gpu_mxfp4_sum6_tokmajor_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_METAL_DISABLE_MXFP4_SUM6_TOKMAJOR") == NULL;
+    return on == 1;
+}
+
+static int ds4_gpu_encode_mul_mv_id_sum6_tokmajor(
+        id<MTLCommandBuffer>          cb,
+        const ds4_gpu_mul_mv_id_args *args,
+        id<MTLBuffer> src0, NSUInteger src0_off,
+        id<MTLBuffer> src1, NSUInteger src1_off,
+        id<MTLBuffer> dst,  NSUInteger dst_off,
+        id<MTLBuffer> ids,  NSUInteger ids_off,
+        NSUInteger    threadgroup_bytes) {
+    const NSUInteger nsg = 2;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_sum6_tokmajor_f32", (int16_t)nsg);
+    if (!cb || !pipeline || !args || !src0 || !src1 || !dst || !ids ||
+        args->ne00 <= 0 || args->ne01 <= 0 ||
+        args->nei0 <= 0 || args->nei0 > 8 || args->nei1 <= 0) {
+        return 0;
+    }
+    const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:src0 offset:src0_off atIndex:1];
+    [enc setBuffer:src1 offset:src1_off atIndex:2];
+    [enc setBuffer:dst  offset:dst_off  atIndex:3];
+    [enc setBuffer:ids  offset:ids_off  atIndex:4];
+    [enc setBuffer:dst  offset:dst_off  atIndex:5];
+    if (threadgroup_bytes != 0) [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)args->nei1, row_groups, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_q4_gather_slots6(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -45597,6 +45638,14 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                          down_smem,
                                                          2,
                                                          q4_batch_table_queue_residency);
+            } else if (direct_down_sum && down_type == DS4_METAL_TENSOR_MXFP4 &&
+                       n_tokens >= 2u && !use_tp_mxfp4_static_batch &&
+                       ds4_gpu_mxfp4_sum6_tokmajor_enabled()) {
+                ok = ds4_gpu_encode_mul_mv_id_sum6_tokmajor(cb, &down_args,
+                        down_buf, (NSUInteger)down_inner,
+                        midbuf, ds4_gpu_tensor_offset(mid),
+                        outbuf, ds4_gpu_tensor_offset(out),
+                        selectedbuf, ds4_gpu_tensor_offset(selected), down_smem);
             } else if (direct_down_sum) {
                 ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                      down_sum6_pipeline,
