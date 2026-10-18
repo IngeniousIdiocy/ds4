@@ -74769,7 +74769,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.eval_seq = 0;
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
-            "tensor parallelism bound: rank %d, %s, %s transport",
+            "tensor parallelism bound: rank %d, %s, %s transport\n",
             e->tp.rank, e->cuda_tp_expert_split ? "MXFP4 expert intermediate split" :
                                                "50/50 expert ownership",
             ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
