@@ -10961,9 +10961,10 @@ int ds4_gpu_tp_init(uint32_t rank,
          * decoder suffix: a command buffer started ~2-2.6 s after commit, the
          * cost of a full residency request for the 285 GB of model views,
          * while the peer rank waited at the next gate.  The views were made
-         * resident at load; keep the committed set but detach it from the
-         * queue.  DS4_METAL_TP_QUEUE_RESIDENCY_SET=1 keeps it attached. */
-        if (getenv("DS4_METAL_TP_QUEUE_RESIDENCY_SET") == NULL &&
+         * resident at load, so DS4_METAL_TP_DETACH_RESIDENCY_SET=1 keeps the
+         * committed set but detaches it from the queue.  That was verified only
+         * with the wired collector disabled (iogpu.disable_wired_collector=1). */
+        if (getenv("DS4_METAL_TP_DETACH_RESIDENCY_SET") != NULL &&
             g_model_residency_set && g_model_residency_added_to_queue &&
             [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
             [g_queue removeResidencySet:g_model_residency_set];
