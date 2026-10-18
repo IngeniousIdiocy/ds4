@@ -42961,7 +42961,14 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m, const ds4_
     for (uint32_t t = 0; ok && t < B; t++)
         ok = ds4_gpu_embed_token_hc_tensor(g->rows_view[t].residual, m->map, m->size,
             w->token_embd->abs_offset, vocab, (uint32_t)tokens[t], dim, hc);
-    for (uint32_t st = 0; ok && st < d->n_stage; st++) ok = ds41_draft_stage(g, st, B);
+    /* commit each stage as it is encoded: the GPU starts the first stage
+     * while the host encodes the rest instead of idling until the head */
+    static int stage_flush_off = -1;
+    if (stage_flush_off < 0) stage_flush_off = getenv("DS4_METAL_DISABLE_V41_DRAFT_STAGE_FLUSH") != NULL;
+    for (uint32_t st = 0; ok && st < d->n_stage; st++) {
+        ok = ds41_draft_stage(g, st, B);
+        if (ok && !stage_flush_off && world == 1) ok = ds4_gpu_flush_commands() != 0;
+    }
     ok = ok && ds4_gpu_hc_weighted_sum_split_tensor(d->x, g->batch.residual, g->batch.ffn_split, dim, hc) &&
         ds4_gpu_rms_norm_weight_rows_tensor(d->xn, d->x, d->m->map, d->m->size,
             last->norm->abs_offset, dim, B, DS4_RMS_EPS) &&
