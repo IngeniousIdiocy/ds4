@@ -87226,6 +87226,11 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+#ifdef __APPLE__
+#define DS41_PHASE(name) ds4_gpu_timeline_phase(name)
+#else
+#define DS41_PHASE(name) ((void)0)
+#endif
 static bool ds41_draft_adapt_off(void) {
     static int cache = -1;
     if (cache < 0) {
@@ -87286,9 +87291,11 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     }
     if (proposed) {
         const double tp = now_sec();
+        DS41_PHASE("propose");
         ds4_gpu_dsv41_mma_rows(1);
         const bool drafted = ds41_draft_propose(g, &e->model, &e->weights, first_token, drafts, conf);
         ds4_gpu_dsv41_mma_rows(0);
+        DS41_PHASE("-");
         if (!drafted) {
             payload_set_err(err, errlen, "DeepSeek V4.1 draft failed");
             return -1;
@@ -87320,7 +87327,10 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         fprintf(stderr, "\n");
     }
     if (k == 0) {
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        DS41_PHASE("serial");
+        const int serial_rc = ds4_session_eval(s, first_token, err, errlen);
+        DS41_PHASE("-");
+        if (serial_rc != 0) return -1;
         accepted[0] = first_token;
         ds41_draft_adapt(d, proposed, 0, 1, now_sec() - t0, propose_s);
         if (stats) {
@@ -87341,7 +87351,9 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     float *rows = xmalloc((size_t)(k + 1u) * vocab * sizeof(float));
     const ds4_engram_history history = g->history;
     const double tv = stats ? now_sec() : 0.0;
+    DS41_PHASE(k == 1 ? "verify2" : k == 2 ? "verify3" : k == 3 ? "verify4" : k == 4 ? "verify5" : "verify6");
     bool ok = ds41_draft_verify(g, &e->model, &e->weights, toks, k + 1u, rows);
+    DS41_PHASE("-");
     if (stats) s->dspark_stats.verify_ms += (now_sec() - tv) * 1000.0;
     if (!ok) {
         free(rows);
@@ -87384,7 +87396,9 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         payload_set_err(err, errlen, "tp: verify commit send failed");
         return -1;
     }
+    DS41_PHASE("rollback");
     ok = ds41_draft_rollback(g, toks, k + 1u, j + 1u, history);
+    DS41_PHASE("-");
     s->checkpoint_valid = ok;
     if (!ok) {
         payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");

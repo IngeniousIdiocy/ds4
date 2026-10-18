@@ -77,6 +77,10 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
         uint32_t                slot_cap);
 
 int ds4_gpu_begin_commands(void);
+#ifdef __APPLE__
+/* DS4_METAL_ENCODER_TIMELINE: label later command buffers (static string). */
+void ds4_gpu_timeline_phase(const char *phase);
+#endif
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);

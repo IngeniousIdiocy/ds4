@@ -82,6 +82,7 @@ typedef struct {
     uint32_t count;
     uint32_t cap;
     uint64_t seq;
+    const char *phase;
 }
 @end
 @implementation DS4TimelineBatch
@@ -93,6 +94,12 @@ static FILE *g_timeline_file;
 static pthread_mutex_t g_timeline_mutex = PTHREAD_MUTEX_INITIALIZER;
 static DS4TimelineBatch *g_timeline_batch;
 static uint64_t g_timeline_seq;
+static const char *g_timeline_phase = "-";
+
+/* Label the command buffers created from now on (a static string). */
+void ds4_gpu_timeline_phase(const char *phase) {
+    g_timeline_phase = phase ? phase : "-";
+}
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
 static BOOL g_timeline_encoder_hooked;
@@ -252,8 +259,8 @@ static void ds4_gpu_timeline_hook_encoder(id<MTLComputeCommandEncoder> enc) {
 static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> cb) {
     if (!b || !g_timeline_file) return;
     pthread_mutex_lock(&g_timeline_mutex);
-    fprintf(g_timeline_file, "B %llu %u %.0f %.0f\n", (unsigned long long)b->seq, b->count,
-            cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9);
+    fprintf(g_timeline_file, "B %llu %u %.0f %.0f %s\n", (unsigned long long)b->seq, b->count,
+            cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9, b->phase ? b->phase : "-");
     uint64_t prev_end = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         const uint32_t sb_index = i / (DS4_TIMELINE_SAMPLES_PER_BUFFER / 2);
@@ -291,6 +298,7 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
     b->recs = calloc(b->cap, sizeof(ds4_timeline_rec));
     b->count = 0;
     b->seq = ++g_timeline_seq;
+    b->phase = g_timeline_phase;
     g_timeline_batch = b;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         ds4_gpu_timeline_resolve(b, done);
