@@ -746,6 +746,12 @@ int main(int argc, char **argv) {
     }
     free(text);
 
+    /* DS4_BENCH_CLAMP_TO_PROMPT: a frontier past the prompt becomes the
+     * prompt end, so one command line serves prompts of different lengths. */
+    if (getenv("DS4_BENCH_CLAMP_TO_PROMPT") && !cfg.teacher_forced_decode && prompt.len < cfg.ctx_max) {
+        cfg.ctx_max = prompt.len;
+        if (cfg.ctx_start > cfg.ctx_max) cfg.ctx_start = cfg.ctx_max;
+    }
     const int prompt_tokens_needed = cfg.ctx_max +
         (cfg.teacher_forced_decode ? cfg.gen_tokens : 0);
     if (prompt.len < prompt_tokens_needed) {
