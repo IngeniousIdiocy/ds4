@@ -732,7 +732,15 @@ int main(int argc, char **argv) {
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
-        ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
+        /* DS4_BENCH_CHAT_THINK=high|max ends the chat prompt in the thinking
+         * prefix, so a frontier at the prompt end decodes a reasoning turn. */
+        const char *think_env = getenv("DS4_BENCH_CHAT_THINK");
+        ds4_think_mode think = DS4_THINK_NONE;
+        if (think_env && !strcmp(think_env, "high")) think = DS4_THINK_HIGH;
+        else if (think_env && !strcmp(think_env, "max")) think = DS4_THINK_MAX;
+        ds4_encode_chat_prompt(engine, cfg.system, text, think, &prompt);
+        if (getenv("DS4_BENCH_CHAT_THINK"))
+            fprintf(stderr, "ds4-bench: chat prompt has %d tokens\n", prompt.len);
     } else {
         ds4_tokenize_text(engine, text, &prompt);
     }
@@ -993,6 +1001,10 @@ int main(int argc, char **argv) {
                 }
             }
             fprintf(stderr, "\"\n");
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] token ids:", frontier);
+            for (int i = 0; i < gen_token_count; i++)
+                fprintf(stderr, " %d", gen_token_buf[i]);
+            fprintf(stderr, "\n");
             fflush(stderr);
         }
         free(gen_token_buf);
