@@ -21,6 +21,10 @@ typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
                                         uint64_t seq, const void *out,
                                         void *in, uint64_t bytes);
 
+/* CUDA: optional pinned slab shared by an integrated GPU and the transport.
+ * NULL requests the ordinary device tensor plus host staging fallback. */
+ds4_gpu_tensor *ds4_gpu_tp_slab_alloc(uint64_t bytes);
+
 int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);

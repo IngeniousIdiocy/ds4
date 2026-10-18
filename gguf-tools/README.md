@@ -272,7 +272,7 @@ The manifest reads only `model.safetensors.index.json`; it does not require the
 large shard files to be present.  The final summary should report three DSpark
 stages and zero unknown DSpark tensors before attempting a full conversion.
 
-To build the support GGUF used by `ds4 --mtp`, run the DSpark support mode.  This
+To build the support GGUF used by `ds4 --dspark`, run the DSpark support mode.  This
 mode writes standalone DSpark metadata plus the packed `mtp.*` tensor payloads;
 it does not require a base-model GGUF template:
 
@@ -282,6 +282,12 @@ gguf-tools/deepseek4-quantize \
   --dspark-support \
   --out DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
+
+Add `--experts mxfp4` to preserve the checkpoint's routed expert weights
+without requantization. Use a different output filename, such as
+`DeepSeek-V4-Flash-DSpark-MXFP4-support-0731.gguf`. This takes about 10.1 GiB
+instead of 5.6 GiB; the other tensors keep the same formats. A more accurate
+drafter can improve acceptance, but does not guarantee faster generation.
 
 `--dspark-support --dry-run` reads safetensors shard headers to derive exact
 GGUF shapes and types, but it does not read tensor payloads.  The DSpark metadata

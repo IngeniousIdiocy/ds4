@@ -8683,6 +8683,20 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     const bool mma_active =
         !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
 
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        /* Unowned expert under the TP split: zero this tile's mid rows, as
+         * kernel_mul_mm_id does, so the down projection sees the same input. */
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            device half *D = (device half *)(dst_mid +
+                ((uint64_t)(idj / args.ne20)*args.ne1 + (uint64_t)(idj % args.ne20))*act.mid_row_stride) + r0;
+            for (int i = tiisg; i < nr0; i += 32) {
+                D[i] = (half)0.0f;
+            }
+        }
+        return;
+    }
+
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
 
@@ -8695,7 +8709,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    const uint64_t offset0 = (uint64_t)(im - args.tp_expert_base)*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
     device const block_q * xg =
@@ -8893,6 +8907,19 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
     const bool mma_active = 16*(short)sgitg < nr1;
 
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        /* Unowned expert under the TP split: zero this tile's mid rows. */
+        for (short j = sgitg; j < nr1; j += 2) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            device half *D = (device half *)(dst_mid +
+                ((uint64_t)(idj / args.ne20)*args.ne1 + (uint64_t)(idj % args.ne20))*act.mid_row_stride) + r0;
+            for (int i = tiisg; i < nr0; i += 32) {
+                D[i] = (half)0.0f;
+            }
+        }
+        return;
+    }
+
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short row_b0 = (short)tiitg/NL1;
     const short row_b1 = row_b0 + 16;
@@ -8911,7 +8938,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     const short i12_b1 = (id_b1 / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    const uint64_t offset0 = (uint64_t)(im - args.tp_expert_base)*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
     device const block_q * xg =

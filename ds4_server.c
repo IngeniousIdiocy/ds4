@@ -12587,8 +12587,16 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
  * it, retaining image conditioning as well. */
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
+                                     bool resample, int last_token,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
+    /* A mode change only needs logits at the retained boundary. Replaying the
+     * previous token can cross before the verifier snapshot in exact mode. */
+    if (resample && ds4_session_rewind_speculative(slot->session, pos)) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return 0;
+    }
+    if (resample) pos--;
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
@@ -12597,6 +12605,8 @@ static int server_generation_rewind(server *s, server_slot *slot,
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
+    if (rc == 0 && resample)
+        rc = server_eval_token(s, slot, last_token, err, errlen);
     return rc;
 }
 
@@ -14243,16 +14253,17 @@ decode_again:
             }
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
-            /* Logits after a rewind belong to the discarded suffix. Re-eval
-             * the last kept token before sampling under a different mode. */
-            int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
-                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+            int pos = block_start + kept;
+            const double rewind_t0 = now_sec();
+            trace_event(s, trace_id, "speculative boundary rewind: from=%d to=%d",
+                        ds4_session_pos(slot->session), pos);
+            if (server_generation_rewind(s, slot, &j->req, pos,
+                    resample, kept ? toks[kept - 1] : 0, err, sizeof(err)) != 0) {
                 finish = "error";
                 stop_decode = true;
             } else {
-                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
-                            kept, ntok - kept, resample);
+                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d rewind_ms=%.3f",
+                            kept, ntok - kept, resample, (now_sec() - rewind_t0) * 1000.0);
             }
         }
         if (stop_decode) break;
