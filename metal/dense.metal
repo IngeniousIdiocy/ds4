@@ -2430,13 +2430,14 @@ typedef decltype(kernel_mul_mv_t_t_4_rows<half, half4, half, half4>) mul_mv_t_t_
 
 template [[host_name("kernel_mul_mv_f16_f32_4_rows")]] kernel mul_mv_t_t_4_rows kernel_mul_mv_t_t_4_rows<half,  half4,  float, float4>;
 
-// A few activation rows against one F32 matrix with one weight load: each
-// thread keeps the single-row kernel's lane, K walk and per-row accumulator
-// expression for every activation row (the repeated weight loads fold into
-// one), and each row reduces through the same simd_sum / threadgroup tree, so
-// row r's output matches a one-row dispatch over row r.  R = args.ne11 rows.
-template<short NR0, short R>
-void kernel_mul_mv_f32_f32_4_xrows_impl(
+// A few activation rows against one F32 or F16 matrix with one weight load:
+// each thread keeps the single-row kernel's lane, K walk and per-row
+// accumulator expression for every activation row (the repeated weight loads
+// fold into one), and each row reduces through the same simd_sum /
+// threadgroup tree, so row r's output matches a one-row dispatch over row r.
+// R = args.ne11 rows (2..8).
+template<typename T0, typename T04, short NR0, short R, bool ROUND>
+void kernel_mul_mv_t_t_4_xrows_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -2455,12 +2456,12 @@ void kernel_mul_mv_f32_f32_4_xrows_impl(
     const int nb = args.ne00/NB;
     const int r0 = tgpig.x*NR0;
 
-    device const float  * ax [NR0];
-    device const float4 * ax4[NR0];
+    device const T0  * ax [NR0];
+    device const T04 * ax4[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         const uint64_t offset0 = (uint64_t)(r0 + row)*args.nb01;
-        ax [row] = (device const float  *) (src0 + offset0);
-        ax4[row] = (device const float4 *) (src0 + offset0);
+        ax [row] = (device const T0  *) (src0 + offset0);
+        ax4[row] = (device const T04 *) (src0 + offset0);
     }
 
     float sumf[R][NR0];
@@ -2484,7 +2485,7 @@ void kernel_mul_mv_f32_f32_4_xrows_impl(
             }
 
             for (short row = 0; row < NR0; row++) {
-                device const float4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+                device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
 
                 float sumq = 0.f;
                 FOR_UNROLL (short i = 0; i < NF4; ++i) {
@@ -2525,28 +2526,29 @@ void kernel_mul_mv_f32_f32_4_xrows_impl(
         device float * dst_f32 = (device float *) dst + (uint64_t)r*args.ne0;
         for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
             float tot = simd_sum(sh[NW*(r*NR0 + row) + tiisg]);
-            if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = tot;
+            if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = ROUND ? ds4_bf16_round(tot) : tot;
         }
     }
 }
 
-template<short NR0>
-void kernel_mul_mv_f32_f32_4_xrows_disp(
+template<typename T0, typename T04, short NR0, bool ROUND>
+void kernel_mul_mv_t_t_4_xrows_disp(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0, device const char * src1, device char * dst,
         threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
     switch (args.ne11) {
-        case 2: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 2>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 3: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 3>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 5: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 5>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 6: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 6>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 7: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 7>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 8: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 8>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 2, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 3: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 3, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 4, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 5: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 5, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 6: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 6, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 7: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 7, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 8: kernel_mul_mv_t_t_4_xrows_impl<T0, T04, NR0, 8, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 
-kernel void kernel_mul_mv_f32_f32_4_xrows(
+template<typename T0, typename T04, bool ROUND>
+kernel void kernel_mul_mv_t_t_4_xrows(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -2556,11 +2558,17 @@ kernel void kernel_mul_mv_f32_f32_4_xrows(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     switch (args.nr0) {
-        case 1: kernel_mul_mv_f32_f32_4_xrows_disp<1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 2: kernel_mul_mv_f32_f32_4_xrows_disp<2>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_f32_f32_4_xrows_disp<4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_4_xrows_disp<T0, T04, 1, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_xrows_disp<T0, T04, 2, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_xrows_disp<T0, T04, 4, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
+
+typedef decltype(kernel_mul_mv_t_t_4_xrows<half, half4, false>) mul_mv_t_t_4_xrows;
+
+template [[host_name("kernel_mul_mv_f32_f32_4_xrows")]]      kernel mul_mv_t_t_4_xrows kernel_mul_mv_t_t_4_xrows<float, float4, false>;
+template [[host_name("kernel_mul_mv_f16_f32_4_xrows")]]      kernel mul_mv_t_t_4_xrows kernel_mul_mv_t_t_4_xrows<half,  half4,  false>;
+template [[host_name("kernel_mul_mv_f16_f32_4_xrows_bf16")]] kernel mul_mv_t_t_4_xrows kernel_mul_mv_t_t_4_xrows<half,  half4,  true>;
 
 template<typename T0, typename T04, typename T1, typename T14>
 kernel void kernel_mul_mv_t_t_4_rows_bf16(
