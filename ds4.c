@@ -87372,15 +87372,23 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         payload_set_err(err, errlen, "tp: verify send failed");
         return -1;
     }
-    float *rows = xmalloc((size_t)(k + 1u) * vocab * sizeof(float));
+    /* The verify rows stay in their shared buffer on Metal: the CPU reads the
+     * finished pass in place instead of copying 3 MB into a fresh allocation. */
+#ifdef __APPLE__
+    const float *rows_shared = ds4_gpu_tensor_contents(d->rows_logits);
+#else
+    const float *rows_shared = NULL;
+#endif
+    float *rows_copy = rows_shared ? NULL : xmalloc((size_t)(k + 1u) * vocab * sizeof(float));
+    const float *rows = rows_shared ? rows_shared : rows_copy;
     const ds4_engram_history history = g->history;
     const double tv = stats ? now_sec() : 0.0;
     DS41_PHASE(k == 1 ? "verify2" : k == 2 ? "verify3" : k == 3 ? "verify4" : k == 4 ? "verify5" : "verify6");
-    bool ok = ds41_draft_verify(g, &e->model, &e->weights, toks, k + 1u, rows);
+    bool ok = ds41_draft_verify(g, &e->model, &e->weights, toks, k + 1u, rows_copy);
     DS41_PHASE("-");
     if (stats) s->dspark_stats.verify_ms += (now_sec() - tv) * 1000.0;
     if (!ok) {
-        free(rows);
+        free(rows_copy);
         s->checkpoint_valid = false;
         if (tp_leader) (void)ds4_tp_send_verify_commit(e->tp.ctx, DS4_TP_VERIFY_ROLLBACK_REPLAY, 0);
         payload_set_err(err, errlen, "DeepSeek V4.1 verify failed");
@@ -87408,7 +87416,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     }
     memcpy(d->block_logits, s->logits, (size_t)vocab * sizeof(float));
     memcpy(s->logits, rows + (size_t)j * vocab, (size_t)vocab * sizeof(float));
-    free(rows);
+    free(rows_copy);
     for (uint32_t i = 0; i <= j; i++) {
         token_vec_push(&s->checkpoint, toks[i]);
         accepted[i] = toks[i];
