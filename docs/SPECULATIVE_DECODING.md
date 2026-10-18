@@ -100,6 +100,12 @@ Use `--mtp-exact-sampling` to preserve the ordinary target sampling
 distribution. Exact mode accepts greedy proposals with their target
 probability and samples from the remaining distribution on rejection.
 
+DeepSeek V4.1 instead samples with noise keyed to the seed and position, and
+keeps a DSpark draft only while it equals the token that sampling picks at
+its position. Sampled output therefore follows the target distribution, and
+the same seed gives the same text with or without drafting. Two-Mac runs keep
+the opportunistic mode; `DS4_V41_KEYED_SAMPLING=0` restores it on one Mac.
+
 When a verified block crosses a tool sampling-mode boundary (for example
 entering tool-call syntax during server decoding), the server rewinds to the
 block start and re-evaluates the boundary token so the next sample uses the
@@ -111,8 +117,10 @@ Accepted tokens keep the state produced by the batched verifier. Floating-point
 reduction order can differ from one-token decode, so long greedy continuations
 need not be byte-identical. For DeepSeek comparisons against the ordinary
 target-only path, use `--quality` or `--dspark-strict`; these disable the
-speculative acceptance path. They do not promise identical output across
-different hardware or execution configurations.
+speculative acceptance path. On one Mac, V4.1 `--dspark-strict` keeps drafting
+and verifies each block on the one-token decode arithmetic instead, so its
+output is byte-identical to target-only decode. They do not promise identical
+output across different hardware or execution configurations.
 
 Session-batched serving uses ordinary target decoding instead of combining
 DSpark/MTP with the session batch. See [serving](SERVER.md#multiple-sessions).

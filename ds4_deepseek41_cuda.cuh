@@ -553,6 +553,7 @@ extern "C" int ds4_gpu_dsv41_hc_block_input_rows(ds4_gpu_tensor *, ds4_gpu_tenso
                                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float,
                                                  uint32_t, uint32_t) { return 0; }
 extern "C" void ds4_gpu_dsv41_verify_rows(int) {}
+extern "C" void ds4_gpu_dsv41_mma_rows(int) {}
 extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t,
                                         uint32_t, uint32_t, float) { return 0; }
 extern "C" int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *,
@@ -568,14 +569,6 @@ extern "C" int ds4_gpu_dsv41_hc_input(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gp
 extern "C" int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                                  uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     return ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k);
-}
-
-extern "C" int ds4_gpu_dsv41_matmul_q8_0_rows_tensor(ds4_gpu_tensor *out, const void *model_map,
-                                                     uint64_t model_size, uint64_t weight_offset,
-                                                     uint64_t in_dim, uint64_t out_dim,
-                                                     const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, model_map, model_size, weight_offset,
-                                                         in_dim, out_dim, x, n_rows);
 }
 
 extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,

@@ -140,6 +140,14 @@ int ds4_gpu_dsv41_indexer_score_one_tensor(ds4_gpu_tensor *scores,
                                            uint32_t n_rows, uint32_t n_head,
                                            uint32_t head_dim, float scale,
                                            bool cache_f16);
+/* The top-k of a row filtered by a block mask of more than 2048 blocks, from
+ * the scores of its 2048 candidate blocks only: the same ids in the same order
+ * (Metal only). Returns 0, leaving the full row to the caller, where unavailable. */
+int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores,
+                                           ds4_gpu_tensor *list, const ds4_gpu_tensor *q,
+                                           const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+                                           const ds4_gpu_tensor *block_mask, uint32_t n_comp,
+                                           float scale, uint32_t top_k);
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */
@@ -167,12 +175,6 @@ int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected,
                                       const ds4_gpu_tensor *scores,
                                       uint32_t n_comp, uint32_t n_tokens,
                                       uint32_t top_k);
-/* Exact Q8 rows, plus the matrix rows kernel from three rows (Metal); other
- * models keep each row's single-row result. */
-int ds4_gpu_dsv41_matmul_q8_0_rows_tensor(ds4_gpu_tensor *out, const void *model_map,
-                                          uint64_t model_size, uint64_t weight_offset,
-                                          uint64_t in_dim, uint64_t out_dim,
-                                          const ds4_gpu_tensor *x, uint32_t n_rows);
 /* Rows with at most 512 visible keys select all of them, in key order. */
 int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
                                    uint32_t start, uint32_t ratio);
@@ -190,6 +192,7 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const ds4_gpu_tensor *in);
 /* A DSpark verify pass runs; its rows take decode's attention path. */
 void ds4_gpu_dsv41_verify_rows(int on);
+void ds4_gpu_dsv41_mma_rows(int on);
 /* The HC mixer projection of one row with its norm fused (0: not fused). */
 int ds4_gpu_dsv41_hc_project(ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual,
                              const void *model_map, uint64_t model_size, uint64_t fn_offset,
@@ -240,6 +243,16 @@ int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
                                    uint32_t raw_start, const ds4_gpu_tensor *comp_cache,
                                    const ds4_gpu_tensor *ids, ds4_gpu_tensor *selected,
                                    uint32_t n_comp, uint32_t attended, uint32_t n_head, uint32_t head_dim);
+/* The same attention for consecutive rows in one pass, each row's window read
+ * from a linear raw copy; _ok says whether rows of that shape are taken. */
+int ds4_gpu_dsv41_attention_decode_rows_ok(uint32_t n_raw, uint32_t attended,
+                                           uint32_t n_head, uint32_t head_dim);
+int ds4_gpu_dsv41_attention_decode_rows(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+                                        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+                                        const ds4_gpu_tensor *raw, uint32_t n_raw,
+                                        const ds4_gpu_tensor *comp_cache, const ds4_gpu_tensor *ids,
+                                        uint32_t ids_stride, uint32_t n_comp, uint32_t attended,
+                                        uint32_t rows, uint32_t n_head, uint32_t head_dim);
 /* The Q8_0 q projection of one row with the layer's rope on its outputs. */
 /* Metal scalar scheduling: collapse now, mix beside the independent query. */
 int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,

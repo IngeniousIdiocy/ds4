@@ -287,6 +287,41 @@ kernel void kernel_dsv41_flash_kv_stage(
     dsv4_flash_kv_stage_body<true>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, ids);
 }
 
+struct ds4_metal_args_flash_kv_stage_rows {
+    uint n_raw;
+    uint n_comp;
+    uint raw_first;
+    uint ids_stride;
+};
+
+// kernel_dsv41_flash_kv_stage for a block of consecutive rows, row y in grid
+// row y: its window starts one raw row after row y - 1's (raw_src is linear),
+// its selection is ids row y, and its keys land in their own scratch rows.
+kernel void kernel_dsv41_flash_kv_stage_rows(
+        constant ds4_metal_args_flash_kv_stage_rows & args,
+        device const char * raw_src,
+        device const char * comp_src,
+        device       char * dst,
+        device const int  * ids,
+        uint2 gid [[thread_position_in_grid]]) {
+    constexpr uint row_vecs = 128;
+    const uint n_keys = args.n_raw + args.n_comp;
+    if (gid.x >= n_keys * row_vecs) return;
+    device packed_half4 *dst_half = (device packed_half4 *)dst + (ulong)gid.y * n_keys * row_vecs;
+    const uint raw_vecs = args.n_raw * row_vecs;
+    if (gid.x < raw_vecs) {
+        device const packed_float4 *raw = (device const packed_float4 *)raw_src;
+        const float4 value = float4(raw[(args.raw_first + gid.y + (gid.x >> 7)) * row_vecs + (gid.x & 127u)]);
+        dst_half[gid.x] = packed_half4(half4(value));
+        return;
+    }
+    const uint comp_gid = gid.x - raw_vecs;
+    device const packed_float4 *comp = (device const packed_float4 *)comp_src;
+    const int id = ids[gid.y * args.ids_stride + (comp_gid >> 7)];
+    const float4 value = float4(comp[(uint)id * row_vecs + (comp_gid & 127u)]);
+    dst_half[gid.x] = packed_half4(half4(value));
+}
+
 // Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
 // Replaces the per-segment copies the compressor store used to encode (one
 // dispatch per prefill layer instead of n_tokens/ratio single-threadgroup
