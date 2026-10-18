@@ -40963,20 +40963,28 @@ typedef struct {
     ds4_gpu_tensor *saved;           /* [40][block + 1][512] window slots a verify pass overwrites */
     ds4_gpu_tensor *pool_kv, *pool_score;  /* [4][block + 1][512] a verify pass's pooling inputs */
     ds4_gpu_tensor *rows_logits, *rows_x, *rows_tmp;  /* [block + 1][vocab], [window][dim] x2 */
+    ds4_gpu_tensor *ring_saved;      /* [n_stage][block + 1][512] ring rows a verify block's commit overwrites */
+    ds4_gpu_tensor *previous_saved;  /* [2][3][512] the ratio-2 pooling inputs before it */
+    float *block_logits;             /* [vocab] the logits its first row was sampled from */
+    uint32_t block_pos0, block_rows, block_kept;   /* the last verified block, its committed rows */
+    uint64_t block_passes;           /* the graph pass that block ended on */
+    ds4_engram_history block_history;
 } ds41_draft;
 
 static void ds41_draft_free(ds41_draft *d) {
     if (!d) return;
     ds4_gpu_tensor *tensors[] = {d->mh, d->pending, d->ring, d->raw, d->conf_proj, d->tokens, d->conf,
         d->parts, d->logits, d->x, d->xn, d->saved, d->pool_kv, d->pool_score, d->rows_logits, d->rows_x,
-        d->rows_tmp};
+        d->rows_tmp, d->ring_saved, d->previous_saved};
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(d->block_logits);
     free(d);
 }
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
+    uint64_t passes;                 /* passes that changed the state, for a block rewind */
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     bool tp_gate_fused, shared_done;
@@ -41104,6 +41112,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
+    g->passes++;
     g->valid = true;
     if (g->draft) g->draft->mh_rows = 0;
     ds4_engram_history_reset(&g->history);
@@ -42862,6 +42871,34 @@ static bool ds41_draft_slots(ds41_gpu_graph *g, uint32_t pos, uint32_t first, ui
     return true;
 }
 
+/* A block also replaces the drafter ring rows of its positions (at commit) and,
+ * from its first row on, the ratio-2 pooling inputs: kept for a rewind into it. */
+static bool ds41_draft_block(ds41_gpu_graph *g, uint32_t pos, uint32_t first, uint32_t rows, bool store) {
+    ds41_draft *d = g->draft;
+    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t st = 0; st < d->n_stage; st++) {
+        const uint64_t base = (uint64_t)st * DS41_DRAFT_WINDOW * row,
+            keep = (uint64_t)st * (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * row;
+        for (uint32_t r = first; r < rows;) {
+            const uint32_t slot = (pos + r) % DS41_DRAFT_WINDOW;
+            uint32_t run = DS41_DRAFT_WINDOW - slot;
+            if (run > rows - r) run = rows - r;
+            const bool ok = store ?
+                ds4_gpu_tensor_copy(d->ring_saved, keep + r * row, d->ring, base + slot * row, run * row) :
+                ds4_gpu_tensor_copy(d->ring, base + slot * row, d->ring_saved, keep + r * row, run * row);
+            if (!ok) return false;
+            r += run;
+        }
+    }
+    for (uint32_t i = 0; first == 0 && i < 6u; i++) {   /* kv, then score, of owners 0..2 */
+        ds4_gpu_tensor *t = i < 3u ? g->previous_kv[i] : g->previous_score[i - 3u];
+        const bool ok = store ? ds4_gpu_tensor_copy(d->previous_saved, i * row, t, 0, row) :
+                                ds4_gpu_tensor_copy(t, 0, d->previous_saved, i * row, row);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 static bool ds41_draft_init(ds41_gpu_graph *g, const ds4_dspark_weights *dw, const ds4_model *dm) {
     if (g->streaming || !dw->n_stages || dw->block_size == 0 ||
         dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE || !dw->target_layer_count ||
@@ -42897,6 +42934,9 @@ static bool ds41_draft_init(ds41_gpu_graph *g, const ds4_dspark_weights *dw, con
         !(d->rows_logits = ds4_gpu_tensor_alloc_managed((B + 1u) * DS4_N_VOCAB * sizeof(float))) ||
         !(d->rows_x = ds4_gpu_tensor_alloc(win * dim * sizeof(float))) ||
         !(d->rows_tmp = ds4_gpu_tensor_alloc(win * dim * sizeof(float))) ||
+        !(d->ring_saved = ds4_gpu_tensor_alloc(d->n_stage * (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) * hd * sizeof(float))) ||
+        !(d->previous_saved = ds4_gpu_tensor_alloc(2u * 3u * hd * sizeof(float))) ||
+        !(d->block_logits = malloc(DS4_N_VOCAB * sizeof(float))) ||
         !ds4_gpu_tensor_write(d->conf_proj, 0, (const char *)dm->map + proj->abs_offset, proj_bytes)) {
         ds41_draft_free(d);
         return false;
@@ -42920,6 +42960,7 @@ static uint32_t ds41_decode_flush_layers(void) {
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    g->passes++;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -43380,6 +43421,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
+    g->passes++;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
@@ -43763,6 +43805,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
+    for (int i = 0; i < count; i++) graphs[i]->passes++;
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows;
     const bool shared_owner = g->tp_world == 2 &&
@@ -43971,7 +44014,8 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     if (tp_block && !ds4_tp_batch_block_begin(g_tp_block_ctx, n, 2u * DS4_N_LAYER)) return false;
     g->tp_verify_block = tp_block;
 #endif
-    bool ok = ds4_gpu_begin_commands() && ds41_draft_slots(g, g->pos, 1, n, true) &&
+    bool ok = ds4_gpu_begin_commands() && ds41_draft_slots(g, g->pos, 0, n, true) &&
+        ds41_draft_block(g, g->pos, 0, n, true) &&
         ds41_graph_step_batch(graphs, tokens, (int)n, n, m, w);
     if (ok) {
         /* every row's logits, from the batch's last-layer stream */
@@ -64448,6 +64492,7 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
+    g->passes++;
     const uint32_t pos = h[7];
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
@@ -87076,6 +87121,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     } else {
         while (j < k && sample_argmax(rows + (size_t)j * vocab, vocab) == drafts[j]) j++;
     }
+    memcpy(d->block_logits, s->logits, (size_t)vocab * sizeof(float));
     memcpy(s->logits, rows + (size_t)j * vocab, (size_t)vocab * sizeof(float));
     free(rows);
     for (uint32_t i = 0; i <= j; i++) {
@@ -87095,6 +87141,8 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");
         return -1;
     }
+    d->block_pos0 = P1; d->block_rows = k + 1u; d->block_kept = j + 1u;
+    d->block_passes = g->passes; d->block_history = history;
     if (replacement >= 0) {
         if (ds4_session_eval(s, replacement, err, errlen) != 0) return -1;
         accepted[j + 1u] = replacement;
@@ -87113,6 +87161,40 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     const uint32_t kept = 1u + j + (replacement >= 0);
     ds41_draft_adapt(d, true, k, kept, now_sec() - t0, propose_s);
     return (int)kept;
+}
+
+/* A rewind inside the last verified block undoes its tail as a shorter accept
+ * would have: window slots, ring rows and pooling inputs from what the verify
+ * kept, logits from its rows.  Any later pass forbids it. */
+static bool ds41_session_rewind_block(ds4_session *s, uint32_t pos) {
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_draft *d = g->draft;
+    if (!d || g->tp_world == 2 || !d->block_kept || d->block_passes != g->passes ||
+        g->pos != d->block_pos0 + d->block_kept || pos < d->block_pos0 || pos >= g->pos) return false;
+    const uint32_t a = pos - d->block_pos0, vocab = DS4_N_VOCAB;
+    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() &&
+        ds41_draft_slots(g, d->block_pos0, a, d->block_rows, false) &&
+        ds41_draft_block(g, d->block_pos0, a, d->block_kept, false);
+    for (uint32_t il = 0; ok && a && il < 20u && ((pos - 1u) & 1u) == 0; il++) {
+        if (!ds41_kv_source(il) || ds4_layer_compress_ratio(il) != 2u) continue;
+        const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : 2u;
+        const uint64_t keep = ((uint64_t)owner * (DS4_DSPARK_MAX_BLOCK_SIZE + 1u) + a - 1u) * row;
+        ok = ds4_gpu_tensor_copy(g->previous_kv[owner], 0, d->pool_kv, keep, row) &&
+            ds4_gpu_tensor_copy(g->previous_score[owner], 0, d->pool_score, keep, row);
+    }
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    g->pos = d->block_pos0;   /* the text mask of the rehashed tokens */
+    g->history = d->block_history;
+    if (ok && a) ok = ds41_hash_tokens(g, &g->history, s->checkpoint.v + d->block_pos0, a, &g->prefill_ids[0][0][0]);
+    g->pos = pos;
+    if (ok && a) ok = ds4_gpu_tensor_read(d->rows_logits, (uint64_t)(a - 1u) * vocab * sizeof(float),
+                                          s->logits, (uint64_t)vocab * sizeof(float)) != 0;
+    else if (ok) memcpy(s->logits, d->block_logits, (size_t)vocab * sizeof(float));
+    d->mh_rows = a;
+    d->block_kept = a;
+    if (!ok) g->valid = false;
+    return ok;
 }
 #endif
 
@@ -88314,9 +88396,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    /* the V4.1 graph keeps no frontier to roll back; a rewind to where it stands is free */
+    /* the V4.1 graph keeps no frontier to roll back but its last verified block;
+     * a rewind to where it stands is free */
     if (s->checkpoint_valid && ds4_session_is_ds41(s))
-        state_ok = s->ds41_graph.valid && s->ds41_graph.pos == (uint32_t)pos;
+        state_ok = s->ds41_graph.valid && (s->ds41_graph.pos == (uint32_t)pos ||
+                                          ds41_session_rewind_block(s, (uint32_t)pos));
 #endif
 #endif
     s->checkpoint.len = pos;
