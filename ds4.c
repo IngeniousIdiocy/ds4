@@ -43237,12 +43237,17 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* Wider encoder tiles amortize weight reads near the next power of two.
      * Keep two tiles so decoder suffix pruning retains its own partitions.
-     * Under TP each tile also crosses fewer partial-sum gates. */
+     * Under TP each tile also crosses fewer partial-sum gates. A narrow last
+     * tile under 256 rows runs other router and expert kernels, so it keeps
+     * its own tile. */
     if (!g->quality && !g->draft &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         !getenv("DS4_METAL_DISABLE_V41_WIDER_SHORT_CHUNKS")) {
-        if (count >= 6144u && count < 8192u && g->prefill_cap >= 4096u) return 4096u;
-        if (count >= 12288u && count < 16384u && g->prefill_cap >= 8192u) return 8192u;
+        const uint32_t tail2 = count % 2048u, tail4 = count % 4096u;
+        if (count >= 6144u && count < 8192u && g->prefill_cap >= 4096u &&
+            (!tail2 || tail2 >= 256u)) return 4096u;
+        if (count >= 12288u && count < 16384u && g->prefill_cap >= 8192u &&
+            (!tail4 || tail4 >= 256u)) return 8192u;
     }
 #endif
     if (count < 8192u && g->prefill_cap > 2048u) return 2048u;
