@@ -44014,7 +44014,9 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     d->mh_rows = n;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     const bool tp_block = g->tp_world == 2 && g_tp_block_ctx != NULL;
-    if (tp_block && !ds4_tp_batch_block_begin(g_tp_block_ctx, n, 2u * DS4_N_LAYER)) return false;
+    uint32_t gates = DS4_TP_GATES_PER_LAYER;
+    if (tp_block && (!ds4_tp_batch_block_begin_gates(g_tp_block_ctx, n, DS4_N_LAYER, &gates) ||
+                     gates != DS4_TP_GATES_PER_LAYER)) return false;
     g->tp_verify_block = tp_block;
 #endif
     bool ok = ds4_gpu_begin_commands() && ds41_draft_slots(g, g->pos, 0, n, true) &&
