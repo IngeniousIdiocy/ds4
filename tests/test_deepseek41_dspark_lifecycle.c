@@ -4,9 +4,9 @@
  *   DS4_TEST_MODEL=/path/to/V4.1.gguf DS4_TEST_DSPARK=/path/to/V4.1-DSpark.gguf \
  *       make test-deepseek41-dspark-lifecycle
  *
- * One DSpark engine with the row-attention verify decodes a greedy continuation
- * per prompt plainly and keeps the logits at every position.  Every case below
- * must reproduce those logits exactly:
+ * One --dspark-strict engine (verify rows on the decode arithmetic) decodes a
+ * greedy continuation per prompt plainly and keeps the logits at every
+ * position.  Every case below must reproduce those logits exactly:
  *   cycles:     DSpark cycles from the prompt;
  *   rewind:     each cycle rewound into the block it returned, as the server does
  *               at a sampling-mode boundary, then a plain step or the next cycle;
@@ -128,7 +128,6 @@ int main(void) {
         fprintf(stderr, "SKIP: DS4_TEST_MODEL or DS4_TEST_DSPARK is not set\n");
         return 0;
     }
-    setenv("DS4_METAL_V41_VERIFY_ROW_ATTN", "1", 1);
     char err[256] = {0};
     ds4_tokens prompt[N_PROMPTS] = {{0}};
     int (*ref)[N_REF] = calloc(N_PROMPTS, sizeof(*ref));
@@ -140,6 +139,7 @@ int main(void) {
         .model_path = model,
         .mtp_path = support,
         .dspark = true,
+        .dspark_strict = true,
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
         .context_size = TEST_CTX,

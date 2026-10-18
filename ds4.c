@@ -40969,6 +40969,7 @@ typedef struct {
     uint32_t block_pos0, block_rows, block_kept;   /* the last verified block, its committed rows */
     uint64_t block_passes;           /* the graph pass that block ended on */
     ds4_engram_history block_history;
+    bool strict;                     /* --dspark-strict: verify rows on the decode arithmetic */
 } ds41_draft;
 
 static void ds41_draft_free(ds41_draft *d) {
@@ -41523,9 +41524,9 @@ static bool ds41_short_sweep_off(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &cache);
 }
 
-static bool ds41_verify_row_attention(void) {
+static bool ds41_verify_row_attention(const ds41_gpu_graph *g) {
     static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_V41_VERIFY_ROW_ATTN", &cache);
+    return (g->draft && g->draft->strict) || metal_graph_env_flag("DS4_METAL_V41_VERIFY_ROW_ATTN", &cache);
 }
 
 static bool ds41_verify_joint_attention_off(void) {
@@ -43880,7 +43881,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
          * keeps the batch's projections on both sides. */
 #ifdef __APPLE__
         const bool row_attention = prefill_only && g->draft && g->draft->verify_rows &&
-            g->tp_world != 2 && ds41_verify_row_attention();
+            g->tp_world != 2 && ds41_verify_row_attention(g);
         const bool batch_attention = prefill_only && !row_attention;
 #else
         const bool row_attention = false, batch_attention = false;
@@ -44006,7 +44007,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     d->verify_rows = n;
     ds4_gpu_dsv41_verify_rows(1);
     /* a row-attention verify keeps every row on the decode arithmetic */
-    ds4_gpu_dsv41_mma_rows(g->tp_world == 2 || !ds41_verify_row_attention());
+    ds4_gpu_dsv41_mma_rows(g->tp_world == 2 || !ds41_verify_row_attention(g));
     d->mh_pos0 = g->pos;
     d->mh_rows = n;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
@@ -46622,12 +46623,16 @@ static int sample_keyed(const float *logits, uint32_t n_vocab, const sample_key 
     return best >= 0 ? best : sample_argmax(logits, n_vocab);
 }
 
-/* DS4_V41_KEYED_SAMPLING: V4.1 samples with sample_keyed (not under TP), and
- * DSpark drafts are kept only when they equal the keyed sample, so sampled
- * output is the same with or without drafting. */
+/* V4.1 samples with sample_keyed (not under TP), and DSpark drafts are kept
+ * only when they equal the keyed sample, so sampled output follows the target
+ * distribution and is the same with or without drafting.
+ * DS4_V41_KEYED_SAMPLING=0 restores greedy-match acceptance. */
 static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, const uint64_t *rng) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_V41_KEYED_SAMPLING") != NULL;
+    if (cached < 0) {
+        const char *v = getenv("DS4_V41_KEYED_SAMPLING");
+        cached = !v || strcmp(v, "0") != 0;
+    }
     return cached != 0 && temperature > 0.0f && rng && !e->tp.active;
 }
 
@@ -75291,6 +75296,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (e->ds41_dspark &&
             !ds41_draft_init(&s->ds41_graph, &e->dspark_weights, &e->mtp_model))
             fprintf(stderr, "ds4: DSpark drafting unavailable for this V4.1 session\n");
+        if (s->ds41_graph.draft) s->ds41_graph.draft->strict = e->dspark_strict;
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
@@ -87027,7 +87033,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     uint32_t k = 0;
     double propose_s = 0.0;
     /* the block continues the position whose stream the last pass captured */
-    const bool draftable = !e->quality && !e->dspark_strict &&
+    const bool draftable = !e->quality && (!e->dspark_strict || g->tp_world != 2) &&
         P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 &&
         P1 - 1u < d->mh_pos0 + d->mh_rows && P1 + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
     const bool proposed = draftable && (!d->skip_left || ds41_draft_adapt_off());
