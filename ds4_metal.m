@@ -20017,7 +20017,7 @@ int ds4_gpu_matmul_q8_0_tensor(
 static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint32_t n_rows, int round_bf16, bool allow_mma);
+        const ds4_gpu_tensor *x, uint32_t n_rows, int round_bf16);
 
 /* The matvec rounds its output to bf16 in the kernel where the single-row Q8
  * path applies; any other path gets the separate rounding pass. */
@@ -20033,7 +20033,7 @@ int ds4_gpu_matmul_q8_0_bf16_tensor(
     int fused = 0;
     if (n_tok >= 2 && n_tok <= 8 &&
         ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset,
-                                             in_dim, out_dim, x, (uint32_t)n_tok, 1, true)) return 1;
+                                             in_dim, out_dim, x, (uint32_t)n_tok, 1)) return 1;
     if (!ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, false, 1, &fused)) return 0;
     return fused ? 1 : ds4_gpu_dsv41_quantize(out, (uint32_t)out_dim, (uint32_t)n_tok, DS4_V41_BF16);
 }
@@ -20051,7 +20051,7 @@ int ds4_gpu_matmul_q8_0_bf16io_tensor(
         uint64_t                n_tok) {
     if (n_tok >= 2 && n_tok <= 8 &&
         ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset,
-                                             in_dim, out_dim, x, (uint32_t)n_tok, 2, true)) return 1;
+                                             in_dim, out_dim, x, (uint32_t)n_tok, 2)) return 1;
     if (n_tok != 1) {
         if (!ds4_gpu_dsv41_quantize(x, (uint32_t)in_dim, (uint32_t)n_tok, DS4_V41_BF16)) return 0;
         return ds4_gpu_matmul_q8_0_bf16_tensor(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok);
@@ -20073,11 +20073,14 @@ int ds4_gpu_qwen4_matmul_q8_0_tensor(
         ds4_gpu_device_name_contains("M3 Ultra"), 0, NULL);
 }
 
-/* The matrix rows kernels round a few outputs differently from the row kernels. */
+/* The matrix rows kernels round a few outputs differently from the row
+ * kernels, so only DSpark's proposal and verify rows take them. */
+static int g_v41_mma_rows;
+void ds4_gpu_dsv41_mma_rows(int on) { g_v41_mma_rows = on; }
 static int ds4_gpu_v41_rows_mma_off(void) {
     static int off = -1;
     if (off < 0) off = getenv("DS4_METAL_DISABLE_V41_ROWS_MMA") != NULL;
-    return off;
+    return off || !g_v41_mma_rows;
 }
 
 /* Two to eight rows share one pass over the weights (the rows kernels);
@@ -20092,8 +20095,7 @@ static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows,
-        int                   round_bf16,
-        bool                  allow_mma) {
+        int                   round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
         n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
@@ -20145,11 +20147,11 @@ static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         if (rows_kernel) { dispatch.nr0 = 4; args.nr0 = 4; }
         const char *rows_name = round_bf16 == 2 ? "kernel_mul_mv_q8_0_f32_bf16io_rows_seq4" :
             round_bf16 == 1 ? "kernel_mul_mv_q8_0_f32_bf16_rows_seq4" : "kernel_mul_mv_q8_0_f32_rows_seq4";
-        /* V4.1's matrix rows kernel pays off from three rows (four on the
+        /* the matrix rows kernel pays off from three rows (four on the
          * widest K); eight simdgroups split a K of 4096 or more */
         const int mma_off = ds4_gpu_v41_rows_mma_off();
         const int mma = in_dim >= 4096u ? 8 : 4;
-        const bool mma_kernel = allow_mma && !mma_off && rows_kernel && n_rows >= (in_dim >= 8192u ? 4u : 3u) &&
+        const bool mma_kernel = !mma_off && rows_kernel && n_rows >= (in_dim >= 8192u ? 4u : 3u) &&
             (in_dim % (mma == 8 ? 256u : 128u)) == 0 && (out_dim % 8u) == 0;
 
         id<MTLComputePipelineState> pipeline = mma_kernel ?
@@ -20204,20 +20206,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows) {
     return ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset,
-                                                in_dim, out_dim, x, n_rows, 0, false);
-}
-
-int ds4_gpu_dsv41_matmul_q8_0_rows_tensor(
-        ds4_gpu_tensor       *out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t              n_rows) {
-    return ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset,
-                                                in_dim, out_dim, x, n_rows, 0, true);
+                                                in_dim, out_dim, x, n_rows, 0);
 }
 
 int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
