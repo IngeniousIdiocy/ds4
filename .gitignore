@@ -122,3 +122,6 @@ __pycache__/
 /tests/test_v41_q8_short
 /tests/test_v41_q8_short_fused
 /tests/test_v41_router_hier
+/tests/test_v41_embed_batch
+/tests/test_v41_prefill_attention
+/tests/test_v41_prefill_folds
