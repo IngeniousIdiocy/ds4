@@ -2064,6 +2064,56 @@ kernel void kernel_glm_indexer_score_one_wide(
     scores[row] = score;
 }
 
+/* Keep the wide scorer arithmetic unchanged; skip blocks already excluded by
+ * layer 20. The per-thread exit must follow the shared-query barrier. */
+kernel void kernel_dsv41_indexer_score_wide_masked(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const float *block_mask,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    device const float *qf = (device const float *)q;
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgpig.x * ntg + tid;
+    if (row >= args.n_rows) return;
+    if (block_mask[row / 8u] != 0.0f) { scores[row] = -INFINITY; return; }
+    float acc[32];
+    FOR_UNROLL (uint h = 0; h < 32u; h++) acc[h] = 0.0f;
+    const uint64_t base = (uint64_t)row * 128u;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[4];
+        if (args.cache_f16 != 0u) {
+            device const half4 *kh = (device const half4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = float4(kh[i]);
+        } else {
+            device const float4 *kf = (device const float4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = kf[i];
+        }
+        FOR_UNROLL (uint h = 0; h < 32u; h++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + h * 128u + d0);
+            acc[h] += dot(q4[0], k[0]) + dot(q4[1], k[1]) + dot(q4[2], k[2]) + dot(q4[3], k[3]);
+        }
+    }
+    float score = 0.0f;
+    FOR_UNROLL (uint h = 0; h < 32u; h++) {
+#pragma clang fp contract(off)
+        score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    }
+    scores[row] = score;
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
@@ -7195,3 +7245,181 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+static inline uint dsv4_nth_set_bit(ushort mask, uint n) {
+    // The n-th set bit of mask, counting from the least significant.  Only
+    // reached when the sixteen-entry window contains an absent or invisible
+    // id; with a full window the caller uses the identity mapping.
+    for (uint j = 0; j < 16u; j++) {
+        if (mask & (ushort)(1u << j)) {
+            if (n == 0u) return j;
+            n--;
+        }
+    }
+    return 15u;
+}
+
+/* WAVE 4, LEVER 2: the same kernel at a different geometry.
+ *
+ * COHORT is how many heads share one threadgroup (and therefore how many
+ * simdgroups it has: 32 x COHORT threads); BLOCK is how many K/V rows are
+ * staged in threadgroup memory per barrier, which is also the threadgroup
+ * allocation the host asks for (BLOCK KiB).  Neither changes a head's
+ * computation: the same rows, in the same order, through the same QK dot, the
+ * same simd_sum reduction and the same online-softmax update -- a head's whole
+ * arithmetic is private to its simdgroup and never crosses one.  The output is
+ * byte-identical at every geometry, so each is Tier 1 by construction and the
+ * only question is occupancy.  Wave 3 measured the allocation axis to be
+ * non-monotonic (1 KiB worse than 16, 32 KiB much worse), so these are tested
+ * as independent jagged points and never interpolated. */
+template<bool LEAN, ushort COHORT = 8, ushort BLOCK = 16>
+kernel void kernel_dsv41_prefill_attention_rb16_t(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tgpig.x;
+    const uint head = tgpig.y * (uint)COHORT + (uint)sg;
+    if (token >= args.n_tokens || head >= args.n_head) {
+        return;
+    }
+
+    device const float4 *q4 = (device const float4 *)(q +
+        (uint64_t)token * args.q_token_stride +
+        (uint64_t)head  * args.q_head_stride);
+    const half4 q0 = (half4)q4[lane +  0];
+    const half4 q1 = (half4)q4[lane + 32];
+    const half4 q2 = (half4)q4[lane + 64];
+    const half4 q3 = (half4)q4[lane + 96];
+
+    float M = -FLT_MAX/2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ?
+        qpos + 1u - args.window : 0u;
+    uint first = max(first_raw_pos, window_first);
+    uint last = min(qpos, raw_last_pos);
+
+    if (first <= last) {
+        for (uint pos0 = first; pos0 <= last; pos0 += (uint)BLOCK) {
+            const uint n_rows = min((uint)BLOCK, last - pos0 + 1u);
+            for (uint off = (uint)tid; off < n_rows * 128u; off += 32u * (uint)COHORT) {
+                const uint r = off >> 7;
+                const uint c = off & 127u;
+                const uint logical = pos0 + r - first_raw_pos;
+                const uint row = (args.raw_start + logical) % args.raw_cap;
+                device const float4 *src = (device const float4 *)(raw_kv +
+                    (uint64_t)row * args.raw_row_stride);
+                kv_shared[off] = (half4)src[c];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint r = 0; r < n_rows; r++) {
+                dsv4_attend_shared_h4_row_at(kv_shared,
+                                             r,
+                                             q0, q1, q2, q3,
+                                             args.scale,
+                                             lane,
+                                             M, S,
+                                             o0, o1, o2, o3);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint visible = (qpos + 1u) / args.ratio;
+    visible = min(visible, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk +
+        (uint64_t)token * args.topk_token_stride);
+    bool stop = false;
+    for (uint i = 0; i < args.top_k && !stop; i += (uint)BLOCK) {
+        uint rows[LEAN ? 1 : BLOCK];
+        ushort mask = 0;
+        uint n_rows = 0;
+        for (uint j = 0; j < (uint)BLOCK && i + j < args.top_k; j++) {
+            const int32_t idx = row_topk[i + j];
+            if (idx < 0) {
+                continue;
+            }
+            if ((uint)idx >= visible) {
+                stop = true;
+                break;
+            }
+            if (LEAN) {
+                mask |= (ushort)(1u << j);
+            } else {
+                rows[n_rows] = (uint)idx;
+            }
+            n_rows++;
+        }
+        if (n_rows == 0) {
+            continue;
+        }
+        const bool dense = LEAN && mask == (ushort)((1u << (uint)BLOCK) - 1u);
+        for (uint off = (uint)tid; off < n_rows * 128u; off += 32u * (uint)COHORT) {
+            const uint r = off >> 7;
+            const uint c = off & 127u;
+            uint src_row;
+            if (LEAN) {
+                /* The r-th set bit of mask is exactly the entry the wave-2
+                 * kernel stored at rows[r], so the rows and their order are
+                 * unchanged. */
+                const uint j = dense ? r : dsv4_nth_set_bit(mask, r);
+                src_row = (uint)row_topk[i + j];
+            } else {
+                src_row = rows[r];
+            }
+            kv_shared[off] = dsv4_load_cache_h4(comp_kv,
+                                                args.comp_row_stride,
+                                                src_row,
+                                                c,
+                                                args.comp_kv_f16 != 0u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < n_rows; r++) {
+            dsv4_attend_shared_h4_row_at(kv_shared,
+                                         r,
+                                         q0, q1, q2, q3,
+                                         args.scale,
+                                         lane,
+                                         M, S,
+                                         o0, o1, o2, o3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+
+    const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+    device float4 *dst4 = (device float4 *)(dst +
+        (uint64_t)token * args.dst_token_stride +
+        (uint64_t)head  * args.dst_head_stride);
+    dst4[lane +  0] = o0 * inv_s;
+    dst4[lane + 32] = o1 * inv_s;
+    dst4[lane + 64] = o2 * inv_s;
+    dst4[lane + 96] = o3 * inv_s;
+}
+
+
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_lean")]]
+kernel void kernel_dsv41_prefill_attention_rb16_t<true>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
