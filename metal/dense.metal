@@ -2430,6 +2430,138 @@ typedef decltype(kernel_mul_mv_t_t_4_rows<half, half4, half, half4>) mul_mv_t_t_
 
 template [[host_name("kernel_mul_mv_f16_f32_4_rows")]] kernel mul_mv_t_t_4_rows kernel_mul_mv_t_t_4_rows<half,  half4,  float, float4>;
 
+// A few activation rows against one F32 matrix with one weight load: each
+// thread keeps the single-row kernel's lane, K walk and per-row accumulator
+// expression for every activation row (the repeated weight loads fold into
+// one), and each row reduces through the same simd_sum / threadgroup tree, so
+// row r's output matches a one-row dispatch over row r.  R = args.ne11 rows.
+template<short NR0, short R>
+void kernel_mul_mv_f32_f32_4_xrows_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+
+    device const float  * ax [NR0];
+    device const float4 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row)*args.nb01;
+        ax [row] = (device const float  *) (src0 + offset0);
+        ax4[row] = (device const float4 *) (src0 + offset0);
+    }
+
+    float sumf[R][NR0];
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[r][row] = 0.f;
+    }
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+
+    device const float4 * yb4[R];
+    FOR_UNROLL (short r = 0; r < R; ++r)
+        yb4[r] = (device const float4 *) (src1 + (uint64_t)r*args.nb11) + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        FOR_UNROLL (short r = 0; r < R; ++r) {
+            float4 yl4[NF4];
+            for (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[r][i];
+            }
+
+            for (short row = 0; row < NR0; row++) {
+                device const float4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                }
+
+                sumf[r][row] += sumq;
+            }
+
+            yb4[r] += NSG*NF*NW/4;
+        }
+    }
+
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        device const float * y = (device const float *) (src1 + (uint64_t)r*args.nb11);
+        for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+            for (short row = 0; row < NR0; row++) {
+                sumf[r][row] += ax[row][i] * y[i];
+            }
+        }
+    }
+
+    threadgroup float * sh = (threadgroup float *) shmem;
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (sgitg == 0) sh[NW*(r*NR0 + row) + tiisg] = 0.0f;
+            sumf[r][row] = simd_sum(sumf[r][row]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) sh[NW*(r*NR0 + row) + sgitg] = sumf[r][row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        device float * dst_f32 = (device float *) dst + (uint64_t)r*args.ne0;
+        for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+            float tot = simd_sum(sh[NW*(r*NR0 + row) + tiisg]);
+            if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = tot;
+        }
+    }
+}
+
+template<short NR0>
+void kernel_mul_mv_f32_f32_4_xrows_disp(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    switch (args.ne11) {
+        case 2: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 2>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 3: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 3>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 5: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 5>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 6: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 6>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 7: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 7>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 8: kernel_mul_mv_f32_f32_4_xrows_impl<NR0, 8>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    };
+}
+
+kernel void kernel_mul_mv_f32_f32_4_xrows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    switch (args.nr0) {
+        case 1: kernel_mul_mv_f32_f32_4_xrows_disp<1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_f32_f32_4_xrows_disp<2>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_f32_f32_4_xrows_disp<4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+    };
+}
+
 template<typename T0, typename T04, typename T1, typename T14>
 kernel void kernel_mul_mv_t_t_4_rows_bf16(
         constant ds4_metal_args_mul_mv & args,

@@ -49300,21 +49300,31 @@ int ds4_gpu_dsv41_matmul_f32_rows(ds4_gpu_tensor *out, const void *model_map, ui
             mv_dispatch.smem = 32u * sizeof(float);
         }
         mv_args.nr0 = mv_dispatch.nr0;
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
-        if (!pipeline) return 0;
         int owned = 0;
+        /* A few rows against one router matrix: each thread loads its weights
+         * once for every row, keeping each row's K walk, accumulator expression
+         * and reduction tree (kernel_mul_mv_f32_f32_4_xrows), so the rows match
+         * one-row dispatches bit for bit. */
+        static int xrows_off = -1;
+        if (xrows_off < 0) xrows_off = getenv("DS4_METAL_DISABLE_V41_F32_XROWS") != NULL;
+        const bool xrows = !xrows_off && rows >= 2u && rows <= 8u && (in_dim % 32u) == 0 &&
+            mv_dispatch.smem && !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f32_f32_4");
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            xrows ? "kernel_mul_mv_f32_f32_4_xrows" : mv_dispatch.function_name, mv_dispatch.nsg);
+        if (!pipeline) return 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
         if (!enc) return 0;
+        if (xrows) mv_args.ne11 = mv_args.ne1 = (int32_t)rows;
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
         [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:1];
         [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        if (mv_dispatch.smem) [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        if (mv_dispatch.smem)
+            [enc setThreadgroupMemoryLength:mv_dispatch.smem * (xrows ? rows : 1u) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                              rows, 1)
+                                              xrows ? 1u : rows, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 F32 matvec rows");
