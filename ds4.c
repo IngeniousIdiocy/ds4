@@ -87313,6 +87313,13 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         propose_s = now_sec() - tp;
         if (stats) s->dspark_stats.propose_ms += propose_s * 1000.0;
         k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
+        static int draft_cap = -1;   /* DS4_DSPARK_V41_MAX_DRAFT: depth experiments */
+        if (draft_cap < 0) {
+            const char *env = getenv("DS4_DSPARK_V41_MAX_DRAFT");
+            draft_cap = env && *env ? atoi(env) : 0;
+            if (draft_cap < 0) draft_cap = 0;
+        }
+        if (draft_cap && k > (uint32_t)draft_cap) k = (uint32_t)draft_cap;
         if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
         if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
         if (k > g->ctx - P1 - 1u - exact) k = g->ctx - P1 - 1u - exact;
