@@ -40950,6 +40950,7 @@ typedef struct {
     uint32_t n_stage, block, n_target, rank, noise_token;
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows;       /* the positions the last pass captured */
+    uint32_t ring_from;              /* the first position whose ring rows this state wrote */
     uint32_t verify_rows;            /* nonzero while a verify pass runs */
     double plain_rate, draft_rate;   /* tokens per second of plain and proposing cycles */
     uint32_t skip_left, skip_len;    /* proposals skipped while drafting loses */
@@ -41115,7 +41116,7 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->passes++;
     g->valid = true;
-    if (g->draft) g->draft->mh_rows = 0;
+    if (g->draft) g->draft->mh_rows = g->draft->ring_from = 0;
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
@@ -42743,7 +42744,8 @@ static bool ds41_draft_attention(ds41_gpu_graph *g, uint32_t stage, const ds4_la
     ds41_draft *d = g->draft;
     ds41_prefill_row *b = &g->batch;
     const uint32_t start = d->mh_pos0 + d->mh_rows;   /* P + 1 */
-    const uint32_t past = start < DS41_DRAFT_WINDOW ? start : DS41_DRAFT_WINDOW;
+    const uint32_t held = start - d->ring_from;
+    const uint32_t past = held < DS41_DRAFT_WINDOW ? held : DS41_DRAFT_WINDOW;
     const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t ring = (uint64_t)stage * DS41_DRAFT_WINDOW * row;
     const uint32_t slot0 = (start - past) % DS41_DRAFT_WINDOW;
@@ -64534,6 +64536,8 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
+            /* the payload holds no drafter rows: the ring's are another state's */
+            if (g->draft) g->draft->ring_from = pos;
             ds4_tokens_copy(&s->checkpoint, &tokens);
             s->checkpoint_valid = true;
         }
