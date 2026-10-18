@@ -80,6 +80,8 @@ int ds4_gpu_begin_commands(void);
 #ifdef __APPLE__
 /* DS4_METAL_ENCODER_TIMELINE: label later command buffers (static string). */
 void ds4_gpu_timeline_phase(const char *phase);
+/* Prebuild the small-batch DSpark verify kernels. */
+void ds4_gpu_dsv41_warm_spec_pipelines(void);
 #endif
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);

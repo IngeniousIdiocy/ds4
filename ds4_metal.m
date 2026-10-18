@@ -32989,6 +32989,18 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
 /* A few rows' pair/SwiGLU with the distinct experts read once: the plan
  * dispatch, then one threadgroup per distinct expert with a simdgroup per
  * (row, slot) pair (kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32). */
+
+/* Build the small-batch DSpark kernels before the first cycle instead of on
+ * its critical path (a function-constant pipeline compiles in ~0.5 s). */
+void ds4_gpu_dsv41_warm_spec_pipelines(void) {
+    if (!g_initialized && !ds4_gpu_init()) return;
+    (void)ds4_gpu_get_pipeline("kernel_ds4_copy_u4");
+    (void)ds4_gpu_get_pipeline("kernel_dsv41_moe_dedup_plan");
+    (void)ds4_gpu_get_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
+    (void)ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_sum6_tokmajor_f32", 2);
+    (void)ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_f32_f32_4_xrows", 8);
+}
+
 static int ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(
         id<MTLCommandBuffer>        cb,
         const ds4_gpu_mul_mv_id_args *args,

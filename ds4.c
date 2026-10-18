@@ -43074,6 +43074,9 @@ static bool ds41_draft_init(ds41_gpu_graph *g, const ds4_dspark_weights *dw, con
         return false;
     }
     g->draft = d;
+#ifdef __APPLE__
+    ds4_gpu_dsv41_warm_spec_pipelines();
+#endif
     return true;
 }
 
