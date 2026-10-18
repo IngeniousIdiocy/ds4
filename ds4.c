@@ -43119,6 +43119,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
                                  : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
     const bool queued_head = queue_layers && logits && g->tp_world == 1 && !ds41_queued_head_off();
+    static int draft_queue_off = -1;
+    if (draft_queue_off < 0) draft_queue_off = getenv("DS4_METAL_DISABLE_V41_QUEUED_DRAFT_COMMIT") != NULL;
+    const bool draft_queued = g->draft && queue_layers && g->tp_world == 1 && !layer_resident &&
+        !draft_queue_off;
     if (g->draft) {
         g->draft->mh_pos0 = g->pos;
         g->draft->mh_rows = 1;
@@ -43151,6 +43155,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             il + 1u == DS4_N_LAYER;
         /* the head only needs the last layer: encode it before the drain */
         if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
+        /* so does the drafter's projection of the captured streams: it joins
+         * the final command buffer instead of a buffer and wait of its own */
+        if (ok && draft_queued && il + 1u == DS4_N_LAYER) ok = ds41_draft_pending(g) && ds41_draft_commit(g, 1);
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -43177,7 +43184,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
-    if (ok && g->draft) {
+    if (ok && g->draft && !draft_queued) {
         ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, 1);
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     }
