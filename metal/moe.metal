@@ -4803,20 +4803,50 @@ kernel void kernel_dsv41_moe_dedup_plan(
         device const char *ids,
         device ds4_metal_dsv41_moe_plan *plan,
         uint tid [[thread_position_in_grid]]) {
-    if (tid != 0) return;
-    uint n = 0;
-    for (int row = 0; row < args.nei1; row++) {
-        device const int32_t *sel = (device const int32_t *)(ids + (uint64_t)row * args.nbi1);
-        for (int idx = 0; idx < args.nei0; idx++) {
-            const uint e = (uint)sel[idx];
-            uint d = 0;
-            while (d < n && plan->expert[d] != e) d++;
-            if (d == n) { plan->expert[n] = e; plan->count[n] = 0; n++; }
-            plan->pair[d * 8 + plan->count[d]] = (uint)(row * args.nei0 + idx);
-            plan->count[d]++;
+    /* The serial first-use plan, computed by one simdgroup: pair p's distinct
+     * index is the number of first uses before its expert's first use, its slot
+     * the number of earlier pairs with its expert.  A single thread walking the
+     * plan in device memory took ~40 us per layer. */
+    threadgroup uint e_tg[64];
+    threadgroup uint first_tg[64];
+    const uint P = (uint)(args.nei1 * args.nei0);
+    for (uint p = tid; p < P; p += 32u) {
+        const uint row = p / (uint)args.nei0, idx = p % (uint)args.nei0;
+        e_tg[p] = (uint)((device const int32_t *)(ids + (uint64_t)row * args.nbi1))[idx];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint fq[2], slot[2];
+    for (uint k = 0; k < 2u; k++) {
+        const uint p = tid + 32u * k;
+        if (p >= P) break;
+        const uint e = e_tg[p];
+        uint f = p, sl = 0;
+        for (uint q = 0; q < p; q++) {
+            if (e_tg[q] == e) { if (f == p) f = q; sl++; }
+        }
+        fq[k] = f; slot[k] = sl;
+        first_tg[p] = f == p ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = 0; k < 2u; k++) {
+        const uint p = tid + 32u * k;
+        if (p >= P) break;
+        uint d = 0;
+        for (uint q = 0; q < fq[k]; q++) d += first_tg[q];
+        plan->pair[d * 8u + slot[k]] = p;
+        if (fq[k] == p) {
+            const uint e = e_tg[p];
+            uint c = 0;
+            for (uint q = p; q < P; q++) c += e_tg[q] == e ? 1u : 0u;
+            plan->expert[d] = e;
+            plan->count[d] = c;
         }
     }
-    plan->n_distinct = n;
+    if (tid == 0) {
+        uint n = 0;
+        for (uint q = 0; q < P; q++) n += first_tg[q];
+        plan->n_distinct = n;
+    }
 }
 
 kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32(
