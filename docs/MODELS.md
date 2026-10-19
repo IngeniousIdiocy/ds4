@@ -46,7 +46,8 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 ## DeepSeek V4.1 Flash
 
 V4.1 Flash text and vision inference work on Metal. CUDA supports text with
-Q2 SSD streaming on one Spark or resident shards across two Sparks. It needs its own
+Q2 SSD streaming on one Spark or resident shards across two Sparks. ROCm
+supports single-host text inference with SSD streaming. It needs its own
 GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files
 are not interchangeable with it.
 
@@ -94,8 +95,10 @@ Resident and TP inference also batch continued prefills automatically.
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
 increasing both context and slot count. CUDA Q2 SSD mode batches up to eight
-decode rows; CUDA network TP currently serves sessions in order. DSpark,
-pipeline execution and ROCm are not implemented for V4.1; vision requires Metal.
+decode rows; CUDA network TP currently serves sessions in order.
+[DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) uses a
+separate V4.1 support GGUF and currently requires one host. Pipeline execution
+is not implemented for V4.1; vision requires Metal.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
