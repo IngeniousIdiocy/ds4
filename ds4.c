@@ -41144,6 +41144,10 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
      * partial pair is overwritten by its even-position token before use. */
 }
 
+static ds4_gpu_tensor *ds41_router_bf16(const ds4_model *m, const ds4_layer_weights *l, uint32_t il);
+static bool ds41_engram_e4m3(const ds4_model *m, const ds4_layer_weights *l, uint32_t table,
+                             ds4_gpu_tensor **codes_out, ds4_gpu_tensor **scales_out);
+
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
                                               uint32_t ctx, bool streaming) {
@@ -41253,6 +41257,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
     ds41_graph_reset(g);
+    /* Narrow decode copies of the router and Engram projections are model-wide
+     * and built once here, not on the first token. */
+    if (!streaming) {
+        ds4_gpu_tensor *codes, *scales;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            (void)ds41_router_bf16(m, &w->layer[il], il);
+            if (ds41_engram_layer(il))
+                (void)ds41_engram_e4m3(m, &w->layer[il], il == 1 ? 0 : 1, &codes, &scales);
+        }
+    }
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
     return true;
@@ -41913,6 +41927,57 @@ static bool ds41_shared_down_half(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_FF_EXP, (uint64_t)g->tp_rank * half, half, DS4_N_EMBD, g->shared_mid, 0) != 0;
 }
 
+/* Decode copies of weights the GGUF widens: model-wide, built at graph
+ * allocation, freed with the engine. */
+static struct {
+    const ds4_model *owner;
+    ds4_gpu_tensor *router[64], *engram_codes[2], *engram_scales[2];
+    bool router_failed, engram_failed[2];
+} g_ds41_narrow;
+
+static void ds41_narrow_free(void) {
+    for (uint32_t i = 0; i < 64u; i++) ds4_gpu_tensor_free(g_ds41_narrow.router[i]);
+    for (uint32_t i = 0; i < 2u; i++) {
+        ds4_gpu_tensor_free(g_ds41_narrow.engram_codes[i]);
+        ds4_gpu_tensor_free(g_ds41_narrow.engram_scales[i]);
+    }
+    memset(&g_ds41_narrow, 0, sizeof(g_ds41_narrow));
+}
+
+static void ds41_narrow_own(const ds4_model *m) {
+    if (g_ds41_narrow.owner == m) return;
+    ds41_narrow_free();
+    g_ds41_narrow.owner = m;
+}
+
+/* The checkpoint's router weights are BF16; the GGUF widens them to F32.
+ * Decode reads them as BF16 again (half the bytes) once every value is
+ * checked to be exact, so the matvec's products and sums are unchanged. */
+static ds4_gpu_tensor *ds41_router_bf16(const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
+#ifdef __APPLE__
+    const ds4_tensor *t = l->ffn_gate_inp;
+    if (getenv("DS4_METAL_DISABLE_V41_ROUTER_BF16") || il >= 64u || !t || t->type != DS4_TENSOR_F32)
+        return NULL;
+    ds41_narrow_own(m);
+    if (g_ds41_narrow.router_failed) return NULL;
+    if (!g_ds41_narrow.router[il]) {
+        const uint64_t n = t->dim[0] * t->dim[1];
+        const uint32_t *src = (const uint32_t *)(m->map + t->abs_offset);
+        for (uint64_t i = 0; i < n; i++)
+            if (src[i] & 0xffffu) { g_ds41_narrow.router_failed = true; return NULL; }
+        ds4_gpu_tensor *dst = ds4_gpu_tensor_alloc(n * sizeof(uint16_t));
+        uint16_t *out = dst ? ds4_gpu_tensor_contents(dst) : NULL;
+        if (!out) { ds4_gpu_tensor_free(dst); g_ds41_narrow.router_failed = true; return NULL; }
+        for (uint64_t i = 0; i < n; i++) out[i] = (uint16_t)(src[i] >> 16);
+        g_ds41_narrow.router[il] = dst;
+    }
+    return g_ds41_narrow.router[il];
+#else
+    (void)m; (void)l; (void)il;
+    return NULL;
+#endif
+}
+
 /* Without shared_down the shared expert's down projection waits for
  * ds41_graph_after_moe, which folds it into the expand. */
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -41927,7 +41992,14 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN] : sum;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
+#ifdef __APPLE__
+    ds4_gpu_tensor *router_bf16 = g->quality ? NULL : ds41_router_bf16(m, l, il);
+    if (router_bf16 ? !ds4_gpu_matmul_bf16_weights_tensor(g->route_logits, router_bf16,
+                                                          l->ffn_gate_inp->dim[0], l->ffn_gate_inp->dim[1], g->norm) :
+        !ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
+#else
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
+#endif
 #ifdef __APPLE__
     const bool routed_one = !ds41_router_one_off() &&
         ds4_gpu_dsv41_router_one(g->selected, g->route_weights, g->route_probs, g->route_logits,
@@ -42088,11 +42160,122 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
 }
 
+/* E4M3 code of q when q is exactly representable (|q| <= 448, three mantissa
+ * bits, subnormals in steps of 2^-9). */
+static DS4_MAYBE_UNUSED bool ds41_e4m3_code(float q, uint8_t *code) {
+    const uint8_t sign = signbit(q) ? 0x80u : 0u;
+    const float a = fabsf(q);
+    if (a == 0.0f) { *code = sign; return true; }
+    if (!(a <= 448.0f)) return false;
+    int e;
+    const float f = frexpf(a, &e);   /* a = f * 2^e, f in [0.5, 1) */
+    if (e - 1 >= -6) {
+        const float m = f * 16.0f - 8.0f;   /* 1.mmm: m in [0, 8) */
+        if (m != floorf(m)) return false;
+        *code = (uint8_t)(sign | (uint8_t)((e - 1 + 7) << 3) | (uint8_t)m);
+        return true;
+    }
+    const float m = a * 512.0f;
+    if (m != floorf(m) || m < 1.0f || m > 7.0f) return false;
+    *code = (uint8_t)(sign | (uint8_t)m);
+    return true;
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+typedef struct {
+    const __fp16 *src;
+    uint64_t cols;
+    uint8_t *codes;
+    float *scales;
+    bool failed;
+} ds41_e4m3_job;
+
+/* One row of 32x32 blocks: the scale that fits the block's largest value,
+ * or one step either side, must hold every weight exactly. */
+static void ds41_e4m3_block_row(void *context, size_t br) {
+    ds41_e4m3_job *job = context;
+    const uint64_t cols = job->cols, bc = cols / 32u;
+    for (uint64_t bj = 0; bj < bc; bj++) {
+        float amax = 0.0f;
+        for (uint32_t r = 0; r < 32u; r++)
+            for (uint32_t j = 0; j < 32u; j++) {
+                const float v = fabsf((float)job->src[(br * 32u + r) * cols + bj * 32u + j]);
+                if (v > amax) amax = v;
+            }
+        const int e0 = amax > 0.0f ? (int)ceilf(log2f(amax / 448.0f)) : 0;
+        bool fit = false;
+        for (int d = 0; !fit && d < 3; d++) {
+            const int e = e0 + (d == 1 ? 1 : d == 2 ? -1 : 0);
+            const float inv = ldexpf(1.0f, -e);
+            fit = true;
+            for (uint32_t r = 0; fit && r < 32u; r++)
+                for (uint32_t j = 0; fit && j < 32u; j++) {
+                    const uint64_t i = (br * 32u + r) * cols + bj * 32u + j;
+                    fit = ds41_e4m3_code((float)job->src[i] * inv, &job->codes[i]);
+                }
+            if (fit) job->scales[br * bc + bj] = ldexpf(1.0f, e);
+        }
+        if (!fit) { job->failed = true; return; }   /* a benign race: any writer sets true */
+    }
+}
+#endif
+
+/* engram_kv is E4M3 with 32x32 block scales in the checkpoint; the GGUF
+ * widens it to F16. Decode reads codes and scales again (half the bytes)
+ * once every block is shown to reproduce the F16 weights exactly. */
+static bool ds41_engram_e4m3(const ds4_model *m, const ds4_layer_weights *l, uint32_t table,
+                             ds4_gpu_tensor **codes_out, ds4_gpu_tensor **scales_out) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    ds4_gpu_tensor **codes = g_ds41_narrow.engram_codes, **scales = g_ds41_narrow.engram_scales;
+    bool *failed = g_ds41_narrow.engram_failed;
+    const ds4_tensor *t = l->engram_kv;
+    if (getenv("DS4_METAL_DISABLE_V41_ENGRAM_E4M3") || table > 1u || !t || t->type != DS4_TENSOR_F16 ||
+        t->dim[0] % 32u || t->dim[1] % 32u) return false;
+    ds41_narrow_own(m);
+    if (failed[table]) return false;
+    if (!codes[table]) {
+        const uint64_t cols = t->dim[0], rows = t->dim[1];
+        ds4_gpu_tensor *c = ds4_gpu_tensor_alloc(rows * cols);
+        ds4_gpu_tensor *sc = ds4_gpu_tensor_alloc((rows / 32u) * (cols / 32u) * sizeof(float));
+        ds41_e4m3_job job = {(const __fp16 *)(m->map + t->abs_offset), cols,
+            c ? ds4_gpu_tensor_contents(c) : NULL, sc ? ds4_gpu_tensor_contents(sc) : NULL, false};
+        bool ok = job.codes && job.scales;
+        if (ok) dispatch_apply_f(rows / 32u, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                                 &job, ds41_e4m3_block_row);
+        ok = ok && !job.failed;
+        if (!ok) {
+            ds4_gpu_tensor_free(c);
+            ds4_gpu_tensor_free(sc);
+            failed[table] = true;
+            fprintf(stderr, "ds4: V4.1 Engram table %u keeps F16 weights (not exact E4M3)\n", table);
+            return false;
+        }
+        codes[table] = c;
+        scales[table] = sc;
+    }
+    *codes_out = codes[table];
+    *scales_out = scales[table];
+    return true;
+#else
+    (void)m; (void)l; (void)table; (void)codes_out; (void)scales_out;
+    return false;
+#endif
+}
+
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, i == 0 ? g->engram_rows : g->engram_rows_b, true) ||
+        const ds4_gpu_tensor *rows = i == 0 ? g->engram_rows : g->engram_rows_b;
+#ifdef __APPLE__
+        ds4_gpu_tensor *codes = NULL, *scales = NULL;
+        const bool e4m3 = !g->quality && ds41_engram_e4m3(m, l, i, &codes, &scales) &&
+            ds4_gpu_matmul_e4m3_bf16_tensor(g->engram_kv, codes, scales,
+                                            l->engram_kv->dim[0], l->engram_kv->dim[1], rows);
+#else
+        const bool e4m3 = false;
+#endif
+        if ((!e4m3 && !ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true)) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -75330,6 +75513,9 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_narrow_free();
+#endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
