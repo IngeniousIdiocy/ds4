@@ -228,10 +228,7 @@ Q2_K; attention, shared experts and the output head use Q8_0. `--quant q4` uses
 Q4_K experts instead and `--quant mxfp4` keeps the released MXFP4 experts
 unchanged, repacked into GGUF blocks without calibration. Engram rows retain
 their original FP8 values and scales, packed together at the end of the GGUF for
-disk lookups. Vision and DSpark are separate models and are not part of this
-text GGUF; `--dspark-out FILE` writes the checkpoint's DSpark stages to their own
-support GGUF for `--dspark --mtp-model`, and `--out` may be omitted to write only
-that file; such a run opens only the shards that hold the `mtp.*` tensors.
+disk lookups. Vision and DSpark weights are not included.
 
 The first conversion uses weight-energy importance for IQ2_XXS. After runtime
 calibration, add `--imatrix FILE` and choose a new output filename to regenerate

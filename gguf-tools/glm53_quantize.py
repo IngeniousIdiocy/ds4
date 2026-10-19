@@ -297,35 +297,29 @@ class SourceDB:
         hf_dir,
         index_validator=validate_glm53_index,
         scale_validator=validate_fp8_scales,
-        tensor_filter=None,
     ):
-        """With a tensor_filter, only the shards holding a selected tensor are opened."""
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
         document, self.weight_map = load_index(index_path)
         index_validator(self.weight_map)
         self.declared_bytes = document.get("metadata", {}).get("total_size")
-        self.tensor_filter = tensor_filter
         self.tensors = {}
         self._fds = {}
         self._fd_lock = threading.Lock()
 
-        wanted = {name for name in self.weight_map if not tensor_filter or tensor_filter(name)}
-        for shard in sorted({self.weight_map[name] for name in wanted}):
+        for shard in sorted(set(self.weight_map.values())):
             path = os.path.join(hf_dir, shard)
             if not os.path.isfile(path):
                 fail(f"missing source shard {path}")
             for name, info in load_safetensors_header(path).items():
                 if self.weight_map.get(name) != shard:
                     fail(f"index assigns {name} to {self.weight_map.get(name)!r}, not {shard}")
-                if name not in wanted:
-                    continue
                 if name in self.tensors:
                     fail(f"duplicate source tensor {name}")
                 self.tensors[name] = dict(info, shard=shard)
 
-        if set(self.tensors) != wanted:
-            missing = sorted(wanted - set(self.tensors))
+        if set(self.tensors) != set(self.weight_map):
+            missing = sorted(set(self.weight_map) - set(self.tensors))
             fail(f"source headers are incomplete; first missing tensor is {missing[0]}")
         scale_validator(self.tensors)
 
@@ -333,8 +327,6 @@ class SourceDB:
         try:
             return self.tensors[name]
         except KeyError:
-            if self.tensor_filter and name in self.weight_map:
-                fail(f"source tensor {name} is outside the opened shard set")
             fail(f"source tensor not found: {name}")
 
     def _fd(self, shard):

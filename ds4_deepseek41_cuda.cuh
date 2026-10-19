@@ -552,8 +552,6 @@ extern "C" int ds4_gpu_dsv41_hc_block_input_rows(ds4_gpu_tensor *, ds4_gpu_tenso
                                                  const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float,
                                                  uint32_t, uint32_t) { return 0; }
-extern "C" void ds4_gpu_dsv41_verify_rows(int) {}
-extern "C" void ds4_gpu_dsv41_mma_rows(int) {}
 extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t,
                                         uint32_t, uint32_t, float) { return 0; }
 extern "C" int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *,
@@ -635,124 +633,6 @@ extern "C" int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_
     dsv41_indexer_all_kernel<<<(unsigned)(((uint64_t)rows * 512u + 255u) / 256u), 256, 0,
         cuda_decode_stream()>>>((int32_t *)selected->ptr, rows, start, ratio);
     return cuda_ok(cudaGetLastError(), "V4.1 indexer select all");
-}
-
-__global__ static void dsv41_hc_mean_kernel(const float *stream, float *out, uint32_t rows,
-                                            uint32_t dim, uint32_t hc, uint32_t out_stride,
-                                            uint32_t out_off) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t row = i / dim, col = i % dim;
-    if (row >= rows) return;
-    float acc = 0.0f;
-    for (uint32_t c = 0; c < hc; c++) acc += stream[((uint64_t)row * hc + c) * dim + col];
-    out[(uint64_t)row * out_stride + out_off + col] = acc / (float)hc;
-}
-
-extern "C" int ds4_gpu_dsv41_hc_mean(uint32_t rows, uint32_t dim, uint32_t hc,
-                                     const ds4_gpu_tensor *stream, ds4_gpu_tensor *out,
-                                     uint32_t out_stride, uint32_t out_off) {
-    if (!rows || !dim || !hc || out_off > out_stride - dim ||
-        !dsv41_has_floats(stream, (uint64_t)rows * hc * dim) ||
-        !dsv41_has_floats(out, (uint64_t)rows * out_stride)) return 0;
-    dsv41_hc_mean_kernel<<<(unsigned)(((uint64_t)rows * dim + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (const float *)stream->ptr, (float *)out->ptr, rows, dim, hc, out_stride, out_off);
-    return cuda_ok(cudaGetLastError(), "V4.1 stream mean");
-}
-
-__device__ static float dsv41_markov_tab(const void *p, uint64_t i, int f16) {
-    return f16 ? __half2float(((const __half *)p)[i]) : ((const float *)p)[i];
-}
-
-/* One block per vocabulary slice: the best biased logit and its index. */
-__global__ static void dsv41_markov_part_kernel(const float *logits, const void *embed, const void *head,
-                                                const int *tokens, float *part_val, int *part_idx,
-                                                uint32_t vocab, uint32_t rank, uint32_t step,
-                                                uint32_t n_parts, int f16) {
-    extern __shared__ float e[];
-    const int prev = tokens[step];
-    for (uint32_t r = threadIdx.x; r < rank; r += blockDim.x)
-        e[r] = dsv41_markov_tab(embed, (uint64_t)prev * rank + r, f16);
-    __syncthreads();
-    const float *lg = logits + (uint64_t)step * vocab;
-    float best = -INFINITY;
-    int bi = -1;
-    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += n_parts * blockDim.x) {
-        float p = lg[v];
-        for (uint32_t r = 0; r < rank; r++) p = fmaf(dsv41_markov_tab(head, (uint64_t)v * rank + r, f16), e[r], p);
-        if (p > best || (p == best && (int)v < bi)) { best = p; bi = (int)v; }
-    }
-    __shared__ float sv[256];
-    __shared__ int si[256];
-    sv[threadIdx.x] = best; si[threadIdx.x] = bi;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        for (uint32_t k = 1; k < blockDim.x; k++)
-            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
-        part_val[blockIdx.x] = best; part_idx[blockIdx.x] = bi;
-    }
-}
-
-__global__ static void dsv41_markov_final_kernel(const float *part_val, const int *part_idx, int *tokens,
-                                                 const float *x, const void *embed, const float *conf_proj,
-                                                 float *conf, uint32_t rank, uint32_t dim, uint32_t step,
-                                                 uint32_t n_parts, int f16) {
-    __shared__ float sv[256];
-    __shared__ int si[256];
-    float best = -INFINITY;
-    int bi = -1;
-    for (uint32_t p = threadIdx.x; p < n_parts; p += blockDim.x) {
-        if (part_idx[p] >= 0 && (part_val[p] > best || (part_val[p] == best && part_idx[p] < bi))) {
-            best = part_val[p]; bi = part_idx[p];
-        }
-    }
-    sv[threadIdx.x] = best; si[threadIdx.x] = bi;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        for (uint32_t k = 1; k < blockDim.x; k++)
-            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
-        tokens[step + 1u] = bi < 0 ? 0 : bi;
-    }
-    const int prev = tokens[step];
-    float acc = 0.0f;
-    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) acc = fmaf(conf_proj[d], x[(uint64_t)step * dim + d], acc);
-    for (uint32_t r = threadIdx.x; r < rank; r += blockDim.x)
-        acc = fmaf(conf_proj[dim + r], dsv41_markov_tab(embed, (uint64_t)prev * rank + r, f16), acc);
-    __syncthreads();
-    sv[threadIdx.x] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float c = 0.0f;
-        for (uint32_t k = 0; k < blockDim.x; k++) c += sv[k];
-        conf[step] = c;
-    }
-}
-
-extern "C" int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
-                                          const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
-                                          const void *model_map, uint64_t model_size,
-                                          uint64_t embed_offset, uint64_t head_offset, int f16,
-                                          const ds4_gpu_tensor *conf_proj, ds4_gpu_tensor *tokens,
-                                          ds4_gpu_tensor *conf, ds4_gpu_tensor *parts, uint32_t n_parts) {
-    const uint64_t bytes = (uint64_t)vocab * rank * (f16 ? 2u : 4u);
-    if (!block || !vocab || !rank || !dim || !n_parts || n_parts > 4096u || !model_map ||
-        embed_offset > model_size - bytes || head_offset > model_size - bytes ||
-        !dsv41_has_floats(logits, (uint64_t)block * vocab) || !dsv41_has_floats(x, (uint64_t)block * dim) ||
-        !dsv41_has_floats(conf_proj, (uint64_t)dim + rank) || !dsv41_has_floats(tokens, (uint64_t)block + 1u) ||
-        !dsv41_has_floats(conf, block) || !dsv41_has_floats(parts, (uint64_t)n_parts * 2u)) return 0;
-    const void *embed = cuda_model_range_ptr(model_map, embed_offset, bytes, "Markov embed");
-    const void *head = cuda_model_range_ptr(model_map, head_offset, bytes, "Markov head");
-    if (!embed || !head) return 0;
-    float *part_val = (float *)parts->ptr;
-    int *part_idx = (int *)((float *)parts->ptr + n_parts);
-    for (uint32_t step = 0; step < block; step++) {
-        dsv41_markov_part_kernel<<<n_parts, 256, rank * sizeof(float), cuda_decode_stream()>>>(
-            (const float *)logits->ptr, embed, head, (const int *)tokens->ptr, part_val, part_idx,
-            vocab, rank, step, n_parts, f16);
-        dsv41_markov_final_kernel<<<1, 256, 0, cuda_decode_stream()>>>(
-            part_val, part_idx, (int *)tokens->ptr, (const float *)x->ptr, embed,
-            (const float *)conf_proj->ptr, (float *)conf->ptr, rank, dim, step, n_parts, f16);
-    }
-    return cuda_ok(cudaGetLastError(), "V4.1 Markov chain");
 }
 
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map,

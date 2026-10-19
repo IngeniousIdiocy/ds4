@@ -190,7 +190,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: resident Spark Q2 0.4, two-Spark Flash Q2/MXFP4 0, Metal 0.6, other CUDA/ROCm 0.7; exact sampling: 0.8");
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
-            opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only output: V4.1 verifies drafts on the one-token decode arithmetic, other models decode target-only.");
+            opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
             opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");

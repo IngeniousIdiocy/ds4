@@ -104,21 +104,6 @@ int ds4_gpu_dsv41_candidate_mask_batch(ds4_gpu_tensor *mask,
                                       const ds4_gpu_tensor *selected,
                                       uint32_t width, uint32_t rows,
                                       uint32_t mask_stride);
-/* DSpark. The mean over the hc copies of each row, into out[row][out_off..]
- * at out_stride floats per row. */
-int ds4_gpu_dsv41_hc_mean(uint32_t rows, uint32_t dim, uint32_t hc,
-                         const ds4_gpu_tensor *stream, ds4_gpu_tensor *out,
-                         uint32_t out_stride, uint32_t out_off);
-/* Draft `block` tokens in sequence: tokens[step + 1] is the argmax of
- * logits[step] + head . embed[tokens[step]], conf[step] the confidence logit
- * proj . [x[step], embed[tokens[step]]]. Tables are [vocab, rank], F16 or F32;
- * parts holds 2 * n_parts floats of scratch. */
-int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
-                              const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
-                              const void *model_map, uint64_t model_size,
-                              uint64_t embed_offset, uint64_t head_offset, int f16,
-                              const ds4_gpu_tensor *conf_proj, ds4_gpu_tensor *tokens,
-                              ds4_gpu_tensor *conf, ds4_gpu_tensor *parts, uint32_t n_parts);
 /* Causal index scores over ratio-1/2 compressed keys, without an extra cast
  * of the already quantized FP4 queries/keys. Scores have source_rows stride. */
 int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
@@ -186,9 +171,6 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint64_t weight_offset, uint32_t width,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
-/* A DSpark verify pass runs; its rows take decode's attention path. */
-void ds4_gpu_dsv41_verify_rows(int on);
-void ds4_gpu_dsv41_mma_rows(int on);
 /* The HC mixer projection of one row with its norm fused (0: not fused). */
 int ds4_gpu_dsv41_hc_project(ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual,
                              const void *model_map, uint64_t model_size, uint64_t fn_offset,
@@ -239,16 +221,6 @@ int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
                                    uint32_t raw_start, const ds4_gpu_tensor *comp_cache,
                                    const ds4_gpu_tensor *ids, ds4_gpu_tensor *selected,
                                    uint32_t n_comp, uint32_t attended, uint32_t n_head, uint32_t head_dim);
-/* The same attention for consecutive rows in one pass, each row's window read
- * from a linear raw copy; _ok says whether rows of that shape are taken. */
-int ds4_gpu_dsv41_attention_decode_rows_ok(uint32_t n_raw, uint32_t attended,
-                                           uint32_t n_head, uint32_t head_dim);
-int ds4_gpu_dsv41_attention_decode_rows(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-                                        uint64_t sinks_offset, const ds4_gpu_tensor *q,
-                                        const ds4_gpu_tensor *raw, uint32_t n_raw,
-                                        const ds4_gpu_tensor *comp_cache, const ds4_gpu_tensor *ids,
-                                        uint32_t ids_stride, uint32_t n_comp, uint32_t attended,
-                                        uint32_t rows, uint32_t n_head, uint32_t head_dim);
 /* The Q8_0 q projection of one row with the layer's rope on its outputs. */
 int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
