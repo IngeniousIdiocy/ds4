@@ -41599,6 +41599,7 @@ static bool ds41_verify_joint_attention_off(void) {
 }
 static DS4_MAYBE_UNUSED bool ds41_rope_tab_off(void) { static int c = -1; return metal_graph_env_flag("DS4_METAL_DISABLE_V41_ROPE_TAB", &c); }
 static DS4_MAYBE_UNUSED bool ds41_heads_once_off(void) { static int c = -1; return metal_graph_env_flag("DS4_METAL_DISABLE_V41_HEADS_ONCE", &c); }
+static DS4_MAYBE_UNUSED bool ds41_engram_add_tg_off(void) { static int c = -1; return metal_graph_env_flag("DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG", &c); }
 static DS4_MAYBE_UNUSED bool ds41_irq_table_off(void) { static int c = -1; return metal_graph_env_flag("DS4_METAL_DISABLE_V41_IRQ_TABLE", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
@@ -43561,6 +43562,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->draft->mh_rows = 1;
     }
     g->scalar_decode = true;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The Engram gate with one 256-thread group per stream on this decode step (the 32-lane kernel's bits);
+     * prefill, TP, streaming and quality keep the 32-lane form (DSpark verify sets it for its own pass). */
+    ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
+#endif
     /* One RoPE coefficient table per decode step, in this step's command stream before layer 0, read by the
      * step's low projections in place of per-lane sincos; a failed producer leaves the lows on their own trig. */
     g->rope_tab_on = false;
@@ -43623,6 +43629,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->scalar_decode = false;
     g->rope_tab_on = false;   /* the table never outlives its step */
     g->heads_once = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_set_engram_add_tg(0);
+#endif
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
@@ -44695,6 +44704,10 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
                      gates != DS4_TP_GATES_PER_LAYER)) return false;
     g->tp_verify_block = tp_block;
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The 256-thread Engram gate gives the 32-lane kernel's bits, so verify takes it too (unmasked rows only). */
+    ds4_gpu_set_engram_add_tg(g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
+#endif
     bool ok = ds4_gpu_begin_commands() && ds41_draft_slots(g, g->pos, 0, n, true) &&
         ds41_draft_block(g, g->pos, 0, n, true) &&
         ds41_graph_step_batch(graphs, tokens, (int)n, n, m, w);
@@ -44722,6 +44735,9 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     d->verify_rows = 0;
     ds4_gpu_dsv41_verify_rows(0);
     ds4_gpu_dsv41_mma_rows(0);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_set_engram_add_tg(0);
+#endif
     if (!ok) { g->valid = false; return false; }
     return !logits_rows || ds4_gpu_tensor_read(d->rows_logits, 0, logits_rows,
                                                 (uint64_t)n * DS4_N_VOCAB * sizeof(float));
@@ -79660,6 +79676,14 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return token;
 }
 
+/* decode Engram gates that ran in the 256-thread form */
+uint64_t ds4_engram_add_tg_count(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    return ds4_gpu_engram_add_tg_count();
+#else
+    return 0;
+#endif
+}
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     if (ds4_session_is_ds41(s) && ds41_keyed_sampling(s->engine, temperature, rng)) {
