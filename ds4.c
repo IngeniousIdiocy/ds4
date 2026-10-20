@@ -86648,6 +86648,11 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
         for (unsigned stage = 0; stage < 3; stage++)
             ready = ready && d->positions[stage][pos % 128u] == pos;
+    if (ready && ds4_session_cancelled(s)) {
+        snprintf(err, errlen, "interrupted");
+        return -1;
+    }
+    ready = ready && !ds4_session_dspark_scheduler_should_skip(s);
     if (!ready) {
         if (stats) s->dspark_stats.no_draft++;
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
@@ -86681,6 +86686,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             s->dspark_stats.no_draft++;
             s->dspark_stats.propose_ms += (now_sec() - started) * 1000;
         }
+        ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
         accepted[0] = first_token;
         return 1;
@@ -86718,6 +86724,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         accepted[i] = tokens[i];
     }
     const uint32_t accepted_drafts = keep - 1u;
+    ds4_session_dspark_scheduler_note(s, accepted_drafts, false, 0.0);
     if (stats) {
         s->dspark_stats.verify_ms += (now_sec() - proposed) * 1000;
         s->dspark_stats.accepted_draft_tokens += accepted_drafts;
