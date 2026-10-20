@@ -1597,6 +1597,50 @@ static int check_split_collapse(void) {
 static int check_split_collapse(void) { return 1; }
 #endif
 
+#ifdef __APPLE__
+/* The fused merge ladder against the prefix merge ladder (DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE), bitwise, at
+ * widths that take one level, the fused ladder only, and staged levels before it; random, tied, -inf-tailed,
+ * signed-zero, NaN and constant rows. */
+static int check_fused_merge(void) {
+    {
+        const uint32_t widths[] = {1024, 1500, 4096, 5000, 9000, 10240, 10241, 12288, 16000, 16383, 20480, 32768, 65536};
+        ds4_gpu_tensor *scores = upload(NULL, 65536u * sizeof(float));
+        ds4_gpu_tensor *fused = upload(NULL, 513u * sizeof(int32_t)), *plain = upload(NULL, 513u * sizeof(int32_t));
+        CHECK(scores && fused && plain);
+        float *s = ds4_gpu_tensor_contents(scores);
+        int32_t *a = ds4_gpu_tensor_contents(fused), *b = ds4_gpu_tensor_contents(plain);
+        uint64_t picked = 0;
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+            const uint32_t width = widths[wi];
+            for (uint32_t pattern = 0; pattern < 6; pattern++) {
+                for (uint32_t i = 0; i < width; i++)
+                    s[i] = pattern == 0 ? random_value() : pattern == 1 ? (float)((int)(random_value() * 8.0f)) :
+                           pattern == 2 ? (i % 3 ? -INFINITY : random_value()) : pattern == 3 ? (i & 1 ? -0.0f : 0.0f) :
+                           pattern == 4 ? (i % 5 == 0 ? NAN : random_value()) : 1.0f;
+                a[512] = b[512] = 0x5eed;
+                CHECK(ds4_gpu_indexer_topk_tensor(fused, scores, width, 1, 512) && ds4_gpu_synchronize());
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE", "1", 1) == 0);
+                const int ok = ds4_gpu_indexer_topk_tensor(plain, scores, width, 1, 512) && ds4_gpu_synchronize();
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE") == 0 && ok && a[512] == 0x5eed && b[512] == 0x5eed);
+                for (uint32_t k = 0; k < 512u; k++) {
+                    if (a[k] != b[k]) {
+                        fprintf(stderr, "fused merge width=%u pattern=%u rank=%u: %d vs %d\n", width, pattern, k, a[k], b[k]);
+                        CHECK(0);
+                    }
+                }
+                picked += 512;
+            }
+        }
+        ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(fused); ds4_gpu_tensor_free(plain);
+        fprintf(stderr, "V4.1 fused merge ladder == prefix merge ladder, 0 of %llu selections differ PASS\n",
+                (unsigned long long)picked);
+    }
+    return 1;
+}
+#else
+static int check_fused_merge(void) { return 1; }
+#endif
+
 /* Rows with at most 512 visible keys select every key; other slots stay. */
 static int check_indexer_all(void) {
     const uint32_t rows = 129u;
@@ -2262,6 +2306,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--fused-merge")) {
+        const int ok = ds4_gpu_init() && check_fused_merge();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--topk-select")) {
         const int ok = ds4_gpu_init() && check_topk_select();
         ds4_gpu_cleanup();
@@ -2282,7 +2331,7 @@ int main(int argc, char **argv) {
              check_rope_quantize() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
              check_index_score_wide() && check_index_candidates() && check_e4m3_copies() && check_blend() && check_embedding() && check_index_projection() && check_general_topk() &&
-             check_topk_select() && check_causal_topk() && check_decode_topk() && check_split_collapse() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() &&
+             check_topk_select() && check_causal_topk() && check_decode_topk() && check_split_collapse() && check_fused_merge() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() &&
              check_attention_output(false) && check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

@@ -19703,6 +19703,15 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* The fused merge ladder (the decode call through the prefix merge): the levels with more than ten runs go
+         * through the staged merge, the rest of the ladder runs in one threadgroup. The prefix ladder's outputs. */
+        const bool fused_ladder = decode_k512 && nth == 1024 && block_top_k == 512 && n_comp <= 65536u &&
+            !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") && !getenv("DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE");
+        id<MTLComputePipelineState> staged_pipeline = fused_ladder ?
+            ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_staged") : nil;
+        id<MTLComputePipelineState> fused_pipeline = fused_ladder ?
+            ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_fused") : nil;
+        if (fused_pipeline && fused_pipeline.maxTotalThreadsPerThreadgroup < 1024u) fused_pipeline = nil;
         int32_t len = block_top_k;
         while (len < work_width) {
             const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
@@ -19733,8 +19742,29 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                 .block_top_k = (uint32_t)block_top_k,
             };
 
+            /* the staged kernel runs with the prefix merge's thread count (its chunks decide the NaN-row order) */
+            id<MTLComputePipelineState> level_pipeline = staged_pipeline &&
+                staged_pipeline.maxTotalThreadsPerThreadgroup >= merge_threads ? staged_pipeline : merge_pipeline;
+            const int32_t runs = (work_width + len - 1) / len;
+            if (fused_pipeline && merge_threads == 512u && runs <= 10) {
+                const uint32_t mt = 512u;
+                merge_args.top_k = (int32_t)top_k;
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:fused_pipeline];
+                [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
+                [enc setBytes:&mt length:sizeof(mt) atIndex:1];
+                [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:2];
+                [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:3];
+                [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+                [enc setThreadgroupMemoryLength:((NSUInteger)runs * 512u * 6u + 15u) & ~(NSUInteger)15u atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                break;
+            }
+
             enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:merge_pipeline];
+            [enc setComputePipelineState:level_pipeline];
+            if (level_pipeline == staged_pipeline) [enc setThreadgroupMemoryLength:8192 atIndex:0];
             [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
             [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:2];
