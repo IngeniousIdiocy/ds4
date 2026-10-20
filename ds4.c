@@ -41111,6 +41111,42 @@ static ds4_gpu_tensor *ds41_router_bf16(const ds4_model *m, const ds4_layer_weig
 static bool ds41_engram_e4m3(const ds4_model *m, const ds4_layer_weights *l, uint32_t table,
                              ds4_gpu_tensor **codes_out, ds4_gpu_tensor **scales_out);
 
+/* Prefill reads 2 x 24 Engram rows per token spread over 189 GiB, a random
+ * pattern that external SSDs serve at a few thousand rows/s (~12 s per 2K
+ * prompt over USB). When the tables fit beside the resident model, stream
+ * them once into the page cache in the background; the uncached row readers
+ * then hit memory. Same bytes either way, so logits do not change. One
+ * warmer per process; it outlives graphs because the page cache does too.
+ * DS4_DISABLE_V41_ENGRAM_WARM=1 skips it; DS4_V41_ENGRAM_WARM_WAIT=1 blocks
+ * until it finishes (benchmarks). */
+static void ds41_engram_warm(const ds4_model *m, const char *path, uint64_t graph_bytes) {
+    static ds4_engram_warm *warm;
+    static bool tried;
+    if (tried || getenv("DS4_DISABLE_V41_ENGRAM_WARM")) return;
+    tried = true;
+    const ds4_tensor *first = required_tensorf(m, "blk.%u.engram_embd.weight", 1u);
+    const ds4_tensor *last = required_tensorf(m, "blk.%u.engram_embd.weight", 14u);
+    const uint64_t begin = first->abs_offset < last->abs_offset ? first->abs_offset : last->abs_offset;
+    const uint64_t end = first->abs_offset + first->bytes > last->abs_offset + last->bytes ?
+        first->abs_offset + first->bytes : last->abs_offset + last->bytes;
+    /* The reserve keeps Q4 (278 GiB resident) out on a 512 GiB Mac: its
+     * internal-SSD rows are fast enough, and the cache would crowd the rest. */
+    const uint64_t span = end - begin, reserve = UINT64_C(64) << 30;
+    const uint64_t phys = ds4_engram_physical_memory();
+    const uint64_t need = ds4_add_sat_u64(ds4_add_sat_u64(m->size, graph_bytes),
+                                          ds4_add_sat_u64(span, reserve));
+    if (!phys || need > phys) return;
+    warm = ds4_engram_warm_start(path, begin, span);
+    if (!warm) return;
+    fprintf(stderr, "ds4: V4.1 Engram %.2f GiB fits in memory; warming the page cache in the background\n",
+            (double)span / 1073741824.0);
+    if (getenv("DS4_V41_ENGRAM_WARM_WAIT")) {
+        double s = 0;
+        const bool ok = ds4_engram_warm_wait(warm, &s);
+        fprintf(stderr, "ds4: V4.1 Engram warming %s in %.1f s\n", ok ? "finished" : "stopped", s);
+    }
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
                                               uint32_t ctx, bool streaming) {
@@ -41159,6 +41195,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
             !ds4_gpu_tensor_write(g->engram_q_norm[i], 0, tensor_data(m, w->layer[il].engram_q_norm), bytes) ||
             !ds4_gpu_tensor_write(g->engram_k_norm[i], 0, tensor_data(m, w->layer[il].engram_k_norm), bytes)) goto fail;
     }
+    if (!streaming) ds41_engram_warm(m, path, g->allocation_bytes);
     for (uint32_t i = 0; i < 40; i++) {
         g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;

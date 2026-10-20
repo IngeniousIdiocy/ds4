@@ -78,4 +78,13 @@ bool ds4_engram_reader_start(ds4_engram_reader *reader,
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
 void ds4_engram_reader_free(ds4_engram_reader *reader);
 
+/* Background sequential read of [offset, offset + bytes) into the kernel page
+ * cache, so the uncached row readers above hit memory. No table allocation;
+ * stops early at memory pressure. Wait reports whether it covered the span. */
+typedef struct ds4_engram_warm ds4_engram_warm;
+uint64_t ds4_engram_physical_memory(void);
+ds4_engram_warm *ds4_engram_warm_start(const char *path, uint64_t offset, uint64_t bytes);
+bool ds4_engram_warm_wait(ds4_engram_warm *warm, double *seconds);
+void ds4_engram_warm_stop(ds4_engram_warm *warm);
+
 #endif
