@@ -1761,9 +1761,130 @@ static int check_index_candidates(void) {
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
     return 1;
 }
+
+/* The E4M3 copy reader (ds4_gpu_matmul_e4m3_bf16_tensor) gives the BF16-rounded F16 projection's bits at the Engram
+ * (6144 -> 256) and indexer q_b (1280 -> 4096, its production size) shapes: E4M3 codes with power-of-two 32x32
+ * block scales 2^-15..2^-8 (every weight exact in F16), normal and small codes. */
+static int check_e4m3_copies(void) {
+    const uint32_t ins[2] = {6144, 1280}, outs[2] = {256, 4096};
+    for (int which = 0; which < 2; which++) {
+        const uint32_t IN = ins[which], OUT = outs[which];
+        const size_t f16_bytes = (size_t)IN * OUT * 2, code_bytes = (size_t)IN * OUT;
+        const size_t nscale = (size_t)(IN / 32) * (OUT / 32), page = (size_t)getpagesize();
+        const size_t map_bytes = (f16_bytes + page - 1) / page * page;
+        unsigned char *map = NULL, *codes = malloc(code_bytes);
+        float *scales = malloc(nscale * sizeof(float)), *x = malloc((size_t)IN * sizeof(float));
+        CHECK(posix_memalign((void **)&map, page, map_bytes) == 0 && codes && scales && x);
+        memset(map, 0, map_bytes);
+        _Float16 *w16 = (_Float16 *)map;
+        CHECK(ds4_gpu_set_model_map(map, map_bytes));
+        for (uint32_t i = 0; i < IN; i++) x[i] = random_value() / 4;
+        ds4_gpu_tensor *xt = upload(x, (size_t)IN * sizeof(float));
+        ds4_gpu_tensor *o16 = upload(NULL, OUT * 4), *o8 = upload(NULL, OUT * 4);
+        CHECK(xt && o16 && o8);
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 0; i < nscale; i++) { (void)random_value(); scales[i] = ldexpf(1.0f, -15 + (int)(seed % 8u)); }
+            for (size_t i = 0; i < code_bytes; i++) {
+                (void)random_value();
+                unsigned char c = (unsigned char)(seed >> 3);
+                if ((c & 0x7f) == 0x7f) c ^= 1;   /* no NaN codes */
+                if (pass) c = (unsigned char)(c & 0x87);   /* subnormal and small codes */
+                codes[i] = c;
+            }
+            for (size_t r = 0; r < OUT; r++)
+                for (size_t k = 0; k < IN; k++) {
+                    const unsigned char c = codes[r * IN + k], a = c & 0x7f;
+                    const uint32_t ex = (a >> 3) & 15u, m = a & 7u;
+                    float v = a == 0 ? 0.0f : ex == 0 ? ldexpf((float)m, -9) : ldexpf(1.0f + m / 8.0f, (int)ex - 7);
+                    if (c & 0x80) v = -v;
+                    w16[r * IN + k] = (_Float16)(v * scales[(r / 32) * (IN / 32) + k / 32]);
+                }
+            ds4_gpu_tensor *ct = upload(codes, code_bytes), *st = upload(scales, nscale * sizeof(float));
+            CHECK(ct && st);
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_project_f16_bf16(o16, map, map_bytes, 0, IN, OUT, xt));
+            CHECK(ds4_gpu_matmul_e4m3_bf16_tensor(o8, ct, st, IN, OUT, xt));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            CHECK(!memcmp(ds4_gpu_tensor_contents(o16), ds4_gpu_tensor_contents(o8), OUT * sizeof(float)));
+            ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st);
+        }
+        fprintf(stderr, "V4.1 E4M3 copy reader %u -> %u == F16 projection (normal and small codes) PASS\n", IN, OUT);
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o16); ds4_gpu_tensor_free(o8);
+        free(codes); free(scales); free(x);   /* map stays: the model views may wrap it */
+    }
+    return 1;
+}
+
+/* Exactly one blend dispatch of this kind (0 router, 1 E4M3 two-row, 2 E4M3 block-owner) since the previous call: the
+ * pair's blend call took the blend kernel and its opt-out call did not, so the comparison is not of a reader with
+ * itself. */
+static int blend_fired(int kind) {
+    static uint64_t last[3];
+    uint64_t now[3];
+    ds4_gpu_dsv41_blend_counts(now);
+    const int ok = now[kind] == last[kind] + 1u;
+    for (int i = 0; i < 3; i++) last[i] = now[i];
+    return ok;
+}
+
+/* The blend readers give the narrow readers' bits: the E4M3 reader at the Engram shape (6144 -> 256, two-row) and the
+ * indexer q_b production shape (1280 -> 4096, block-owner; smaller outputs can take one row per threadgroup, where the
+ * blend reader does not apply), scales 2^-18..2^-8, and the BF16 router at 5120 -> 384, against the same calls with
+ * DS4_METAL_DISABLE_V41_BLEND set. */
+static int check_blend(void) {
+    (void)blend_fired(0);   /* the baseline */
+    {
+        const uint32_t ins[2] = {6144, 1280}, outs[2] = {256, 4096};
+        for (int which = 0; which < 2; which++) {
+            const uint32_t in = ins[which], out = outs[which];
+            const size_t nscale = (size_t)(in / 32) * (out / 32);
+            unsigned char *codes = malloc((size_t)in * out);
+            float *scales = malloc(nscale * sizeof(float)), *x = malloc((size_t)in * 4);
+            CHECK(codes && scales && x);
+            for (size_t i = 0; i < nscale; i++) { (void)random_value(); scales[i] = ldexpf(1.0f, -18 + (int)(seed % 11u)); }
+            for (size_t i = 0; i < (size_t)in * out; i++) {
+                (void)random_value();
+                unsigned char c = (unsigned char)(seed >> 3);
+                if ((c & 0x7f) == 0x7f) c ^= 1;   /* no NaN codes */
+                codes[i] = c;
+            }
+            for (uint32_t i = 0; i < in; i++) x[i] = random_value() / 4;
+            ds4_gpu_tensor *ct = upload(codes, (size_t)in * out), *st = upload(scales, nscale * sizeof(float));
+            ds4_gpu_tensor *xt = upload(x, (size_t)in * 4), *o = upload(NULL, out * 4);
+            CHECK(ct && st && xt && o);
+            LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4, ds4_gpu_matmul_e4m3_bf16_tensor(o, ct, st, in, out, xt));
+            CHECK(blend_fired(which == 0 ? 1 : 2));
+            ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
+            free(codes); free(scales); free(x);
+        }
+    }
+    {   /* BF16 router 5120 -> 384 */
+        const uint32_t in = 5120, out = 384;
+        uint16_t *w = malloc((size_t)in * out * 2);
+        float *x = malloc((size_t)in * 4);
+        CHECK(w && x);
+        for (size_t i = 0; i < (size_t)in * out; i++) {
+            const float v = random_value() / 64;
+            uint32_t bits;
+            memcpy(&bits, &v, 4);
+            w[i] = (uint16_t)(bits >> 16);
+        }
+        for (uint32_t i = 0; i < in; i++) x[i] = random_value();
+        ds4_gpu_tensor *wt = upload(w, (size_t)in * out * 2), *xt = upload(x, (size_t)in * 4), *o = upload(NULL, out * 4);
+        CHECK(wt && xt && o);
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4, ds4_gpu_matmul_bf16_weights_tensor(o, wt, in, out, xt));
+        CHECK(blend_fired(0));
+        ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
+        free(w); free(x);
+    }
+    fprintf(stderr, "V4.1 blend readers (E4M3 two-row, E4M3 block-owner, router) == narrow readers PASS\n");
+    return 1;
+}
 #else
 static int check_index_score_wide(void) { return 1; }
 static int check_index_candidates(void) { return 1; }
+static int check_e4m3_copies(void) { return 1; }
+static int check_blend(void) { return 1; }
 #endif
 
 static int check_compact_carry(void) {
@@ -1992,6 +2113,16 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--e4m3-copies")) {
+        const int ok = ds4_gpu_init() && check_e4m3_copies();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--blend")) {
+        const int ok = ds4_gpu_init() && check_blend();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-topk")) {
         const int ok = ds4_gpu_init() && check_causal_topk();
         ds4_gpu_cleanup();
@@ -2036,7 +2167,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() &&
              check_rope_quantize() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
-             check_index_score_wide() && check_index_candidates() && check_embedding() && check_index_projection() && check_general_topk() &&
+             check_index_score_wide() && check_index_candidates() && check_e4m3_copies() && check_blend() && check_embedding() && check_index_projection() && check_general_topk() &&
              check_topk_select() && check_causal_topk() && check_decode_topk() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() &&
              check_attention_output(false) && check_tp_attention();
     ds4_gpu_cleanup();

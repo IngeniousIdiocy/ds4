@@ -45,6 +45,12 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+#ifdef __APPLE__
+/* Weights built at load (Metal): allocated with the model views' storage options, and kept in a residency set of
+ * their own (requested at once, added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
+#endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -1169,6 +1175,11 @@ int ds4_gpu_matmul_e4m3_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *c
 int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
                                        uint64_t in_dim, uint64_t out_dim,
                                        const ds4_gpu_tensor *x);
+/* Blend-kernel dispatches of the two narrow readers above so far, by kernel: router, E4M3 two-row, E4M3
+ * block-owner (Metal only). */
+void ds4_gpu_dsv41_blend_counts(uint64_t out[3]);
+/* While on, blend dispatches are neither counted nor announced (load-time warm-up dispatches). */
+void ds4_gpu_dsv41_blend_quiet(int on);
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
