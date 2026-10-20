@@ -41006,6 +41006,12 @@ typedef struct {
     ds4_gpu_tensor *rope_tab;
     bool rope_tab_on;
     uint32_t rope_tab_pos;
+    /* candidate list once per token: pos + 1 once block_list holds the candidates of block_mask as layer 20 wrote it for
+     * pos (set by a candidate-only index row, cleared when layer 20 writes the mask); 0 = not ready.
+     * block_list_mask is the mask it was built from: prefill and verify rows are copies of the graph that read their
+     * own mask views but share block_list, so a copied record must not make a row reuse another mask's list. */
+    uint32_t block_list_pos;
+    const ds4_gpu_tensor *block_list_mask;
     /* The decode reduce wrote this layer's heads already inverse-roped and bf16-rounded (heads_once_arm); the next
      * low projection must be the plain one. Set by ds41_attention, cleared by its consumer and at step end. */
     bool heads_once;
@@ -41771,6 +41777,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     if (n_comp && ds41_index_source(il) && (n_comp + 7u) / 8u > 2048u) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u;
+            g->block_list_pos = 0;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_dsv41_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, 2048u) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, 2048u)) return false;
@@ -41789,6 +41796,44 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
 }
 
 /* One row's index scores and selection, its index queries already projected. */
+#ifdef __APPLE__
+/* The candidate-only index row over layer 20's 2,048 candidate blocks, with the once-per-token list: reused only when
+ * it was built for this position from this graph's own mask (row copies read their own mask views but share the
+ * list). False: unavailable, the caller scores the full row. */
+static bool ds41_candidates_row(ds41_gpu_graph *g, uint32_t owner, uint32_t n_comp) {
+    if (!ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
+            g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp, 1.0f / 64.0f,
+            DS4_N_INDEXER_TOP_K, g->block_list_pos == g->pos + 1u && g->block_list_mask == g->block_mask))
+        return false;
+    g->block_list_pos = g->pos + 1u;
+    g->block_list_mask = g->block_mask;
+    return true;
+}
+#endif
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Test entry (tests/test_deepseek41_metal --index-candidates): ds41_candidates_row on a graph holding only these
+ * tensors at pos, with the list record *list_pos / *list_mask carried in and out, so a test can run the decode
+ * graph and its row copies (other mask views, the same list) in any order. */
+int ds4_test_v41_candidates_row(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores, ds4_gpu_tensor *list,
+                                ds4_gpu_tensor *q, ds4_gpu_tensor *weights, ds4_gpu_tensor *keys,
+                                ds4_gpu_tensor *mask, uint32_t n_comp, uint32_t pos,
+                                uint32_t *list_pos, const ds4_gpu_tensor **list_mask) {
+    ds41_gpu_graph *g = calloc(1, sizeof(*g));
+    if (!g || !list_pos || !list_mask) { free(g); return 0; }
+    g->selected_comp = selected; g->index_scores = scores; g->block_list = list;
+    g->index_q = q; g->index_weights = weights; g->index_cache[0] = keys; g->block_mask = mask;
+    g->pos = pos;
+    g->block_list_pos = *list_pos;
+    g->block_list_mask = *list_mask;
+    const bool ok = ds41_candidates_row(g, 0, n_comp);
+    *list_pos = g->block_list_pos;
+    *list_mask = g->block_list_mask;
+    free(g);
+    return ok;
+}
+#endif
+
 static bool ds41_attention_select_projected(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
@@ -41796,10 +41841,7 @@ static bool ds41_attention_select_projected(ds41_gpu_graph *g, uint32_t il) {
     if (n_comp && ds41_index_source(il)) {
 #ifdef __APPLE__
         /* past layer 20 only its candidate blocks can be selected */
-        if (il > 20u && (n_comp + 7u) / 8u > 2048u &&
-            ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
-                g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp,
-                1.0f / 64.0f, DS4_N_INDEXER_TOP_K)) return true;
+        if (il > 20u && (n_comp + 7u) / 8u > 2048u && ds41_candidates_row(g, owner, n_comp)) return true;
         if (!ds4_gpu_dsv41_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else

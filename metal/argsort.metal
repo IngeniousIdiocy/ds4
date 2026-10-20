@@ -150,6 +150,8 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+// The same SIMD-exchange network for the non-causal block sort of the decode call (one row, k = 512).
+template [[host_name("kernel_argsort_f32_i32_desc_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,
@@ -318,6 +320,10 @@ kernel void kernel_argsort_merge_f32_i32(
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+// The decode call (non-causal, one row, k = 512) keeps only the ordered top 512 of every merged pair (run offsets
+// unchanged): the same comparisons and tie order on every NaN-free row. The per-thread chunk follows the truncated
+// total, so a row holding NaN (inconsistent compares) may order differently than the full merge.
+template [[host_name("kernel_argsort_merge_f32_i32_desc_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 
 // ---- Whole-GPU top-k for wide score rows -----------------------------------
 //
@@ -584,4 +590,42 @@ kernel void kernel_topk_select_sort(
         }
     }
     for (uint i = tid; i < args.top_k; i += 1024u) out[i] = (int)ids[i];
+}
+
+// kernel_topk_select_sort for top_k <= 512: one key per thread, 512 threads,
+// SIMD shuffles below a distance of 32.  Score descending, ties by ascending
+// id is a total order on the winners, so the result equals the 2048-wide
+// sort's.  map != 0: winners are candidate positions, written back as key ids
+// list[p / 8] * 8 + p % 8 (kernel_dsv41_candidate_ids folded in).
+kernel void kernel_topk_select_sort512(
+        constant ds4_metal_args_topk_select & args,
+        device const float * scores,
+        device int * selected,
+        device const uint * list,
+        constant uint & map,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint tk[512], ti[512];
+    device const float * s = scores + (ulong)row * args.n;
+    device int * out = selected + (ulong)row * args.top_k;
+    uint key = 0u, id = 0xffffffffu;
+    if (tid < args.top_k) { id = (uint)out[tid]; key = ds4_topk_key(s[id]); }
+    for (uint k = 2u; k <= 512u; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            uint pk, pi;
+            if (j < 32u) {
+                pk = simd_shuffle_xor(key, (ushort)j);
+                pi = simd_shuffle_xor(id, (ushort)j);
+            } else {
+                tk[tid] = key; ti[tid] = id;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                pk = tk[tid ^ j]; pi = ti[tid ^ j];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const bool mine_first = key > pk || (key == pk && id < pi);
+            const bool keep_first = ((tid & j) == 0u) == ((tid & k) == 0u);
+            if (mine_first != keep_first) { key = pk; id = pi; }
+        }
+    }
+    if (tid < args.top_k) out[tid] = map ? (int)(list[id >> 3] * 8u + (id & 7u)) : (int)id;
 }
