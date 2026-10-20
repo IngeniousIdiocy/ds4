@@ -65,7 +65,7 @@ static BOOL g_batch_has_work;
  * timeline (durations and the gaps between them) without ending command
  * buffers. Pass boundaries add a little serialization, so absolute numbers
  * are an upper bound; the anatomy is what this exists for. Off by default. */
-#define DS4_TIMELINE_NAME_MAX 80
+#define DS4_TIMELINE_NAME_MAX 400
 #define DS4_TIMELINE_SAMPLES_PER_BUFFER 4096
 typedef struct {
     uintptr_t caller;
