@@ -1760,6 +1760,160 @@ static int check_index_score_wide(void) {
     return 1;
 }
 
+static float gaussian_value(void) {
+    float s = 0;
+    for (int i = 0; i < 4; i++) s += random_value();
+    return s / 4.0f;   /* sums of uniforms: a bell, |x| <= 4 */
+}
+
+/* The bf16 key view and its scorer against the wide scorer on the f32 cache:
+ * the same bits for every key. Keys pass the production FP4_E8M0 quantizer
+ * with block scales spread over 41 exponents, over 12 exponents (where the
+ * summation order shows in the bits), and as in the model (normed rows, block
+ * scales within a few octaves, bf16 head weights). The view converts in two
+ * pieces at an odd boundary; a key with low bits set raises the check flag. */
+static int check_index_score_bf16(void) {
+    enum { HEADS = 32, DIM = 128, ROUNDS = 6 };
+    const uint32_t counts[] = {8192, 8200, 20011, 65536, 131077, 300000};
+    const uint32_t max_keys = 300000;
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *wt = upload(NULL, (size_t)HEADS * sizeof(float));
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * sizeof(float));
+    ds4_gpu_tensor *vt = upload(NULL, (size_t)max_keys * DIM * sizeof(uint16_t));
+    ds4_gpu_tensor *sw = upload(NULL, ((size_t)max_keys + 1) * sizeof(float));
+    ds4_gpu_tensor *sb = upload(NULL, ((size_t)max_keys + 1) * sizeof(float));
+    ds4_gpu_tensor *ft = upload(NULL, sizeof(uint32_t));
+    CHECK(qt && wt && kt && vt && sw && sb && ft);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt);
+    float *wide = ds4_gpu_tensor_contents(sw), *fast = ds4_gpu_tensor_contents(sb);
+    uint32_t *flag = ds4_gpu_tensor_contents(ft);
+    CHECK(q && w && k && wide && fast && flag);
+    const char *names[] = {"spread-41", "spread-12", "model-like"};
+    for (int dist = 0; dist < 3; dist++) {
+        int scale[HEADS], block = 0;
+        for (size_t h = 0; h < HEADS; h++) { (void)random_value(); scale[h] = (int)(seed % 5u) - 2; }
+        for (size_t i = 0; i < (size_t)HEADS * DIM; i++)
+            q[i] = dist == 0 ? ldexpf(random_value(), (int)((i / 32) % 41) - 20) :
+                   dist == 1 ? ldexpf(random_value(), (int)((i / 32 * 7) % 13) - 6) :
+                               ldexpf(gaussian_value(), scale[i / DIM]);
+        for (size_t i = 0; i < HEADS; i++)
+            w[i] = bf16(dist == 2 ? gaussian_value() * 0.18f : random_value());
+        for (size_t i = 0; i < (size_t)max_keys * DIM; i++) {
+            if (dist == 2 && i % 32 == 0) { (void)random_value(); block = (int)(seed % 4u) - 1; }
+            k[i] = dist == 0 ? ldexpf(random_value(), (int)((i / 32) % 41) - 20) :
+                   dist == 1 ? ldexpf(random_value(), (int)((i / 32 * 5 + i / DIM) % 13) - 6) :
+                               ldexpf(gaussian_value(), block);
+        }
+        CHECK(ds4_gpu_dsv41_quantize(qt, DIM, HEADS, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_quantize(kt, DIM, max_keys, DS4_V41_FP4_E8M0));
+        *flag = 0;
+        CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 0, 77777, ft));
+        CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 77777, max_keys - 77777, ft));
+        CHECK(ds4_gpu_synchronize());
+        CHECK(*flag == 0);
+        for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+            const uint32_t keys = counts[ci];
+            wide[keys] = fast[keys] = 12345;
+            double seconds[2] = {0, 0};
+            ds4_gpu_test_set_flags(DS4_GPU_TEST_INDEX_SCORE_WIDE);
+            for (int round = 0; round < ROUNDS; round++) {
+                for (int mode = 0; mode < 2; mode++) {
+                    memset(mode ? fast : wide, 0xff, (size_t)keys * sizeof(float));
+                    const double t0 = monotonic_seconds();
+                    CHECK(mode ? ds4_gpu_dsv41_indexer_score_bf16(sb, qt, wt, vt, keys) :
+                        ds4_gpu_glm_indexer_score_one_tensor(sw, qt, wt, kt, keys, HEADS, DIM, 1.0f / 64.0f, false));
+                    CHECK(ds4_gpu_synchronize());
+                    if (round) seconds[mode] += monotonic_seconds() - t0;
+                }
+            }
+            ds4_gpu_test_set_flags(0);
+            CHECK(wide[keys] == 12345 && fast[keys] == 12345);
+            uint32_t differing = 0, positive = 0, rounded = 0;
+            for (uint32_t j = 0; j < keys; j++) {
+                differing += memcmp(wide + j, fast + j, sizeof(float)) != 0;
+                positive += wide[j] > 0;
+            }
+            /* sensitivity: keys whose f32 score is not the exact sum, so order shows */
+            for (uint32_t j = 0; ci == 0 && j < 2048; j++) {
+                double expected = 0;
+                for (uint32_t h = 0; h < HEADS; h++) {
+                    double dot = 0;
+                    for (uint32_t d = 0; d < DIM; d++)
+                        dot += (double)q[(size_t)h * DIM + d] * k[(size_t)j * DIM + d];
+                    expected += fmax(dot / 64.0, 0) * w[h];
+                }
+                rounded += (double)wide[j] != expected;
+            }
+            fprintf(stderr, "V4.1 bf16 index score %s keys=%u differing=%u positive=%u rounded(first 2048)=%u "
+                    "us per call wide=%.0f bf16=%.0f\n", names[dist], keys, differing, positive, rounded,
+                    seconds[0] / (ROUNDS - 1) * 1e6, seconds[1] / (ROUNDS - 1) * 1e6);
+            CHECK(differing == 0 && positive > keys / 16 && (ci != 0 || rounded > 0));
+            /* below 65536 keys the default is a split scorer (4 lanes per key below 10240, else 2); the opt-out
+             * runs the grouped one there */
+            if (keys < 65536u) {
+                CHECK(setenv("DS4_METAL_DISABLE_V41_SCORE_SPLIT", "1", 1) == 0);
+                memset(fast, 0xff, (size_t)keys * sizeof(float));
+                const int ok = ds4_gpu_dsv41_indexer_score_bf16(sb, qt, wt, vt, keys) && ds4_gpu_synchronize();
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_SCORE_SPLIT") == 0);
+                CHECK(ok && !memcmp(wide, fast, (size_t)keys * sizeof(float)) && fast[keys] == 12345);
+            }
+        }
+    }
+    /* the engine's decode row: the view where the wide scorer runs, the f32
+     * keys below it, a restore that rebuilds the view, and the f32 fallback
+     * when a restore brings a key that is not bf16-exact */
+    const uint32_t row_keys = 131077;
+    const int view_path = getenv("DS4_METAL_DISABLE_V41_INDEX_BF16") ? 1 : 2;   /* the opt-out scores f32 */
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_INDEX_SCORE_WIDE);
+    CHECK(ds4_gpu_glm_indexer_score_one_tensor(sw, qt, wt, kt, row_keys, HEADS, DIM, 1.0f / 64.0f, false));
+    ds4_gpu_test_set_flags(0);
+    CHECK(ds4_gpu_synchronize());
+    memset(fast, 0xff, (size_t)row_keys * sizeof(float));
+    CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, row_keys, 0) == view_path);
+    CHECK(ds4_gpu_synchronize());
+    CHECK(!memcmp(wide, fast, (size_t)row_keys * sizeof(float)));
+    memset(ds4_gpu_tensor_contents(vt), 0xa5, (size_t)row_keys * DIM * sizeof(uint16_t));
+    memset(fast, 0xff, (size_t)row_keys * sizeof(float));
+    CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, row_keys, 1) == view_path);
+    CHECK(ds4_gpu_synchronize());
+    CHECK(!memcmp(wide, fast, (size_t)row_keys * sizeof(float)));
+    CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, 4096, 0) == 1);
+    {
+        uint32_t low;
+        memcpy(&low, &k[(size_t)99999 * DIM + 3], 4);
+        low |= 1u;
+        memcpy(&k[(size_t)99999 * DIM + 3], &low, 4);
+        ds4_gpu_test_set_flags(DS4_GPU_TEST_INDEX_SCORE_WIDE);
+        CHECK(ds4_gpu_glm_indexer_score_one_tensor(sw, qt, wt, kt, row_keys, HEADS, DIM, 1.0f / 64.0f, false));
+        ds4_gpu_test_set_flags(0);
+        CHECK(ds4_gpu_synchronize());
+        memset(fast, 0xff, (size_t)row_keys * sizeof(float));
+        CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, row_keys, 1) == 1);
+        CHECK(ds4_gpu_synchronize());
+        CHECK(!memcmp(wide, fast, (size_t)row_keys * sizeof(float)));
+        low &= ~1u;
+        memcpy(&k[(size_t)99999 * DIM + 3], &low, 4);
+    }
+    fprintf(stderr, "V4.1 decode index row: bf16 view, restore rebuild, f32 below 8192 and after an inexact restore PASS\n");
+    /* the flag: one key with a low bit, in the second piece only */
+    uint32_t bits;
+    memcpy(&bits, &k[(size_t)123456 * DIM + 77], 4);
+    bits |= 1u;
+    memcpy(&k[(size_t)123456 * DIM + 77], &bits, 4);
+    *flag = 0;
+    CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 0, 123456, ft));
+    CHECK(ds4_gpu_synchronize());
+    CHECK(*flag == 0);
+    CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 123456, 1, ft));
+    CHECK(ds4_gpu_synchronize());
+    CHECK(*flag != 0);
+    ds4_gpu_tensor_free(ft); ds4_gpu_tensor_free(sb); ds4_gpu_tensor_free(sw);
+    ds4_gpu_tensor_free(vt); ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(qt);
+    fprintf(stderr, "V4.1 bf16 index score == wide scorer bits PASS\n");
+    return 1;
+}
+
 /* Candidate-only index rows against the wide row they replace (wide scores,
  * candidate filter, radix top-512): the same ids in the same order, with
  * realistic and wide FP4 block scales, partial newest blocks and ties. */
@@ -2030,6 +2184,7 @@ static int check_blend(void) {
 }
 #else
 static int check_index_score_wide(void) { return 1; }
+static int check_index_score_bf16(void) { return 1; }
 static int check_index_candidates(void) { return 1; }
 static int check_e4m3_copies(void) { return 1; }
 static int check_blend(void) { return 1; }
@@ -2256,6 +2411,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--index-score-bf16")) {
+        const int ok = ds4_gpu_init() && check_index_score_bf16();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-candidates")) {
         const int ok = ds4_gpu_init() && check_index_candidates();
         ds4_gpu_cleanup();
@@ -2330,7 +2490,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() &&
              check_rope_quantize() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
-             check_index_score_wide() && check_index_candidates() && check_e4m3_copies() && check_blend() && check_embedding() && check_index_projection() && check_general_topk() &&
+             check_index_score_wide() && check_index_score_bf16() && check_index_candidates() && check_e4m3_copies() && check_blend() && check_embedding() && check_index_projection() && check_general_topk() &&
              check_topk_select() && check_causal_topk() && check_decode_topk() && check_split_collapse() && check_fused_merge() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() &&
              check_attention_output(false) && check_tp_attention();
     ds4_gpu_cleanup();
