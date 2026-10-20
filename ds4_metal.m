@@ -22321,6 +22321,110 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
     return 1;
 }
 
+/* One activation row against BF16 weights in a GPU tensor: the F32 matvec's
+ * dispatch and reduction, so weights that are exactly BF16 give its bits. */
+int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
+                                       uint64_t in_dim, uint64_t out_dim,
+                                       const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (in_dim < 32u || (in_dim % 4u) != 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!wbuf || !xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(weights) < in_dim * out_dim * sizeof(uint16_t) ||
+            ds4_gpu_tensor_bytes(x) < in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < out_dim * sizeof(float)) return 0;
+        ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        mv_args.nb00 = sizeof(uint16_t);
+        mv_args.nb01 = in_dim * sizeof(uint16_t);
+        mv_args.nb02 = mv_args.nb03 = in_dim * out_dim * sizeof(uint16_t);
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+        if (ds4_gpu_plain_mv_single_row(out_dim)) {
+            mv_dispatch.nr0 = 1;
+            mv_dispatch.smem = 32u * sizeof(float);
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_bf16_f32_4", mv_dispatch.nsg);
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        if (mv_dispatch.smem) [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                              (NSUInteger)mv_dispatch.nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "BF16 weights matvec")) return 0;
+    }
+    return 1;
+}
+
+/* One activation row against E4M3 codes with per-32x32-block float scales,
+ * output rounded to bf16: the F16 matvec's dispatch, walk and reductions, so
+ * codes repacked exactly from F16 weights give its bits. */
+int ds4_gpu_matmul_e4m3_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes,
+                                    const ds4_gpu_tensor *scales, uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_quality_mode || in_dim < 32u || (in_dim % 32u) != 0 || (out_dim % 32u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(codes);
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(scales);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!wbuf || !sbuf || !xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(codes) < in_dim * out_dim ||
+            ds4_gpu_tensor_bytes(scales) < (in_dim / 32u) * (out_dim / 32u) * sizeof(float) ||
+            ds4_gpu_tensor_bytes(x) < in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < out_dim * sizeof(float)) return 0;
+        ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+        mv_args.nb00 = 1;
+        mv_args.nb01 = in_dim;
+        mv_args.nb02 = mv_args.nb03 = in_dim * out_dim;
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+        if ((out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
+            mv_dispatch.nr0 = 4;
+            mv_dispatch.smem = 32u * 4u * sizeof(float);
+        }
+        if (ds4_gpu_plain_mv_single_row(out_dim)) {
+            mv_dispatch.nr0 = 1;
+            mv_dispatch.smem = 32u * sizeof(float);
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+        if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0) return 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_e4m3_f32_4_bf16", mv_dispatch.nsg);
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(codes) atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(scales) atIndex:4];
+        if (mv_dispatch.smem) [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                              (NSUInteger)mv_dispatch.nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "E4M3 weights matvec")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
