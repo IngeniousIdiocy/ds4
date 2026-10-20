@@ -49917,6 +49917,19 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
     return buffer;
 }
 
+/* The split collapse's 32 partial sums, between its two dispatches. */
+static id<MTLBuffer> ds4_gpu_v41_collapse_slots(void) {
+    if (!g_dsv4_completion_cache) return nil;
+    id<MTLBuffer> buffer = [g_dsv4_completion_cache objectForKey:@"v41_collapse_slots"];
+    if (!buffer) {
+        buffer = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        if (!buffer) return nil;
+        [g_dsv4_completion_cache setObject:buffer forKey:@"v41_collapse_slots"];
+    }
+    [g_transient_buffers addObject:buffer];
+    return buffer;
+}
+
 int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *pre,
         const void *model_map, uint64_t model_size, uint64_t norm_offset, float eps) {
@@ -49937,6 +49950,33 @@ int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         id<MTLBuffer> count=ds4_gpu_v41_deferred_counter();
         if (!w || !count) return 0;
         const struct { int32_t n_embd,n_hc,iters; float hc_eps,norm_eps; } args={5120,4,0,0,eps};
+        if (!getenv("DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE")) {   /* the collapse over 32 + 10 groups */
+            id<MTLComputePipelineState> part = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_part");
+            id<MTLComputePipelineState> fin = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_norm");
+            id<MTLBuffer> slots = ds4_gpu_v41_collapse_slots();
+            if (!part || !fin || !slots) return 0;
+            int owned=0;id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned);
+            id<MTLComputeCommandEncoder> enc=cb?ds4_gpu_compute_encoder(cb):nil;if(!enc)return 0;
+            [enc setComputePipelineState:part];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(residual) offset:ds4_gpu_tensor_offset(residual) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(pre) offset:ds4_gpu_tensor_offset(pre) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:3];
+            [enc setBuffer:slots offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+            /* the norm reads the collapsed values and partials (a serial encoder orders them; a concurrent one needs this) */
+            if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:fin];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+            [enc setBuffer:slots offset:0 atIndex:2];
+            [enc setBuffer:w offset:(NSUInteger)inner atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(norm) offset:ds4_gpu_tensor_offset(norm) atIndex:4];
+            [enc setBuffer:count offset:0 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(10,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            ds4_gpu_end_compute_encoder(cb,enc);
+            return ds4_gpu_finish_command_buffer(cb,owned,"V4.1 independent HC collapse (split)");
+        }
         int owned=0;id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc=cb?ds4_gpu_compute_encoder(cb):nil;if(!enc)return 0;
         [enc setComputePipelineState:pipeline];

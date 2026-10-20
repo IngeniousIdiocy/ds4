@@ -1067,6 +1067,66 @@ kernel void kernel_dsv41_deferred_collapse(
 
 }
 
+/* The split HC collapse: kernel_dsv41_deferred_collapse as two dispatches with the same bits. The single 1024-thread group
+ * spends most of its time pulling 100 KB through one core; here the loads spread over 32 groups.
+ * Part: group s is the original's simdgroup s (thread t = 32 s + lane owns elements t and t + 1024, as there) and stores
+ * the collapsed values and its simd_sum partial in slots[s]. The four-row sum is written as the fma chain the original's
+ * `acc += x * w` sequence compiles to under fast math (checked bit for bit against it), so the two cannot drift apart.
+ * Norm: every simdgroup reloads the 32 partials, lane = slot, and repeats the original's second simd_sum over the same 32
+ * values in the same lanes, then normalizes its elements from the stored collapsed values. Group 0 resets the counter as
+ * the original does at its end. Host contract: n_embd 5120, n_hc 4 (as the original). */
+kernel void kernel_dsv41_deferred_collapse_part(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device float *slots,
+        uint group [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n_embd = (uint)args.n_embd, n4 = n_embd >> 2;
+    const uint i0 = group * 32u + tiisg, i1 = i0 + 1024u;
+    const bool h0 = i0 < n4, h1 = i1 < n4;
+    device const float4 *x0 = (device const float4 *)(x + 0u * n_embd);
+    device const float4 *x1 = (device const float4 *)(x + 1u * n_embd);
+    device const float4 *x2 = (device const float4 *)(x + 2u * n_embd);
+    device const float4 *x3 = (device const float4 *)(x + 3u * n_embd);
+    const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
+    float4 a0 = 0.0f, b0 = 0.0f, c0 = 0.0f, d0 = 0.0f, a1 = 0.0f, b1 = 0.0f, c1 = 0.0f, d1 = 0.0f;
+    if (h0) { a0 = x0[i0]; b0 = x1[i0]; c0 = x2[i0]; d0 = x3[i0]; }
+    if (h1) { a1 = x0[i1]; b1 = x1[i1]; c1 = x2[i1]; d1 = x3[i1]; }
+    device float4 *collapsed4 = (device float4 *)collapsed;
+    float sumf = 0.0f;
+    if (h0) {
+        const float4 v = dsv41_bf16(fma(d0, w3, fma(c0, w2, fma(b0, w1, a0 * w0))));
+        collapsed4[i0] = v;
+        sumf += dot(v, v);
+    }
+    if (h1) {
+        const float4 v = dsv41_bf16(fma(d1, w3, fma(c1, w2, fma(b1, w1, a1 * w0))));
+        collapsed4[i1] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    if (tiisg == 0) slots[group] = sumf;
+}
+
+kernel void kernel_dsv41_deferred_collapse_norm(
+        constant ds4_deferred_hc_args &args,
+        device const float *collapsed, device const float *slots,
+        device const float *norm_weight, device float *norm_dst, device atomic_uint *counter,
+        uint gid [[thread_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n4 = (uint)args.n_embd >> 2;
+    float sumf = slots[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf / (float)args.n_embd;
+    const float rscale = 1.0f / sqrt(mean + args.norm_eps);
+    if (gid < n4) {
+        const float4 r = ((device const float4 *)collapsed)[gid];
+        const float4 v = (r * rscale) * ((device const float4 *)norm_weight)[gid];
+        ((device float4 *)norm_dst)[gid] = float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+    }
+    if (gid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
+}
+
 kernel void kernel_dsv41_query_deferred_hc(
         constant ds4_metal_args_hc_norm_mix &hc [[buffer(0)]],
         constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm &split_args [[buffer(1)]],
