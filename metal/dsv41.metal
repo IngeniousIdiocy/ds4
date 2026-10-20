@@ -380,6 +380,48 @@ kernel void kernel_dsv41_rope_quantize(
     if (valid) dst[column] = dsv41_bf16(result);
 }
 
+/* The decode indexer query's rope and quantization in ONE dispatch over every head, in place: grid
+ * (width / block, heads) x 32, each threadgroup one block of one head row. The arithmetic is dsv41_rope_quantize_body
+ * with the coefficients read from the step's RoPE coefficient table (kernel_dsv41_rope_coeff_table: float2(cos, sin)
+ * of the same theta; the host binds the half the frequencies select, compressed = entries 32..63 at byte 256). Each
+ * lane reads its own word before the pair shuffle and writes it last. */
+kernel void kernel_dsv41_rope_quantize_heads_tab(
+        constant ds4_metal_args_dsv41_rope_quantize &args,
+        device float *x,
+        device const float2 *tab,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    device float *row = x + (ulong)group.y * args.width;
+    const uint block = args.mode == 3u ? 16u : 32u;
+    const uint column = group.x * block + lane;
+    const bool valid = lane < block && column < args.width;
+    float value = valid ? row[column] : 0.0f;
+    const float other = simd_shuffle_xor(value, 1u);
+    const uint rotary = args.width - 64u;
+    if (valid && column >= rotary) {
+        const float2 cs = tab[(column - rotary) >> 1u];
+        const float c = cs.x;
+        const float s = args.inverse ? -cs.y : cs.y;
+        const float re = (column & 1u) ? other : value;
+        const float im = (column & 1u) ? value : other;
+        /* the contraction kernel_dsv41_rope compiles to */
+        value = (column & 1u) ? dsv41_bf16(fma(im, c, re * s)) : dsv41_bf16(fma(re, c, -(im * s)));
+    }
+    value = dsv41_bf16(value);
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (args.mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (args.mode == 2u || args.mode == 3u) {
+        const float scale = args.mode == 3u
+            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    }
+    if (valid) row[column] = dsv41_bf16(result);
+}
+
 struct ds4_metal_args_dsv41_norm_pair {
     uint n0, n1, ntg0, ntg1;
     float eps;
@@ -1094,4 +1136,76 @@ kernel void kernel_dsv41_add_bf16_rows4(
     const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
     bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
     out[gid] = bits & 0xffff0000u;
+}
+
+/* The split-K decode reduce of flash_attn.metal (the same body, line for line) whose final writer stores the
+ * attention-output low projection's prepared input instead of the raw head: every coordinate as
+ * ds4_bf16_round(v*S), and the rotary tail (the last 64 of each 512-wide head) inverse-rotated with the step's
+ * coefficient table exactly as kernel_mul_mv_q8_0_f32_rope_impl<.., ROUND_IN, ROPE_IN, .., ROPE_TAB> does it on its
+ * rounded inputs (s = -sin, the same FMA order, BF16 after each FMA). rope_tab is the table already offset to the
+ * layer's mode (raw entries 0..31, compressed 32..63). The plain low projection (no round, no rope) then reads these
+ * words; ds4_bf16_round is idempotent, so its K walk sees exactly the bits the table consumer computes. */
+static __attribute__((noinline)) void ds4_dsv41_flash_attn_vec_reduce_heads_row(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        device const float2 * rope_tab,
+        uint   tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        short  NWG_,
+        short  DV_) {
+    const uint64_t rid = tgpig;
+
+    const short iwg = tiisg;
+
+    device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
+
+    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
+    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+
+    const float m  = simd_max(M);
+    const float ms = exp(M - m);
+
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    const short DV4 = DV_/4;
+
+    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG_;
+    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+
+    for (short i = sgitg; i < DV4; i += NWG_) {
+        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+
+        if (iwg == 0) {
+            const float4 t = v*S;
+            float4 r = float4(ds4_bf16_round(t.x), ds4_bf16_round(t.y), ds4_bf16_round(t.z), ds4_bf16_round(t.w));
+            if (i >= DV4 - 16) {
+                const short p0 = 2*(i - (DV4 - 16));
+                const float2 c0 = rope_tab[p0];
+                const float2 c1 = rope_tab[p0 + 1];
+                const float s0 = -c0.y, s1 = -c1.y;
+                const float re0 = r.x, im0 = r.y, re1 = r.z, im1 = r.w;
+                r.x = ds4_bf16_round(fma(re0, c0.x, -(im0 * s0)));
+                r.y = ds4_bf16_round(fma(im0, c0.x, re0 * s0));
+                r.z = ds4_bf16_round(fma(re1, c1.x, -(im1 * s1)));
+                r.w = ds4_bf16_round(fma(im1, c1.x, re1 * s1));
+            }
+            dst4[i] = r;
+        }
+    }
+}
+
+kernel void kernel_dsv41_flash_attn_vec_reduce_heads(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        device const float2 * rope_tab,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_dsv41_flash_attn_vec_reduce_heads_row(args, htmp, dst, rope_tab, tgpig, tiisg, sgitg,
+                                              (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                              (short)FC_flash_attn_ext_vec_reduce_DV);
 }
