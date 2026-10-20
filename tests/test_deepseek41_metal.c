@@ -642,6 +642,94 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* Random Q8_0 weights [rows][cols] at page-aligned memory (scales around 2^-8). */
+static void *q8_weights(uint32_t rows, uint32_t cols, uint64_t *bytes) {
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    *bytes = (uint64_t)rows * cols / 32 * sizeof(q8_block);
+    void *model = NULL;
+    if (posix_memalign(&model, getpagesize(), *bytes) != 0) return NULL;
+    q8_block *w = model;
+    for (uint64_t i = 0; i < *bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1c00 + (int)(random_value() * 8192) % 1024);
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
+    }
+    return model;
+}
+
+/* Run one call twice, with the literal-shape kernel and with its opt-out set; both outputs must match bitwise. */
+#define LITERAL_PAIR(env, out, bytes, call) do { \
+        CHECK(ds4_gpu_begin_commands() && (call) && ds4_gpu_end_commands() && ds4_gpu_synchronize()); \
+        void *lit_ = malloc(bytes); \
+        CHECK(lit_); \
+        memcpy(lit_, ds4_gpu_tensor_contents(out), bytes); \
+        CHECK(setenv(env, "1", 1) == 0 && ds4_gpu_begin_commands()); \
+        const int gen_ok_ = (call); \
+        CHECK(unsetenv(env) == 0 && gen_ok_ && ds4_gpu_end_commands() && ds4_gpu_synchronize()); \
+        CHECK(!memcmp(lit_, ds4_gpu_tensor_contents(out), bytes)); \
+        free(lit_); \
+    } while (0)
+
+/* The V4.1 decode calls that take literal-shape kernels give the generic kernels' bits. */
+static int check_literal_shapes(void) {
+    {   /* attention output-B into the HC streams: 8192 -> 5120, one row, no add */
+        uint64_t wb = 0;
+        void *model = q8_weights(5120, 8192, &wb);
+        CHECK(model && ds4_gpu_set_model_map(model, wb));
+        float *h = malloc(8192 * 4);
+        CHECK(h);
+        for (int i = 0; i < 8192; i++) h[i] = random_value();
+        ds4_gpu_tensor *x = upload(h, 8192 * 4), *res = upload(NULL, 4 * 5120 * 4), *split = upload(NULL, 24 * 4);
+        ds4_gpu_tensor *out = upload(NULL, 4 * 5120 * 4);
+        CHECK(x && res && split && out);
+        float *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
+        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
+        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_HC_CONSUMER_STATIC", out, 4 * 5120 * 4,
+                     ds4_gpu_dsv41_matmul_expand_rows(out, model, wb, 0, 8192, 5120, x, NULL, res, split, 4, 1));
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(res); ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
+        free(h); free(model);
+        fprintf(stderr, "V4.1 literal output-B HC consumer == generic PASS\n");
+    }
+    {   /* the serial FFN join: shared + routed into the HC streams, one token, bf16 rounding */
+        ds4_gpu_tensor *blk = upload(NULL, 5120 * 4), *add = upload(NULL, 5120 * 4), *res = upload(NULL, 4 * 5120 * 4);
+        ds4_gpu_tensor *split = upload(NULL, 24 * 4), *out = upload(NULL, 4 * 5120 * 4);
+        CHECK(blk && add && res && split && out);
+        float *b = ds4_gpu_tensor_contents(blk), *a = ds4_gpu_tensor_contents(add);
+        float *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
+        for (int i = 0; i < 5120; i++) { b[i] = random_value(); a[i] = random_value(); }
+        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
+        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_HC_JOIN_LITERAL", out, 4 * 5120 * 4,
+                     ds4_gpu_hc_expand_split_add_bf16_tensor(out, blk, add, res, split, 5120, 4));
+        ds4_gpu_tensor_free(blk); ds4_gpu_tensor_free(add); ds4_gpu_tensor_free(res);
+        ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
+        fprintf(stderr, "V4.1 literal serial HC join == generic PASS\n");
+    }
+    {   /* the attention q_a/kv pair: 5120 -> 1280 and 5120 -> 512, one row, bf16 outputs */
+        uint64_t wb = 0;
+        void *model = q8_weights(1280 + 512, 5120, &wb);
+        CHECK(model && ds4_gpu_set_model_map(model, wb));
+        const uint64_t off_b = 1280ull * (5120 / 32) * 34;
+        float *h = malloc(5120 * 4);
+        CHECK(h);
+        for (int i = 0; i < 5120; i++) h[i] = random_value();
+        ds4_gpu_tensor *x = upload(h, 5120 * 4), *qa = upload(NULL, 1280 * 4), *kv = upload(NULL, 512 * 4);
+        CHECK(x && qa && kv);
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_QA_KV_PAIR_LITERAL", qa, 1280 * 4,
+                     ds4_gpu_dsv41_project_pair_q8(qa, kv, model, wb, 0, off_b, 5120, 1280, 512, x));
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_QA_KV_PAIR_LITERAL", kv, 512 * 4,
+                     ds4_gpu_dsv41_project_pair_q8(qa, kv, model, wb, 0, off_b, 5120, 1280, 512, x));
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(qa); ds4_gpu_tensor_free(kv);
+        free(h); free(model);
+        fprintf(stderr, "V4.1 literal q_a/kv pair == generic PASS\n");
+    }
+    return 1;
+}
+#else
+static int check_literal_shapes(void) { return 1; }
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1689,6 +1777,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
+        const int ok = ds4_gpu_init() && check_literal_shapes();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--topk-select")) {
         const int ok = ds4_gpu_init() && check_topk_select();
         ds4_gpu_cleanup();
@@ -1709,7 +1802,7 @@ int main(int argc, char **argv) {
              check_rope_quantize() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() &&
              check_index_score_wide() && check_index_candidates() && check_embedding() && check_index_projection() && check_general_topk() &&
-             check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() &&
+             check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_literal_shapes() &&
              check_attention_output(false) && check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
