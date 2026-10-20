@@ -492,6 +492,11 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+/* The V4.1 pre-encoded next-token buffer (Metal): out[0] prepared, [1] used, [2] pending now, [3..] drops by reason
+ * (foreign command buffer, position, latch, state, error, prepare, off, invalid, step failure, release). */
+void ds4_preencode_stats(uint64_t *out, int n);
+/* The finite GPU bridge behind each pre-encoded V4.1 decode head (Metal): committed, retired, failed. */
+void ds4_decode_bridge_stats(uint64_t out[3]);
 /* V4.1 decode Engram gates that ran with one 256-thread group per stream (Metal). */
 uint64_t ds4_engram_add_tg_count(void);
 #ifdef DS4_TEST_HOOKS
