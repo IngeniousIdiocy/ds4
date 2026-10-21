@@ -50,8 +50,17 @@ void ds4_gpu_cleanup(void);
  * "0" means not set. */
 enum {
     DS4_GPU_V41_LITERAL_SHAPES = 1u << 0,
+    DS4_GPU_V41_INDEXER_E4M3 = 1u << 1,
+    DS4_GPU_V41_MODEL_TRACKED = 1u << 2,   /* opt-out: DS4_METAL_MODEL_TRACKED */
+    DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
 };
 uint32_t ds4_gpu_v41_off(void);
+/* Weights built at load: allocated with the model views' storage options, and kept in a residency set of their
+ * own; ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+/* Model views and weights built at load skip hazard tracking (call before the model is mapped). */
+void ds4_gpu_set_model_untracked_default(int on);
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
 #endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);

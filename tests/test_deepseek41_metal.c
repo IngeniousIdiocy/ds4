@@ -1568,9 +1568,89 @@ static int check_index_candidates(void) {
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
     return 1;
 }
+
+/* The FP8 copy reader (ds4_gpu_matmul_e4m3_bf16_tensor), with its blend kernels and with the narrow readers, gives
+ * the BF16-rounded F16 projection's bits at the Engram (6144 -> 256, two-row blend) and indexer q_b (1280 -> 4096,
+ * block-owner blend) shapes: power-of-two 32x32 block scales 2^-15..2^-8 (every weight exact in F16), normal and
+ * small codes. The BF16 router's blend reader (5120 -> 384) gives the narrow reader's bits. */
+static int check_e4m3_copies(void) {
+    const uint32_t ins[2] = {6144, 1280}, outs[2] = {256, 4096};
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (int which = 0; which < 2; which++) {
+        const uint32_t IN = ins[which], OUT = outs[which];
+        const char *blend = which ? "kernel_e4m3_blend_owner_r2_bf16" : "kernel_e4m3_blend_r2_bf16";
+        const size_t f16_bytes = (size_t)IN * OUT * 2, code_bytes = (size_t)IN * OUT;
+        const size_t nscale = (size_t)(IN / 32) * (OUT / 32), page = (size_t)getpagesize();
+        const size_t map_bytes = (f16_bytes + page - 1) / page * page;
+        unsigned char *map = NULL, *codes = malloc(code_bytes);
+        float *scales = malloc(nscale * sizeof(float)), *x = malloc((size_t)IN * sizeof(float));
+        CHECK(posix_memalign((void **)&map, page, map_bytes) == 0 && codes && scales && x);
+        memset(map, 0, map_bytes);
+        _Float16 *w16 = (_Float16 *)map;
+        CHECK(ds4_gpu_set_model_map(map, map_bytes));
+        for (uint32_t i = 0; i < IN; i++) x[i] = random_value() / 4;
+        ds4_gpu_tensor *xt = upload(x, (size_t)IN * sizeof(float));
+        ds4_gpu_tensor *o16 = upload(NULL, OUT * 4), *o8 = upload(NULL, OUT * 4), *o8n = upload(NULL, OUT * 4);
+        CHECK(xt && o16 && o8 && o8n);
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 0; i < nscale; i++) { (void)random_value(); scales[i] = ldexpf(1.0f, -15 + (int)(seed % 8u)); }
+            for (size_t i = 0; i < code_bytes; i++) {
+                (void)random_value();
+                unsigned char c = (unsigned char)(seed >> 3);
+                if ((c & 0x7f) == 0x7f) c ^= 1;   /* no NaN codes */
+                if (pass) c = (unsigned char)(c & 0x87);   /* subnormal and small codes */
+                codes[i] = c;
+            }
+            for (size_t r = 0; r < OUT; r++)
+                for (size_t k = 0; k < IN; k++) {
+                    const unsigned char c = codes[r * IN + k], a = c & 0x7f;
+                    const uint32_t ex = (a >> 3) & 15u, m = a & 7u;
+                    float v = a == 0 ? 0.0f : ex == 0 ? ldexpf((float)m, -9) : ldexpf(1.0f + m / 8.0f, (int)ex - 7);
+                    if (c & 0x80) v = -v;
+                    w16[r * IN + k] = (_Float16)(v * scales[(r / 32) * (IN / 32) + k / 32]);
+                }
+            ds4_gpu_tensor *ct = upload(codes, code_bytes), *st = upload(scales, nscale * sizeof(float));
+            CHECK(ct && st);
+            const uint64_t runs = ds4_gpu_test_kernel_runs(blend);
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_project_f16_bf16(o16, map, map_bytes, 0, IN, OUT, xt));
+            CHECK(ds4_gpu_matmul_e4m3_bf16_tensor(o8, ct, st, IN, OUT, xt));
+            ds4_gpu_test_set_v41_off(DS4_GPU_V41_PLAIN_READERS);
+            const int ok = ds4_gpu_matmul_e4m3_bf16_tensor(o8n, ct, st, IN, OUT, xt);
+            ds4_gpu_test_set_v41_off(0);
+            CHECK(ok && ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            CHECK(ds4_gpu_test_kernel_runs(blend) == runs + 1);
+            CHECK(!memcmp(ds4_gpu_tensor_contents(o16), ds4_gpu_tensor_contents(o8), OUT * sizeof(float)));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(o16), ds4_gpu_tensor_contents(o8n), OUT * sizeof(float)));
+            ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st);
+        }
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o16); ds4_gpu_tensor_free(o8); ds4_gpu_tensor_free(o8n);
+        free(codes); free(scales); free(x);   /* map stays: the model views may wrap it */
+    }
+    {   /* BF16 router 5120 -> 384 */
+        const uint32_t in = 5120, out = 384;
+        ds4_gpu_tensor *wt = upload(NULL, (size_t)in * out * 2), *xt = upload(NULL, (size_t)in * 4), *o = upload(NULL, out * 4);
+        CHECK(wt && xt && o);
+        uint16_t *w = ds4_gpu_tensor_contents(wt);
+        float *x = ds4_gpu_tensor_contents(xt);
+        for (size_t i = 0; i < (size_t)in * out; i++) {
+            const float v = random_value() / 64;
+            uint32_t bits;
+            memcpy(&bits, &v, 4);
+            w[i] = (uint16_t)(bits >> 16);
+        }
+        for (uint32_t i = 0; i < in; i++) x[i] = random_value();
+        LITERAL_PAIR(DS4_GPU_V41_PLAIN_READERS, "kernel_router_blend_r1", o, out * 4,
+                     ds4_gpu_matmul_bf16_weights_tensor(o, wt, in, out, xt));
+        ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
+    }
+    fprintf(stderr, "V4.1 FP8 copy reader (blend and narrow) == F16 projection; router blend == narrow PASS\n");
+    return 1;
+}
 #else
 static int check_index_score_wide(void) { return 1; }
 static int check_index_candidates(void) { return 1; }
+static int check_e4m3_copies(void) { return 1; }
 #endif
 
 static int check_compact_carry(void) {
@@ -1819,6 +1899,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--e4m3-copies")) {
+        const int ok = ds4_gpu_init() && check_e4m3_copies();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
         const int ok = ds4_gpu_init() && check_literal_shapes();
         ds4_gpu_cleanup();
@@ -1832,6 +1917,7 @@ int main(int argc, char **argv) {
              check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() &&
              check_attention_output(false) && check_tp_attention();
     ok = ok && check_literal_shapes();
+    ok = ok && check_e4m3_copies();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }
