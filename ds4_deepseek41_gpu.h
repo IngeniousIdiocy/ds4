@@ -25,6 +25,13 @@ typedef enum {
 int ds4_gpu_dsv41_indexer_score_masked(ds4_gpu_tensor *scores,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *cache, const ds4_gpu_tensor *mask, uint32_t rows);
+/* Rows [first, first + rows) of the index-key cache into its bf16 view; with flag, a key that is not bf16-exact
+ * sets it nonzero. score_row: one decode index row (32 heads x 128, scale 1/64) over the cache, reading view, when
+ * given, where the wide scorer runs (the same bits). */
+int ds4_gpu_dsv41_index_keys_bf16(ds4_gpu_tensor *view, const ds4_gpu_tensor *cache,
+        uint32_t first, uint32_t rows, ds4_gpu_tensor *flag);
+int ds4_gpu_dsv41_indexer_score_row(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *cache, const ds4_gpu_tensor *view, uint32_t rows);
 
 int ds4_gpu_dsv41_router_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
                              ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
