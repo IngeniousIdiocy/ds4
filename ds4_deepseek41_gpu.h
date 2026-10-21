@@ -143,6 +143,13 @@ int ds4_gpu_dsv41_indexer_score_one_tensor(ds4_gpu_tensor *scores,
                                            uint32_t n_rows, uint32_t n_head,
                                            uint32_t head_dim, float scale,
                                            bool cache_f16);
+/* Rows [first, first + rows) of the index-key cache into its bf16 view; with flag, a key that is not bf16-exact
+ * sets it nonzero. score_row: one decode index row (32 heads x 128, scale 1/64) over the cache, reading view, when
+ * given, where the wide scorer runs (the same bits). */
+int ds4_gpu_dsv41_index_keys_bf16(ds4_gpu_tensor *view, const ds4_gpu_tensor *cache,
+        uint32_t first, uint32_t rows, ds4_gpu_tensor *flag);
+int ds4_gpu_dsv41_indexer_score_row(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *cache, const ds4_gpu_tensor *view, uint32_t rows);
 /* The top-k of a row filtered by a block mask of more than 2048 blocks, from
  * the scores of its 2048 candidate blocks only: the same ids in the same order
  * (Metal only). Returns 0, leaving the full row to the caller, where unavailable. */
