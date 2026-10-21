@@ -663,6 +663,21 @@ kernel void kernel_mul_mv_q8_0_f32_bf16io(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// BF16-rounded input, F32 output: a TP rank's K slice of a bf16 projection,
+// whose partial is rounded only after the peer's half joins it.
+[[host_name("kernel_mul_mv_q8_0_f32_bf16in")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16in(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, false, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // The q projection with its rope applied to the bf16 outputs.
 [[host_name("kernel_mul_mv_q8_0_f32_bf16_rope")]]
 kernel void kernel_mul_mv_q8_0_f32_bf16_rope(

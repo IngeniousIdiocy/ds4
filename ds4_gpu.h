@@ -112,6 +112,24 @@ int ds4_gpu_parallel_ffn_start_bf16(
         uint32_t              shared_dim,
         const ds4_gpu_tensor *x,
         float                 clamp);
+/* A TP rank's lanes of the V4.1 shared expert beside its routed experts:
+ * BF16 mid, then the K slice of the down projection with F32 output. */
+int ds4_gpu_parallel_ffn_start_bf16_kslice(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        uint32_t              shared_lane_offset,
+        uint32_t              shared_lane_count,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
 int ds4_gpu_parallel_ffn_start_sliced(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -524,6 +542,12 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off);
+/* One row's kslice matvec over an input not yet rounded to BF16: rounded as
+ * it loads. Returns 0 (nothing encoded) where only the rounded input works. */
+int ds4_gpu_matmul_q8_0_kslice_bf16in_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x);
 /* CUDA input rows contain only the owned contiguous K slice. Metal input
  * rows span full_in_dim and the kernel reads the slice at k_off within them.
  * Both backends produce full-width output rows. */

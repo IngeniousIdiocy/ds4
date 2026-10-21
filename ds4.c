@@ -40972,6 +40972,7 @@ typedef struct {
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     bool tp_gate_fused, shared_done;
+    bool low_unrounded;   /* TP: low's BF16 rounding is left to its kslice consumer */
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;
@@ -41533,6 +41534,20 @@ static bool ds41_queued_head_off(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_QUEUED_HEAD", &cache);
 }
 
+/* TP decode: the attention output's K slice rounds low on load instead of a
+ * separate BF16 pass (DS4_METAL_DISABLE_V41_TP_KSLICE_ROUND_IN=1: separate). */
+static bool ds41_tp_kslice_round_in_on(void) {
+    static int cache = -1;
+    return !metal_graph_env_flag("DS4_METAL_DISABLE_V41_TP_KSLICE_ROUND_IN", &cache);
+}
+
+/* TP decode: the rank's shared-expert half and the FFN HC mixer ride the
+ * routed experts' concurrent encoder (DS4_METAL_DISABLE_V41_TP_CONCURRENT_FFN=1: serial). */
+static bool ds41_tp_concurrent_ffn_on(void) {
+    static int cache = -1;
+    return !metal_graph_env_flag("DS4_METAL_DISABLE_V41_TP_CONCURRENT_FFN", &cache);
+}
+
 static bool ds41_short_sweep_off(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &cache);
@@ -41587,13 +41602,25 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                                     g->pos, compressed, true)) ||
          !ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size, offset,
                                                  4096, 1024, groups, g->heads))) return false;
-    return g->tp_world != 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0 ?
+    /* a TP rank's one-row K slice rounds low as it loads it */
+    g->low_unrounded = g->tp_world == 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        ds41_tp_kslice_round_in_on();
+    return (g->tp_world != 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0) || g->low_unrounded ?
         true : ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
 static bool ds41_attention_b(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, ds4_gpu_tensor *out) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+    if (g->tp_world == 2 && g->low_unrounded) {
+        g->low_unrounded = false;
+        uint64_t row = 0;
+        if (tensor_nbytes(l->attn_output_b->type, 8192, &row) &&
+            ds4_gpu_matmul_q8_0_kslice_bf16in_tensor(out, m->map, m->size, l->attn_output_b->abs_offset,
+                8192, (uint64_t)g->tp_rank * groups * 1024u, (uint64_t)groups * 1024u, DS4_N_EMBD, g->low))
+            return true;
+        if (!ds41_bf16(g->low, groups * DS4_N_LORA_O)) return false;
+    }
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(out, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
@@ -41990,7 +42017,17 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_parallel_ffn_start_bf16(g->shared_gate, g->shared_up, g->shared_mid, g->shared,
             m->map, m->size, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
             l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP);
-    if (concurrent) shared_queued = true;
+    /* A balanced TP rank's half of the shared expert rides its three routed
+     * experts the same way: its lanes' mid, then its K slice of the down. */
+    const bool concurrent_tp = !concurrent && shared_here && shared_split && shared_down &&
+        g->tp_world == 2 && !g->streaming && !g->quality && ds41_concurrent_ffn_on() &&
+        ds41_tp_concurrent_ffn_on() && ds41_tp_balanced_route() &&
+        l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        ds4_gpu_parallel_ffn_start_bf16_kslice(g->shared_gate, g->shared_up, g->shared_mid, g->shared,
+            m->map, m->size, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+            l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP, g->tp_rank * shared_dim, shared_dim,
+            g->norm, DS4_SWIGLU_CLAMP_EXP);
+    if (concurrent || concurrent_tp) shared_queued = true;
 #endif
     const bool shared_fused = shared_here && !shared_queued &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
@@ -42047,6 +42084,14 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                        l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP,
                        g->norm, DS4_SWIGLU_CLAMP_EXP, 1u) && ds41_shared_down(g, m, l))) return false;
         g->shared_done = routed_ok;
+    }
+    if (concurrent_tp) {
+        if (!routed_ok) ds4_gpu_parallel_ffn_abort();
+        else if (!ds4_gpu_parallel_ffn_finish() &&
+                 !(ds4_gpu_dsv41_shared_swiglu(g->shared_mid, g->shared_gate, g->shared_up, m->map, m->size,
+                       l->ffn_gate_shexp->abs_offset + shared_lane, l->ffn_up_shexp->abs_offset + shared_lane,
+                       DS4_N_EMBD, shared_dim, g->norm, DS4_SWIGLU_CLAMP_EXP, 1u) &&
+                   ds41_shared_down_half(g, m, l))) return false;
     }
 #endif
     if (!routed_ok) return false;
