@@ -54,6 +54,7 @@ enum {
     DS4_GPU_V41_INDEXER_E4M3 = 1u << 2,
     DS4_GPU_V41_MODEL_TRACKED = 1u << 3,   /* opt-out: DS4_METAL_MODEL_TRACKED */
     DS4_GPU_V41_ROPE_TABLE = 1u << 4,
+    DS4_GPU_V41_SPLIT_REDUCE = 1u << 5,
     DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
 };
 uint32_t ds4_gpu_v41_off(void);

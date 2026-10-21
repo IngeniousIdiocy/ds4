@@ -364,6 +364,25 @@ static int check_engram(void) {
     CHECK(sqrt(error2 / norm2) < 1e-4);
     fprintf(stderr, "V4.1 Engram gate: %zu BF16 boundary differences, relative RMS %.8g\n",
             rounded_differently, sqrt(error2 / norm2));
+#ifdef __APPLE__
+    {   /* the decode step's gate over 8 SIMD groups (unmasked, width 5120, <= 16 rows) gives the 32-lane bits */
+        float *spread = malloc(N * sizeof(float));
+        CHECK(spread);
+        ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+        for (int off = 0; off < 2; off++) {
+            const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_engram_add_tg256");
+            ds4_gpu_test_set_v41_off(off ? DS4_GPU_V41_SPLIT_REDUCE : 0);
+            const int ok = ds4_gpu_tensor_write(xt, 0, x, N * sizeof(float)) &&
+                ds4_gpu_dsv41_engram_add(xt, kt, qwt, kwt, NULL, D, ROWS, 1e-20f);
+            ds4_gpu_test_set_v41_off(0);
+            CHECK(ok && ds4_gpu_tensor_read(xt, 0, off ? actual : spread, N * sizeof(float)));
+            CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_engram_add_tg256") == runs + !off);
+        }
+        CHECK(!memcmp(actual, spread, N * sizeof(float)));
+        free(spread);
+        fprintf(stderr, "V4.1 Engram gate over 8 SIMD groups == 32 lanes, bitwise PASS\n");
+    }
+#endif
     CHECK(!ds4_gpu_dsv41_engram_add(xt, kt, qwt, kwt, mt, D, ROWS + 1, 1e-20f));
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(qwt);
     ds4_gpu_tensor_free(kwt); ds4_gpu_tensor_free(mt);
@@ -903,9 +922,45 @@ static int check_literal_shapes(void) {
     fprintf(stderr, "V4.1 literal shapes (output-B HC, serial HC join, q_a/kv pair, MoE gate/up) == generic PASS\n");
     return 1;
 }
+
+/* The HC collapse over 32 + 10 groups against one group, bitwise, fresh inputs on every call: the collapsed row and
+ * its RMS norm. */
+static int check_split_collapse(void) {
+    const uint64_t wb = 65536;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+    ds4_gpu_tensor *res = upload(NULL, 4 * 5120 * 4), *pre = upload(NULL, 16);
+    ds4_gpu_tensor *x[2] = {upload(NULL, 5120 * 4), upload(NULL, 5120 * 4)};
+    ds4_gpu_tensor *n[2] = {upload(NULL, 5120 * 4), upload(NULL, 5120 * 4)};
+    CHECK(res && pre && x[0] && x[1] && n[0] && n[1] && ds4_gpu_set_model_map(model, wb));
+    float *w = model, *r = ds4_gpu_tensor_contents(res), *p = ds4_gpu_tensor_contents(pre);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (int call = 0; call < 8; call++) {
+        for (int i = 0; i < 5120; i++) w[i] = 1.0f + random_value() / 8.0f;
+        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value() * (call % 4 == 3 ? 64.0f : 1.0f);
+        for (int i = 0; i < 4; i++) p[i] = random_value();
+        const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part");
+        for (int off = 0; off < 2; off++) {
+            ds4_gpu_test_set_v41_off(off ? DS4_GPU_V41_SPLIT_REDUCE : 0);
+            const int ok = ds4_gpu_begin_commands() && ds4_gpu_dsv41_deferred_collapse(x[off], n[off], res, pre,
+                model, wb, 0, 1e-6f) && ds4_gpu_end_commands() && ds4_gpu_synchronize();
+            ds4_gpu_test_set_v41_off(0);
+            CHECK(ok);
+        }
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part") == runs + 1);
+        CHECK(!memcmp(ds4_gpu_tensor_contents(x[0]), ds4_gpu_tensor_contents(x[1]), 5120 * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(n[0]), ds4_gpu_tensor_contents(n[1]), 5120 * 4));
+    }
+    ds4_gpu_tensor_free(res); ds4_gpu_tensor_free(pre);
+    for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(x[i]); ds4_gpu_tensor_free(n[i]); }
+    free(model);
+    fprintf(stderr, "V4.1 split HC collapse == one group, bitwise PASS\n");
+    return 1;
+}
 #else
 static int check_rope_tab(void) { return 1; }
 static int check_literal_shapes(void) { return 1; }
+static int check_split_collapse(void) { return 1; }
 #endif
 
 static int check_attention_output(bool large) {
@@ -2065,6 +2120,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--engram")) {
+        const int ok = ds4_gpu_init() && check_engram();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--rope-tab")) {
         const int ok = ds4_gpu_init() && check_rope_tab();
         ds4_gpu_cleanup();
@@ -2072,6 +2132,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
         const int ok = ds4_gpu_init() && check_literal_shapes();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--split-collapse")) {
+        const int ok = ds4_gpu_init() && check_split_collapse();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
@@ -2085,6 +2150,7 @@ int main(int argc, char **argv) {
     ok = ok && check_literal_shapes();
     ok = ok && check_e4m3_copies();
     ok = ok && check_rope_tab();
+    ok = ok && check_split_collapse();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }
