@@ -12,6 +12,9 @@ static inline float dsv41_bf16(float x) {
         bits += 0x7fffu + ((bits >> 16u) & 1u);
     return as_type<float>(bits & 0xffff0000u);
 }
+static inline float4 dsv41_bf16(float4 v) {
+    return float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+}
 
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
@@ -514,6 +517,67 @@ kernel void kernel_dsv41_engram_add(
             gate * dsv41_bf16(kv[value_offset + i]));
 }
 
+/* A single product, rounded as written: fast math may not reassociate it into a neighbouring product. */
+static inline float dsv41_engram_mul(float a, float b) {
+#pragma METAL fp math_mode(safe)
+    return a * b;
+}
+
+/* kernel_dsv41_engram_add over eight SIMD groups per stream (width 5120): each lane's chain runs in order, segment by
+ * segment, handing its three accumulators on, with the fma contractions the 32-lane kernel compiles to written out. */
+kernel void kernel_dsv41_engram_add_tg256(
+        constant ds4_metal_args_dsv41_engram &args,
+        device float *residual,
+        device const float *kv,
+        device const float *q_weight,
+        device const float *k_weight,
+        device const uchar *mask,
+        threadgroup float *sh [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.masked && !mask[group.x]) return;
+    constexpr uint W = 5120u, J = W / 256u;
+    const uint e0 = sg * 32u * J + lane;
+    device float *hp = residual + ((ulong)group.x * 4u + group.y) * W + e0;
+    device const float *kp = kv + ((ulong)group.x * 5u + group.y) * W + e0;
+    device const float *vp = kv + ((ulong)group.x * 5u + 4u) * W + e0;
+    device const float *qp = q_weight + (ulong)group.y * W + e0;
+    device const float *wp = k_weight + (ulong)group.y * W + e0;
+    float h[J], k[J], p[J], v[J];
+    for (uint j = 0; j < J; j++) {
+        h[j] = hp[32u * j];
+        k[j] = dsv41_bf16(kp[32u * j]);
+        p[j] = dsv41_engram_mul(dsv41_engram_mul(h[j], qp[32u * j]), wp[32u * j]);
+        v[j] = vp[32u * j];
+    }
+    float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
+    for (uint s = 0; s < 8u; s++) {
+        if (sg == s) {
+            if (s) { h2 = sh[lane]; k2 = sh[32u + lane]; dot = sh[64u + lane]; }
+            for (uint j = 0; j < J; j++) {
+                h2 = fma(h[j], h[j], h2);
+                k2 = fma(k[j], k[j], k2);
+                dot = fma(p[j], k[j], dot);
+            }
+            if (s < 7u) { sh[lane] = h2; sh[32u + lane] = k2; sh[64u + lane] = dot; }
+        }
+        if (s < 7u) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == 7u) {
+        h2 = simd_sum(h2);
+        k2 = simd_sum(k2);
+        dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
+              rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
+        const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
+        if (lane == 0u) sh[96] = gate;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gate = sh[96];
+    for (uint j = 0; j < J; j++)
+        hp[32u * j] = dsv41_bf16(fma(gate, dsv41_bf16(v[j]), h[j]));
+}
+
 struct ds4_metal_args_dsv41_pool {
     uint width;
     uint pairs;
@@ -991,6 +1055,60 @@ kernel void kernel_dsv41_deferred_collapse(
 
     if (tid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
 
+}
+
+/* kernel_dsv41_deferred_collapse as two dispatches over 32 + 10 groups: group s does the original's simdgroup s (the
+ * same fma chain, written out) and the norm repeats its second simd_sum on the same 32 partials, so the same bits. */
+kernel void kernel_dsv41_deferred_collapse_part(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device float *slots,
+        uint group [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n_embd = (uint)args.n_embd, n4 = n_embd >> 2;
+    const uint i0 = group * 32u + tiisg, i1 = i0 + 1024u;
+    const bool h0 = i0 < n4, h1 = i1 < n4;
+    device const float4 *x0 = (device const float4 *)(x + 0u * n_embd);
+    device const float4 *x1 = (device const float4 *)(x + 1u * n_embd);
+    device const float4 *x2 = (device const float4 *)(x + 2u * n_embd);
+    device const float4 *x3 = (device const float4 *)(x + 3u * n_embd);
+    const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
+    float4 a0 = 0.0f, b0 = 0.0f, c0 = 0.0f, d0 = 0.0f, a1 = 0.0f, b1 = 0.0f, c1 = 0.0f, d1 = 0.0f;
+    if (h0) { a0 = x0[i0]; b0 = x1[i0]; c0 = x2[i0]; d0 = x3[i0]; }
+    if (h1) { a1 = x0[i1]; b1 = x1[i1]; c1 = x2[i1]; d1 = x3[i1]; }
+    device float4 *collapsed4 = (device float4 *)collapsed;
+    float sumf = 0.0f;
+    if (h0) {
+        const float4 v = dsv41_bf16(fma(d0, w3, fma(c0, w2, fma(b0, w1, a0 * w0))));
+        collapsed4[i0] = v;
+        sumf += dot(v, v);
+    }
+    if (h1) {
+        const float4 v = dsv41_bf16(fma(d1, w3, fma(c1, w2, fma(b1, w1, a1 * w0))));
+        collapsed4[i1] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    if (tiisg == 0) slots[group] = sumf;
+}
+
+kernel void kernel_dsv41_deferred_collapse_norm(
+        constant ds4_deferred_hc_args &args,
+        device const float *collapsed, device const float *slots,
+        device const float *norm_weight, device float *norm_dst, device atomic_uint *counter,
+        uint gid [[thread_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n4 = (uint)args.n_embd >> 2;
+    float sumf = slots[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf / (float)args.n_embd;
+    const float rscale = 1.0f / sqrt(mean + args.norm_eps);
+    if (gid < n4) {
+        const float4 r = ((device const float4 *)collapsed)[gid];
+        const float4 v = (r * rscale) * ((device const float4 *)norm_weight)[gid];
+        ((device float4 *)norm_dst)[gid] = float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+    }
+    if (gid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
 }
 
 kernel void kernel_dsv41_query_deferred_hc(
