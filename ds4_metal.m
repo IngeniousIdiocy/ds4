@@ -22465,6 +22465,17 @@ int ds4_gpu_matmul_e4m3_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *c
     return 1;
 }
 
+static int ds4_gpu_matmul_f32_impl(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok);
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -22474,6 +22485,34 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
+    return ds4_gpu_matmul_f32_impl(out, model_map, model_size, weight_offset,
+                                   in_dim, out_dim, x, n_tok, n_tok);
+}
+
+int ds4_gpu_matmul_f32_plan_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok) {
+    return ds4_gpu_matmul_f32_impl(out, model_map, model_size, weight_offset,
+                                   in_dim, out_dim, x, n_tok, plan_tok > n_tok ? plan_tok : n_tok);
+}
+
+static int ds4_gpu_matmul_f32_impl(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok == 0 || n_tok > UINT32_MAX) return 0;
     if (in_dim > UINT64_MAX / n_tok / sizeof(float) ||
@@ -22513,7 +22552,7 @@ int ds4_gpu_matmul_f32_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1) {
+        if (plan_tok == 1) {
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
             if (ds4_gpu_plain_mv_single_row(out_dim)) {
@@ -22544,10 +22583,13 @@ int ds4_gpu_matmul_f32_tensor(
             return 1;
         }
 
+        /* plan_tok picks the kernel: a pruned sweep's rows keep the one the
+         * whole sweep would use, and each row's sums do not depend on how
+         * many rows share the dispatch. */
         const bool router_batch = in_dim == 5120u && out_dim == 384u &&
-            n_tok >= 32u && !g_quality_mode &&
+            plan_tok >= 32u && !g_quality_mode &&
             !getenv("DS4_METAL_DISABLE_V41_ROUTER_BATCH");
-        if (router_batch && n_tok >= 256u && !getenv("DS4_METAL_DISABLE_V41_ROUTER_MM")) {
+        if (router_batch && plan_tok >= 256u && !getenv("DS4_METAL_DISABLE_V41_ROUTER_MM")) {
             const bool bc_out = (n_tok % 32u) != 0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32_full", false, bc_out);
@@ -22568,7 +22610,7 @@ int ds4_gpu_matmul_f32_tensor(
             return ds4_gpu_finish_command_buffer(cb, owned, "F32 router prefill matmul");
         }
 
-        if ((n_tok <= 8 || router_batch) && (in_dim % 128u) == 0) {
+        if ((plan_tok <= 8 || router_batch) && (in_dim % 128u) == 0) {
             const int16_t nsg = router_batch ? 2 : ds4_gpu_mv_ext_nsg();
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);

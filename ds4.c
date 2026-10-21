@@ -40968,6 +40968,9 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
+    /* Rows the unpruned sweep would run here; batched kernels that pick by
+     * row count pick for these, so pruned rows match it. 0: the batch's own. */
+    uint32_t plan_rows;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -42779,6 +42782,20 @@ static bool ds41_shared_down_batch(ds41_prefill_row *b, const ds4_model *m,
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true);
 }
 
+/* Router logits for a batch; under a pruned sweep the F32 router picks the
+ * kernel the whole sweep would use. */
+static bool ds41_router_batch(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, uint32_t count) {
+#ifdef __APPLE__
+    if (g->plan_rows > count && count > DS4_TP_BATCH_MAX_ROWS &&
+        l->ffn_gate_inp->type == DS4_TENSOR_F32)
+        return ds4_gpu_matmul_f32_plan_tensor(g->batch.route_logits, m->map, m->size,
+            l->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, g->batch.norm,
+            count, g->plan_rows) != 0;
+#endif
+    return ds41_matmul_batch(g->batch.route_logits, m, l->ffn_gate_inp, g->batch.norm, count, false);
+}
+
 /* Without shared_down the shared expert's down projection waits for
  * ds41_moe_expand_batch, which folds it into the expand. */
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -42800,7 +42817,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_EXPERT_WEIGHT_SCALE, count);
 #endif
     return (routed ||
-        (ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+        (ds41_router_batch(g, m, l, count) &&
          ds41_route_batch(g, m, l, count))) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (((count <= DS4_TP_BATCH_MAX_ROWS &&
@@ -43330,7 +43347,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
-    const bool wide = total_count > encoder_chunk;
+    /* Short sweeps prune the decoder suffix inside the plain schedule's
+     * chunks too, with the same kernels per row, so the output is unchanged
+     * (DS4_METAL_DISABLE_V41_SUFFIX_ALL=1: whole tiles only). */
+    static int suffix_all_off = -1;
+    if (suffix_all_off < 0) suffix_all_off = getenv("DS4_METAL_DISABLE_V41_SUFFIX_ALL") != NULL;
+    const bool suffix_all = !suffix_all_off && !g->quality && g->tp_world == 1 && !g->streaming &&
+        !g->image_count && total_count >= 384u && total_count < 8192u && total_count <= g->carry_cap;
+    const bool wide = total_count > encoder_chunk || suffix_all;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
@@ -43343,8 +43367,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
     /* Layer 20 keeps 1 + (n_layer - 21) * 127 rows and replays the 127 before them. */
     const uint32_t suffix_rows = 1u + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = wide && total_count >= suffix_rows &&
-        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    const bool decoder_suffix = suffix_all || (wide && total_count >= suffix_rows &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX"));
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
     ds4_engram_history next_history = g->history;
@@ -43426,27 +43450,46 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
         }
         const double t_map = profile ? now_sec() : 0;
+        /* Keep the decoder suffix's established matrix partitions; unlike
+         * the encoder, its shrinking tail is not aligned to large tiles. */
+        const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
         uint32_t first = 0;
         if (ok && decoder_suffix && il >= 20u) {
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
             const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
-            first = total_count - needed;
+            first = needed < total_count ? total_count - needed : 0u;
+            if (suffix_all) {
+                /* Skip the plain schedule's chunks before the cut and start
+                 * the cut chunk at a 128-row boundary of the sequence (the
+                 * compressor blocks), keeping 256+ rows: below that, router
+                 * and expert kernels change. Its rows pick kernels as the
+                 * whole chunk would (plan_rows below). */
+                const uint32_t cs = first - first % chunk;
+                const uint32_t ce = total_count - cs < chunk ? total_count : cs + chunk;
+                if (ce - first < 256u) first = ce - cs > 256u ? ce - 256u : cs;
+                const uint32_t over = (initial_start + first) % 128u;
+                first = first - cs >= over ? first - over : cs;
+            }
             /* short sweeps prune whole tiles and warm a complete one, keeping
              * the partitions the plain schedule would have used */
-            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off();
+            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off() && !suffix_all;
             if (short_sweep) first -= first % 2048u;
-            const uint32_t warm = short_sweep ? 128u : 127u;
+            uint32_t warm = short_sweep ? 128u : 127u;
+            /* rows before the sweep are already in the window ring */
+            if (warm > first) warm = first;
             if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
-        /* Keep the decoder suffix's established matrix partitions; unlike
-         * the encoder, its shrinking tail is not aligned to large tiles. */
-        const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
-        for (uint32_t off = first; ok && off < total_count; off += chunk) {
+        for (uint32_t off = first; ok && off < total_count;
+             off += suffix_all ? chunk - off % chunk : chunk) {
             if (cancel && cancel(cancel_ud)) { ok = false; break; }
-            const uint32_t count = total_count - off < chunk ? total_count - off : chunk;
+            const uint32_t span = suffix_all ? chunk - off % chunk : chunk;
+            const uint32_t count = total_count - off < span ? total_count - off : span;
+            const uint32_t chunk_rows = total_count - (off - off % chunk) < chunk ?
+                total_count - (off - off % chunk) : chunk;
+            g->plan_rows = suffix_all ? chunk_rows : 0u;
             const uint32_t start = initial_start + off;
             g->pos = start;
             ds41_prefill_row active = {0};
@@ -43649,6 +43692,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 row.pre = g->rows_view[count - 1u].ffn_split;
             }
         }
+        g->plan_rows = 0;
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
 #ifdef DS4_ROCM_BUILD

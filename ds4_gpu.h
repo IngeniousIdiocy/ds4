@@ -1196,6 +1196,18 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+/* The same over n_tok rows, with the kernel chosen as for plan_tok rows
+ * (plan_tok >= n_tok), so each row's result matches the larger dispatch. */
+int ds4_gpu_matmul_f32_plan_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok);
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
