@@ -569,6 +569,82 @@ void kernel_mul_mv_q8_0_f32_rows_seq_impl(
     }
 }
 
+// NR0 output rows by NT activation rows per threadgroup. Each lane runs the
+// one-row kernel's walk for every activation row, with the weight block
+// dequantized once into registers, and each row then takes the one-row
+// reduction: every result matches kernel_mul_mv_q8_0_f32_impl<NR0>.
+template<short NR0, short NT>
+void kernel_mul_mv_q8_0_f32_rows_tok_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+    const int t0 = tgpig.y*NT;
+    const int nt = min((int)NT, args.ne11 - t0);
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + (uint64_t)(r0 + row)*args.nb01);
+    }
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float sumf[NT][NR0];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+    }
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        float yl[NT][NQ];
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            device const float * yb = (device const float *) (src1 + (uint64_t)min(t0 + t, args.ne11 - 1)*args.nb11) +
+                ib*QK8_0 + il*NQ;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) yl[t][i] = yb[i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            const float d = ax[row][ib].d;
+            float q[NQ];
+            FOR_UNROLL (short i = 0; i < NQ; ++i) q[i] = qs[i];
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += q[i] * yl[t][i];
+                }
+                sumf[t][row] += sumq*d;
+            }
+        }
+    }
+    for (short t = 0; t < nt; ++t) {
+        device float * dst_f32 = (device float *) dst + (uint64_t)(t0 + t)*args.ne0;
+        helper_mv_reduce_and_write<NR0, false>(dst_f32, sumf[t], r0, args.ne01, tiisg, sgitg, shmem);
+        threadgroup_barrier(mem_flags::mem_threadgroup);   /* the reduce scratch is reused */
+    }
+}
+
+#define DS4_MUL_MV_Q8_0_ROWS_TOK(NAME, NR0, NT) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_f32_rows_tok_impl<NR0, NT>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_MUL_MV_Q8_0_ROWS_TOK(kernel_mul_mv_q8_0_f32_rows8_tok2, 8, 2)
+#undef DS4_MUL_MV_Q8_0_ROWS_TOK
+
 #define DS4_MUL_MV_Q8_0_ROWS_SEQ(NAME, NR0, ...) \
 [[host_name(#NAME)]] \
 kernel void NAME( \

@@ -27199,6 +27199,7 @@ static int ds4_gpu_matmul_q8_0_kslice_exact_rows(
         mv_args.nb12 = (uint64_t)n_rows * k_cnt * sizeof(float);
         mv_args.nb13 = mv_args.nb12;
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        uint32_t rows_grp = 1;
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         /* Reuse the input across more output rows without changing the K
          * traversal or SIMD reduction used by TP attention partials. */
@@ -27209,6 +27210,13 @@ static int ds4_gpu_matmul_q8_0_kslice_exact_rows(
             mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows8";
             mv_dispatch.nr0 = 8;
             mv_dispatch.smem = 32u * 8u * sizeof(float);
+            /* Two activation rows per threadgroup share each dequantized
+             * weight block; every row keeps this kernel's walk and
+             * reduction, so the partials are unchanged. */
+            if (!getenv("DS4_METAL_DISABLE_V41_TP_KSLICE_TOK2")) {
+                mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows8_tok2";
+                rows_grp = 2;
+            }
         }
         mv_args.nr0 = mv_dispatch.nr0;
         /* TP partial producer: publish the gate's checked flag from the
@@ -27250,7 +27258,7 @@ static int ds4_gpu_matmul_q8_0_kslice_exact_rows(
             [enc setThreadgroupMemoryLength:16 atIndex:1];
         }
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(ntg, n_rows, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(ntg, ((NSUInteger)n_rows + rows_grp - 1u) / rows_grp, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (fold) g_tp_flag_prepublished_seq = g_tp_seq + 1u;
