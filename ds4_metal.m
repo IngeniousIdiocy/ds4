@@ -442,6 +442,7 @@ uint32_t ds4_gpu_v41_off(void) {
     if (!g_v41_off_read) {
         static const char *names[] = {   /* in bit order */
             "DS4_METAL_DISABLE_V41_DEFERRED_HC",
+            "DS4_METAL_DISABLE_V41_LITERAL_SHAPES",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -501,6 +502,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1;
+/* The same pair at the V4.1 Flash shape with that shape as literals (nil: the static pipeline above serves it). */
+static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1;
@@ -8304,6 +8307,9 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32", 1);
+        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 =
+            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32", 1);
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32", 1);
@@ -11913,6 +11919,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 = nil;
+        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1 = nil;
@@ -20206,8 +20213,13 @@ int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
         ds4_gpu_q8_0_matvec_args args_a = ds4_gpu_make_q8_0_mv_args(in_dim, out_a_dim);
         ds4_gpu_q8_0_matvec_args args_b = ds4_gpu_make_q8_0_mv_args(in_dim, out_b_dim);
         args_a.nr0 = args_b.nr0 = dispatch.nr0;
+        /* the V4.1 q_a/kv shape: the kernel with that shape's arguments as literals */
+        const bool literal = in_dim == 5120u && out_a_dim == 1280u && out_b_dim == 512u && dispatch.nr0 == 2 &&
+            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES);
+        if (literal) DS4_TEST_NOTE("kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv");
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16_pair", dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(literal ? "kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv"
+                                                : "kernel_mul_mv_q8_0_f32_bf16_pair", dispatch.nsg);
         if (!pipeline) return 0;
         const NSUInteger nr0 = (NSUInteger)dispatch.nr0;
         const NSUInteger groups = ((NSUInteger)out_a_dim + nr0 - 1u) / nr0 +
@@ -41724,6 +41736,17 @@ int ds4_gpu_routed_moe_one_tensor(
                 pair_swiglu_nsg = 1;
             }
         }
+        /* the static-trip pair at the V4.1 Flash shape (every literal its kernel assumes is checked here) */
+        if (pair_swiglu_pipeline == g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 &&
+            use_mxfp4_moe_decode_static_trip_pair && pair_swiglu_nsg == 1 &&
+            gate_args.ne00 == 5120 && gate_args.ne01 == 2304 && gate_args.ne02 == 384 && gate_args.nb01 == 2720 &&
+            gate_args.nb02 == 2304ull * 2720ull && gate_args.ne0 == 2304 && gate_args.nei0 == 6 && gate_args.nei1 == 1 &&
+            gate_args.ne11 == 1 && gate_args.tp_world == 1 && gate_args.tp_expert_base == 0 &&
+            g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 != nil &&
+            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES)) {
+            pair_swiglu_pipeline = g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
+            DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32");
+        }
         const bool use_iq2_pair_pack2 =
             gate_type == DS4_METAL_TENSOR_IQ2_XXS && n_tokens == 1 &&
             n_expert == 6 && n_total_expert == 256 &&
@@ -47187,7 +47210,14 @@ static int ds4_gpu_hc_expand_split_impl(
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
-        if (n_hc == 4) {
+        /* the single-host one-token join with an add and bf16 rounding (the V4.1 decode FFN join) */
+        const bool literal = n_hc == 4 && n_embd == 5120 && n_tokens64 == 1 && block_add && round_bf16 &&
+            !ds4_gpu_tp_world_is_two() && ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES);
+        if (literal) {
+            expand_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_serial_add_bf16");
+            n_elem = (uint64_t)n_embd;
+            DS4_TEST_NOTE("kernel_dsv4_hc_expand4_serial_add_bf16");
+        } else if (n_hc == 4) {
             expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
                                                       "kernel_dsv4_hc_expand4");
             n_elem = (uint64_t)n_embd * n_tokens64;
@@ -49456,6 +49486,12 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
             rows > 1u ? "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows_seq4" : "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4",
             dispatch.nsg);
+        /* the one-row 8192 -> 5120 call without an add (the single-host attention output-B) */
+        if (rows == 1u && in_dim == 8192u && out_dim == 5120u && !add && dispatch.nr0 == 2 &&
+            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES)) {
+            pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static", dispatch.nsg);
+            DS4_TEST_NOTE("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static");
+        }
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

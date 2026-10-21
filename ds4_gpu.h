@@ -50,6 +50,7 @@ void ds4_gpu_cleanup(void);
  * "0" means not set. */
 enum {
     DS4_GPU_V41_DEFERRED_HC = 1u << 0,
+    DS4_GPU_V41_LITERAL_SHAPES = 1u << 1,
 };
 uint32_t ds4_gpu_v41_off(void);
 #endif

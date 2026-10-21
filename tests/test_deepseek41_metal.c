@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -732,6 +733,120 @@ static int check_sparse_gather(void) {
     fprintf(stderr, "V4.1 bounded sparse KV gather: exact\n");
     return 1;
 }
+
+#ifdef __APPLE__
+/* Random Q8_0 weights [rows][cols] at page-aligned memory (scales around 2^-8). */
+static void *q8_weights(uint32_t rows, uint32_t cols, uint64_t *bytes) {
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    *bytes = (uint64_t)rows * cols / 32 * sizeof(q8_block);
+    void *model = NULL;
+    if (posix_memalign(&model, getpagesize(), *bytes) != 0) return NULL;
+    q8_block *w = model;
+    for (uint64_t i = 0; i < *bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1c00 + (int)(random_value() * 8192) % 1024);
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
+    }
+    return model;
+}
+
+/* Run one call as built, where kernel must run once, then with the V4.1 paths in off; the outputs must match. */
+#define LITERAL_PAIR(off, kernel, out, bytes, call) do { \
+        const uint64_t runs_ = ds4_gpu_test_kernel_runs(kernel); \
+        CHECK(ds4_gpu_begin_commands() && (call) && ds4_gpu_end_commands() && ds4_gpu_synchronize()); \
+        CHECK(ds4_gpu_test_kernel_runs(kernel) == runs_ + 1); \
+        void *lit_ = malloc(bytes); \
+        CHECK(lit_); \
+        memcpy(lit_, ds4_gpu_tensor_contents(out), bytes); \
+        ds4_gpu_test_set_v41_off(off); \
+        const int gen_ok_ = ds4_gpu_begin_commands() && (call) && ds4_gpu_end_commands() && ds4_gpu_synchronize(); \
+        ds4_gpu_test_set_v41_off(0); \
+        CHECK(gen_ok_ && ds4_gpu_test_kernel_runs(kernel) == runs_ + 1); \
+        CHECK(!memcmp(lit_, ds4_gpu_tensor_contents(out), bytes)); \
+        free(lit_); \
+    } while (0)
+
+/* The V4.1 decode calls that take literal-shape kernels give the generic kernels' bits. */
+static int check_literal_shapes(void) {
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    {   /* attention output-B into the HC streams: 8192 -> 5120, one row, no add */
+        uint64_t wb = 0;
+        void *model = q8_weights(5120, 8192, &wb);
+        CHECK(model && ds4_gpu_set_model_map(model, wb));
+        ds4_gpu_tensor *x = upload(NULL, 8192 * 4), *res = upload(NULL, 4 * 5120 * 4), *split = upload(NULL, 24 * 4);
+        ds4_gpu_tensor *out = upload(NULL, 4 * 5120 * 4);
+        CHECK(x && res && split && out);
+        float *h = ds4_gpu_tensor_contents(x), *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
+        for (int i = 0; i < 8192; i++) h[i] = random_value();
+        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
+        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
+        LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static", out, 4 * 5120 * 4,
+                     ds4_gpu_dsv41_matmul_expand_rows(out, model, wb, 0, 8192, 5120, x, NULL, res, split, 4, 1));
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(res); ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
+        free(model);
+    }
+    {   /* the serial FFN join: shared + routed into the HC streams, one token, bf16 rounding */
+        ds4_gpu_tensor *blk = upload(NULL, 5120 * 4), *add = upload(NULL, 5120 * 4), *res = upload(NULL, 4 * 5120 * 4);
+        ds4_gpu_tensor *split = upload(NULL, 24 * 4), *out = upload(NULL, 4 * 5120 * 4);
+        CHECK(blk && add && res && split && out);
+        float *b = ds4_gpu_tensor_contents(blk), *a = ds4_gpu_tensor_contents(add);
+        float *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
+        for (int i = 0; i < 5120; i++) { b[i] = random_value(); a[i] = random_value(); }
+        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
+        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
+        LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_dsv4_hc_expand4_serial_add_bf16", out, 4 * 5120 * 4,
+                     ds4_gpu_hc_expand_split_add_bf16_tensor(out, blk, add, res, split, 5120, 4));
+        ds4_gpu_tensor_free(blk); ds4_gpu_tensor_free(add); ds4_gpu_tensor_free(res);
+        ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
+    }
+    {   /* the attention q_a/kv pair: 5120 -> 1280 and 5120 -> 512, one row, bf16 outputs */
+        uint64_t wb = 0;
+        void *model = q8_weights(1280 + 512, 5120, &wb);
+        CHECK(model && ds4_gpu_set_model_map(model, wb));
+        const uint64_t off_b = 1280ull * (5120 / 32) * 34;
+        ds4_gpu_tensor *x = upload(NULL, 5120 * 4), *qa = upload(NULL, 1280 * 4), *kv = upload(NULL, 512 * 4);
+        CHECK(x && qa && kv);
+        float *h = ds4_gpu_tensor_contents(x);
+        for (int i = 0; i < 5120; i++) h[i] = random_value();
+        for (int i = 0; i < 2; i++)
+            LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv", i ? kv : qa,
+                         i ? 512 * 4 : 1280 * 4, ds4_gpu_dsv41_project_pair_q8(qa, kv, model, wb, 0, off_b, 5120, 1280, 512, x));
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(qa); ds4_gpu_tensor_free(kv);
+        free(model);
+    }
+    if (ds4_gpu_device_is_pre_m5_apple_silicon()) {
+        /* MoE gate/up of one token, 6 of 384 MXFP4 experts (5120 -> 2304), into the down projection. Only the routed
+         * experts are written: up reads the gate experts one row on, down (5120 x 1224 bytes) from byte 0. */
+        const uint64_t row = 2720, expert = 2304 * row, page = (uint64_t)getpagesize();
+        const uint64_t map_bytes = (384 * expert + row + page - 1) / page * page;
+        unsigned char *map = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        CHECK(map != MAP_FAILED && ds4_gpu_set_model_map(map, map_bytes));
+        const int32_t sel[6] = {3, 77, 150, 200, 301, 383};
+        const float weights[6] = {0.3f, 0.25f, 0.2f, 0.12f, 0.08f, 0.05f};
+        for (int e = 0; e < 6; e++)
+            for (uint64_t i = (uint64_t)sel[e] * expert; i < (uint64_t)(sel[e] + 1) * expert + row; i++) {
+                (void)random_value();
+                map[i] = i % 17 ? (unsigned char)(seed >> 5) : (unsigned char)(118 + seed % 8);   /* e8m0 scales */
+            }
+        ds4_gpu_tensor *x = upload(NULL, 5120 * 4), *st = upload(sel, sizeof(sel)), *wt = upload(weights, sizeof(weights));
+        ds4_gpu_tensor *t[5];
+        for (int i = 0; i < 5; i++) t[i] = upload(NULL, 6 * 5120 * 4);
+        CHECK(x && st && wt && t[0] && t[1] && t[2] && t[3] && t[4]);
+        float *h = ds4_gpu_tensor_contents(x);
+        for (int i = 0; i < 5120; i++) h[i] = random_value();
+        LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32",
+                     t[2], 6 * 2304 * 4, ds4_gpu_routed_moe_one_tensor(t[4], t[0], t[1], t[2], t[3], map, map_bytes,
+                     0, row, 0, 39, 39, expert, row, expert, 1224, 5120, 2304, 5120, st, wt, 384, 6, 10.0f, x, NULL,
+                     0, true));
+        for (int i = 0; i < 5; i++) ds4_gpu_tensor_free(t[i]);
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(wt);
+        /* map stays: the model views may wrap it */
+    }
+    fprintf(stderr, "V4.1 literal shapes (output-B HC, serial HC join, q_a/kv pair, MoE gate/up) == generic PASS\n");
+    return 1;
+}
+#else
+static int check_literal_shapes(void) { return 1; }
+#endif
 
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
@@ -1805,6 +1920,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
+        const int ok = ds4_gpu_init() && check_literal_shapes();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() &&
              check_rope_quantize() && check_deferred_hc() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
@@ -1812,6 +1932,7 @@ int main(int argc, char **argv) {
              check_index_score_wide() && check_index_candidates() && check_embedding() && check_index_projection() && check_general_topk() &&
              check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() &&
              check_attention_output(false) && check_tp_attention();
+    ok = ok && check_literal_shapes();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }
