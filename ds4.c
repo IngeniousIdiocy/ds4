@@ -41004,6 +41004,9 @@ typedef struct {
      * (0: none). */
     ds4_gpu_tensor *rope_tab;
     uint32_t rope_tab_pos;
+    /* the mask whose candidates block_list holds (cleared when layer 20 writes a mask); prefill and verify rows are
+     * graph copies that read their own mask views and share the list */
+    const ds4_gpu_tensor *block_list_mask;
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block row partials, two slots per layer */
@@ -41813,6 +41816,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     if (n_comp && ds41_index_source(il) && (n_comp + 7u) / 8u > 2048u) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u;
+            g->block_list_mask = NULL;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_dsv41_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, 2048u) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, 2048u)) return false;
@@ -41837,11 +41841,14 @@ static bool ds41_attention_select_projected(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t n_comp = ratio ? (g->pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
 #ifdef __APPLE__
-        /* past layer 20 only its candidate blocks can be selected */
+        /* past layer 20 only its candidate blocks can be selected; the list is built once per mask */
         if (il > 20u && (n_comp + 7u) / 8u > 2048u &&
             ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
                 g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp,
-                1.0f / 64.0f, DS4_N_INDEXER_TOP_K)) return true;
+                1.0f / 64.0f, DS4_N_INDEXER_TOP_K, g->block_list_mask == g->block_mask)) {
+            g->block_list_mask = g->block_mask;
+            return true;
+        }
         if (!ds4_gpu_dsv41_indexer_score_row(g->index_scores, g->index_q, g->index_weights, g->index_cache[owner],
                                              g->index_bf16_ok ? g->index_bf16[owner] : NULL, n_comp)) return false;
 #else

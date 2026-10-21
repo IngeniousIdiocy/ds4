@@ -55,7 +55,9 @@ enum {
     DS4_GPU_V41_ROPE_TABLE = 1u << 3,
     DS4_GPU_V41_SPLIT_REDUCE = 1u << 4,
     DS4_GPU_V41_INDEX_BF16 = 1u << 5,
+    DS4_GPU_V41_DECODE_TOPK = 1u << 6,
     DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
+    DS4_GPU_V41_UNFUSED_TOPK = 1u << 30,    /* test only: the decode top-k without its fused merge */
 };
 uint32_t ds4_gpu_v41_off(void);
 /* Weights built at load: allocated with the model views' storage options, and kept in a residency set of their
