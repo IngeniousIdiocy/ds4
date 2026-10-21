@@ -271,6 +271,21 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
 int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                 uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
                                 uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed);
+/* Metal: one decode step's RoPE coefficient table (64 float2: (cos, sin) of float(pos) * frequency, entries 0..31
+ * raw, 32..63 compressed). rope_quantize_heads_tab: rope + quantization of heads rows of width in place, in one
+ * dispatch reading it. heads_once_arm: the next single-row decode reduce of 64 heads x 512 writes its heads already
+ * bf16-rounded and inverse-roped with the table; take returns 1 when it did (and disarms), and attention_low_plain
+ * then projects them. reduce_check (test entry): that reduce on tmp's partials, plain or transformed. */
+int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos);
+int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
+                                          bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab);
+void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
+int ds4_gpu_dsv41_heads_once_take(void);
+int ds4_gpu_dsv41_attention_low_plain(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                      uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
+                                      uint32_t n_groups, const ds4_gpu_tensor *heads);
+int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
+                                          int transform, const ds4_gpu_tensor *tab, bool compressed);
 /* Two weighted RMS norms rounded to bf16 in one dispatch. */
 int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0, uint64_t weight0_offset, uint32_t n0,
                                  ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,

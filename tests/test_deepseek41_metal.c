@@ -765,6 +765,65 @@ static void *q8_weights(uint32_t rows, uint32_t cols, uint64_t *bytes) {
         free(lit_); \
     } while (0)
 
+/* One RoPE table per decode token. From the same attention partials: the reduce that writes the heads inverse-roped
+ * and bf16-rounded, then the plain low (literal and generic), gives the plain reduce and inline-rope low's bits; the
+ * indexer query's one-dispatch rope + quantize gives rope then quantize. Raw and compressed, up to the 1M limit. */
+static int check_rope_tab(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, NROWS = 64, DV = 512, NWG = 32, QN = 32 * 128 };
+    const uint64_t hb = (uint64_t)NROWS * DV * 4, lb = (uint64_t)GROUPS * RANK * 4;
+    const uint64_t tn = (uint64_t)NROWS * (DV * NWG + 2u * NWG);
+    uint64_t wb = 0;
+    void *model = q8_weights(GROUPS * RANK, GROUP, &wb);
+    float *t = malloc(tn * 4), *qref = malloc(QN * 4);
+    CHECK(model && t && qref && ds4_gpu_set_model_map(model, wb));
+    for (uint64_t i = 0; i < (uint64_t)NROWS * DV * NWG; i++) t[i] = random_value();
+    for (uint64_t i = (uint64_t)NROWS * DV * NWG; i < tn; i += 2) {
+        t[i] = fabsf(random_value()) + 0.25f;   /* S */
+        t[i + 1] = random_value();              /* M */
+    }
+    ds4_gpu_tensor *tmp = upload(t, tn * 4), *plain = upload(NULL, hb), *once = upload(NULL, hb);
+    ds4_gpu_tensor *q = upload(NULL, QN * 4), *tab = upload(NULL, 512);
+    ds4_gpu_tensor *low[3] = {upload(NULL, lb), upload(NULL, lb), upload(NULL, lb)};
+    CHECK(tmp && plain && once && q && tab && low[0] && low[1] && low[2]);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint32_t positions[] = {0, 1, 8191, 1048575};
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) for (int compressed = 0; compressed < 2; compressed++) {
+        const uint32_t pos = positions[pi];
+        const uint64_t reduce = ds4_gpu_test_kernel_runs("kernel_dsv41_flash_attn_vec_reduce_heads");
+        const uint64_t literal = ds4_gpu_test_kernel_runs("kernel_dsv4_attn_out_low_q8_0_f32_static");
+        CHECK(ds4_gpu_begin_commands() && ds4_gpu_dsv41_rope_coeff_table(tab, pos));
+        CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(plain, tmp, NROWS, 0, NULL, false));
+        CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(once, tmp, NROWS, 1, tab, compressed));
+        CHECK(ds4_gpu_dsv41_attention_low_plain(low[1], model, wb, 0, GROUP, RANK, GROUPS, once));
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+        /* the indexer query from the plain heads */
+        CHECK(ds4_gpu_tensor_write(q, 0, ds4_gpu_tensor_contents(plain), QN * 4) && ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_rope(q, 128, 32, 1, pos, compressed, false));
+        CHECK(ds4_gpu_dsv41_quantize(q, 128, 32, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_read(q, 0, qref, QN * 4));
+        CHECK(ds4_gpu_tensor_write(q, 0, ds4_gpu_tensor_contents(plain), QN * 4) && ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_rope_quantize_heads_tab(q, 128, 32, pos, compressed, DS4_V41_FP4_E8M0, tab));
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize() && !memcmp(qref, ds4_gpu_tensor_contents(q), QN * 4));
+        /* the inline-rope low on the plain heads, and the generic plain low on the transformed ones */
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv41_attention_low(low[0], model, wb, 0, GROUP, RANK, GROUPS, plain, pos, compressed));
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_LITERAL_SHAPES);
+        const int ok = ds4_gpu_dsv41_attention_low_plain(low[2], model, wb, 0, GROUP, RANK, GROUPS, once);
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(ok && ds4_gpu_end_commands() && ds4_gpu_synchronize());
+        CHECK(!memcmp(ds4_gpu_tensor_contents(low[0]), ds4_gpu_tensor_contents(low[1]), lb));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(low[0]), ds4_gpu_tensor_contents(low[2]), lb));
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_flash_attn_vec_reduce_heads") == reduce + 1);
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv4_attn_out_low_q8_0_f32_static") == literal + 1);
+    }
+    ds4_gpu_tensor *tensors[] = {tmp, plain, once, q, tab, low[0], low[1], low[2]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(t); free(qref); free(model);
+    fprintf(stderr, "V4.1 RoPE table: transformed heads + plain low == inline rope low; indexer query rope + quantize "
+            "in one dispatch == two PASS\n");
+    return 1;
+}
+
 /* The V4.1 decode calls that take literal-shape kernels give the generic kernels' bits. */
 static int check_literal_shapes(void) {
     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
@@ -845,6 +904,7 @@ static int check_literal_shapes(void) {
     return 1;
 }
 #else
+static int check_rope_tab(void) { return 1; }
 static int check_literal_shapes(void) { return 1; }
 #endif
 
@@ -2005,6 +2065,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--rope-tab")) {
+        const int ok = ds4_gpu_init() && check_rope_tab();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
         const int ok = ds4_gpu_init() && check_literal_shapes();
         ds4_gpu_cleanup();
@@ -2019,6 +2084,7 @@ int main(int argc, char **argv) {
              check_attention_output(false) && check_tp_attention();
     ok = ok && check_literal_shapes();
     ok = ok && check_e4m3_copies();
+    ok = ok && check_rope_tab();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

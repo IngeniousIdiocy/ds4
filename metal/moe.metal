@@ -3546,6 +3546,50 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope(
         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, &rope);
 }
 
+/* kernel_dsv4_attn_out_low_q8_0_f32 at the V4.1 decode shape (4096, 1024, 8) as literals. */
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_static(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)args;
+    const int iid1 = tgpig.z/8;
+    const int idx  = tgpig.z%8;
+
+    tgpig.z = 0;
+
+    const int64_t i11 = idx % 8;
+    const int64_t i12 = iid1;
+
+    device const char * src0_cur = src0s + idx*(1024ull*4352ull);
+    device const char * src1_cur = src1  + i11*16384ull + i12*(8ull*16384ull);
+    device       char * dst_cur  = dst   + (idx*1024 + i12*8*1024)*sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = ds4_q8_0_static_args(4096, 1024);
+
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+        args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
+}
+
+/* One decode step's RoPE table: float2(cos, sin) of float(start) * frequency, raw 0..31 and compressed 32..63, the
+ * rope low kernels' own expression. */
+kernel void kernel_dsv41_rope_coeff_table(
+        constant ds4_metal_args_mv_rope & raw,
+        constant ds4_metal_args_mv_rope & comp,
+        device float2 * tab,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= 64u) return;
+    constant ds4_metal_args_mv_rope * r = tid < 32u ? &raw : &comp;
+    const float theta = float(r->start) * r->frequencies[tid & 31u];
+    float c;
+    const float sn = precise::sincos(theta, c);
+    tab[tid] = float2(c, sn);
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
