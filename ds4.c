@@ -42263,7 +42263,7 @@ typedef struct {
     uint64_t cols;
     uint8_t *codes;
     float *scales;
-    bool failed;
+    bool failed;   /* shared by the dispatch_apply workers: atomic accesses only */
 } ds41_e4m3_job;
 
 /* One row of 32x32 blocks: the scale that fits the block's largest value,
@@ -42272,6 +42272,7 @@ static void ds41_e4m3_block_row(void *context, size_t br) {
     ds41_e4m3_job *job = context;
     const uint64_t cols = job->cols, bc = cols / 32u;
     for (uint64_t bj = 0; bj < bc; bj++) {
+        if (__atomic_load_n(&job->failed, __ATOMIC_RELAXED)) return;   /* another row already failed the copy */
         float amax = 0.0f;
         for (uint32_t r = 0; r < 32u; r++)
             for (uint32_t j = 0; j < 32u; j++) {
@@ -42291,7 +42292,7 @@ static void ds41_e4m3_block_row(void *context, size_t br) {
                 }
             if (fit) job->scales[br * bc + bj] = ldexpf(1.0f, e);
         }
-        if (!fit) { job->failed = true; return; }   /* a benign race: any writer sets true */
+        if (!fit) { __atomic_store_n(&job->failed, true, __ATOMIC_RELAXED); return; }
     }
 }
 #endif
@@ -42318,7 +42319,7 @@ static bool ds41_engram_e4m3(const ds4_model *m, const ds4_layer_weights *l, uin
         bool ok = job.codes && job.scales;
         if (ok) dispatch_apply_f(rows / 32u, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                                  &job, ds41_e4m3_block_row);
-        ok = ok && !job.failed;
+        ok = ok && !__atomic_load_n(&job.failed, __ATOMIC_RELAXED);   /* dispatch_apply_f returned: every row is done */
         if (!ok) {
             ds4_gpu_tensor_free(c);
             ds4_gpu_tensor_free(sc);
