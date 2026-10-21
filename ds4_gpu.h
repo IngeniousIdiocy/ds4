@@ -57,6 +57,7 @@ enum {
     DS4_GPU_V41_SPLIT_REDUCE = 1u << 5,
     DS4_GPU_V41_INDEX_BF16 = 1u << 6,
     DS4_GPU_V41_DECODE_TOPK = 1u << 7,
+    DS4_GPU_V41_PREENCODE = 1u << 8,
     DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
     DS4_GPU_V41_UNFUSED_TOPK = 1u << 30,    /* test only: the decode top-k without its fused merge */
 };
@@ -234,6 +235,22 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+#ifdef __APPLE__
+/* The next decode token's first command buffer (the slot), encoded during this token's terminal wait.
+ * end_commands_commit / _wait split ds4_gpu_end_commands around it (bridge: a short GPU kernel behind the committed
+ * buffer keeps the GPU busy across the handoff); pe_begin opens the slot as the batch (only between those two),
+ * pe_end closes it, pe_commit writes the token word and commits it as the token's first buffer. Any other command
+ * buffer drops a held slot first. pe_embed_word: the embed encoded next reads the token from the slot's word. */
+int ds4_gpu_pe_supported(void);
+int ds4_gpu_pe_pending(void);
+int ds4_gpu_pe_begin(void);
+void ds4_gpu_pe_embed_word(int on);
+int ds4_gpu_pe_end(int ok);
+int ds4_gpu_pe_commit(int32_t token);
+void ds4_gpu_pe_drop(void);
+int ds4_gpu_end_commands_commit(bool bridge);
+int ds4_gpu_end_commands_wait(void);
+#endif
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

@@ -40972,6 +40972,7 @@ typedef struct {
      * row count pick for these, so pruned rows match it. 0: the batch's own. */
     uint32_t plan_rows;
     uint64_t allocation_bytes;
+    uint64_t passes;   /* passes that changed the state, for the pre-encoded decode slot */
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     bool tp_gate_fused, shared_done, hc_attn_deferred, hc_ffn_deferred, scalar_decode, kv_stored;
@@ -41029,6 +41030,9 @@ static bool ds41_index_bf16_on(void) { return !(ds4_gpu_v41_off() & DS4_GPU_V41_
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+#ifdef __APPLE__
+    ds4_gpu_pe_drop();   /* a held pre-encoded buffer never outlives its graph */
+#endif
     ds41_dspark_free(g->dspark);
     ds4_engram_reader_free(g->engram_reader);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41126,6 +41130,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
+    g->passes++;
     g->valid = true;
     g->index_bf16_ok = true;   /* every row is rewritten through its producer */
     ds4_engram_history_reset(&g->history);
@@ -43177,61 +43182,166 @@ static uint32_t ds41_decode_flush_layers(void) {
     return (uint32_t)cached;
 }
 
+/* The decode step's host state, set before layer 0. encode: the step's RoPE table producer goes into the open batch
+ * (else the pre-encoded slot already holds it). */
+static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool layer_resident, bool encode) {
+    g->scalar_decode = true;
+    g->rope_tab_pos = 0;
+#ifdef __APPLE__
+    if (logits && g->rope_tab && g->tp_world == 1 && !g->streaming && !g->quality && !layer_resident &&
+        !(ds4_gpu_v41_off() & DS4_GPU_V41_ROPE_TABLE) &&
+        (!encode || (ds4_gpu_commands_active() && ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos))))
+        g->rope_tab_pos = g->pos + 1u;   /* the step's RoPE table, read by the decode reduce and the index query */
+#else
+    (void)logits; (void)layer_resident; (void)encode;
+#endif
+    g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+}
+
+static bool ds41_engram_join(ds41_gpu_graph *g, ds4_engram_prefetch **rows, unsigned table, bool overlap, bool ok) {
+    const bool read = overlap ? ds4_engram_reader_wait(g->engram_reader, table) :
+        ds4_engram_read_batch_finish(rows[table]);
+    rows[table] = NULL;
+    return ok && read && ds4_gpu_tensor_write(table ? g->engram_rows_b : g->engram_rows, 0,
+                                              g->rows[table], sizeof(g->rows[table]));
+}
+
+#ifdef __APPLE__
+/* ==== The next token's first command buffer, pre-encoded ====
+ * During this token's terminal wait, after its final buffer is committed, the next token's first buffer (embed, RoPE
+ * table and layer 0 at pos + 1) is encoded into the Metal slot; the token id is read from a device word written at
+ * commit. The next step commits it when its key still holds (the same graph, position and pass count, which every
+ * state change advances), re-runs the prologue without encoding and takes layer 0's carry flags; anything else drops
+ * it. Same kernels, same order, same command buffers as a step without it. */
+static struct {
+    const ds41_gpu_graph *g;
+    uint32_t pos;
+    uint64_t passes;
+    bool shared_done, hc_attn_deferred, hc_ffn_deferred, kv_stored;
+} g_ds41_slot;
+
+/* a resident TP-1 step with logits and the queued head, layer flushes, no images, no DSpark drafter (it drafts
+ * between steps), and the routed-one router (layer 0 never reads the token) */
+static bool ds41_pe_eligible(const ds41_gpu_graph *g, bool queued_head) {
+    return queued_head && !g->streaming && !g->quality && !g->image_count && !g->dspark &&
+        ds41_decode_flush_layers() != 0 && !ds41_router_one_off() && ds4_gpu_pe_supported();
+}
+
+/* *taken: the held slot is this step's first buffer (its key holds); it is committed, and the step takes the host
+ * state its layer 0 left. Any other slot is dropped. False: the commit failed. */
+static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool *taken) {
+    const float initial_pre[] = {1, 0, 0, 0};
+    *taken = ds4_gpu_pe_pending() && g_ds41_slot.g == g && g_ds41_slot.pos == g->pos &&
+        g_ds41_slot.passes == g->passes && ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre));
+    g_ds41_slot.g = NULL;
+    if (!*taken) {
+        ds4_gpu_pe_drop();
+        return true;
+    }
+    if (!ds4_gpu_pe_commit(token)) return false;
+    ds41_step_prologue(g, true, false, false);
+    g->shared_done = g_ds41_slot.shared_done;
+    g->hc_attn_deferred = g_ds41_slot.hc_attn_deferred;
+    g->hc_ffn_deferred = g_ds41_slot.hc_ffn_deferred;
+    g->kv_stored = g_ds41_slot.kv_stored;
+    return true;
+}
+
+/* commit the final buffer (the bridge behind it), encode the slot for pos + 1, then wait */
+static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool ok) {
+    if (!ds4_gpu_end_commands_commit(true)) return false;
+    if (ok && g->pos + 1u < g->ctx && ds4_gpu_pe_begin()) {
+        const uint32_t pos = g->pos;
+        const bool carry[4] = {g->shared_done, g->hc_attn_deferred, g->hc_ffn_deferred, g->kv_stored};
+        g->pos = pos + 1u;
+        ds4_gpu_pe_embed_word(1);
+        bool encoded = ds41_embed(g, m, w, g->residual, g->x, 0, g->pos);
+        ds4_gpu_pe_embed_word(0);
+        ds41_step_prologue(g, true, false, true);
+        if (encoded) encoded = ds41_graph_layer(g, m, &w->layer[0], 0, 0);
+        g_ds41_slot.g = g;
+        g_ds41_slot.pos = g->pos;
+        g_ds41_slot.passes = g->passes;
+        g_ds41_slot.shared_done = g->shared_done;
+        g_ds41_slot.hc_attn_deferred = g->hc_attn_deferred;
+        g_ds41_slot.hc_ffn_deferred = g->hc_ffn_deferred;
+        g_ds41_slot.kv_stored = g->kv_stored;
+        if (!ds4_gpu_pe_end(encoded)) g_ds41_slot.g = NULL;
+        g->pos = pos;
+        g->shared_done = carry[0];
+        g->hc_attn_deferred = carry[1];
+        g->hc_ffn_deferred = carry[2];
+        g->kv_stored = carry[3];
+    }
+    return ds4_gpu_end_commands_wait() && ok;
+}
+#else
+static bool ds41_pe_eligible(const ds41_gpu_graph *g, bool queued_head) {
+    (void)g; (void)queued_head;
+    return false;
+}
+static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool *taken) {
+    (void)g; (void)token;
+    *taken = false;
+    return true;
+}
+static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool ok) {
+    (void)g; (void)m; (void)w; (void)ok;
+    return false;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
-    uint32_t ids[2][DS4_ENGRAM_COLS];
-    ds4_engram_history next_history = g->history;
-    if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
-    const bool overlap_engram = g->engram_reader && !ds41_image_at(g, g->pos) &&
-        !getenv("DS4_DISABLE_V41_ENGRAM_OVERLAP");
-    if (overlap_engram && !ds4_engram_reader_start(g->engram_reader,
-            g->table, ids, &g->rows[0][0])) return false;
-    /* The rows come from an uncached file: workers read them while layer 0
-     * encodes; layer 1 joins them and uploads. */
-    ds4_engram_prefetch *rows[2] = {NULL, NULL};
-    for (uint32_t i = 0; !overlap_engram && !ds41_image_at(g, g->pos) && i < 2; i++) {
-        rows[i] = ds4_engram_read_batch_start(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]);
-        if (!rows[i]) {
-            if (i) ds4_engram_read_batch_finish(rows[0]);
-            return false;
-        }
-    }
-    const float initial_pre[] = {1, 0, 0, 0};
-    bool ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
-        ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
-    if (layer_resident && !ds4_gpu_end_commands()) ok = false;
     /* Queue the layers in one command stream; a flush every few layers lets
      * the GPU start while the host keeps encoding. */
     const bool queue_layers = !g->imatrix && !layer_resident &&
         !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
                                  : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
     const bool queued_head = queue_layers && logits && g->tp_world == 1 && !ds41_queued_head_off();
-    g->scalar_decode = true;
-    g->rope_tab_pos = 0;
-#ifdef __APPLE__
-    if (logits && g->rope_tab && g->tp_world == 1 && !g->streaming && !g->quality && !layer_resident &&
-        !(ds4_gpu_v41_off() & DS4_GPU_V41_ROPE_TABLE) && ds4_gpu_commands_active() &&
-        ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos))
-        g->rope_tab_pos = g->pos + 1u;   /* the step's RoPE table, read by the decode reduce and the index query */
-#endif
-    g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    /* Pre-encoded steps start from the slot the previous step left, join the Engram rows just before their
+     * layer's buffer commits, and encode the next slot while their last buffer runs. */
+    const bool pe = ds41_pe_eligible(g, queued_head);
+    bool slot = false;
+    bool ok = !pe || ds41_slot_take(g, token, &slot);
+    g->passes++;
+    uint32_t ids[2][DS4_ENGRAM_COLS];
+    ds4_engram_history next_history = g->history;
+    if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) ok = false;
+    const bool overlap_engram = ok && g->engram_reader && !ds41_image_at(g, g->pos) &&
+        !getenv("DS4_DISABLE_V41_ENGRAM_OVERLAP");
+    if (overlap_engram && !ds4_engram_reader_start(g->engram_reader,
+            g->table, ids, &g->rows[0][0])) ok = false;
+    /* The rows come from an uncached file: workers read them while layer 0
+     * encodes; layer 1 joins them and uploads. */
+    ds4_engram_prefetch *rows[2] = {NULL, NULL};
+    for (uint32_t i = 0; ok && !overlap_engram && !ds41_image_at(g, g->pos) && i < 2; i++) {
+        rows[i] = ds4_engram_read_batch_start(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]);
+        if (!rows[i]) ok = false;
+    }
+    if (!ok && !slot) {   /* nothing encoded yet */
+        if (rows[0]) ds4_engram_read_batch_finish(rows[0]);
+        return false;
+    }
+    if (!slot) {
+        const float initial_pre[] = {1, 0, 0, 0};
+        ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
+            ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
+        if (layer_resident && !ds4_gpu_end_commands()) ok = false;
+        ds41_step_prologue(g, logits != NULL, layer_resident, true);
+    }
+    for (uint32_t il = slot ? 1u : 0u; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         const unsigned table = il == 1 ? 0 : 1;
-        if (ds41_engram_layer(il) && (rows[table] || overlap_engram)) {   /* each table joins at its layer */
-            const bool read = overlap_engram ? ds4_engram_reader_wait(g->engram_reader, table) :
-                ds4_engram_read_batch_finish(rows[table]);
-            rows[table] = NULL;
-            if (ok && !(read && ds4_gpu_tensor_write(table ? g->engram_rows_b : g->engram_rows, 0,
-                                                    g->rows[table], sizeof(g->rows[table])))) ok = false;
-        }
+        if (!pe && ds41_engram_layer(il) && (rows[table] || overlap_engram))   /* each table joins at its layer */
+            ok = ds41_engram_join(g, rows, table, overlap_engram, ok);
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
@@ -43245,14 +43355,6 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             il + 1u == DS4_N_LAYER;
         /* the head only needs the last layer: encode it before the drain */
         if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
-        if (drain && !ds4_gpu_end_commands()) ok = false;
-        if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
-        if (ok && g->imatrix)
-            ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
-                                               g->selected, false, il, 1);
-        if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
-        if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
-            ok = ds4_gpu_begin_commands() != 0;
         const uint32_t flush_layers = ds41_decode_flush_layers();
         /* the first flush follows layer 0, so the GPU starts a token early */
 #ifdef __APPLE__
@@ -43260,15 +43362,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #else
         const bool tp_inline_gates = false;
 #endif
-        if (ok && queue_layers && !drain && (g->tp_world != 2 || tp_inline_gates) && flush_layers &&
-            (il == 0 || (il + 1u) % flush_layers == 0))
-            ok = ds4_gpu_flush_commands() != 0;
+        const bool flush = queue_layers && !drain && (g->tp_world != 2 || tp_inline_gates) && flush_layers &&
+            (il == 0 || (il + 1u) % flush_layers == 0);
+        for (unsigned i = 0; pe && (drain || flush) && i < 2; i++)   /* before the buffer of its layer commits */
+            if (rows[i] && il >= (i ? 14u : 1u)) ok = ds41_engram_join(g, rows, i, false, ok);
+        if (drain && pe) ok = ds41_slot_drain(g, m, w, ok);
+        else if (drain && !ds4_gpu_end_commands()) ok = false;
+        if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+        if (ok && g->imatrix)
+            ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
+                                               g->selected, false, il, 1);
+        if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
+        if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
+            ok = ds4_gpu_begin_commands() != 0;
+        if (ok && flush) ok = ds4_gpu_flush_commands() != 0;
     }
     g->scalar_decode = false;
     g->rope_tab_pos = 0;
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
-        if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
+        if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before the join */
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
@@ -43656,6 +43769,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
+    g->passes++;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
@@ -44070,6 +44184,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
+    for (int i = 0; i < count; i++) graphs[i]->passes++;
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
     const bool shared_owner = g->tp_world == 2 &&
@@ -64621,6 +64736,7 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
+    g->passes++;
     const uint32_t pos = h[7];
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
