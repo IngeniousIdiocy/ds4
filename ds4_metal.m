@@ -443,6 +443,8 @@ uint32_t ds4_gpu_v41_off(void) {
         static const char *names[] = {   /* in bit order */
             "DS4_METAL_DISABLE_V41_DEFERRED_HC",
             "DS4_METAL_DISABLE_V41_LITERAL_SHAPES",
+            "DS4_METAL_DISABLE_V41_INDEXER_E4M3",
+            "DS4_METAL_MODEL_TRACKED",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -1669,9 +1671,15 @@ static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
            strcmp(label, "ds4_attention_output_group_ids") == 0;
 }
 
+/* Set by the engine for DeepSeek V4.1 before the model is mapped: its model views and weights built at load are
+ * read-only to the GPU, so they skip hazard tracking, as DS4_METAL_MODEL_UNTRACKED=1 does for any model. */
+static int g_model_untracked_default;
+void ds4_gpu_set_model_untracked_default(int on) { g_model_untracked_default = on != 0; }
+
 static MTLResourceOptions ds4_gpu_model_resource_options(void) {
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL) {
+    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL ||
+        (g_model_untracked_default && ds4_gpu_v41_on(DS4_GPU_V41_MODEL_TRACKED))) {
         options |= MTLResourceHazardTrackingModeUntracked;
     }
     return options;
@@ -9263,14 +9271,14 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
-ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+static ds4_gpu_tensor *ds4_gpu_tensor_alloc_options(uint64_t bytes, MTLResourceOptions options) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
 
     @autoreleasepool {
         DS4MetalTensor *tensor = [DS4MetalTensor new];
         tensor.buffer = [g_device newBufferWithLength:(NSUInteger)bytes
-                                              options:MTLResourceStorageModeShared];
+                                              options:options];
         if (!tensor.buffer) {
             return NULL;
         }
@@ -9302,8 +9310,67 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc_options(bytes, MTLResourceStorageModeShared);
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
+}
+
+/* Weights built at load: the model views' storage options (untracked with DS4_METAL_MODEL_UNTRACKED, which is safe
+ * for buffers the CPU fills once before any GPU use and nothing writes afterwards). */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc_options(bytes, ds4_gpu_model_resource_options());
+}
+
+/* Weights built at load in a residency set of their own, as the model views are in theirs (residency requested
+ * now and the set added to the queue), so the first decode token does not discover them. Replaces the previous
+ * set; n == 0 only releases it. The same switches as the views' set apply. */
+static id g_weight_residency_set;
+static int g_weight_residency_added_to_queue;
+static void ds4_gpu_weight_residency_clear(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_weight_residency_set) {
+            if (g_weight_residency_added_to_queue && g_queue &&
+                [g_queue respondsToSelector:@selector(removeResidencySet:)])
+                [g_queue removeResidencySet:g_weight_residency_set];
+            [g_weight_residency_set endResidency];
+            [g_weight_residency_set removeAllAllocations];
+            g_weight_residency_set = nil;
+        }
+    }
+#endif
+    g_weight_residency_added_to_queue = 0;
+}
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n) {
+    ds4_gpu_weight_residency_clear();
+    if (!n || !g_device || g_ssd_streaming_mode || g_model_residency_skipped || getenv("DS4_METAL_NO_RESIDENCY")) return 1;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_built_weights";
+        desc.initialCapacity = n;
+        NSError *error = nil;
+        g_weight_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!g_weight_residency_set) {
+            fprintf(stderr, "ds4: Metal built-weight residency set creation failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return 0;
+        }
+        for (uint32_t i = 0; i < n; i++)
+            if (tensors[i]) [g_weight_residency_set addAllocation:ds4_gpu_tensor_buffer(tensors[i])];
+        [g_weight_residency_set commit];
+        [g_weight_residency_set requestResidency];
+        if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL && g_queue &&
+            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_weight_residency_set];
+            g_weight_residency_added_to_queue = 1;
+        }
+    }
+#endif
+    return 1;
 }
 
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
@@ -12133,6 +12200,7 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache_evictions = 0;
         g_model_buffer_cache_over_limit = 0;
         ds4_gpu_model_residency_clear();
+        ds4_gpu_weight_residency_clear();
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
@@ -22409,6 +22477,9 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
     return 1;
 }
 
+/* The narrow readers below take blend kernels (metal/dense.metal) with wider loads and the same bits. */
+static int ds4_blend_on(void) { return ds4_gpu_v41_on(DS4_GPU_V41_PLAIN_READERS); }
+
 /* One activation row against BF16 weights in a GPU tensor: the F32 matvec's
  * dispatch and reduction, so weights that are exactly BF16 give its bits. */
 int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
@@ -22429,13 +22500,16 @@ int ds4_gpu_matmul_bf16_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
         mv_args.nb01 = in_dim * sizeof(uint16_t);
         mv_args.nb02 = mv_args.nb03 = in_dim * out_dim * sizeof(uint16_t);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
-        if (ds4_gpu_plain_mv_single_row(out_dim)) {
+        /* blend: 16-byte weight loads, one row per threadgroup */
+        const int rblend = (in_dim % 32u) == 0 && (ds4_gpu_tensor_offset(weights) % 16u) == 0 && ds4_blend_on();
+        if (rblend || ds4_gpu_plain_mv_single_row(out_dim)) {
             mv_dispatch.nr0 = 1;
             mv_dispatch.smem = 32u * sizeof(float);
         }
         mv_args.nr0 = mv_dispatch.nr0;
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_bf16_f32_4", mv_dispatch.nsg);
+        if (rblend) DS4_TEST_NOTE("kernel_router_blend_r1");
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            rblend ? "kernel_router_blend_r1" : "kernel_mul_mv_bf16_f32_4", mv_dispatch.nsg);
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -22488,10 +22562,23 @@ int ds4_gpu_matmul_e4m3_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *c
             mv_dispatch.nr0 = 1;
             mv_dispatch.smem = 32u * sizeof(float);
         }
-        mv_args.nr0 = mv_dispatch.nr0;
         if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0) return 0;
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_e4m3_f32_4_bf16", mv_dispatch.nsg);
+        /* blend (16-byte code loads, two rows sharing a scale load): with only the simdgroups that own a 32-column
+         * block when every lane owns at most one (the indexer q_b), else the two-row walk (the Engram projection) */
+        const int16_t owner_nsg = (int16_t)((in_dim / 32u + 15u) / 16u);
+        const int blend = (ds4_gpu_tensor_offset(codes) % 16u) == 0 && ds4_blend_on();
+        const int owner = blend && mv_dispatch.nr0 == 2 && owner_nsg <= mv_dispatch.nsg;
+        if (owner) {
+            mv_dispatch.nsg = owner_nsg;
+        } else if (blend) {
+            mv_dispatch.nr0 = 2;
+            mv_dispatch.smem = 32u * 2u * sizeof(float);
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+        const char *fn = owner ? "kernel_e4m3_blend_owner_r2_bf16" : blend ? "kernel_e4m3_blend_r2_bf16" :
+            "kernel_mul_mv_e4m3_f32_4_bf16";
+        if (blend) DS4_TEST_NOTE(fn);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(fn, mv_dispatch.nsg);
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
